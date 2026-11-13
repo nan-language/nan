@@ -1,4 +1,4 @@
-//! Programs started as child processes with their arguments, this process's environment, their standard streams and their working directory, waited for to their end or ended; and this process replaced by a program.
+//! Programs started as child processes with their arguments, this process's environment with the variables they set, their standard streams and their working directory, waited for to their end or ended; and this process replaced by a program.
 
 /// The flags of `posix_spawnattr_setflags` setting the signals a started program finds at their
 /// default action, and its signal mask.
@@ -45,7 +45,7 @@ foreign fn waitpid(pid: i32, wstatus: hw::Ptr[i32], options: i32) -> i32 convent
 
 foreign fn kill(pid: i32, number: i32) -> i32 convention "sysv"
 
-foreign fn execv(path: hw::Ptr[u8], argv: hw::Ptr[u64]) -> i32 convention "sysv"
+foreign fn execvpe(file: hw::Ptr[u8], argv: hw::Ptr[u64], envp: hw::Ptr[u64]) -> i32 convention "sysv"
 
 foreign fn pthread_sigmask(how: i32, set: hw::Ptr[u64], previous: hw::Ptr[u64]) -> i32 convention "sysv"
 
@@ -76,6 +76,13 @@ foreign fn posix_spawnattr_setflags(attributes: hw::Ptr[u64], flags: i16) -> i32
 foreign fn posix_spawnattr_setsigmask(attributes: hw::Ptr[u64], mask: hw::Ptr[u64]) -> i32 convention "sysv"
 
 foreign fn posix_spawnattr_setsigdefault(attributes: hw::Ptr[u64], defaults: hw::Ptr[u64]) -> i32 convention "sysv"
+
+/// A variable of the environment a program starts with, which replaces this process's variable
+/// of its name.
+pkg struct EnvVar derives Copy {
+    pkg name: Str
+    pkg value: Str
+} EnvVar
 
 /// How a process ended: the status it exited with, or the number of the signal that ended it.
 pkg enum Status derives Copy, Eq {
@@ -152,6 +159,13 @@ fn Gathered.empty(alloc: mem::Alloc) -> Gathered {
 /// for none; its standard output captured; its standard error captured, or the null device unless
 /// `capture_errors`. It starts with no signal blocked and `SIGPIPE` at its default action.
 pkg fn run_output(program: Str, args: Slice[text::String], take input: Option[mem::Bytes], capture_errors: bool, alloc: mem::Alloc) -> Output fails IoError {
+    let env = mem::List[EnvVar].empty(alloc)
+    return try run_output_with(program, args, env: env.view(), input: take input, capture_errors, alloc)
+} run_output
+
+/// Runs a program as `run_output` does, with this process's environment with the variables of
+/// `env` set.
+pkg fn run_output_with(program: Str, args: Slice[text::String], env: Slice[EnvVar], take input: Option[mem::Bytes], capture_errors: bool, alloc: mem::Alloc) -> Output fails IoError {
     var streams = Streams(input: Stream.Null, out: Stream.Piped, err: Stream.Null)
     if input.is_some() {
         streams.input = Stream.Piped
@@ -160,7 +174,7 @@ pkg fn run_output(program: Str, args: Slice[text::String], take input: Option[me
     if capture_errors {
         streams.err = Stream.Piped
     }
-    var child = try spawn(program, args, streams, dir: None, alloc)
+    var child = try spawn(program, args, streams, dir: None, env, alloc)
     var gathered = Gathered.empty(alloc)
     loop {
         let pumped = attempt mut child.pump(mut gathered, input: given.view(), timeout: -1)
@@ -178,7 +192,7 @@ pkg fn run_output(program: Str, args: Slice[text::String], take input: Option[me
     }
     let Gathered(stdout: out_bytes, stderr: err_bytes, written: _, scratch: _) = gathered
     return Output(status: ended, stdout: take out_bytes, stderr: take err_bytes)
-} run_output
+} run_output_with
 
 /// The bytes given as a program's input, none for none.
 fn input_bytes(take input: Option[mem::Bytes], alloc: mem::Alloc) -> mem::Bytes {
@@ -193,7 +207,7 @@ fn input_bytes(take input: Option[mem::Bytes], alloc: mem::Alloc) -> mem::Bytes 
 /// `within` with its process id, between waits of `poll_ms` milliseconds for its output, whether
 /// it may go on, and once that gives false or fails, kills it and gives none or the failure.
 pkg fn run_bounded(program: Str, args: Slice[text::String], dir: Str, poll_ms: i32, within: fn(id: u32) -> bool fails IoError, alloc: mem::Alloc) -> Option[Output] fails IoError {
-    var child = try spawn(program, args, streams: Streams(input: Stream.Null, out: Stream.Piped, err: Stream.Piped), dir: Some(dir), alloc)
+    var child = try spawn(program, args, streams: Streams(input: Stream.Null, out: Stream.Piped, err: Stream.Piped), dir: Some(dir), env: mem::List[EnvVar].empty(alloc).view(), alloc)
     var gathered = Gathered.empty(alloc)
     var ended: Option[Status] = None
     loop {
@@ -240,7 +254,7 @@ pkg fn run_attached(program: Str, args: Slice[text::String], dir: Str, alloc: me
     if changed != 0 {
         fail error_of(changed)
     }
-    let child = try spawn(program, args, streams: Streams(input: Stream.Inherited, out: Stream.Inherited, err: Stream.Inherited), dir: Some(dir), alloc)
+    let child = try spawn(program, args, streams: Streams(input: Stream.Inherited, out: Stream.Inherited, err: Stream.Inherited), dir: Some(dir), env: mem::List[EnvVar].empty(alloc).view(), alloc)
     let Some(ended) = try waited(child.pid, options: 0) else {
         fail IoError.Other(0)
     }
@@ -255,7 +269,7 @@ pkg struct Background derives Copy {
 /// Starts a program the `PATH` finds, given its arguments after its name, in the directory `dir`,
 /// with its standard streams the null device.
 pkg fn start_background(program: Str, args: Slice[text::String], dir: Str, alloc: mem::Alloc) -> Background fails IoError {
-    let child = try spawn(program, args, streams: Streams(input: Stream.Null, out: Stream.Null, err: Stream.Null), dir: Some(dir), alloc)
+    let child = try spawn(program, args, streams: Streams(input: Stream.Null, out: Stream.Null, err: Stream.Null), dir: Some(dir), env: mem::List[EnvVar].empty(alloc).view(), alloc)
     return Background(pid: child.pid)
 } start_background
 
@@ -275,10 +289,11 @@ pkg fn sleep_ms(milliseconds: i32) {
     discard trusted "poll waits on no descriptor, so it reads none" { poll(hw::Ptr.of_addr(0), count: 0, timeout: milliseconds) }
 } sleep_ms
 
-/// Replaces this process by a program at a path, given its arguments after its name, with this
-/// process's environment and standard streams, no signal blocked and `SIGPIPE` at its default
-/// action. Returns only when the system refuses, with the failure.
-pkg fn replace_process(program: Str, args: Slice[text::String], alloc: mem::Alloc) -> IoError {
+/// Replaces this process by a program the `PATH` finds, a name holding `/` being its path, given
+/// its arguments after its name, with this process's environment with the variables of `env` set
+/// and this process's standard streams, no signal blocked and `SIGPIPE` at its default action.
+/// Returns only when the system refuses, with the failure.
+pkg fn replace_process(program: Str, args: Slice[text::String], env: Slice[EnvVar], alloc: mem::Alloc) -> IoError {
     let Ok(path) = attempt c_text(program.as_bytes()) else {
         return IoError.Other(EINVAL)
     }
@@ -292,10 +307,15 @@ pkg fn replace_process(program: Str, args: Slice[text::String], alloc: mem::Allo
         }
     }
     let argv = pointers(texts.view(), alloc)
+    let environment = match attempt environment_with(env, alloc) {
+        Ok(found) => found
+        Err(error) => return error
+    }
+    let envp = pointers(environment.view(), alloc)
     let empty = Array[u64, 16].filled(0)
     discard trusted "empty addresses a sigset_t, and a null pointer asks for no previous mask" { pthread_sigmask(SIG_SETMASK, set: hw::Ptr.of_view(empty.view()), previous: hw::Ptr.of_addr(0)) }
     discard trusted "SIG_DFL is the null handler" { signal(SIGPIPE, handler: hw::Ptr.of_addr(0)) }
-    discard trusted "path holds a NUL-terminated path and argv the addresses of the NUL-terminated texts of texts, then 0" { execv(hw::Ptr.of_view(path.bytes.view()), argv: hw::Ptr.of_view(argv.view())) }
+    discard trusted "path holds a NUL-terminated name, and argv and envp the addresses of the NUL-terminated texts of texts and environment, then 0" { execvpe(hw::Ptr.of_view(path.bytes.view()), argv: hw::Ptr.of_view(argv.view()), envp: hw::Ptr.of_view(envp.view())) }
     return last_error()
 } replace_process
 
@@ -323,9 +343,10 @@ pkg fn monotonic_nanos() -> u64 {
 } monotonic_nanos
 
 /// Starts a program the `PATH` finds, given its arguments after its name, with this process's
-/// environment, its standard streams as `streams` gives, in the directory `dir` or this process's
-/// for none, no signal blocked and `SIGPIPE` at its default action.
-fn spawn(program: Str, args: Slice[text::String], streams: Streams, dir: Option[Str], alloc: mem::Alloc) -> Child fails IoError {
+/// environment with the variables of `env` set, its standard streams as `streams` gives, in the
+/// directory `dir` or this process's for none, no signal blocked and `SIGPIPE` at its default
+/// action.
+fn spawn(program: Str, args: Slice[text::String], streams: Streams, dir: Option[Str], env: Slice[EnvVar], alloc: mem::Alloc) -> Child fails IoError {
     let file = try c_text(program.as_bytes())
     var texts = mem::Bytes.empty(alloc)
     try add_text(mut texts, written: program.as_bytes())
@@ -333,7 +354,7 @@ fn spawn(program: Str, args: Slice[text::String], streams: Streams, dir: Option[
         try add_text(mut texts, written: arg.as_bytes())
     }
     let argv = pointers(texts.view(), alloc)
-    let environment = try read_file("/proc/self/environ", alloc)
+    let environment = try environment_with(env, alloc)
     let envp = pointers(environment.view(), alloc)
     var ends = Ends(input: -1, input_far: -1, out: -1, out_far: -1, err: -1, err_far: -1)
     var directory: Option[CText] = None
@@ -479,6 +500,56 @@ fn add_text(mut texts: mem::Bytes, written: Slice[u8]) fails IoError {
     mut texts.append(written)
     mut texts.push(0)
 } add_text
+
+/// The NUL-terminated `NAME=VALUE` texts of this process's environment with the variables of
+/// `env` set.
+fn environment_with(env: Slice[EnvVar], alloc: mem::Alloc) -> mem::Bytes fails IoError {
+    let current = try read_file("/proc/self/environ", alloc)
+    let held = current.view()
+    var texts = mem::Bytes.empty(alloc)
+    var start: usize = 0
+    for at in 0..<held.len() {
+        if held[at] != 0 {
+            continue
+        }
+        let Some(before) = held.split_at(at) else {
+            continue
+        }
+        let Some(entry) = before.head.split_at(start) else {
+            continue
+        }
+        if not set_by(entry.tail, env) {
+            mut texts.append(entry.tail)
+            mut texts.push(0)
+        }
+        start = at + 1
+    }
+    for variable in env {
+        var written = mem::Bytes.empty(alloc)
+        mut written.append(variable.name.as_bytes())
+        mut written.push(b'=')
+        mut written.append(variable.value.as_bytes())
+        try add_text(mut texts, written: written.view())
+    }
+    return texts
+} environment_with
+
+/// Whether an environment entry `NAME=VALUE` names a variable of `env`.
+fn set_by(entry: Slice[u8], env: Slice[EnvVar]) -> bool {
+    for variable in env {
+        let name = variable.name.as_bytes()
+        let Some(parts) = entry.split_at(name.len()) else {
+            continue
+        }
+        let Some(sign) = parts.tail.prefix(1) else {
+            continue
+        }
+        if parts.head == name and sign == b"=" {
+            return true
+        }
+    }
+    return false
+} set_by
 
 /// The address of each NUL-terminated text of `texts`, then 0, as the C library reads a list of
 /// texts.

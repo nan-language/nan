@@ -1,0 +1,1058 @@
+//! The Windows targets, everything Windows-specific: the program entry seam, the image's entry point; the executor threads, one per processor of the process's affinity set, which all wait on the process's I/O completion port; termination requests, which the console's control handler passes to them through that port; stack overflows, which a vectored exception handler receives; and the support routines' calls into the system, each through the import address table's word of a `kernel32.dll` function.
+
+/// The symbol of the program entry seam, the image's entry point.
+pkg const WINDOWS_ENTRY: Str = "_NSentry"
+
+/// The flags of `HeapAlloc` giving zeroed memory, of `VirtualAlloc` reserving and committing
+/// memory, of `VirtualFree` releasing a whole reservation, and the protections of memory that
+/// can be read and written and of memory that cannot be accessed.
+const HEAP_ZERO_MEMORY: i64 = 8
+
+const MEM_COMMIT_RESERVE: i64 = 0x3000
+
+const MEM_RELEASE: i64 = 0x8000
+
+const PAGE_READWRITE: i64 = 4
+
+const PAGE_NOACCESS: i64 = 1
+
+/// The pseudo handle `INVALID_HANDLE_VALUE`, which makes `CreateIoCompletionPort` create a port,
+/// and the flag of `DuplicateHandle` keeping the access of the handle duplicated.
+const INVALID_HANDLE: i64 = -1
+
+const DUPLICATE_SAME_ACCESS: i64 = 2
+
+/// The thread-local slots a thread's environment block holds, and their count.
+const TLS_SLOTS: u64 = 0x1480
+
+const TLS_MINIMUM: i64 = 64
+
+/// The handle numbers `GetStdHandle` takes for standard output and standard error.
+const STD_OUTPUT: i64 = -11
+
+const STD_ERROR: i64 = -12
+
+/// The entries a thread takes from the completion port at once, the size of an
+/// `OVERLAPPED_ENTRY` and the offsets of its completion key and `OVERLAPPED` address.
+const PORT_ENTRIES: u64 = 16
+
+const PORT_ENTRY_SIZE: u64 = 32
+
+const PORT_ENTRY_KEY: u64 = 0
+
+const PORT_ENTRY_OVERLAPPED: u64 = 8
+
+/// The completion keys of a packet waking an executor thread, of the first termination
+/// request and of a request's completion, and the timeout of a wait that never ends.
+const KEY_WAKE: i64 = 1
+
+const KEY_TERMINATION: i64 = 2
+
+const KEY_REQUEST: i64 = 3
+
+const INFINITE: i64 = 0xFFFF_FFFF
+
+/// The status a termination request ends the process with, `STATUS_CONTROL_C_EXIT`.
+const CONTROL_C_EXIT: i64 = 0xC000_013A
+
+/// The size of each thread's stack for stack overflow reports.
+const WINDOWS_TRAP_STACK: u64 = 65_536
+
+/// A task stack's guard region: a page no access reaches, the stack's floor, then the pages the
+/// system guards. A touch of a guarded page while the stack is the running thread's makes the
+/// system raise a stack overflow, those pages then holding the handler's frames.
+const WINDOWS_GUARD: u64 = 12_288
+
+const GUARD_FLOOR: u64 = 4_096
+
+const PAGE_GUARD: i64 = 0x100
+
+/// The offsets in a thread's environment block of the bounds of the stack it runs on: its top,
+/// the lowest address of its usable part, the base of its reservation, and the bytes of its
+/// guard region the system keeps for a stack overflow's handler.
+const STACK_BASE: u64 = 0x8
+
+const STACK_LIMIT: u64 = 0x10
+
+const DEALLOCATION_STACK: u64 = 0x1478
+
+const GUARANTEED_STACK_BYTES: u64 = 0x1748
+
+/// The code of a stack overflow exception, the offsets in an exception record of its parameter
+/// count and of the parameter holding the faulting address, and the offsets of the record and
+/// of the thread's saved registers in the exception pointers a vectored handler receives.
+const STACK_OVERFLOW: i64 = 0xC000_00FD
+
+const PARAMETER_COUNT: u64 = 24
+
+const WINDOWS_FAULT_ADDRESS: u64 = 40
+
+const POINTERS_RECORD: u64 = 0
+
+const POINTERS_CONTEXT: u64 = 8
+
+/// What a vectored exception handler returns to resume the thread with its saved registers, and
+/// to pass the exception on.
+const CONTINUE_EXECUTION: i64 = -1
+
+const CONTINUE_SEARCH: i64 = 0
+
+/// The 100-nanosecond intervals of processor time after which a seeded run ends, and the
+/// milliseconds between two reads of the process's times.
+const CPU_INTERVALS: i64 = 100_000_000
+
+const CPU_PERIOD: i64 = 100
+
+/// The layout of a thread's saved registers, a `CONTEXT`: its size, the offset of its flags and
+/// the flags asking for its control and integer registers, and the offsets of the registers a
+/// stop or fault handler reads and redirects.
+struct WindowsSaved derives Copy {
+    size: u64
+    flags_at: u64
+    flags: i64
+    registers: Context
+} WindowsSaved
+
+fn windows_saved(arch: workspace::Arch) -> WindowsSaved {
+    return match arch {
+        workspace::Arch.Amd64 => WindowsSaved(size: 0x4D0, flags_at: 0x30, flags: 0x10_0003, registers: Context(arg: 0xB0, fp: 0xA0, sp: 0x98, ip: 0xF8, link: None))
+        workspace::Arch.Aarch64 => WindowsSaved(size: 0x390, flags_at: 0, flags: 0x40_0003, registers: Context(arg: 0x8, fp: 0xF0, sp: 0x100, ip: 0x108, link: Some(0xF8u64)))
+    }
+} windows_saved
+
+/// The bounds of the stack a thread runs on, as its environment block records them.
+struct StackBounds derives Copy {
+    base: clif::Value
+    limit: clif::Value
+    deallocation: clif::Value
+    guaranteed: clif::Value
+} StackBounds
+
+/// The words of a command line after the program's name: their count and the address of their
+/// addresses.
+struct CommandWords derives Copy {
+    count: clif::Value
+    texts: clif::Value
+} CommandWords
+
+/// The calling convention of the system's functions on an architecture.
+fn windows_convention(arch: workspace::Arch) -> clif::CallConv {
+    return match arch {
+        workspace::Arch.Amd64 => clif::CallConv.WindowsFastcall
+        workspace::Arch.Aarch64 => clif::CallConv.SystemV
+    }
+} windows_convention
+
+/// Calls a function of a system library, by its name for a `kernel32.dll` function and
+/// otherwise by its library's name, `!` and its name, through its word of the image's import
+/// address table, under the system's calling convention, giving its results.
+fn Lowering.call_system(mut self, mut fx: Fx, name: Str, args: Slice[clif::Value], returns: Slice[clif::Type]) -> mem::List[clif::Value] {
+    var signature = clif::Signature.new(windows_convention(self.arch()), alloc: self.alloc)
+    for arg in args {
+        mut signature.params.push(clif::AbiParam(value_type: fx.b.value_type(arg)))
+    }
+    for returned in returns {
+        mut signature.returns.push(clif::AbiParam(value_type: returned))
+    }
+    let call = mut self.call_imported(mut fx, name, signature: take signature, args)
+    return fx.b.inst_results(call, alloc: fx.alloc)
+} Lowering.call_system
+
+/// Calls a function the image imports, named as `call_system` names it, through its word of
+/// the import address table, under `signature`.
+fn Lowering.call_imported(mut self, mut fx: Fx, name: Str, take signature: clif::Signature, args: Slice[clif::Value]) -> clif::Inst {
+    var symbol = text::String.of(image::IMPORT_PREFIX, alloc: self.alloc)
+    mut symbol.append(name)
+    let id = mut self.module.declare_data(symbol.as_str(), linkage: object::Linkage.Import, writable: false, tls: false)
+    let word = mut self.data_address(mut fx, id)
+    let function = mut fx.load(PTR, addr: word, offset: 0)
+    let imported = mut fx.b.import_signature(take signature)
+    let call = mut fx.b.call_indirect(imported, callee: function, args)
+    mut fx.classify(call, kind: StackKind.Stub)
+    return call
+} Lowering.call_imported
+
+/// Calls the function at an address under the system's calling convention with pointer-sized
+/// arguments, giving its result of type `result`.
+fn Lowering.call_address(mut self, mut fx: Fx, function: clif::Value, args: Slice[clif::Value], result: clif::Type) -> clif::Value {
+    let signature = windows_callback(self, params: args.len(), result)
+    let imported = mut fx.b.import_signature(take signature)
+    let call = mut fx.b.call_indirect(imported, callee: function, args)
+    mut fx.classify(call, kind: StackKind.Stub)
+    return first_result(fx.b.inst_results(call, alloc: fx.alloc))
+} Lowering.call_address
+
+/// The architecture of the target.
+fn Lowering.arch(self) -> workspace::Arch {
+    let Some(arch) = self.ck.db().target.arch() else {
+        expect false
+        return workspace::Arch.Amd64
+    }
+    return arch
+} Lowering.arch
+
+/// The signature, under the system's calling convention, of a function of `params`
+/// pointer-sized arguments giving a result of type `result`.
+fn windows_callback(lo: Lowering, params: usize, result: clif::Type) -> clif::Signature {
+    var signature = clif::Signature.new(windows_convention(lo.arch()), alloc: lo.alloc)
+    for _ in 0usize..<params {
+        mut signature.params.push(clif::AbiParam(value_type: PTR))
+    }
+    mut signature.returns.push(clif::AbiParam(value_type: result))
+    return signature
+} windows_callback
+
+/// Declares and defines a function the system calls with `params` pointer-sized arguments,
+/// giving a 32-bit result.
+fn windows_define_callback(mut lo: Lowering, name: Str, params: usize, build: fn(mut lo: Lowering, mut fx: Fx, params: Slice[clif::Value])) -> object::FuncId {
+    let signature = windows_callback(lo, params, result: clif::Type.Int32)
+    let id = mut lo.module.declare_function(name, linkage: object::Linkage.Local, signature)
+    mut lo.define(id, signature: take signature, flags: LINES_HIDDEN | LINES_CRITICAL, build: fn(mut callback_lo: Lowering, mut callback_fx: Fx) {
+        let incoming = mut callback_fx.entry()
+        build(lo: mut callback_lo, fx: mut callback_fx, params: incoming.view())
+    })
+    return id
+} windows_define_callback
+
+/// The address of a function the system calls.
+fn windows_function_address(mut lo: Lowering, mut fx: Fx, id: object::FuncId) -> clif::Value {
+    let reference = mut lo.func_ref(mut fx, id)
+    return mut fx.b.func_addr(PTR, func_ref: reference)
+} windows_function_address
+
+/// Defines the program entry seam, which the system enters the image at, and the glue running
+/// the entry function as the first task.
+fn windows_entry_seam(mut lo: Lowering, program: Program) {
+    let entry = entry_task(mut lo, program)
+    let signature = clif::Signature.new(windows_convention(lo.arch()), alloc: lo.alloc)
+    let id = mut lo.module.declare_function(WINDOWS_ENTRY, linkage: object::Linkage.Export, signature)
+    mut lo.define(id, signature: take signature, flags: LINES_HIDDEN | LINES_CRITICAL, build: fn(mut seam_lo: Lowering, mut seam_fx: Fx) {
+        discard mut seam_fx.entry()
+        mut seam_lo.check_level(fx: mut seam_fx)
+        system_start(mut seam_lo, fx: mut seam_fx)
+        run_entry(mut seam_lo, fx: mut seam_fx, program, entry, landing: mem::List[clif::Value].empty(seam_fx.alloc).view())
+    })
+} windows_entry_seam
+
+/// Defines the entry seam of a test image, whose command line's words after the program's name
+/// are the texts naming its run.
+fn windows_test_seam(mut lo: Lowering, entry_glue: object::FuncId) {
+    let signature = clif::Signature.new(windows_convention(lo.arch()), alloc: lo.alloc)
+    let id = mut lo.module.declare_function(WINDOWS_ENTRY, linkage: object::Linkage.Export, signature)
+    mut lo.define(id, signature: take signature, flags: LINES_HIDDEN | LINES_CRITICAL, build: fn(mut seam_lo: Lowering, mut seam_fx: Fx) {
+        discard mut seam_fx.entry()
+        system_start(mut seam_lo, fx: mut seam_fx)
+        let line = first_result(mut seam_lo.call_system(mut seam_fx, name: "GetCommandLineA", args: mem::List[clif::Value].empty(seam_fx.alloc).view(), returns: seam_fx.types1(PTR).view()))
+        let words = windows_words(mut seam_lo, fx: mut seam_fx, line)
+        start_run(mut seam_lo, fx: mut seam_fx, entry_glue, count: words.count, texts: words.texts)
+    })
+} windows_test_seam
+
+/// The words of a command line after the program's name, which a word in double quotes may
+/// hold blanks in, each word a NUL-terminated text in a copy of the line.
+fn windows_words(mut lo: Lowering, mut fx: Fx, line: clif::Value) -> CommandWords {
+    let len = test_image_text_len(mut fx, text: line)
+    let size = mut fx.b.iadd_imm_s(len, y: 1)
+    let copy = mut lo.record_alloc(mut fx, size)
+    let slots = mut fx.b.imul_imm_s(size, y: 8)
+    let texts = mut lo.record_alloc(mut fx, size: slots)
+    let no_copy = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: copy, y: 0)
+    let no_texts = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: texts, y: 0)
+    let missing = mut fx.b.bor(no_copy, y: no_texts)
+    mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+        system_unavailable(mut lo, fx: mut fx1)
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: fx.list3(copy, b: line, c: size).view())
+    let first = mut fx.load(clif::Type.Int8, addr: copy, offset: 0)
+    let quoted = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: first, y: i64.widen(b'"'))
+    let start = mut fx.b.uextend(PTR, x: quoted)
+    let name_end = mut fx.repeat(fx.list1(start).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() == 1
+        let at = mut fx1.b.iadd(copy, y: state[0])
+        let byte = mut fx1.load(clif::Type.Int8, addr: at, offset: 0)
+        let ended = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: byte, y: 0)
+        let quote = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: byte, y: i64.widen(b'"'))
+        let blank = windows_is_blank(mut fx1, byte)
+        let closing = mut fx1.b.select(quoted, x: quote, y: blank)
+        let stop = mut fx1.b.bor(ended, y: closing)
+        let next = mut fx1.b.iadd_imm_s(state[0], y: 1)
+        let index = mut fx1.b.select(stop, x: state[0], y: next)
+        let again = mut fx1.b.bxor_imm_s(stop, y: 1)
+        return Pass(again: again, next: fx1.list1(index))
+    })
+    expect name_end.len() == 1
+    let zero = mut fx.ptr(0)
+    let result = mut fx.repeat(fx.list3(name_end[0], b: zero, c: zero).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() == 3
+        let index = state[0]
+        let count = state[1]
+        let inside = state[2]
+        let at = mut fx1.b.iadd(copy, y: index)
+        let byte = mut fx1.load(clif::Type.Int8, addr: at, offset: 0)
+        let ended = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: byte, y: 0)
+        let blank = windows_is_blank(mut fx1, byte)
+        let quote = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: byte, y: i64.widen(b'"'))
+        let separator = mut fx1.b.bor(blank, y: quote)
+        let outside = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: inside, y: 0)
+        let unseparated = mut fx1.b.bxor_imm_s(separator, y: 1)
+        let unquoted = mut fx1.b.band(unseparated, y: outside)
+        let ending = mut fx1.b.bxor_imm_s(ended, y: 1)
+        let starts = mut fx1.b.band(unquoted, y: ending)
+        mut fx1.if_true(starts, then: fn(mut fx2: Fx) {
+            let offset = mut fx2.b.imul_imm_s(count, y: 8)
+            let slot = mut fx2.b.iadd(texts, y: offset)
+            mut fx2.store(at, addr: slot, offset: 0)
+        })
+        mut fx1.if_true(separator, then: fn(mut fx2: Fx) {
+            let nul = mut fx2.int(clif::Type.Int8, value: 0)
+            mut fx2.store(nul, addr: at, offset: 0)
+        })
+        let counted = mut fx1.b.iadd_imm_s(count, y: 1)
+        let next_count = mut fx1.b.select(starts, x: counted, y: count)
+        let one = mut fx1.ptr(1)
+        let none = mut fx1.ptr(0)
+        let left = mut fx1.b.select(separator, x: none, y: inside)
+        let entered = mut fx1.b.select(starts, x: one, y: left)
+        let next = mut fx1.b.iadd_imm_s(index, y: 1)
+        return Pass(again: ending, next: fx1.list3(next, b: next_count, c: entered))
+    })
+    expect result.len() == 3
+    return CommandWords(count: result[1], texts: texts)
+} windows_words
+
+/// Whether a byte is a space or a tab.
+fn windows_is_blank(mut fx: Fx, byte: clif::Value) -> clif::Value {
+    let space = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: byte, y: i64.widen(b' '))
+    let tab = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: byte, y: i64.widen(b'\t'))
+    return mut fx.b.bor(space, y: tab)
+} windows_is_blank
+
+/// Writes a byte range to standard output, for `fd` 1, or standard error, for 2, whole unless
+/// the stream refuses.
+fn windows_write_all(mut lo: Lowering, mut fx: Fx, fd: i64, text: clif::Value, len: clif::Value) {
+    var stream = STD_ERROR
+    if fd == 1 {
+        stream = STD_OUTPUT
+    }
+    let which = mut fx.int(clif::Type.Int32, value: stream)
+    let handle = first_result(mut lo.call_system(mut fx, name: "GetStdHandle", args: fx.list1(which).view(), returns: fx.types1(PTR).view()))
+    let written = mut fx.slot(8, align: 8)
+    let none = mut fx.ptr(0)
+    discard mut fx.repeat(fx.list2(text, b: len).view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() == 2
+        let at = state[0]
+        let left = state[1]
+        let most = mut fx1.ptr(0xFFFF_FFFF)
+        let bounded = mut fx1.b.umin(left, y: most)
+        let count = mut fx1.b.ireduce(clif::Type.Int32, x: bounded)
+        let cleared = mut fx1.int(clif::Type.Int32, value: 0)
+        mut fx1.store(cleared, addr: written, offset: 0)
+        let ok = first_result(mut lo.call_system(mut fx1, name: "WriteFile", args: fx1.list5(handle, b: at, c: count, d: written, e: none).view(), returns: fx1.types1(clif::Type.Int32).view()))
+        let done32 = mut fx1.load(clif::Type.Int32, addr: written, offset: 0)
+        let done = mut fx1.b.uextend(PTR, x: done32)
+        let wrote = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: ok, y: 0)
+        let moved = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: done, y: 0)
+        let progressed = mut fx1.b.band(wrote, y: moved)
+        let next_at = mut fx1.b.iadd(at, y: done)
+        let remaining = mut fx1.b.isub(left, y: done)
+        let zero = mut fx1.ptr(0)
+        let next_left = mut fx1.b.select(progressed, x: remaining, y: zero)
+        let more = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: next_left, y: 0)
+        return Pass(again: more, next: fx1.list2(next_at, b: next_left))
+    })
+} windows_write_all
+
+/// Defines the record routines, over the process heap, a resize of no record allocating one,
+/// and `Exit`.
+fn windows_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
+    let incoming = mut fx.entry()
+    let no_values = mem::List[clif::Value].empty(fx.alloc)
+    match routine {
+        Routine.RecordAlloc => {
+            expect incoming.len() == 1
+            let heap = first_result(mut lo.call_system(mut fx, name: "GetProcessHeap", args: no_values.view(), returns: fx.types1(PTR).view()))
+            let zeroed = mut fx.int(clif::Type.Int32, value: HEAP_ZERO_MEMORY)
+            let address = first_result(mut lo.call_system(mut fx, name: "HeapAlloc", args: fx.list3(heap, b: zeroed, c: incoming[0]).view(), returns: fx.types1(PTR).view()))
+            mut fx.b.ret(fx.list1(address).view())
+        }
+        Routine.RecordFree => {
+            expect incoming.len() == 1
+            let heap = first_result(mut lo.call_system(mut fx, name: "GetProcessHeap", args: no_values.view(), returns: fx.types1(PTR).view()))
+            let flags = mut fx.int(clif::Type.Int32, value: 0)
+            discard mut lo.call_system(mut fx, name: "HeapFree", args: fx.list3(heap, b: flags, c: incoming[0]).view(), returns: fx.types1(clif::Type.Int32).view())
+            mut fx.b.ret(no_values.view())
+        }
+        Routine.RecordResize => {
+            expect incoming.len() == 2
+            let held_address = incoming[0]
+            let wanted = incoming[1]
+            let heap = first_result(mut lo.call_system(mut fx, name: "GetProcessHeap", args: no_values.view(), returns: fx.types1(PTR).view()))
+            let flags = mut fx.int(clif::Type.Int32, value: 0)
+            let held = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: held_address, y: 0)
+            let address = mut fx.choose_in(mut lo, condition: held, results: fx.types1(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+                return mut lo1.call_system(mut fx1, name: "HeapReAlloc", args: fx1.list4(heap, b: flags, c: held_address, d: wanted).view(), returns: fx1.types1(PTR).view())
+            }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+                return mut lo1.call_system(mut fx1, name: "HeapAlloc", args: fx1.list3(heap, b: flags, c: wanted).view(), returns: fx1.types1(PTR).view())
+            })
+            mut fx.b.ret(fx.list1(address[0]).view())
+        }
+        Routine.Exit => {
+            expect incoming.len() == 1
+            let status = mut fx.b.ireduce(clif::Type.Int32, x: incoming[0])
+            windows_exit(mut lo, mut fx, status)
+        }
+        else => {
+            expect false
+        }
+    }
+} windows_define
+
+/// Ends the process with a 32-bit status.
+fn windows_exit(mut lo: Lowering, mut fx: Fx, status: clif::Value) {
+    discard mut lo.call_system(mut fx, name: "ExitProcess", args: fx.list1(status).view(), returns: mem::List[clif::Type].empty(fx.alloc).view())
+    mut fx.b.trap(clif::TrapCode(user: 1))
+} windows_exit
+
+/// The record of the executor thread running the caller, zero outside one: the thread-local
+/// slot `Init` allocated, read from the running thread's environment block.
+fn windows_current_thread(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let teb = first_result(mut lo.call_stub(mut fx, stub: Stub.Teb, args: mem::List[clif::Value].empty(fx.alloc).view()))
+    let state_address = mut lo.state(mut fx)
+    let index = mut fx.load(PTR, addr: state_address, offset: STATE_TLS_INDEX)
+    let offset = mut fx.b.imul_imm_s(index, y: 8)
+    let slot = mut fx.b.iadd(teb, y: offset)
+    return mut fx.load(PTR, addr: slot, offset: TLS_SLOTS)
+} windows_current_thread
+
+/// Makes a record the running thread's, keeping a handle to the thread in it, and gives the
+/// thread a stack for stack overflow reports; nonzero when the system refuses one.
+fn windows_thread_start(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value {
+    let no_values = mem::List[clif::Value].empty(fx.alloc)
+    let state_address = mut lo.state(mut fx)
+    let index = mut fx.load(clif::Type.Int32, addr: state_address, offset: STATE_TLS_INDEX)
+    discard mut lo.call_system(mut fx, name: "TlsSetValue", args: fx.list2(index, b: record).view(), returns: fx.types1(clif::Type.Int32).view())
+    let process = first_result(mut lo.call_system(mut fx, name: "GetCurrentProcess", args: no_values.view(), returns: fx.types1(PTR).view()))
+    let current = first_result(mut lo.call_system(mut fx, name: "GetCurrentThread", args: no_values.view(), returns: fx.types1(PTR).view()))
+    let handle_slot = mut fx.slot(8, align: 8)
+    let access = mut fx.int(clif::Type.Int32, value: 0)
+    let inherit = mut fx.int(clif::Type.Int32, value: 0)
+    let same = mut fx.int(clif::Type.Int32, value: DUPLICATE_SAME_ACCESS)
+    var duplicate_args = fx.list6(process, b: current, c: process, d: handle_slot, e: access, f: inherit)
+    mut duplicate_args.push(same)
+    let duplicated = first_result(mut lo.call_system(mut fx, name: "DuplicateHandle", args: duplicate_args.view(), returns: fx.types1(clif::Type.Int32).view()))
+    let handle = mut fx.load(PTR, addr: handle_slot, offset: 0)
+    mut fx.store(handle, addr: record, offset: THREAD_SYSTEM)
+    let size = mut fx.ptr(WINDOWS_TRAP_STACK)
+    let stack = windows_commit(mut lo, mut fx, len: size)
+    let no_handle = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: duplicated, y: 0)
+    let no_stack = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: stack, y: 0)
+    let top = mut fx.b.iadd_imm_s(stack, y: i64.fit(WINDOWS_TRAP_STACK))
+    mut fx.store(top, addr: record, offset: THREAD_TRAP_STACK)
+    return mut fx.b.bor(no_handle, y: no_stack)
+} windows_thread_start
+
+/// Reserves and commits `len` bytes that can be read and written, zero-filled and aligned to
+/// the system's allocation granularity; zero when the system refuses.
+fn windows_commit(mut lo: Lowering, mut fx: Fx, len: clif::Value) -> clif::Value {
+    let anywhere = mut fx.ptr(0)
+    let reservation = mut fx.int(clif::Type.Int32, value: MEM_COMMIT_RESERVE)
+    let protection = mut fx.int(clif::Type.Int32, value: PAGE_READWRITE)
+    return first_result(mut lo.call_system(mut fx, name: "VirtualAlloc", args: fx.list4(anywhere, b: len, c: reservation, d: protection).view(), returns: fx.types1(PTR).view()))
+} windows_commit
+
+/// The executor threads of `Init`: one per processor of the process's affinity set, the calling
+/// thread being the first, which all wait on the process's completion port, after the handlers
+/// of stack overflows and termination requests; returns 1 from `Init` when the system refuses
+/// one.
+fn windows_start_threads(mut lo: Lowering, mut fx: Fx) {
+    let state_address = mut lo.state(mut fx)
+    windows_allocate_slot(mut lo, mut fx)
+    if lo.seeded() {
+        windows_start_seeded(mut lo, mut fx)
+        return
+    }
+    let invalid = mut fx.int(PTR, value: INVALID_HANDLE)
+    let zero = mut fx.ptr(0)
+    let concurrency = mut fx.int(clif::Type.Int32, value: 0)
+    let port = first_result(mut lo.call_system(mut fx, name: "CreateIoCompletionPort", args: fx.list4(invalid, b: zero, c: zero, d: concurrency).view(), returns: fx.types1(PTR).view()))
+    unavailable_unless(mut fx, address: port)
+    mut fx.store(port, addr: state_address, offset: STATE_PORT)
+    let count = windows_processors(mut lo, mut fx)
+    let threads = windows_thread_records(mut lo, mut fx, count)
+    let first = mut fx.load(PTR, addr: threads, offset: 0)
+    let refused = windows_thread_start(mut lo, mut fx, record: first)
+    unavailable_if(mut fx, condition: refused)
+    windows_handle_faults(mut lo, mut fx)
+    let handler_id = windows_control_handler(mut lo)
+    let handler = windows_function_address(mut lo, mut fx, id: handler_id)
+    let add = mut fx.int(clif::Type.Int32, value: 1)
+    let installed = first_result(mut lo.call_system(mut fx, name: "SetConsoleCtrlHandler", args: fx.list2(handler, b: add).view(), returns: fx.types1(clif::Type.Int32).view()))
+    let uninstalled = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: installed, y: 0)
+    unavailable_if(mut fx, condition: uninstalled)
+    let start_id = windows_thread_glue(mut lo)
+    let start = windows_function_address(mut lo, mut fx, id: start_id)
+    let one = mut fx.ptr(1)
+    mut fx.each(one, end: count, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+        let offset = mut fx1.b.imul_imm_s(index, y: 8)
+        let slot = mut fx1.b.iadd(threads, y: offset)
+        let record = mut fx1.load(PTR, addr: slot, offset: 0)
+        let created = windows_spawn_thread(mut lo, fx: mut fx1, start, argument: record)
+        unavailable_unless(mut fx1, address: created)
+        discard mut lo.call_system(mut fx1, name: "CloseHandle", args: fx1.list1(created).view(), returns: fx1.types1(clif::Type.Int32).view())
+    })
+} windows_start_threads
+
+/// Allocates the thread-local slot holding each executor thread's record, which the thread's
+/// environment block holds itself.
+fn windows_allocate_slot(mut lo: Lowering, mut fx: Fx) {
+    let allocated = first_result(mut lo.call_system(mut fx, name: "TlsAlloc", args: mem::List[clif::Value].empty(fx.alloc).view(), returns: fx.types1(clif::Type.Int32).view()))
+    let index = mut fx.b.uextend(PTR, x: allocated)
+    let beyond = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: index, y: TLS_MINIMUM)
+    unavailable_if(mut fx, condition: beyond)
+    let state_address = mut lo.state(mut fx)
+    mut fx.store(index, addr: state_address, offset: STATE_TLS_INDEX)
+} windows_allocate_slot
+
+/// The records of `count` executor threads, numbered from 0, in a new array of their addresses
+/// the runtime state keeps.
+fn windows_thread_records(mut lo: Lowering, mut fx: Fx, count: clif::Value) -> clif::Value {
+    let state_address = mut lo.state(mut fx)
+    mut fx.store(count, addr: state_address, offset: STATE_THREAD_COUNT)
+    let size = mut fx.b.imul_imm_s(count, y: 8)
+    let threads = mut lo.record_alloc(mut fx, size)
+    unavailable_unless(mut fx, address: threads)
+    mut fx.store(threads, addr: state_address, offset: STATE_THREADS)
+    let zero = mut fx.ptr(0)
+    mut fx.each(zero, end: count, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+        let record_size = mut fx1.ptr(THREAD_SIZE)
+        let record = mut lo.record_alloc(mut fx1, size: record_size)
+        unavailable_unless(mut fx1, address: record)
+        mut fx1.store(index, addr: record, offset: THREAD_INDEX)
+        let offset = mut fx1.b.imul_imm_s(index, y: 8)
+        let slot = mut fx1.b.iadd(threads, y: offset)
+        mut fx1.store(record, addr: slot, offset: 0)
+    })
+    return threads
+} windows_thread_records
+
+/// A new thread of the process running `start` with an argument, zero when the system refuses.
+fn windows_spawn_thread(mut lo: Lowering, mut fx: Fx, start: clif::Value, argument: clif::Value) -> clif::Value {
+    let none = mut fx.ptr(0)
+    let flags = mut fx.int(clif::Type.Int32, value: 0)
+    return first_result(mut lo.call_system(mut fx, name: "CreateThread", args: fx.list6(none, b: none, c: start, d: argument, e: flags, f: none).view(), returns: fx.types1(PTR).view()))
+} windows_spawn_thread
+
+/// The executor of `Init` for the seeded scheduler: the calling thread is the one executor
+/// thread, without the completion port; a stack overflow is reported, and the run ends with
+/// status `TIMED_OUT` once the process has used 10 seconds of processor time.
+fn windows_start_seeded(mut lo: Lowering, mut fx: Fx) {
+    let one = mut fx.ptr(1)
+    let threads = windows_thread_records(mut lo, mut fx, count: one)
+    let record = mut fx.load(PTR, addr: threads, offset: 0)
+    let refused = windows_thread_start(mut lo, mut fx, record)
+    unavailable_if(mut fx, condition: refused)
+    windows_handle_faults(mut lo, mut fx)
+    let watchdog_id = windows_cpu_watchdog(mut lo)
+    let watchdog = windows_function_address(mut lo, mut fx, id: watchdog_id)
+    let zero = mut fx.ptr(0)
+    let created = windows_spawn_thread(mut lo, mut fx, start: watchdog, argument: zero)
+    unavailable_unless(mut fx, address: created)
+    discard mut lo.call_system(mut fx, name: "CloseHandle", args: fx.list1(created).view(), returns: fx.types1(clif::Type.Int32).view())
+} windows_start_seeded
+
+/// The thread ending a seeded run with status `TIMED_OUT` once the process has used 10 seconds
+/// of processor time, which it reads every 100 milliseconds.
+fn windows_cpu_watchdog(mut lo: Lowering) -> object::FuncId {
+    return windows_define_callback(mut lo, name: "_NSreplay_cpu_limit", params: 1, build: fn(mut lo1: Lowering, mut fx1: Fx, params: Slice[clif::Value]) {
+        let times = mut fx1.slot(32, align: 8)
+        let period = mut fx1.int(clif::Type.Int32, value: CPU_PERIOD)
+        let process = first_result(mut lo1.call_system(mut fx1, name: "GetCurrentProcess", args: mem::List[clif::Value].empty(fx1.alloc).view(), returns: fx1.types1(PTR).view()))
+        discard mut fx1.repeat(mem::List[clif::Value].empty(fx1.alloc).view(), body: fn[mut lo1](mut fx2: Fx, state: Slice[clif::Value]) -> Pass {
+            discard mut lo1.call_system(mut fx2, name: "Sleep", args: fx2.list1(period).view(), returns: mem::List[clif::Type].empty(fx2.alloc).view())
+            let exited = mut fx2.b.iadd_imm_s(times, y: 8)
+            let kernel_at = mut fx2.b.iadd_imm_s(times, y: 16)
+            let user_at = mut fx2.b.iadd_imm_s(times, y: 24)
+            discard mut lo1.call_system(mut fx2, name: "GetProcessTimes", args: fx2.list5(process, b: times, c: exited, d: kernel_at, e: user_at).view(), returns: fx2.types1(clif::Type.Int32).view())
+            let kernel_time = mut fx2.load(PTR, addr: times, offset: 16)
+            let user_time = mut fx2.load(PTR, addr: times, offset: 24)
+            let used = mut fx2.b.iadd(kernel_time, y: user_time)
+            let over = mut fx2.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: used, y: CPU_INTERVALS)
+            mut fx2.if_true(over, then: fn[mut lo1](mut fx3: Fx) {
+                let status = mut fx3.int(clif::Type.Int32, value: i64.widen(TIMED_OUT))
+                windows_exit(mut lo1, fx: mut fx3, status)
+            })
+            let again = mut fx2.int(clif::Type.Int8, value: 1)
+            return Pass(again: again, next: mem::List[clif::Value].empty(fx2.alloc))
+        })
+        mut fx1.b.trap(clif::TrapCode(user: 1))
+    })
+} windows_cpu_watchdog
+
+/// The function each executor thread but the first starts in, which the system calls with the
+/// thread's record: it runs `ThreadMain`.
+fn windows_thread_glue(mut lo: Lowering) -> object::FuncId {
+    return windows_define_callback(mut lo, name: "_NSstack_switch_thread_start", params: 1, build: fn(mut lo1: Lowering, mut fx1: Fx, params: Slice[clif::Value]) {
+        expect params.len() == 1
+        discard mut lo1.call_routine(mut fx1, routine: Routine.ThreadMain, args: fx1.list1(params[0]).view())
+        mut fx1.b.trap(clif::TrapCode(user: 1))
+    })
+} windows_thread_glue
+
+/// The number of processors in the process's affinity set, at least 1.
+fn windows_processors(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let masks = mut fx.slot(16, align: 8)
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: masks, offset: 0)
+    let process = first_result(mut lo.call_system(mut fx, name: "GetCurrentProcess", args: mem::List[clif::Value].empty(fx.alloc).view(), returns: fx.types1(PTR).view()))
+    let system_mask = mut fx.b.iadd_imm_s(masks, y: 8)
+    discard mut lo.call_system(mut fx, name: "GetProcessAffinityMask", args: fx.list3(process, b: masks, c: system_mask).view(), returns: fx.types1(clif::Type.Int32).view())
+    let mask = mut fx.load(PTR, addr: masks, offset: 0)
+    let count = mut fx.b.popcnt(mask)
+    let one = mut fx.ptr(1)
+    return mut fx.b.umax(count, y: one)
+} windows_processors
+
+/// Installs the vectored exception handler receiving stack overflows; returns 1 from `Init`
+/// when the system refuses it.
+fn windows_handle_faults(mut lo: Lowering, mut fx: Fx) {
+    let handler_id = windows_fault_handler(mut lo)
+    let handler = windows_function_address(mut lo, mut fx, id: handler_id)
+    let first = mut fx.ptr(1)
+    let added = first_result(mut lo.call_system(mut fx, name: "AddVectoredExceptionHandler", args: fx.list2(first, b: handler).view(), returns: fx.types1(PTR).view()))
+    unavailable_unless(mut fx, address: added)
+} windows_handle_faults
+
+/// The vectored exception handler: a stack overflow in the guard region of the running task's
+/// stack resumes in `OverflowRaise` on the thread's trap stack, which becomes the stack the
+/// thread's environment block records; every other exception passes on.
+fn windows_fault_handler(mut lo: Lowering) -> object::FuncId {
+    return windows_define_callback(mut lo, name: "_NStrap_overflow", params: 1, build: fn(mut lo1: Lowering, mut fx1: Fx, params: Slice[clif::Value]) {
+        expect params.len() == 1
+        let record = mut fx1.load(PTR, addr: params[0], offset: POINTERS_RECORD)
+        let context = mut fx1.load(PTR, addr: params[0], offset: POINTERS_CONTEXT)
+        let code32 = mut fx1.load(clif::Type.Int32, addr: record, offset: 0)
+        let code = mut fx1.b.uextend(PTR, x: code32)
+        let overflow = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: code, y: STACK_OVERFLOW)
+        mut fx1.if_true(overflow, then: fn[mut lo1](mut fx2: Fx) {
+            let registers = windows_saved(lo1.arch()).registers
+            let count = mut fx2.load(clif::Type.Int32, addr: record, offset: PARAMETER_COUNT)
+            let addressed = mut fx2.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: count, y: 2)
+            let fault = mut fx2.choose(addressed, results: fx2.types1(PTR).view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let given = mut fx3.load(PTR, addr: record, offset: WINDOWS_FAULT_ADDRESS)
+                return fx3.list1(given)
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let pointer = mut fx3.load(PTR, addr: context, offset: registers.sp)
+                return fx3.list1(pointer)
+            })
+            let thread = mut lo1.thread(mut fx2)
+            let guarded = overflow_interrupted(mut lo1, fx: mut fx2, thread, fault: fault[0], context, ctx: registers)
+            mut fx2.if_true(guarded, then: fn[mut lo1](mut fx3: Fx) {
+                let top = mut fx3.load(PTR, addr: thread, offset: THREAD_TRAP_STACK)
+                let low = mut fx3.b.iadd_imm_s(top, y: -i64.fit(WINDOWS_TRAP_STACK))
+                let none = mut fx3.int(clif::Type.Int32, value: 0)
+                windows_set_stack_bounds(mut lo1, fx: mut fx3, bounds: StackBounds(base: top, limit: low, deallocation: low, guaranteed: none))
+                let resume = mut fx3.int(clif::Type.Int32, value: CONTINUE_EXECUTION)
+                mut fx3.b.ret(fx3.list1(resume).view())
+            })
+        })
+        let search = mut fx1.int(clif::Type.Int32, value: CONTINUE_SEARCH)
+        mut fx1.b.ret(fx1.list1(search).view())
+    })
+} windows_fault_handler
+
+/// The console's control handler, which the system calls on a thread of its own with each
+/// control event: the first is a termination request it records and passes to the executor
+/// threads through the completion port; a later one ends the process at once.
+fn windows_control_handler(mut lo: Lowering) -> object::FuncId {
+    return windows_define_callback(mut lo, name: "_NSstack_switch_terminations", params: 1, build: fn(mut lo1: Lowering, mut fx1: Fx, params: Slice[clif::Value]) {
+        let state_address = mut lo1.state(mut fx1)
+        let word = mut fx1.offset(state_address, offset: STATE_TERMINATION)
+        let zero = mut fx1.ptr(0)
+        let status = mut fx1.int(PTR, value: CONTROL_C_EXIT)
+        let before = mut fx1.b.atomic_cas(clif::MemFlags.owned(), p: word, e: zero, x: status)
+        let later = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: before, y: 0)
+        mut fx1.if_true(later, then: fn[mut lo1](mut fx2: Fx) {
+            let exit_status = mut fx2.int(clif::Type.Int32, value: CONTROL_C_EXIT)
+            windows_exit(mut lo1, fx: mut fx2, status: exit_status)
+        })
+        let none = mut fx1.ptr(0)
+        windows_post(mut lo1, fx: mut fx1, key: KEY_TERMINATION, overlapped: none)
+        let handled = mut fx1.int(clif::Type.Int32, value: 1)
+        mut fx1.b.ret(fx1.list1(handled).view())
+    })
+} windows_control_handler
+
+/// Stops the task an executor thread runs when it may stop where it runs: suspends the thread,
+/// redirects its saved registers as a stop signal's handler does, resumes it and lets it run for
+/// a millisecond before it may be suspended again. A task that has just started running may not
+/// have recorded its thread yet: a record of none, or of the calling thread, is left alone.
+fn windows_stop_thread(mut lo: Lowering, mut fx: Fx, thread: clif::Value) {
+    let current = mut lo.thread(mut fx)
+    let other = mut fx.b.icmp(clif::IntCC.NotEqual, x: thread, y: current)
+    let recorded = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: thread, y: 0)
+    let elsewhere = mut fx.b.band(other, y: recorded)
+    mut fx.if_true(elsewhere, then: fn[mut lo](mut fx1: Fx) {
+        windows_suspend_and_stop(mut lo, fx: mut fx1, thread)
+    })
+} windows_stop_thread
+
+fn windows_suspend_and_stop(mut lo: Lowering, mut fx: Fx, thread: clif::Value) {
+    let handle = mut fx.load(PTR, addr: thread, offset: THREAD_SYSTEM)
+    let count = first_result(mut lo.call_system(mut fx, name: "SuspendThread", args: fx.list1(handle).view(), returns: fx.types1(clif::Type.Int32).view()))
+    let suspended = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: count, y: -1)
+    mut fx.if_true(suspended, then: fn[mut lo](mut fx1: Fx) {
+        let layout = windows_saved(lo.arch())
+        let context = mut fx1.slot(layout.size, align: 16)
+        let flags = mut fx1.int(clif::Type.Int32, value: layout.flags)
+        mut fx1.store(flags, addr: context, offset: layout.flags_at)
+        let got = first_result(mut lo.call_system(mut fx1, name: "GetThreadContext", args: fx1.list2(handle, b: context).view(), returns: fx1.types1(clif::Type.Int32).view()))
+        let read = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: got, y: 0)
+        mut fx1.if_true(read, then: fn[mut lo](mut fx2: Fx) {
+            let before = mut fx2.load(PTR, addr: context, offset: layout.registers.ip)
+            stop_interrupted(mut lo, fx: mut fx2, thread, context, ctx: layout.registers)
+            let after = mut fx2.load(PTR, addr: context, offset: layout.registers.ip)
+            let redirected = mut fx2.b.icmp(clif::IntCC.NotEqual, x: before, y: after)
+            mut fx2.if_true(redirected, then: fn[mut lo](mut fx3: Fx) {
+                discard mut lo.call_system(mut fx3, name: "SetThreadContext", args: fx3.list2(handle, b: context).view(), returns: fx3.types1(clif::Type.Int32).view())
+            })
+        })
+        discard mut lo.call_system(mut fx1, name: "ResumeThread", args: fx1.list1(handle).view(), returns: fx1.types1(clif::Type.Int32).view())
+        let period = mut fx1.int(clif::Type.Int32, value: 1)
+        discard mut lo.call_system(mut fx1, name: "Sleep", args: fx1.list1(period).view(), returns: mem::List[clif::Type].empty(fx1.alloc).view())
+    })
+} windows_suspend_and_stop
+
+/// Waits idle on the completion port until a packet arrives, unless a task is ready, then
+/// handles the packets taken.
+fn windows_idle(mut lo: Lowering, mut fx: Fx) {
+    let current = mut lo.thread(mut fx)
+    let idle = mut fx.offset(current, offset: THREAD_IDLE)
+    let one = mut fx.ptr(1)
+    mut fx.atomic_store(one, addr: idle)
+    let state_address = mut lo.state(mut fx)
+    let head_at = mut fx.offset(state_address, offset: STATE_READY_HEAD)
+    let head = mut fx.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: head_at)
+    let empty = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: head, y: 0)
+    windows_take_packets(mut lo, mut fx, wait: Some(empty))
+    let zero = mut fx.ptr(0)
+    mut fx.atomic_store(zero, addr: idle)
+} windows_idle
+
+/// Takes the packets the completion port holds, when `wait` is given and nonzero waiting for
+/// one until the first timer is due, and handles them, then delivers the expiries of the timers
+/// due.
+fn windows_take_packets(mut lo: Lowering, mut fx: Fx, wait: Option[clif::Value]) {
+    let entries = mut fx.slot(PORT_ENTRIES * PORT_ENTRY_SIZE, align: 8)
+    let removed = mut fx.slot(8, align: 8)
+    let state_address = mut lo.state(mut fx)
+    let port = mut fx.load(PTR, addr: state_address, offset: STATE_PORT)
+    let count = mut fx.int(clif::Type.Int32, value: i64.fit(PORT_ENTRIES))
+    let timeout = match wait {
+        Some(waiting) => first_result(mut fx.choose_in(mut lo, condition: waiting, results: fx.types1(clif::Type.Int32).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+            let first = windows_first_timeout(mut lo1, fx: mut fx1)
+            return fx1.list1(first)
+        }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+            let polled = mut fx1.int(clif::Type.Int32, value: 0)
+            return fx1.list1(polled)
+        }))
+        None => mut fx.int(clif::Type.Int32, value: 0)
+    }
+    let alertable = mut fx.int(clif::Type.Int32, value: 0)
+    let taken = first_result(mut lo.call_system(mut fx, name: "GetQueuedCompletionStatusEx", args: fx.list6(port, b: entries, c: count, d: removed, e: timeout, f: alertable).view(), returns: fx.types1(clif::Type.Int32).view()))
+    let some = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: taken, y: 0)
+    mut fx.if_true(some, then: fn[mut lo](mut fx1: Fx) {
+        let removed32 = mut fx1.load(clif::Type.Int32, addr: removed, offset: 0)
+        let removed_count = mut fx1.b.uextend(PTR, x: removed32)
+        let zero = mut fx1.ptr(0)
+        mut fx1.each(zero, end: removed_count, body: fn[mut lo](mut fx2: Fx, index: clif::Value) {
+            let offset = mut fx2.b.imul_imm_s(index, y: i64.fit(PORT_ENTRY_SIZE))
+            let entry = mut fx2.b.iadd(entries, y: offset)
+            let key = mut fx2.load(PTR, addr: entry, offset: PORT_ENTRY_KEY)
+            let overlapped = mut fx2.load(PTR, addr: entry, offset: PORT_ENTRY_OVERLAPPED)
+            windows_handle_packet(mut lo, fx: mut fx2, key, overlapped)
+        })
+    })
+    windows_expire(mut lo, mut fx)
+} windows_take_packets
+
+/// Handles a packet of the completion port: a request's completion is delivered to its
+/// operation, and the first termination request cancels the entry task's construct; a wake needs
+/// nothing more.
+fn windows_handle_packet(mut lo: Lowering, mut fx: Fx, key: clif::Value, overlapped: clif::Value) {
+    let request = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: key, y: KEY_REQUEST)
+    mut fx.if_true(request, then: fn[mut lo](mut fx1: Fx) {
+        let op = mut fx1.b.iadd_imm_s(overlapped, y: i64.fit(REQUEST_OP))
+        let result = mut fx1.int(clif::Type.Int32, value: 0)
+        deliver(mut lo, fx: mut fx1, op, result)
+    })
+    let termination = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: key, y: KEY_TERMINATION)
+    mut fx.if_true(termination, then: fn[mut lo](mut fx1: Fx) {
+        let state_address = mut lo.state(mut fx1)
+        let root = mut fx1.load(PTR, addr: state_address, offset: STATE_ROOT)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Cancel, args: fx1.list1(root).view())
+    })
+} windows_handle_packet
+
+/// The milliseconds until the first timer is due, rounded up, `INFINITE` without one.
+fn windows_first_timeout(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let state_address = mut lo.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_TIMER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+    let first = mut fx.load(PTR, addr: state_address, offset: STATE_TIMERS)
+    let armed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: first, y: 0)
+    let due = mut fx.choose(armed, results: fx.types1(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let first_due = mut fx1.load(PTR, addr: first, offset: OPERATION_DUE)
+        return fx1.list1(first_due)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let never = mut fx1.int(PTR, value: -1)
+        return fx1.list1(never)
+    })
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+    let now = mut lo.now_ns(mut fx)
+    let ahead = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: due[0], y: now)
+    let difference = mut fx.b.isub(due[0], y: now)
+    let zero = mut fx.ptr(0)
+    let left = mut fx.b.select(ahead, x: difference, y: zero)
+    let per_ms = mut fx.ptr(NS_PER_MS)
+    let whole_ms = mut fx.b.udiv(left, y: per_ms)
+    let rest = mut fx.b.urem(left, y: per_ms)
+    let partial = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: rest, y: 0)
+    let partial_word = mut fx.b.uextend(PTR, x: partial)
+    let rounded = mut fx.b.iadd(whole_ms, y: partial_word)
+    let longest = mut fx.ptr(u64.fit(INFINITE - 1))
+    let bounded = mut fx.b.umin(rounded, y: longest)
+    let ms = mut fx.b.ireduce(clif::Type.Int32, x: bounded)
+    let forever = mut fx.int(clif::Type.Int32, value: INFINITE)
+    return mut fx.b.select(armed, x: ms, y: forever)
+} windows_first_timeout
+
+/// `ClockNow`: the nanoseconds of the monotonic clock, the performance counter's.
+fn windows_define_clock_now(mut lo: Lowering, mut fx: Fx) {
+    discard mut fx.entry()
+    let words = mut fx.slot(16, align: 8)
+    let frequency = mut fx.b.iadd_imm_s(words, y: 8)
+    discard mut lo.call_system(mut fx, name: "QueryPerformanceCounter", args: fx.list1(words).view(), returns: fx.types1(clif::Type.Int32).view())
+    discard mut lo.call_system(mut fx, name: "QueryPerformanceFrequency", args: fx.list1(frequency).view(), returns: fx.types1(clif::Type.Int32).view())
+    let count = mut fx.load(PTR, addr: words, offset: 0)
+    let given_rate = mut fx.load(PTR, addr: words, offset: 8)
+    let one = mut fx.ptr(1)
+    let rate = mut fx.b.umax(given_rate, y: one)
+    let billion = mut fx.ptr(1_000_000_000)
+    let seconds = mut fx.b.udiv(count, y: rate)
+    let rest = mut fx.b.urem(count, y: rate)
+    let whole = mut fx.b.imul(seconds, y: billion)
+    let scaled = mut fx.b.imul(rest, y: billion)
+    let part = mut fx.b.udiv(scaled, y: rate)
+    let now = mut fx.b.iadd(whole, y: part)
+    mut fx.b.ret(fx.list1(now).view())
+} windows_define_clock_now
+
+/// Arms a timer of the monotonic clock due `ns` nanoseconds from now, through `TimerArm`.
+fn windows_arm(mut lo: Lowering, mut fx: Fx, op: clif::Value, ns: clif::Value) {
+    discard mut lo.call_routine(mut fx, routine: Routine.TimerArm, args: fx.list2(op, b: ns).view())
+} windows_arm
+
+/// The body of `TimerArm`: arms the timer in the timers the runtime keeps, and wakes a thread
+/// waiting idle, so that it waits no longer than the timer.
+fn windows_arm_timer(mut lo: Lowering, mut fx: Fx, op: clif::Value, ns: clif::Value) {
+    let state_address = mut lo.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_TIMER_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+    let now = mut lo.now_ns(mut fx)
+    let due = due_after(mut fx, now, delay: ns)
+    arm(mut lo, mut fx, op, due)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+    let none = mut fx.ptr(0)
+    windows_post(mut lo, mut fx, key: KEY_WAKE, overlapped: none)
+} windows_arm_timer
+
+/// Takes each timer due out of the timers, one at a time under the timer lock, and delivers its
+/// expiry outside it.
+fn windows_expire(mut lo: Lowering, mut fx: Fx) {
+    let now = mut lo.now_ns(mut fx)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        let state_address = mut lo.state(mut fx1)
+        let lock = mut fx1.offset(state_address, offset: STATE_TIMER_LOCK)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: fx1.list1(lock).view())
+        let first = mut fx1.load(PTR, addr: state_address, offset: STATE_TIMERS)
+        let armed = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: first, y: 0)
+        let due = mut fx1.choose(armed, results: fx1.types1(clif::Type.Int8).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let first_due = mut fx2.load(PTR, addr: first, offset: OPERATION_DUE)
+            let passed = mut fx2.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: first_due, y: now)
+            return fx2.list1(passed)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let no = mut fx2.int(clif::Type.Int8, value: 0)
+            return fx2.list1(no)
+        })
+        mut fx1.if_true(due[0], then: fn[mut lo](mut fx2: Fx) {
+            disarm(mut lo, fx: mut fx2, op: first)
+            claim_timer(mut fx2, op: first)
+        })
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: fx1.list1(lock).view())
+        mut fx1.if_true(due[0], then: fn[mut lo](mut fx2: Fx) {
+            let expired = mut fx2.int(clif::Type.Int32, value: TASKS_EXPIRED)
+            deliver(mut lo, fx: mut fx2, op: first, result: expired)
+        })
+        return Pass(again: due[0], next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+} windows_expire
+
+/// Asks once for the cancellation of an operation whose record stays valid during the call: a
+/// timer armed and not expired leaves the timers and completes cancelled at once, and a request
+/// in flight is cancelled as `windows_cancel_request` does.
+fn windows_cancel_operation(mut lo: Lowering, mut fx: Fx, op: clif::Value) {
+    let claimed = claim_armed(mut lo, mut fx, op)
+    mut fx.if_true(claimed, then: fn[mut lo](mut fx1: Fx) {
+        deliver_cancelled(mut lo, fx: mut fx1, op)
+    })
+    let kind = mut fx.load(PTR, addr: op, offset: OPERATION_KIND)
+    let wait = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: TASKS_KIND_WAIT)
+    let handle = mut fx.load(PTR, addr: op, offset: OPERATION_WAITER)
+    let on_handle = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: handle, y: 0)
+    let waits_on_handle = mut fx.b.band(wait, y: on_handle)
+    let done = mut fx.load(PTR, addr: op, offset: OPERATION_DONE)
+    let pending = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: done, y: 0)
+    let request = mut fx.b.band(waits_on_handle, y: pending)
+    mut fx.if_true(request, then: fn[mut lo](mut fx1: Fx) {
+        windows_cancel_request(mut lo, fx: mut fx1, op)
+    })
+} windows_cancel_operation
+
+/// Wakes an executor thread waiting idle, other than the running one, so a task made ready
+/// runs: a wake packet on the completion port, posted when another thread is idle, which
+/// whichever thread waits there takes. Each thread clears its own idle flag once its wait ends,
+/// so a packet another thread took leaves a thread still waiting marked idle.
+fn windows_wake_idle(mut lo: Lowering, mut fx: Fx) {
+    let state_address = mut lo.state(mut fx)
+    let threads = mut fx.load(PTR, addr: state_address, offset: STATE_THREADS)
+    let count = mut fx.load(PTR, addr: state_address, offset: STATE_THREAD_COUNT)
+    let current = mut lo.thread(mut fx)
+    let zero = mut fx.ptr(0)
+    discard mut fx.repeat(fx.list1(zero).view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() == 1
+        let index = state[0]
+        let inside = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: index, y: count)
+        let next = mut fx1.choose_in(mut lo, condition: inside, results: fx1.types2(PTR, b: clif::Type.Int8).view(), then: fn(mut lo1: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let offset = mut fx2.b.imul_imm_s(index, y: 8)
+            let slot = mut fx2.b.iadd(threads, y: offset)
+            let record = mut fx2.load(PTR, addr: slot, offset: 0)
+            let other = mut fx2.b.icmp(clif::IntCC.NotEqual, x: record, y: current)
+            let idle = mut fx2.offset(record, offset: THREAD_IDLE)
+            let woken = mut fx2.choose(other, results: fx2.types1(clif::Type.Int8).view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let nothing = mut fx3.ptr(0)
+                let seen = fetch_add(mut fx3, address: idle, amount: nothing)
+                let waiting = mut fx3.b.icmp_imm_s(clif::IntCC.Equal, x: seen, y: 1)
+                return fx3.list1(waiting)
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let no = mut fx3.int(clif::Type.Int8, value: 0)
+                return fx3.list1(no)
+            })
+            mut fx2.if_true(woken[0], then: fn[mut lo1](mut fx3: Fx) {
+                let none = mut fx3.ptr(0)
+                windows_post(mut lo1, fx: mut fx3, key: KEY_WAKE, overlapped: none)
+            })
+            let following = mut fx2.b.iadd_imm_s(index, y: 1)
+            let unwoken = mut fx2.b.bxor_imm_s(woken[0], y: 1)
+            return fx2.list2(following, b: unwoken)
+        }, otherwise: fn(mut lo1: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let stop = mut fx2.int(clif::Type.Int8, value: 0)
+            return fx2.list2(index, b: stop)
+        })
+        expect next.len() == 2
+        return Pass(again: next[1], next: fx1.list1(next[0]))
+    })
+} windows_wake_idle
+
+/// Posts a packet of a completion key and an `OVERLAPPED` address to the completion port.
+fn windows_post(mut lo: Lowering, mut fx: Fx, key: i64, overlapped: clif::Value) {
+    let state_address = mut lo.state(mut fx)
+    let port = mut fx.load(PTR, addr: state_address, offset: STATE_PORT)
+    let count = mut fx.int(clif::Type.Int32, value: 0)
+    let key_value = mut fx.int(PTR, value: key)
+    discard mut lo.call_system(mut fx, name: "PostQueuedCompletionStatus", args: fx.list4(port, b: count, c: key_value, d: overlapped).view(), returns: fx.types1(clif::Type.Int32).view())
+} windows_post
+
+/// Maps `count` chunks, which the allocation granularity aligns to their size; zero when the
+/// system refuses.
+fn windows_map_chunks(mut lo: Lowering, mut fx: Fx, count: clif::Value) -> clif::Value {
+    let len = mut fx.b.imul_imm_s(count, y: i64.fit(MEMORY_CHUNK))
+    return windows_commit(mut lo, mut fx, len)
+} windows_map_chunks
+
+/// Releases memory `windows_commit` or `windows_map_chunks` gave, a whole reservation at once.
+fn windows_unmap(mut lo: Lowering, mut fx: Fx, address: clif::Value) {
+    let whole = mut fx.ptr(0)
+    let release = mut fx.int(clif::Type.Int32, value: MEM_RELEASE)
+    discard mut lo.call_system(mut fx, name: "VirtualFree", args: fx.list3(address, b: whole, c: release).view(), returns: fx.types1(clif::Type.Int32).view())
+} windows_unmap
+
+/// Maps a stack of `len` bytes, its guard region protected when `guarded`, zero when the system
+/// refuses.
+fn windows_map_stack(mut lo: Lowering, mut fx: Fx, len: clif::Value, guarded: bool) -> clif::Value {
+    let base = windows_commit(mut lo, mut fx, len)
+    if guarded {
+        let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: base, y: 0)
+        mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+            windows_protect_guard(mut lo, fx: mut fx1, base, accessible: false)
+        })
+    }
+    return base
+} windows_map_stack
+
+/// Protects the guard region at the base of a stack, its floor inaccessible and the rest
+/// guarded, or makes it accessible again.
+fn windows_protect_guard(mut lo: Lowering, mut fx: Fx, base: clif::Value, accessible: bool) {
+    let old = mut fx.slot(8, align: 8)
+    if accessible {
+        windows_protect(mut lo, mut fx, base, offset: 0, len: WINDOWS_GUARD, protection: PAGE_READWRITE, old)
+        return
+    }
+    windows_protect(mut lo, mut fx, base, offset: 0, len: GUARD_FLOOR, protection: PAGE_NOACCESS, old)
+    windows_protect(mut lo, mut fx, base, offset: GUARD_FLOOR, len: WINDOWS_GUARD - GUARD_FLOOR, protection: PAGE_READWRITE | PAGE_GUARD, old)
+} windows_protect_guard
+
+/// Gives `len` bytes at `offset` past `base` a protection, the one they had written at `old`.
+fn windows_protect(mut lo: Lowering, mut fx: Fx, base: clif::Value, offset: u64, len: u64, protection: i64, old: clif::Value) {
+    let at = mut fx.b.iadd_imm_s(base, y: i64.fit(offset))
+    let size = mut fx.ptr(len)
+    let given = mut fx.int(clif::Type.Int32, value: protection)
+    discard mut lo.call_system(mut fx, name: "VirtualProtect", args: fx.list4(at, b: size, c: given, d: old).view(), returns: fx.types1(clif::Type.Int32).view())
+} windows_protect
+
+/// The bounds of the stack the running thread runs on, as its environment block records them.
+fn windows_stack_bounds(mut lo: Lowering, mut fx: Fx) -> StackBounds {
+    let teb = first_result(mut lo.call_stub(mut fx, stub: Stub.Teb, args: mem::List[clif::Value].empty(fx.alloc).view()))
+    let base = mut fx.load(PTR, addr: teb, offset: STACK_BASE)
+    let limit = mut fx.load(PTR, addr: teb, offset: STACK_LIMIT)
+    let deallocation = mut fx.load(PTR, addr: teb, offset: DEALLOCATION_STACK)
+    let guaranteed = mut fx.load(clif::Type.Int32, addr: teb, offset: GUARANTEED_STACK_BYTES)
+    return StackBounds(base: base, limit: limit, deallocation: deallocation, guaranteed: guaranteed)
+} windows_stack_bounds
+
+/// Records in the running thread's environment block the bounds of the stack it runs on, as
+/// `windows_stack_bounds` gives them.
+fn windows_set_stack_bounds(mut lo: Lowering, mut fx: Fx, bounds: StackBounds) {
+    let teb = first_result(mut lo.call_stub(mut fx, stub: Stub.Teb, args: mem::List[clif::Value].empty(fx.alloc).view()))
+    mut fx.store(bounds.base, addr: teb, offset: STACK_BASE)
+    mut fx.store(bounds.limit, addr: teb, offset: STACK_LIMIT)
+    mut fx.store(bounds.deallocation, addr: teb, offset: DEALLOCATION_STACK)
+    mut fx.store(bounds.guaranteed, addr: teb, offset: GUARANTEED_STACK_BYTES)
+} windows_set_stack_bounds
+
+/// Records a task's own stack as the running thread's: from its base, its guard region, then
+/// its usable part up to its top.
+fn windows_enter_task_stack(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let base = mut fx.load(PTR, addr: record, offset: TASK_STACK)
+    let size = mut fx.load(PTR, addr: record, offset: TASK_STACK_SIZE)
+    let low = mut fx.load(PTR, addr: record, offset: TASK_GUARD)
+    let top = mut fx.b.iadd(base, y: size)
+    let guarded = mut fx.int(clif::Type.Int32, value: i64.fit(WINDOWS_GUARD - GUARD_FLOOR))
+    windows_set_stack_bounds(mut lo, mut fx, bounds: StackBounds(base: top, limit: low, deallocation: base, guaranteed: guarded))
+} windows_enter_task_stack
+
+/// Records a segment from `low` to `high`, which has no guard region, as the running thread's
+/// stack.
+fn windows_enter_segment(mut lo: Lowering, mut fx: Fx, low: clif::Value, high: clif::Value) {
+    let none = mut fx.int(clif::Type.Int32, value: 0)
+    windows_set_stack_bounds(mut lo, mut fx, bounds: StackBounds(base: high, limit: low, deallocation: low, guaranteed: none))
+} windows_enter_segment

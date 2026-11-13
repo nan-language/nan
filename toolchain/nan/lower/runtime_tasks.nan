@@ -135,12 +135,13 @@ const TASK_HEADER: u64 = 376
 const TASK_SIZE: u64 = 416
 
 /// The offsets of an executor thread record's fields: the scheduler's saved context, the task
-/// it runs, its index and the locks it holds; on a host target also its ring, whether it waits
-/// idle in its ring, the operations in flight on it, whether another thread asked to cancel
-/// one, its POSIX thread and the top of the stack its stack overflow reports run on; on a
-/// kernel the flags from before its outermost held lock disabled interrupts and the time its
-/// CPU's timer was last programmed to need; and on a machine target whether its CPU's extended
-/// state is enabled, holding the state of the last task owning one that it ran.
+/// it runs, its index and the locks it holds; on a host target also whether it waits idle, the
+/// system's handle to it, which is its POSIX thread on Linux, and the top of the stack its stack
+/// overflow reports run on, and on a Linux target its ring, the operations in flight on it and
+/// whether another thread asked to cancel one; on a kernel the flags from before its outermost
+/// held lock disabled interrupts and the time its CPU's timer was last programmed to need; and on
+/// a machine target whether its CPU's extended state is enabled, holding the state of the last
+/// task owning one that it ran.
 const THREAD_CONTEXT: u64 = 0
 
 const THREAD_CURRENT: u64 = 24
@@ -159,7 +160,7 @@ const THREAD_REQUESTS: u64 = 64
 /// them.
 const THREAD_LOCKS: u64 = 72
 
-const THREAD_PTHREAD: u64 = 80
+const THREAD_SYSTEM: u64 = 80
 
 const THREAD_TRAP_STACK: u64 = 88
 
@@ -261,21 +262,22 @@ const OPERATION_CANCEL: u64 = 32
 
 const OPERATION_KIND: u64 = 40
 
-/// Its links among its thread's operations in flight; on the seeded scheduler and on a kernel,
-/// among the timers of its clock or in the queue of the sim it waits in.
+/// Its links among its thread's operations in flight; on the seeded scheduler, on a kernel and on
+/// a Windows target, among the timers of its clock or in the queue of the sim it waits in.
 const OPERATION_NEXT: u64 = 48
 
 const OPERATION_PREVIOUS: u64 = 56
 
 /// For a deadline, the task to wake once it completes, and the next deadline its task armed;
-/// for a wait in a sim, the sim's record.
+/// for a wait in a sim, the sim's record; for a Windows request, its handle and the thread
+/// running it, zero for one through the completion port.
 const OPERATION_WAITER: u64 = 64
 
 const OPERATION_LINK: u64 = 72
 
-/// When a deadline is due, and on the seeded scheduler and on a kernel when a timer is due and
-/// the order in which it was armed; for a wait in a sim, the glue withdrawing it from the sim,
-/// given the record.
+/// When a deadline is due, and on the seeded scheduler, on a kernel and on a Windows target when a
+/// timer is due and the order in which it was armed; for a wait in a sim, the glue withdrawing it
+/// from the sim, given the record.
 const OPERATION_DUE: u64 = 80
 
 const OPERATION_ORDER: u64 = 88
@@ -324,7 +326,7 @@ const TRAP_RECORD_LEN: u64 = 8
 const TRAP_RECORD_BYTES: u64 = 16
 
 /// The default size of a task's stack, of the entry task's stack on a host target, and of a
-/// host target's guard region.
+/// Linux target's guard region.
 const TASKS_STACK: u64 = 65_536
 
 const ENTRY_STACK: u64 = 67_108_864
@@ -347,6 +349,9 @@ const ROUTINE_RESERVE_SYMBOL: Str = "_NSroutine_reserve"
 fn guard_bytes(lo: Lowering) -> u64 {
     if lo.machine() {
         return 0
+    }
+    if lo.windows() {
+        return WINDOWS_GUARD
     }
     return TASKS_GUARD
 } guard_bytes
@@ -560,10 +565,15 @@ fn tasks_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
         Routine.ThreadMain => {
             let params = mut fx.entry()
             expect params.len() > 0
-            let slot = mut lo.thread_slot(mut fx)
-            mut fx.store(params[0], addr: slot, offset: 0)
-            thread_start(mut lo, mut fx, record: params[0])
-            let refused = thread_signals(mut lo, mut fx, record: params[0])
+            var refused = params[0]
+            if lo.windows() {
+                refused = windows_thread_start(mut lo, mut fx, record: params[0])
+            } else {
+                let slot = mut lo.thread_slot(mut fx)
+                mut fx.store(params[0], addr: slot, offset: 0)
+                thread_start(mut lo, mut fx, record: params[0])
+                refused = thread_signals(mut lo, mut fx, record: params[0])
+            }
             mut fx.if_true(refused, then: fn[mut lo](mut fx1: Fx) {
                 let status = mut fx1.ptr(70)
                 discard mut lo.call_routine(mut fx1, routine: Routine.Exit, args: fx1.list1(status).view())
@@ -870,6 +880,9 @@ fn task_start(mut lo: Lowering, mut fx: Fx) {
     let params = mut fx.entry()
     expect params.len() > 0
     let record = params[0]
+    if lo.windows() {
+        windows_enter_task_stack(mut lo, mut fx, record)
+    }
     var signature = clif::Signature.new(CALL_CONV, alloc: fx.alloc)
     mut signature.params.push(clif::AbiParam(value_type: PTR))
     let imported = mut fx.b.import_signature(take signature)
@@ -1371,13 +1384,26 @@ fn io_submit(mut lo: Lowering, mut fx: Fx) {
     mut fx.store(record, addr: op, offset: OPERATION_TASK)
     let word = mut fx.offset(record, offset: TASK_IO)
     mut fx.atomic_store(op, addr: word)
-    host_submit(mut lo, mut fx, prepared: entry, op: Some(op))
+    linux_submit(mut lo, mut fx, prepared: entry, op: Some(op))
     let origin_submitted = regions_origin(mut fx, region)
     let cancelled_submitted = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin_submitted, y: 0)
     mut fx.if_true(cancelled_submitted, then: fn[mut lo](mut fx1: Fx) {
         cancel_operation(mut lo, fx: mut fx1, op)
     })
     wait_delivered(mut lo, mut fx, op)
+    release_io(mut lo, mut fx, word, op)
+    let result = mut fx.load(clif::Type.Int32, addr: op, offset: OPERATION_RESULT)
+    let refused = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: result, y: CANCELED)
+    let origin_after = regions_origin(mut fx, region)
+    let cancelled_after = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin_after, y: 0)
+    let failed = mut fx.b.band(refused, y: cancelled_after)
+    mut fx.b.ret(fx.list2(failed, b: result).view())
+} io_submit
+
+/// Clears the operation the running task waits on from the `IO` word of its record, once no
+/// cancellation holds it claimed.
+fn release_io(mut lo: Lowering, mut fx: Fx, word: clif::Value, op: clif::Value) {
+    let zero = mut fx.ptr(0)
     discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
         let seen = mut fx1.b.atomic_cas(clif::MemFlags.owned(), p: word, e: op, x: zero)
         let claimed = mut fx1.b.icmp(clif::IntCC.NotEqual, x: seen, y: op)
@@ -1386,13 +1412,7 @@ fn io_submit(mut lo: Lowering, mut fx: Fx) {
         })
         return Pass(again: claimed, next: mem::List[clif::Value].empty(fx1.alloc))
     })
-    let result = mut fx.load(clif::Type.Int32, addr: op, offset: OPERATION_RESULT)
-    let refused = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: result, y: CANCELED)
-    let origin_after = regions_origin(mut fx, region)
-    let cancelled_after = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin_after, y: 0)
-    let failed = mut fx.b.band(refused, y: cancelled_after)
-    mut fx.b.ret(fx.list2(failed, b: result).view())
-} io_submit
+} release_io
 
 /// Delivers an operation's completion with its result, by its kind: a waiting task wakes, a
 /// deadline that expired cancels its region and wakes the task disarming it, and a component's
@@ -1484,6 +1504,10 @@ fn Lowering.arm_timer(mut self, mut fx: Fx, op: clif::Value, ns: clif::Value, sp
         mut self.kernel_arm(mut fx, op, ns)
         return
     }
+    if self.windows() {
+        windows_arm(mut self, mut fx, op, ns)
+        return
+    }
     let billion = mut fx.ptr(1_000_000_000)
     let seconds = mut fx.b.udiv(ns, y: billion)
     let nanoseconds = mut fx.b.urem(ns, y: billion)
@@ -1500,31 +1524,36 @@ fn Lowering.cancel_operation(mut self, mut fx: Fx, op: clif::Value) {
         seeded_cancel(mut self, fx: mut fx, op)
     } else if self.kernel() {
         mut self.kernel_cancel(mut fx, op)
+    } else if self.windows() {
+        windows_cancel_operation(mut self, fx: mut fx, op)
     } else {
         cancel_operation(mut self, fx: mut fx, op)
     }
 } Lowering.cancel_operation
 
-/// Delivers the completions that have arrived: those on the running thread's ring, those the
-/// seeded scheduler queued, or the expiries of an isolated space's timers that are due; a
-/// kernel's waits end by wakes alone.
+/// Delivers the completions that have arrived: those on the running thread's ring or on the
+/// completion port, those the seeded scheduler queued, or the expiries of an isolated space's
+/// timers that are due; a kernel's waits end by wakes alone.
 fn Lowering.reap(mut self, mut fx: Fx) {
     if self.seeded() {
         seeded_reap(mut self, fx: mut fx)
     } else if self.user() {
         space_reap(mut self, mut fx)
+    } else if self.windows() {
+        windows_take_packets(mut self, fx: mut fx, wait: None)
     } else if not self.kernel() {
-        host_reap(mut self, fx: mut fx, wait: None)
+        linux_reap(mut self, fx: mut fx, wait: None)
     }
 } Lowering.reap
 
 /// The nanoseconds of the clock that delays count: the monotonic clock, the virtual clock on the
-/// seeded scheduler, or the kernel's clock.
+/// seeded scheduler, or the kernel's clock; a kernel's and a Windows target's through
+/// `ClockNow`.
 fn Lowering.now_ns(mut self, mut fx: Fx) -> clif::Value {
     if self.seeded() {
         return seeded_now(mut self, fx: mut fx)
     }
-    if self.kernel() {
+    if self.kernel() or self.windows() {
         let called = mut self.call_routine(mut fx, routine: Routine.ClockNow, args: mem::List[clif::Value].empty(fx.alloc).view())
         return called[0]
     }

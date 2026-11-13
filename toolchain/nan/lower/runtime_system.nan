@@ -1,4 +1,4 @@
-//! The system the runtime runs on: the memory of its records and of the chunks cells draw, task stacks, idling, its standard streams, its start and its exit. On a host target the host module provides them over the C library and Linux; on a machine target the machine module does, over the boot heap, the serial and exit ports and the CPUs; in an isolated space's runtime the space module does, over the boot heap whose chunks it draws and the system calls its kernel serves.
+//! The system the runtime runs on: the memory of its records and of the chunks cells draw, task stacks, idling, its standard streams, its start and its exit. On a Linux target the Linux module provides them over the C library and Linux, and on a Windows target the Windows module over `kernel32.dll`; on a machine target the machine module does, over the boot heap, the serial and exit ports and the CPUs; in an isolated space's runtime the space module does, over the boot heap whose chunks it draws and the system calls its kernel serves.
 
 /// The text written when the runtime cannot start.
 const RUNTIME_SYSTEM_UNAVAILABLE: Str = "nan: runtime unavailable\n"
@@ -73,8 +73,10 @@ fn system_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
         }
     } else if lo.machine() {
         heap_define(mut lo, mut fx, routine)
+    } else if lo.windows() {
+        windows_define(mut lo, mut fx, routine)
     } else {
-        host_define(mut lo, mut fx, routine)
+        linux_define(mut lo, mut fx, routine)
     }
 } system_define
 
@@ -115,6 +117,8 @@ fn init(mut lo: Lowering, mut fx: Fx) {
         space_init(mut lo, mut fx)
     } else if lo.machine() {
         mut lo.machine_init(mut fx)
+    } else if lo.windows() {
+        windows_start_threads(mut lo, mut fx)
     } else {
         start_threads(mut lo, mut fx)
     }
@@ -172,8 +176,10 @@ fn write_stream(mut lo: Lowering, mut fx: Fx, fd: i64, text: clif::Value, len: c
     }
     if lo.machine() {
         mut lo.serial_write(mut fx, text, len)
+    } else if lo.windows() {
+        windows_write_all(mut lo, mut fx, fd, text, len)
     } else {
-        host_write_all(mut lo, mut fx, fd, text, len)
+        linux_write_all(mut lo, mut fx, fd, text, len)
     }
 } write_stream
 
@@ -182,33 +188,43 @@ fn system_map_chunks(mut lo: Lowering, mut fx: Fx, count: clif::Value) -> clif::
     if lo.machine() {
         return heap_map_chunks(mut lo, mut fx, count)
     }
-    return host_map_chunks(mut lo, mut fx, count)
+    if lo.windows() {
+        return windows_map_chunks(mut lo, mut fx, count)
+    }
+    return linux_map_chunks(mut lo, mut fx, count)
 } system_map_chunks
 
 /// Returns `count` chunks from `base` to the supply.
 fn system_unmap_chunks(mut lo: Lowering, mut fx: Fx, base: clif::Value, count: clif::Value) {
     if lo.machine() {
         heap_unmap_chunks(mut lo, mut fx, base, count)
+    } else if lo.windows() {
+        windows_unmap(mut lo, mut fx, address: base)
     } else {
         let len = mut fx.b.imul_imm_s(count, y: i64.fit(MEMORY_CHUNK))
         unmap(mut lo, mut fx, address: base, len)
     }
 } system_unmap_chunks
 
-/// A stack of `len` bytes whose lowest page is an inaccessible guard on a host target when
+/// A stack of `len` bytes whose guard region at its base is protected on a host target when
 /// `guarded`, zero when the system refuses; a machine target draws it as a runtime record, its
 /// guard region unprotected since its stacks have static bounds.
 fn system_map_stack(mut lo: Lowering, mut fx: Fx, len: clif::Value, guarded: bool) -> clif::Value {
     if lo.machine() {
         return mut lo.record_alloc(mut fx, size: len)
     }
-    return host_map_stack(mut lo, mut fx, len, guarded)
+    if lo.windows() {
+        return windows_map_stack(mut lo, mut fx, len, guarded)
+    }
+    return linux_map_stack(mut lo, mut fx, len, guarded)
 } system_map_stack
 
 /// Returns a task stack `system_map_stack` gave.
 fn unmap_stack(mut lo: Lowering, mut fx: Fx, stack: clif::Value, len: clif::Value) {
     if lo.machine() {
         mut lo.record_free(mut fx, address: stack)
+    } else if lo.windows() {
+        windows_unmap(mut lo, mut fx, address: stack)
     } else {
         unmap(mut lo, mut fx, address: stack, len)
     }
@@ -217,28 +233,40 @@ fn unmap_stack(mut lo: Lowering, mut fx: Fx, stack: clif::Value, len: clif::Valu
 /// Makes the guard region at the base of a stack drawn through a cell inaccessible, or
 /// accessible again, on a host target.
 fn system_protect_guard(mut lo: Lowering, mut fx: Fx, base: clif::Value, accessible: bool) {
-    if not lo.machine() {
-        host_protect_guard(mut lo, mut fx, base, accessible)
+    if lo.machine() {
+        return
+    }
+    if lo.windows() {
+        windows_protect_guard(mut lo, mut fx, base, accessible)
+    } else {
+        linux_protect_guard(mut lo, mut fx, base, accessible)
     }
 } system_protect_guard
 
-/// Waits until a task may be ready: on a host target in the running thread's ring, handling the
-/// completions that arrive; on a machine target the CPU halts until an interrupt; in an isolated
-/// space until its first timer is due.
+/// Waits until a task may be ready: on a Linux target in the running thread's ring and on a
+/// Windows target on the completion port, handling the completions that arrive; on a machine
+/// target the CPU halts until an interrupt; in an isolated space until its first timer is due.
 fn system_idle(mut lo: Lowering, mut fx: Fx) {
     if lo.user() {
         space_idle(mut lo, mut fx)
     } else if lo.machine() {
         discard mut lo.call_stub(mut fx, stub: Stub.IdleWait, args: mem::List[clif::Value].empty(fx.alloc).view())
+    } else if lo.windows() {
+        windows_idle(mut lo, mut fx)
     } else {
-        host_idle(mut lo, mut fx)
+        linux_idle(mut lo, mut fx)
     }
 } system_idle
 
 /// Wakes an executor thread waiting idle, other than the running one, so a task made ready
 /// runs; a machine CPU waiting idle wakes on its own timer.
 fn system_wake_idle(mut lo: Lowering, mut fx: Fx) {
-    if not lo.machine() {
-        host_wake_idle(mut lo, mut fx)
+    if lo.machine() {
+        return
+    }
+    if lo.windows() {
+        windows_wake_idle(mut lo, mut fx)
+    } else {
+        linux_wake_idle(mut lo, mut fx)
     }
 } system_wake_idle

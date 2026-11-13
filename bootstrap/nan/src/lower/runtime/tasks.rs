@@ -121,12 +121,12 @@ pub mod task {
 
 /// The offsets of an executor thread record's fields: the scheduler's saved context, the task
 /// it runs, its index and the locks it holds; on a host target also whether it waits idle, the
-/// system's handle to it, its POSIX thread on Linux, and the top of the stack its stack overflow
-/// reports run on, and on a Linux target its ring, the operations in flight on it and whether
-/// another thread asked to cancel one; on a kernel the
-/// flags from before its outermost held lock disabled interrupts and the time its CPU's timer was
-/// last programmed to need; and on a machine target whether its CPU's extended state is enabled,
-/// holding the state of the last task owning one that it ran.
+/// system's handle to it, which is its POSIX thread on Linux, and the top of the stack its stack
+/// overflow reports run on, and on a Linux target its ring, the operations in flight on it and
+/// whether another thread asked to cancel one; on a kernel the flags from before its outermost
+/// held lock disabled interrupts and the time its CPU's timer was last programmed to need; and on
+/// a machine target whether its CPU's extended state is enabled, holding the state of the last
+/// task owning one that it ran.
 pub mod thread {
     pub const CONTEXT: u64 = 0;
     pub const CURRENT: u64 = 24;

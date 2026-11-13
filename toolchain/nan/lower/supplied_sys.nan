@@ -61,7 +61,12 @@ fn sys_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
         "sys::fs::File" or "sys::net::Listener" or "sys::net::Conn" => resource(mut lo, mut fx, supply)
         "sys::revocable" or "sys::Revoker" => revocation(mut lo, mut fx, supply)
         "linux_platform::submit" => sys_submit(mut lo, mut fx, supply)
-        else => return false
+        else => {
+            if not owner.starts_with("windows_platform::") {
+                return false
+            }
+            sys_windows_platform(mut lo, mut fx, supply)
+        }
     }
     return true
 } sys_lower
@@ -505,10 +510,12 @@ fn sys_clock(mut lo: Lowering, mut fx: Fx, supply: Supply) {
                 supply.done(mut lo, fx: mut fx1)
             })
             let delay = clock_delay(mut lo, mut fx, minted, resolution, ns)
-            if lo.seeded() or lo.kernel() {
+            if lo.seeded() or lo.kernel() or lo.windows() {
                 let cancelled = sims_wait(mut lo, mut fx, slot: None, enqueue: fn(mut lo1: Lowering, mut fx1: Fx, op: clif::Value) {
                     if lo1.seeded() {
                         seeded_arm(mut lo1, fx: mut fx1, op, ns: delay)
+                    } else if lo1.windows() {
+                        windows_arm(mut lo1, fx: mut fx1, op, ns: delay)
                     } else {
                         mut lo1.kernel_arm(mut fx1, op, ns: delay)
                     }
@@ -1057,6 +1064,71 @@ fn revocation(mut lo: Lowering, mut fx: Fx, supply: Supply) {
         }
     }
 } revocation
+
+/// The operations `windows_platform` declares without a body: `call`, a call of the function
+/// at an address with nine arguments under the system's calling convention; `generate`, the
+/// system's random bytes; `associate`, the association of a handle with the completion port;
+/// and `transfer`, `accept` and `connect`, the requests a task waits for, whose result they
+/// give.
+fn sys_windows_platform(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let path = supply.path.as_str()
+    let Some(name) = path.slice_bytes("windows_platform::".byte_len(), end: path.byte_len()) else {
+        expect false
+        return
+    }
+    if name == "call" {
+        var args = mem::List[clif::Value].empty(fx.alloc)
+        for index in 1..10 {
+            mut args.push(supply.param(index).scalar_value())
+        }
+        let result = mut lo.call_address(mut fx, function: supply.param(0).scalar_value(), args: args.view(), result: clif::Type.Int64)
+        supply.ret(mut lo, mut fx, held: Held.Scalar(result))
+        return
+    }
+    if name == "generate" {
+        let args = fx.list2(supply.param(0).scalar_value(), b: supply.param(1).scalar_value())
+        discard mut lo.call_system(mut fx, name: "bcryptprimitives.dll!ProcessPrng", args: args.view(), returns: fx.types1(clif::Type.Int32).view())
+        supply.done(mut lo, mut fx)
+        return
+    }
+    if name == "associate" {
+        let associated = windows_associate(mut lo, mut fx, handle: supply.param(0).scalar_value())
+        supply.ret(mut lo, mut fx, held: Held.Scalar(associated))
+        return
+    }
+    var args = mem::List[clif::Value].empty(fx.alloc)
+    match name {
+        "transfer" => {
+            let writes = mut fx.b.uextend(clif::Type.Int64, x: supply.param(3).scalar_value())
+            let blocking_flag = mut fx.b.uextend(clif::Type.Int64, x: supply.param(4).scalar_value())
+            let blocking = mut fx.b.ishl_imm_s(blocking_flag, y: 1)
+            let kind = mut fx.b.bor(writes, y: blocking)
+            let len = mut fx.b.uextend(clif::Type.Int64, x: supply.param(2).scalar_value())
+            let none = mut fx.ptr(0)
+            args = fx.list5(kind, b: supply.param(0).scalar_value(), c: supply.param(1).scalar_value(), d: len, e: none)
+        }
+        "accept" => {
+            let kind = mut fx.int(clif::Type.Int64, value: REQUEST_ACCEPT)
+            args = fx.list5(kind, b: supply.param(1).scalar_value(), c: supply.param(0).scalar_value(), d: supply.param(2).scalar_value(), e: supply.param(3).scalar_value())
+        }
+        "connect" => {
+            let kind = mut fx.int(clif::Type.Int64, value: REQUEST_CONNECT)
+            let len = mut fx.b.uextend(clif::Type.Int64, x: supply.param(3).scalar_value())
+            args = fx.list5(kind, b: supply.param(1).scalar_value(), c: supply.param(0).scalar_value(), d: supply.param(2).scalar_value(), e: len)
+        }
+        else => {
+            expect false
+        }
+    }
+    let results = mut lo.call_routine(mut fx, routine: Routine.Request, args: args.view())
+    expect results.len() == 2
+    let result = results[1]
+    mut fx.if_true(results[0], then: fn[mut lo](mut fx1: Fx) {
+        let origin = tasks_origin(mut lo, fx: mut fx1)
+        tasks_fail_cancelled(mut lo, fx: mut fx1, supply, origin)
+    })
+    supply.ret(mut lo, mut fx, held: Held.Scalar(result))
+} sys_windows_platform
 
 /// `linux_platform::submit(entry)`: the operation's result once its completion arrives.
 fn sys_submit(mut lo: Lowering, mut fx: Fx, supply: Supply) {

@@ -686,6 +686,32 @@ error type.mismatch example/example.nan:3 example::ratio
 failed dep sync example: files 0, errors 1, incomplete 0
 ```
 
+In the next example, the local store holds no release under the store name `gauge`, so its source has no candidate and no assignment exists: `nan dep sync` reports `dep.unresolved` and writes no lock.
+
+```nan
+// file: report/package.nan
+//! Reports gauge readings.
+
+package report {
+    language 1
+    targets any
+    dep gauge "gauge" // error: dep.lock-stale
+} report
+
+// file: report/report.nan
+//! Readings of reports.
+
+pub const FIRST: u64 = gauge::START
+```
+
+```text
+$ nan dep sync report
+failed dep sync report: files 0, errors 1, incomplete 0
+error dep.unresolved report/package.nan:3 report
+    package report {
+failed dep sync report: files 0, errors 1, incomplete 0
+```
+
 ### Upgrades
 
 `nan upgrade` without `--language` resolves as `nan dep sync` does, except that condition 2 accepts `name.moved` errors and checks P's source after replacing in memory each use matching a `preserves` or `changes` tombstone of a candidate by the exact fix forwarding gives it, when one exists. It writes the lock and those replacements, and reports each use still matching a `changes` or `manual` tombstone as `name.moved`.

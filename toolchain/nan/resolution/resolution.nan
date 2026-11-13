@@ -132,12 +132,17 @@ pkg fn resolve(session: check::Session, package_index: usize, local: store::Stor
         expect false
         return Ok(Outcome.Unresolved(mem::List[diagnostic::Diagnostic].empty(alloc)))
     }
-    let direct = resolver.sources_of(root.dir.as_str(), deps: workspace::manifest_deps(root, alloc).view())
     var assigned = mem::List[Assigned].empty(alloc)
-    var found = try mut resolver.search(assigned: mut assigned, pending: copied_sources(direct.view(), alloc), user_cache)
-    if found.is_none() {
-        resolver.own_errors = false
-        found = try mut resolver.search(assigned: mut assigned, pending: take direct, user_cache)
+    var found: Option[mem::List[Assigned]] = None
+    match resolver.sources_of(root.dir.as_str(), deps: workspace::manifest_deps(root, alloc).view()) {
+        Some(direct) => {
+            found = try mut resolver.search(assigned: mut assigned, pending: copied_sources(direct.view(), alloc), user_cache)
+            if found.is_none() {
+                resolver.own_errors = false
+                found = try mut resolver.search(assigned: mut assigned, pending: take direct, user_cache)
+            }
+        }
+        None => {}
     }
     let Some(assignment) = found else {
         let Some(manifest) = root.manifest else {
@@ -181,8 +186,8 @@ proj fn Resolver.root(self) -> workspace::Package {
 } Resolver.root
 
 /// The sources of `dep` directives written in the package directory `dir`, as the locking
-/// package writes them.
-fn Resolver.sources_of(self, dir: Str, deps: Slice[workspace::DepSource]) -> mem::List[Source] {
+/// package writes them; none when one has no candidate, reaching no package.
+fn Resolver.sources_of(self, dir: Str, deps: Slice[workspace::DepSource]) -> Option[mem::List[Source]] {
     let alloc = self.alloc
     let held = self.session.workspace.contents()
     var sources = mem::List[Source].empty(alloc)
@@ -190,26 +195,26 @@ fn Resolver.sources_of(self, dir: Str, deps: Slice[workspace::DepSource]) -> mem
         if dep.path {
             let target = workspace::resolve_source(dir, source: dep.written.as_str(), alloc)
             let Some(at) = held.package_position(fn(candidate: workspace::Package) => candidate.dir.as_str() == target.as_str()) else {
-                continue
+                return None
             }
             let Some(pack) = held.package_at(at) else {
                 expect false
-                continue
+                return None
             }
             let Some(name) = pack.name() else {
-                continue
+                return None
             }
             let written = workspace::relative_source(self.root().dir.as_str(), to: target.as_str(), alloc)
             mut sources.push(Source(written: take written, package_name: text::String.of(name, alloc), dir: Some(take target)))
             continue
         }
         let Some(at) = self.entries.position(fn(entry: mem::Shared[store::Entry]) => named_as(entry.contents(), name: dep.written.as_str())) else {
-            continue
+            return None
         }
         let package_name = text::String.of(self.entries[at].contents().package_name.as_str(), alloc)
         mut sources.push(Source(written: text::String.of(dep.written.as_str(), alloc), package_name: take package_name, dir: None))
     }
-    return sources
+    return Some(take sources)
 } Resolver.sources_of
 
 /// Whether a store entry is a named release of a store name.
@@ -302,21 +307,21 @@ fn Resolver.descends(self, named: Slice[usize], at: usize, ancestor: hashing::Ha
     return false
 } Resolver.descends
 
-/// The dependency sources a candidate's manifest names.
-fn Resolver.reached(self, candidate: Candidate, source: Source) -> mem::List[Source] {
+/// The dependency sources a candidate's manifest names; none when one has no candidate.
+fn Resolver.reached(self, candidate: Candidate, source: Source) -> Option[mem::List[Source]] {
     let alloc = self.alloc
     let held = self.session.workspace.contents()
     match candidate {
         Candidate.Current(index) => {
             let Some(pack) = held.package_at(index) else {
                 expect false
-                return mem::List[Source].empty(alloc)
+                return Some(mem::List[Source].empty(alloc))
             }
             return self.sources_of(pack.dir.as_str(), deps: workspace::manifest_deps(pack, alloc).view())
         }
         Candidate.Stored(entry) => {
             let Some(at) = entry.contents().sources.position(fn(file: artefact::SourceFile) => file.path.as_str() == "package.nan") else {
-                return mem::List[Source].empty(alloc)
+                return Some(mem::List[Source].empty(alloc))
             }
             var manifest = mem::Bytes.empty(alloc)
             mut manifest.append(entry.contents().sources[at].content.view())
@@ -366,12 +371,15 @@ fn Resolver.search(mut self, mut assigned: mem::List[Assigned], take pending: me
         return None
     }
     for candidate in take self.candidates(next) {
+        let Some(reached) = self.reached(candidate, source: next) else {
+            continue
+        }
         var rest = mem::List[Source].empty(alloc)
         for index in 1..<sources.len() {
             mut rest.push(sources[index].copy(alloc))
         }
-        for reached in take self.reached(candidate, source: next) {
-            mut rest.push(take reached)
+        for source in take reached {
+            mut rest.push(take source)
         }
         mut assigned.push(Assigned(source: next.copy(alloc), candidate: take candidate))
         match try mut self.search(assigned: mut assigned, pending: take rest, user_cache) {

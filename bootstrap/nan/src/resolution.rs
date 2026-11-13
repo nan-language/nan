@@ -140,12 +140,16 @@ pub fn resolve(
         forwarding,
     };
     let root = &workspace.packages[package];
-    let direct = resolver.sources_of(&root.dir, manifest_deps(root));
-    let mut found = resolver.search(&mut Vec::new(), direct.clone())?;
-    if found.is_none() {
-        resolver.own_errors = false;
-        found = resolver.search(&mut Vec::new(), direct)?;
-    }
+    let found = match resolver.sources_of(&root.dir, manifest_deps(root)) {
+        Some(direct) => match resolver.search(&mut Vec::new(), direct.clone())? {
+            None => {
+                resolver.own_errors = false;
+                resolver.search(&mut Vec::new(), direct)?
+            }
+            found => found,
+        },
+        None => None,
+    };
     let Some(assignment) = found else {
         let manifest = root.manifest.as_ref().expect("a package with a manifest");
         let mut diagnostics = vec![Diagnostic::at(
@@ -162,11 +166,11 @@ pub fn resolve(
 
 impl Resolver<'_> {
     /// The sources of `dep` directives written in the package directory `dir`, as the locking
-    /// package writes them.
-    fn sources_of(&self, dir: &str, deps: Vec<(String, String, bool)>) -> Vec<Source> {
+    /// package writes them; none when one has no candidate, reaching no package.
+    fn sources_of(&self, dir: &str, deps: Vec<(String, String, bool)>) -> Option<Vec<Source>> {
         let root = &self.workspace.packages[self.package];
         deps.into_iter()
-            .filter_map(|(_, written, path)| {
+            .map(|(_, written, path)| {
                 if path {
                     let target = crate::workspace::resolve_source(dir, &written);
                     let package = self
@@ -240,8 +244,8 @@ impl Resolver<'_> {
         found
     }
 
-    /// The dependency sources a candidate's manifest names.
-    fn reached(&self, candidate: &Candidate, source: &Source) -> Vec<Source> {
+    /// The dependency sources a candidate's manifest names; none when one has no candidate.
+    fn reached(&self, candidate: &Candidate, source: &Source) -> Option<Vec<Source>> {
         match candidate {
             Candidate::Current(index) => {
                 let package = &self.workspace.packages[*index];
@@ -251,7 +255,7 @@ impl Resolver<'_> {
                 let Some((_, manifest)) =
                     entry.sources.iter().find(|(path, _)| path == "package.nan")
                 else {
-                    return Vec::new();
+                    return Some(Vec::new());
                 };
                 let file = parse(manifest.clone());
                 let dir = source.dir.clone().unwrap_or_else(|| source.package.clone());
@@ -291,8 +295,11 @@ impl Resolver<'_> {
             return Ok(None);
         }
         for candidate in self.candidates(&next) {
+            let Some(reached) = self.reached(&candidate, &next) else {
+                continue;
+            };
             let mut rest: Vec<Source> = pending[1..].to_vec();
-            rest.extend(self.reached(&candidate, &next));
+            rest.extend(reached);
             assigned.push((next.clone(), candidate));
             if let Some(found) = self.search(assigned, rest)? {
                 return Ok(Some(found));

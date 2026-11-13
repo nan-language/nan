@@ -66,13 +66,16 @@ impl Scope {
         named(workspace, text, None)
     }
 
-    /// Whether the scope covers a line of a file, or the file as a whole when `line` is absent.
+    /// Whether the scope covers a line of a file, or the file as a whole when `line` is absent; a
+    /// package covers its machine files.
     pub fn holds(&self, workspace: &Workspace, path: &str, line: Option<u32>) -> bool {
         let file = workspace.file(path);
         match self {
             Scope::Workspace => true,
             Scope::Package(index) => {
-                file.is_some_and(|(package, _)| std::ptr::eq(package, &*workspace.packages[*index]))
+                let package = &*workspace.packages[*index];
+                file.is_some_and(|(holder, _)| std::ptr::eq(holder, package))
+                    || package.machine.bytes(path).is_some()
             }
             Scope::Module(index, module) => file.is_some_and(|(package, file)| {
                 std::ptr::eq(package, &*workspace.packages[*index]) && file.module == Some(*module)

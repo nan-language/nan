@@ -189,7 +189,7 @@ A machine file is **valid** when it lexes, its first line names its kind, it par
 
 - A format version the toolchain does not implement is an error (`format.machine-version`), reported on line 1.
 - Otherwise a machine file that is not valid, other than through a reserved lock field, is an error (`format.machine-invalid`), reported on its first line that breaks these rules, or on its check line when only the check differs. It has no exact fix.
-- A command reads nothing from a machine file that is not valid and never rewrites it.
+- A command reads nothing from a machine file that is not valid and never rewrites it: a command that would write or delete it writes no file and reports its error.
 
 ```nan
 // file: meter/package.nan
@@ -209,6 +209,14 @@ check "afsiq3a6v4hy3tlzg5iqw5vfj6ttzhf54unbrywkj6sv3htmxqsq6n7" // error: format
 //! Totals of samples.
 
 pub const START: u64 = 0
+```
+
+```text
+$ nan publish --local meter
+failed publish --local meter: files 0, errors 1, incomplete 0
+error format.machine-invalid meter/.nan/history.nan:3 -
+    check "afsiq3a6v4hy3tlzg5iqw5vfj6ttzhf54unbrywkj6sv3htmxqsq6n7" // error: format.machine-invalid
+failed publish --local meter: files 0, errors 1, incomplete 0
 ```
 
 ### Lock

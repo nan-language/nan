@@ -164,6 +164,37 @@ fn a_stray_file_is_reported_on_its_first_line() {
 }
 
 #[test]
+fn a_command_writing_a_machine_file_that_is_not_valid_reports_it_and_writes_nothing() {
+    let key = crate::command::key::tests::TestPrincipal::key_of([7; 32]);
+    for (file, command) in [
+        ("lock.nan", "dep sync app".to_owned()),
+        ("api/app.nan", "api update app".to_owned()),
+        ("principals.nan", format!("key trust keeper {key}")),
+    ] {
+        let path = format!("app/.nan/{file}");
+        let invalid = "nan lock 1\ncheck \"a\"\n";
+        let scratch = Scratch::new(&[
+            ("app/package.nan", MANIFEST),
+            ("app/app.nan", "//! Root.\n\npub const MAX: u32 = 1\n"),
+            (&path, invalid),
+        ]);
+        let run = run_in(&scratch.0.join("app"), &command);
+        assert_eq!(
+            (run.status, run.output.lines().nth(1)),
+            (
+                1,
+                Some(format!("error format.machine-invalid {path}:1 -").as_str())
+            ),
+            "{command}"
+        );
+        assert_eq!(
+            fs::read_to_string(scratch.0.join(&path)).expect("the file"),
+            invalid
+        );
+    }
+}
+
+#[test]
 fn fmt_writes_through_the_journal_and_names_each_file() {
     let scratch = Scratch::new(&[
         ("app/package.nan", MANIFEST),

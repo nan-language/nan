@@ -5,12 +5,12 @@ use std::fs::File;
 use std::io::{self, Read as _};
 use std::path::Path;
 
-use super::{Invocation, Trace, unlocated};
+use super::{Invocation, Trace, apply, record, unlocated};
 use crate::cache::{Cache, Exposed};
 use crate::diagnostic::{Class, Code, Diagnostic};
-use crate::journal;
 use crate::machine::principals::{Principals, is_principal};
 use crate::output::{Output, Record, Verdict};
+use crate::scope::Scope;
 use crate::sign;
 use crate::workspace::Workspace;
 
@@ -118,15 +118,22 @@ pub fn trust(
     };
     let path = format!("{}/.nan/principals.nan", package.dir);
     let trusted = package.machine.principals().trusting(principal, key);
-    let mut records = Vec::new();
+    let mut changes = Vec::new();
     if workspace.bytes(&path) != trusted.bytes().as_deref() {
-        journal::apply(&workspace.root, &[(path.clone(), trusted.bytes())])?;
-        records.push(Record {
+        changes.push((path, trusted.bytes()));
+    }
+    if let Some(invalid) = apply(workspace, &mut changes)?.first() {
+        let record = record(workspace, &Scope::Workspace, invalid);
+        return Ok(refused(invocation, &written, record));
+    }
+    let records: Vec<Record> = changes
+        .into_iter()
+        .map(|(path, _)| Record {
             word: "wrote".to_owned(),
             fields: vec![path],
             lines: Vec::new(),
-        });
-    }
+        })
+        .collect();
     let files = records.len();
     Ok(output(invocation, &written, records, files))
 }

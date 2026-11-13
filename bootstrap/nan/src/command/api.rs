@@ -5,10 +5,9 @@
 use std::io;
 use std::path::Path;
 
-use super::{Invocation, Trace, record};
+use super::{Invocation, Trace, apply, record};
 use crate::check::{self, Snapshots};
 use crate::diagnostic::{Class, Code, Diagnostic, Reason};
-use crate::journal;
 use crate::output::{Output, Record, Verdict};
 use crate::scope::Scope;
 use crate::workspace::Workspace;
@@ -95,8 +94,8 @@ pub fn update(
         }
     }
     changes.sort();
+    diagnostics.extend(apply(workspace, &mut changes)?);
     check::sort_diagnostics(&mut diagnostics);
-    journal::apply(&workspace.root, &changes)?;
     let count = |class: Class| {
         diagnostics
             .iter()

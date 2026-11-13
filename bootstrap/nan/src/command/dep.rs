@@ -6,11 +6,11 @@ use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 
-use super::{Invocation, Trace, record};
+use super::{Invocation, Trace, apply, record};
 use crate::cache::Cache;
+use crate::check;
 use crate::diagnostic::{Class, Code, Diagnostic};
 use crate::format;
-use crate::journal;
 use crate::output::{Output, Record, Verdict};
 use crate::resolution::{self, Outcome};
 use crate::scope::Scope;
@@ -113,15 +113,18 @@ pub fn approve(
     trace.scope = Some(written.clone());
     let package = &workspace.packages[index];
     let lock = package.machine.lock().cloned().unwrap_or_default();
-    let (approved, _) = crate::check::approvals(workspace, package, lock, true);
+    let (approved, _) = check::approvals(workspace, package, lock, true);
     let path = format!("{}/.nan/lock.nan", package.dir);
     let bytes = approved.bytes();
     let mut changes = Vec::new();
     if bytes.as_deref() != package.machine.bytes(&path) {
         changes.push((path, bytes));
     }
-    journal::apply(&workspace.root, &changes)?;
-    Ok(written_output(invocation, &written, Vec::new(), &changes))
+    let records = apply(workspace, &mut changes)?
+        .iter()
+        .map(|diagnostic| record(workspace, &Scope::Workspace, diagnostic))
+        .collect();
+    Ok(written_output(invocation, &written, records, &changes))
 }
 
 /// Resolves a package's closure, forwarding its uses of retired forms when `forwarding`, writing
@@ -157,9 +160,21 @@ fn synced(
             lock,
             changes: released,
             sources,
-            errors,
+            mut errors,
         } => {
-            for change in released {
+            let path = format!("{}/.nan/lock.nan", package.dir);
+            let bytes = lock.bytes();
+            if bytes.as_deref() != package.machine.bytes(&path) {
+                changes.push((path, bytes));
+            }
+            changes.extend(
+                sources
+                    .into_iter()
+                    .map(|(path, source)| (path, Some(source))),
+            );
+            changes.sort();
+            let invalid = apply(workspace, changes)?;
+            for change in released.into_iter().filter(|_| invalid.is_empty()) {
                 let hash = |hash: Option<crate::hash::Hash>| {
                     hash.map_or_else(|| "-".to_owned(), |hash| hash.short())
                 };
@@ -174,23 +189,13 @@ fn synced(
                     lines: Vec::new(),
                 });
             }
+            errors.extend(invalid);
+            check::sort_diagnostics(&mut errors);
             records.extend(
                 errors
                     .iter()
                     .map(|diagnostic| record(workspace, &Scope::Workspace, diagnostic)),
             );
-            let path = format!("{}/.nan/lock.nan", package.dir);
-            let bytes = lock.bytes();
-            if bytes.as_deref() != package.machine.bytes(&path) {
-                changes.push((path, bytes));
-            }
-            changes.extend(
-                sources
-                    .into_iter()
-                    .map(|(path, source)| (path, Some(source))),
-            );
-            changes.sort();
-            journal::apply(&workspace.root, changes)?;
         }
         Outcome::Unresolved(diagnostics) => {
             changes.clear();

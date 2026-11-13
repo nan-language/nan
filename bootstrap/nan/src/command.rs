@@ -848,6 +848,29 @@ fn item_written(
         .map_or_else(|| "-".to_owned(), |item| written_for(&item, writer))
 }
 
+/// Writes or deletes files through the journal unless one is a machine file that is not valid:
+/// then it clears `changes`, writes nothing and returns the errors of those files.
+fn apply(
+    workspace: &Workspace,
+    changes: &mut Vec<(String, Option<Vec<u8>>)>,
+) -> io::Result<Vec<Diagnostic>> {
+    let invalid: Vec<Diagnostic> = workspace
+        .packages
+        .iter()
+        .flat_map(|package| package.machine.diagnostics())
+        .filter(|diagnostic| {
+            changes
+                .iter()
+                .any(|(path, _)| diagnostic.path.as_ref() == Some(path))
+        })
+        .collect();
+    match invalid.is_empty() {
+        true => journal::apply(&workspace.root, changes)?,
+        false => changes.clear(),
+    }
+    Ok(invalid)
+}
+
 /// The record of a diagnostic without location or item.
 fn unlocated(code: Code, lines: Vec<String>) -> Record {
     Record {

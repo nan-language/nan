@@ -1491,14 +1491,14 @@ convention_clause = 'convention' TEXT ;
 - Declaring a foreign fn is a `trusted` operation (`authority.ungranted`), and each declaration is a trust escape.
 - Its parameters are read parameters, and its parameter and result types are integer and float scalars, `hw::Ptr[T]` and AnyBits layouts; its result may also be `Unit` or `Never`. Its name is one identifier, and it has no generic parameters or `fails`. Any other head is an error (`trusted.foreign-signature`). [Effects, digests and limits](10-effects-digests.md#foreign-functions-and-trusted-code) gives its waiting and digest rules.
 - Its symbol is its name. A call of a foreign fn, or through a foreign function type, passes and returns an integer or float scalar as the convention passes the C type of that width and signedness, a pointer as its address, an integer layout as its bits value, and a bytes layout as a structure of N bytes with alignment 1.
-- A final build of a host target's image resolves the symbols of the foreign fns it reaches through its linker ([images](27-program-model.md#images)). A final build of a machine target's image reaching a foreign fn is an error (`trusted.foreign-unresolved`); on those targets, foreign function types describe the firmware's entries.
+- A final build of a Linux target's image resolves the symbols of the foreign fns it reaches through its linker ([images](27-program-model.md#images)). A final build of a machine target's image reaching a foreign fn is an error (`trusted.foreign-unresolved`); on those targets, foreign function types describe the firmware's entries.
 
 ### Calling conventions
 
 | Convention | Meaning | Targets |
 | --- | --- | --- |
 | `"sysv"` | the calling convention of the System V ABI for the target's architecture: the AMD64 one on x86_64 and the Procedure Call Standard for the Arm 64-bit Architecture on AArch64 | `x86_64-linux`, `aarch64-linux` |
-| `"win64"` | the Microsoft x64 calling convention | `x86_64-uefi` |
+| `"win64"` | the calling convention of 64-bit Windows for the target's architecture: the Microsoft x64 one on x86_64 and, on AArch64, the Procedure Call Standard for the Arm 64-bit Architecture with `x18` reserved for the platform | `x86_64-windows`, `x86_64-uefi`, `aarch64-windows` |
 | `"aapcs64"` | the Procedure Call Standard for the Arm 64-bit Architecture, with `x18` reserved for the platform | `aarch64-uefi` |
 
 - Any other convention text is an error (`trusted.convention-unknown`).
@@ -1567,6 +1567,26 @@ foreign fn getpid() -> i32 limits notrap, terminates, noalloc convention "sysv"
 
 pub fn process_id() -> i32 {
     return getpid()
+} process_id
+```
+
+```nan
+// file: procinfo/package.nan
+//! Process facts on both Windows architectures.
+
+package procinfo {
+    language 1
+    targets aarch64-windows, x86_64-windows
+    allow trusted in procinfo
+} procinfo
+
+// file: procinfo/procinfo.nan
+//! Reads the process id from the system.
+
+foreign fn GetCurrentProcessId() -> u32 limits notrap, terminates, noalloc convention "win64"
+
+pub fn process_id() -> u32 {
+    return GetCurrentProcessId()
 } process_id
 ```
 

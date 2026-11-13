@@ -964,11 +964,13 @@ fn compare_example(
 }
 
 /// The concrete targets.
-const TARGETS: [&str; 6] = [
+const TARGETS: [&str; 8] = [
     "x86_64-linux",
+    "x86_64-windows",
     "x86_64-uefi",
     "x86_64-bare",
     "aarch64-linux",
+    "aarch64-windows",
     "aarch64-uefi",
     "aarch64-bare",
 ];

@@ -51,7 +51,7 @@ deny_directive = 'deny' IDENT "->" IDENT NL ;
 A **directive** is one manifest line:
 
 - `language` states the [language version](37-evolution.md#language-versions) of the package.
-- `targets` lists the [targets](27-program-model.md#targets) the package is checked and built for, among `x86_64-linux`, `x86_64-uefi`, `x86_64-bare`, `x86_64-nanos`, `aarch64-linux`, `aarch64-uefi`, `aarch64-bare`, `aarch64-nanos` and `any`. Any other name is an error (`manifest.unknown-target`). `any` listed with another target is an error (`manifest.any-not-alone`).
+- `targets` lists the [targets](27-program-model.md#targets) the package is checked and built for, among `x86_64-linux`, `x86_64-windows`, `x86_64-uefi`, `x86_64-bare`, `x86_64-nanos`, `aarch64-linux`, `aarch64-windows`, `aarch64-uefi`, `aarch64-bare`, `aarch64-nanos` and `any`. Any other name is an error (`manifest.unknown-target`). `any` listed with another target is an error (`manifest.any-not-alone`).
 - `entry` names the [entry function](27-program-model.md#entry), or the component entries of a nanos program.
 - `codegen` lists the [codegen levels](27-program-model.md#codegen-levels) of the program's final builds, among `x86_64-v2`, `x86_64-v3`, `x86_64-v4` and `aarch64-dotprod`. Any other name is an error (`manifest.unknown-codegen`). A `codegen` directive in a package without an `entry` directive is an error (`manifest.codegen-library`), and so is a level of an architecture that none of the package's targets has (`manifest.codegen-target`).
 - `dep` declares an [alias](#aliases).
@@ -322,7 +322,7 @@ pkg fn scaled(side: u32) -> u64 {
 
 ## Target variants
 
-A **target variant** is a module directory `name@selector` holding module `name` for the declared targets its selector matches. The selectors are exactly the names of the eight concrete targets, each matching that target; `x86_64` and `aarch64`, each matching the four targets starting with it; and `linux`, `uefi`, `bare` and `nanos`, each matching the two targets ending in it. Any other selector matches no target.
+A **target variant** is a module directory `name@selector` holding module `name` for the declared targets its selector matches. The selectors are exactly the names of the ten concrete targets, each matching that target; `x86_64` and `aarch64`, each matching the five targets starting with it; and `linux`, `windows`, `uefi`, `bare` and `nanos`, each matching the two targets ending in it. Any other selector matches no target.
 
 - A module is one plain directory or a set of variants; a plain directory and a variant of one module are an error (`module.variant-mixed`), reported on the variant. The root module is a plain directory.
 - Each declared [concrete target](27-program-model.md#targets) matches exactly one variant of each module that has variants. A target matching none is an error (`module.variant-missing`), reported on the `targets` directive; a target matching two is an error (`module.variant-overlap`), reported on the later of the two variant directories in byte order of path. A variant matching no declared target, as every variant of a package declaring `any` does, is an error (`module.variant-unmatched`).

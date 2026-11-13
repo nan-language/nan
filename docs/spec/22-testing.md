@@ -433,12 +433,12 @@ A test is affected on a run target when it has no recorded pass there under the 
 
 ## Emulator runs
 
-A package's tests run on each declared [target](27-program-model.md#targets), `any` standing for the host target of the machine's architecture, `x86_64-linux` or `aarch64-linux`, which is the **run target** of their runs. On a host target each run is a host process.
+A package's tests run on each declared [target](27-program-model.md#targets), `any` standing for the Linux target of the machine's architecture, `x86_64-linux` or `aarch64-linux`, which is the **run target** of their runs. On a Linux target each run is a host process.
 
 - On the machine targets, each run boots, under the emulator of the target's [descriptor](27-program-model.md#descriptors), a [test image](30-artefacts.md#lowering) of the test's reach and the support routines. It starts the seeded scheduler on one processor, runs the body as its first task, writes the outcome, test trace and any trap report to the descriptor's serial port, then writes the byte 0 to its [exit port](27-program-model.md#descriptors), which ends the run. The image holds the registry tables that the tested package admits ([contributors](25-registries.md#contributors)).
 - Each boot finds the machine as new: its serial port reads no input, its console port is connected to nothing, its disks are blank, its firmware's variables are the firmware's template and its TPM's state is new, and what it writes to them, or to its boot volume, lasts until the boot ends. Its network reaches no host outside the machine, and a reset ends the run.
 - The run's domain is that boot's kernel domain: a trap halts it, and the report on serial is the run's failure. When no task is ready and no deadline is pending, the processor waits for an interrupt.
-- When the emulator or `swtpm` cannot be started, for a host target when the machine running the toolchain has another architecture, and on a nanos target, every run on that target fails (`test.emulator-unavailable`).
+- When the emulator or `swtpm` cannot be started, for a Linux target when the machine running the toolchain has another architecture, and on a Windows or nanos target, every run on that target fails (`test.emulator-unavailable`).
 
 ```nan
 // file: checksum/package.nan

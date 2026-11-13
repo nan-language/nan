@@ -107,6 +107,9 @@ pub fn primer(tier: &str, dir: &Path) -> Result<String, String> {
     let run = nan::run(&args, &workspace);
     match run.status {
         0 => Ok(run.output),
-        status => Err(format!("nan primer {tier} exits with {status}\n{}", run.output)),
+        status => Err(format!(
+            "nan primer {tier} exits with {status}\n{}",
+            run.output
+        )),
     }
 }

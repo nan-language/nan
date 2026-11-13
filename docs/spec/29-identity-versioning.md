@@ -153,11 +153,11 @@ retired_class = 'preserves' | 'changes' TEXT ;
 
 `manual` is a context word exactly when a `TEXT` token follows it.
 
-- The **old form** is `retired_old`: a path, optionally `.` and a member name, and for a retired function the **old head**. Its path is read as written in the tombstone's module, except that a module segment may name a module without files. An old path whose first segment is an alias is an error (`retired.foreign-path`).
+- The **old form** is `retired_old`: a path, optionally `.` and a member name, and for a retired function the **old head**. Its path is read as written in the tombstone's module, except that a module segment may name a module without files, and that before a member name it names a type or interface directly or through the package's `preserves` tombstones without an old head. An old path whose first segment is an alias is an error (`retired.foreign-path`).
 - The **rewrite** is the `expr` of `retired_new`. `preserves` states that it behaves as the old form did, and `changes` that it behaves differently, as its **note** says; `manual` gives no rewrite, only a reason.
 - A rewrite is an error (`retired.bad-rewrite`) unless:
   - with an old head, it is a call or a path whose only markers are `mut` and `take`, and it checks as the one statement of a function of the tombstone's module having the old head: `return` and the rewrite, or the rewrite alone without a result, preceded by the `try` and `await` its outermost call needs;
-  - without an old head, it is a path, optionally followed by `.` and a member name, and a member of the old form's type when the old form is a member;
+  - without an old head, it is a path, optionally followed by `.` and a member name, and a member of the old form's type or interface when the old form is a member;
   - each name in it resolves to a live item or member, directly or through `preserves` tombstones of the package.
 - A **rename tombstone** is a `preserves` tombstone without an old head; [edits](33-toolchain.md#edits) write them.
 - The **replacement** is what the rewrite's path or outermost call names. A `preserves` or `changes` old form is visible exactly where its replacement is, and a `manual` one to consumers. Every other item and member a rewrite names must be visible wherever the replacement is (`retired.rewrite-hidden`).

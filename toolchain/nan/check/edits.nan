@@ -46,12 +46,14 @@ pkg fn Session.identity(self, path: Str, line: u32) -> Option[text::String] {
 } Session.identity
 
 /// The edit renaming the item or member declared on lines of a workspace file to `name`: each
-/// span writing its name rewritten, and for a field or variant of a type deriving `Encode` the
-/// rename tombstone after the type.
+/// span writing its name rewritten, the rename tombstone it needs, or without one the old paths
+/// of the tombstones retiring members of a type it renames, and each rename tombstone it then
+/// takes removed.
 pkg fn Session.renamed(self, path: Str, lines: core::Range[u32], name: Str) -> Option[diagnostic::Fix] {
     let alloc = self.alloc
     var spans = mem::Set[Span].empty(alloc)
     var tombstone: Option[diagnostic::Edit] = None
+    var retaken = mem::List[diagnostic::Edit].empty(alloc)
     var found = false
     for held in self.closures_checked() {
         let checker = held.checker
@@ -62,16 +64,17 @@ pkg fn Session.renamed(self, path: Str, lines: core::Range[u32], name: Str) -> O
         for span in take checker.name_spans(target) {
             discard mut spans.insert(take span)
         }
-        match target {
-            RenameTarget.Field(owner: owner, name: old) or RenameTarget.Variant(owner: owner, name: old) => {
-                match checker.encode_tombstone(owner, old: old.as_str(), name) {
-                    Some(edit) => {
-                        tombstone = Some(take edit)
-                    }
-                    None => {}
-                }
+        let written = checker.rename_tombstone(target, name)
+        if written.is_none() {
+            for span in take checker.member_tombstone_spans(target) {
+                discard mut spans.insert(take span)
             }
-            else => {}
+        }
+        if tombstone.is_none() {
+            tombstone = written
+        }
+        if retaken.len() == 0 {
+            retaken = checker.retaking(checker.db().package_of(target.item()), current: checker.target_form(target).as_str(), new: checker.renamed_form(target, name).as_str())
         }
     }
     if not found {
@@ -85,38 +88,102 @@ pkg fn Session.renamed(self, path: Str, lines: core::Range[u32], name: Str) -> O
         Some(edit) => mut edits.push(take edit)
         None => {}
     }
+    for removed in retaken {
+        removing(mut edits, removed, alloc)
+    }
     return Some(diagnostic::Fix(edits: take edits))
 } Session.renamed
 
-/// The rename tombstone a field or variant of a type deriving `Encode` needs, after the type;
-/// none for a member of another type.
-fn Checker.encode_tombstone(self, owner: ty::ItemId, old: Str, name: Str) -> Option[diagnostic::Edit] {
+/// The canonical path of a target.
+fn Checker.target_form(self, target: RenameTarget) -> text::String {
+    let db = self.db()
+    return match target {
+        RenameTarget.Item(item) => db.canonical(item)
+        RenameTarget.Field(owner: owner, name: member) or RenameTarget.Variant(owner: owner, name: member) or RenameTarget.Method(owner: owner, name: member) => form_of(db.canonical(owner), member: member.as_str())
+    }
+} Checker.target_form
+
+/// The canonical path of a target once renamed to `name`.
+fn Checker.renamed_form(self, target: RenameTarget, name: Str) -> text::String {
+    let db = self.db()
+    match target {
+        RenameTarget.Item(item) => match db.owners.get(item) {
+            Some(key) => return form_of(db.type_path(key), member: name)
+            None => {
+                var form = db.module_path(db.module_of(item))
+                mut form.append("::")
+                mut form.append(name)
+                return form
+            }
+        }
+        RenameTarget.Field(owner: owner, name: _) or RenameTarget.Variant(owner: owner, name: _) or RenameTarget.Method(owner: owner, name: _) => return form_of(db.canonical(owner), member: name)
+    }
+} Checker.renamed_form
+
+/// The rename tombstone renaming a target to `name` writes after the item it retires, or the
+/// type holding the member: none unless the package's history head has an item or member
+/// visible to consumers at the target's canonical path, or the target is a field or variant
+/// of a type deriving `Encode`.
+fn Checker.rename_tombstone(self, target: RenameTarget, name: Str) -> Option[diagnostic::Edit] {
     let db = self.db()
     let alloc = self.alloc()
-    let derives_encode = match db.ast(owner).kind {
-        ast::ItemKind.Struct(structure) => names_encode(structure.derived.view())
-        ast::ItemKind.Enum(enumeration) => names_encode(enumeration.derived.view())
-        else => false
+    match target {
+        RenameTarget.Item(item) => {
+            if not self.head_exports_form(db.package_of(item), form: self.target_form(target).as_str()) {
+                return None
+            }
+            let Some(old) = db.ast(item).name(alloc) else {
+                return None
+            }
+            var new = text::String.empty(alloc)
+            match last_dot(old.as_str()) {
+                Some(dot) => {
+                    let Some(owner) = old.slice_bytes(0, end: dot + 1) else {
+                        return None
+                    }
+                    mut new.append(owner)
+                }
+                None => {}
+            }
+            mut new.append(name)
+            return Some(self.tombstone_after(item, old: old.as_str(), new: new.as_str()))
+        }
+        RenameTarget.Field(owner: owner, name: member) or RenameTarget.Variant(owner: owner, name: member) or RenameTarget.Method(owner: owner, name: member) => {
+            let keeps_key = match db.ast(owner).kind {
+                ast::ItemKind.Struct(structure) => names_encode(structure.derived.view())
+                ast::ItemKind.Enum(enumeration) => names_encode(enumeration.derived.view())
+                else => false
+            }
+            if not keeps_key and not self.head_exports_form(db.package_of(owner), form: self.target_form(target).as_str()) {
+                return None
+            }
+            let owner_name = declared_name_of(db.ast(owner), alloc)
+            var old = text::String.of(owner_name.as_str(), alloc)
+            mut old.push('.')
+            mut old.append(member.as_str())
+            var new = text::String.of(owner_name.as_str(), alloc)
+            mut new.push('.')
+            mut new.append(name)
+            return Some(self.tombstone_after(owner, old: old.as_str(), new: new.as_str()))
+        }
     }
-    if not derives_encode {
-        return None
-    }
-    let syntax = db.syntax(owner)
-    let data = db.item(owner)
+} Checker.rename_tombstone
+
+/// The edit writing the rename tombstone `retired <old> => <new> preserves` after an item.
+fn Checker.tombstone_after(self, item: ty::ItemId, old: Str, new: Str) -> diagnostic::Edit {
+    let db = self.db()
+    let alloc = self.alloc()
+    let syntax = db.syntax(item)
+    let data = db.item(item)
     expect data.index < syntax.items.len()
     let at = line_start_after(syntax, line: syntax.item_lines(syntax.items[data.index]).high)
-    let owner_name = declared_name_of(db.ast(owner), alloc)
     var written = text::String.of("\nretired ", alloc)
-    mut written.append(owner_name.as_str())
-    mut written.push('.')
     mut written.append(old)
     mut written.append(" => ")
-    mut written.append(owner_name.as_str())
-    mut written.push('.')
-    mut written.append(name)
+    mut written.append(new)
     mut written.append(" preserves\n")
-    return Some(diagnostic::Edit(path: text::String.of(db.item_file(owner).path.as_str(), alloc), replacement: diagnostic::Replacement(start: at, end: at, text: take written)))
-} Checker.encode_tombstone
+    return diagnostic::Edit(path: text::String.of(db.item_file(item).path.as_str(), alloc), replacement: diagnostic::Replacement(start: at, end: at, text: take written))
+} Checker.tombstone_after
 
 /// The edit moving the item declared on lines of a workspace file into the module of its package
 /// named `module`: none when the lines declare nothing, an error when the move is invalid.

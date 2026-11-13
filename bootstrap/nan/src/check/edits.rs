@@ -4,8 +4,8 @@
 use std::ops::RangeInclusive;
 
 use super::db::ItemId;
-use super::references::{Move, Target};
-use super::{check_targets, checked, checked_closures, unchecked};
+use super::references::{Move, Target, removing};
+use super::{Checker, check_targets, checked, checked_closures, unchecked};
 use crate::diagnostic::{Fix, Replacement};
 use crate::syntax::ast::ItemKind;
 use crate::workspace::Workspace;
@@ -38,8 +38,9 @@ pub fn identity(workspace: &Workspace, path: &str, line: u32) -> Option<String> 
 }
 
 /// The edit renaming the item or member declared on lines of a workspace file to `name`: each
-/// span writing its name rewritten, and for a field or variant of a type deriving `Encode` the
-/// rename tombstone after the type.
+/// span writing its name rewritten, the rename tombstone it needs, or without one the old paths
+/// of the tombstones retiring members of a type it renames, and each rename tombstone it then
+/// takes removed.
 pub fn renamed(
     workspace: &Workspace,
     path: &str,
@@ -49,6 +50,7 @@ pub fn renamed(
     let std = crate::stdlib::packages();
     let mut spans = std::collections::BTreeSet::new();
     let mut tombstone = None;
+    let mut retaken = Vec::new();
     let mut found = false;
     for (_, checker) in checked_closures(workspace, std) {
         let Some(target) = checker.target_at(path, lines) else {
@@ -56,32 +58,17 @@ pub fn renamed(
         };
         found = true;
         spans.extend(checker.name_spans(&target));
-        if let Target::Field(owner, old) | Target::Variant(owner, old) = &target {
-            let derives_encode = match &checker.db.ast(*owner).kind {
-                ItemKind::Struct(structure) => {
-                    structure.derives.iter().any(|entry| entry.text == "Encode")
-                }
-                ItemKind::Enum(enumeration) => enumeration
-                    .derives
-                    .iter()
-                    .any(|entry| entry.text == "Encode"),
-                _ => false,
-            };
-            if derives_encode {
-                let data = checker.db.item(*owner);
-                let syntax = data.syntax();
-                let last = *syntax.item_lines(&syntax.items[data.index]).end();
-                let at = syntax
-                    .lines
-                    .get(last as usize)
-                    .map_or(syntax.source.len() as u32, |next| next.start);
-                let owner_name = data.ast.name().unwrap_or_default();
-                tombstone = Some((
-                    data.file.path.clone(),
-                    at,
-                    format!("\nretired {owner_name}.{old} => {owner_name}.{name} preserves\n"),
-                ));
-            }
+        let written = checker.rename_tombstone(&target, name);
+        if written.is_none() {
+            spans.extend(checker.member_tombstone_spans(&target));
+        }
+        tombstone = tombstone.or(written);
+        if retaken.is_empty() {
+            retaken = checker.retaking(
+                checker.db.package_of(target.item()),
+                &checker.target_form(&target),
+                &checker.renamed_form(&target, name),
+            );
         }
     }
     if !found {
@@ -100,17 +87,89 @@ pub fn renamed(
             )
         })
         .collect();
-    if let Some((path, at, text)) = tombstone {
-        replacements.push((
-            path,
+    replacements.extend(tombstone);
+    for removed in retaken {
+        removing(&mut replacements, removed);
+    }
+    Some(Fix(replacements))
+}
+
+impl Checker<'_> {
+    /// The canonical path of a target.
+    fn target_form(&self, target: &Target) -> String {
+        match target {
+            Target::Item(item) => self.db.canonical(*item),
+            Target::Field(owner, member)
+            | Target::Variant(owner, member)
+            | Target::Method(owner, member) => format!("{}.{member}", self.db.canonical(*owner)),
+        }
+    }
+
+    /// The canonical path of a target once renamed to `name`.
+    fn renamed_form(&self, target: &Target, name: &str) -> String {
+        let db = &self.db;
+        match target {
+            Target::Item(item) => match db.owners.get(item) {
+                Some(key) => format!("{}.{name}", db.type_path(*key)),
+                None => format!("{}::{name}", db.module_path(db.module_of(*item))),
+            },
+            Target::Field(owner, _) | Target::Variant(owner, _) | Target::Method(owner, _) => {
+                format!("{}.{name}", db.canonical(*owner))
+            }
+        }
+    }
+
+    /// The rename tombstone renaming a target to `name` writes after the item it retires, or the
+    /// type holding the member: none unless the package's history head has an item or member
+    /// visible to consumers at the target's canonical path, or the target is a field or variant
+    /// of a type deriving `Encode`.
+    fn rename_tombstone(&self, target: &Target, name: &str) -> Option<(String, Replacement)> {
+        let db = &self.db;
+        let (old, new, keeps_key) = match target {
+            Target::Item(item) => {
+                let old = db.ast(*item).name()?;
+                let new = match old.rsplit_once('.') {
+                    Some((owner, _)) => format!("{owner}.{name}"),
+                    None => name.to_owned(),
+                };
+                (old, new, false)
+            }
+            Target::Field(owner, member)
+            | Target::Variant(owner, member)
+            | Target::Method(owner, member) => {
+                let derives = match &db.ast(*owner).kind {
+                    ItemKind::Struct(structure) => &structure.derives[..],
+                    ItemKind::Enum(enumeration) => &enumeration.derives[..],
+                    _ => &[],
+                };
+                let owner_name = db.ast(*owner).name()?;
+                (
+                    format!("{owner_name}.{member}"),
+                    format!("{owner_name}.{name}"),
+                    derives.iter().any(|entry| entry.text == "Encode"),
+                )
+            }
+        };
+        let item = target.item();
+        if !keeps_key && !self.head_exports_form(db.package_of(item), &self.target_form(target)) {
+            return None;
+        }
+        let data = db.item(item);
+        let syntax = data.syntax();
+        let last = *syntax.item_lines(&syntax.items[data.index]).end();
+        let at = syntax
+            .lines
+            .get(last as usize)
+            .map_or(syntax.source.len() as u32, |next| next.start);
+        Some((
+            data.file.path.clone(),
             Replacement {
                 start: at,
                 end: at,
-                text,
+                text: format!("\nretired {old} => {new} preserves\n"),
             },
-        ));
+        ))
     }
-    Some(Fix(replacements))
 }
 
 /// The edit moving the item declared on lines of a workspace file into the module of its package

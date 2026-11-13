@@ -351,10 +351,182 @@ failed edit replace meter::mean --expect afl2l7z66yterlysb2 --from narrow.txt: f
 `nan edit rename <item> <name>` renames an item or member; `nan edit move <item> <module>` moves an item to another module of its package, with the functions named after it and the impl lines naming it in its module. Each:
 
 - rewrites the declaration, its closing label and every reference in the workspace, doc references included; a move appends the moved items to the target module's [summary file](32-docs.md#module-summaries) and raises a private item to `pkg` when an item of another module then names it;
-- writes the rename [tombstone](29-identity-versioning.md#tombstones) `retired <old path> => <new path> preserves`, placed as [Canonical order](35-format.md#canonical-order) states, when the package's [history head](29-identity-versioning.md#publishing) has an item or member visible to consumers at the old canonical path, or the member is a field or variant of a type deriving `Encode`;
+- writes the rename [tombstone](29-identity-versioning.md#tombstones) `retired <old path> => <new path> preserves`, placed as [Canonical order](35-format.md#canonical-order) states, when the package's [history head](29-identity-versioning.md#publishing) has an item or member visible to consumers at the old canonical path, or the member is a field or variant of a type deriving `Encode`; without it, rewrites the old path of each tombstone in source that names a type it renames or moves before a member name;
+- removes each rename tombstone in source whose old form is the item's or member's new canonical path and whose rewrite names it;
 - checks the workspace with every change, an error that the workspace did not report before being an error (`edit.check-failed`) that writes nothing.
 
 Moving a member, a function named after a type without that type, or an item into a missing module or another package, is an error (`edit.move-invalid`).
+
+```nan
+// file: meter/package.nan
+//! Running totals.
+
+package meter {
+    language 1
+    targets any
+} meter
+
+// file: meter/meter.nan
+//! Totals of samples.
+
+pub fn start() -> u64 = 0
+
+pub const LIMIT: u64 = 100
+
+pub const CEILING: u64 = LIMIT * 2
+
+// file: meter/bounds/bounds.nan
+//! Sample bounds.
+
+pub const FLOOR: u64 = 0
+
+// file: report/package.nan
+//! Reports meter totals.
+
+package report {
+    language 1
+    targets any
+    dep meter "meter"
+} report
+
+// file: report/report.nan
+//! Totals of reports.
+
+pub const FIRST: u64 = meter::start()
+```
+
+Once `meter` is published, its history head holds `start` and `LIMIT`, so renaming one and moving the other write their tombstones:
+
+```text
+$ nan edit rename meter::start origin
+ok edit rename meter::start origin: files 1, errors 0, incomplete 0
+wrote meter/meter.nan
+ok edit rename meter::start origin: files 1, errors 0, incomplete 0
+$ nan edit move meter::LIMIT bounds
+ok edit move meter::LIMIT bounds: files 2, errors 0, incomplete 0
+wrote meter/bounds/bounds.nan
+wrote meter/meter.nan
+ok edit move meter::LIMIT bounds: files 2, errors 0, incomplete 0
+$ nan show meter
+ok show meter: records 8
+module meter
+    Totals of samples.
+item bounds::FLOOR meter/bounds/bounds.nan:3 ae3lz3k7blxmsdpjht agguv7l3xq7zvsbmbx
+    pub const FLOOR: u64 = 0
+item bounds::LIMIT meter/bounds/bounds.nan:5 afuejser3c7mycegdy aeksrkbkumb4w7v5o6
+    pub const LIMIT: u64 = 100
+item - meter/bounds/bounds.nan:7 ae2mkpkmry2cz5lids afwrnhqsgbnaebywem
+    retired meter::LIMIT => LIMIT preserves
+item meter::origin meter/meter.nan:3 ahkxasf5b34mw2jtrk ahtbahkgdkmkv5khdf
+    pub fn origin() -> u64 = 0
+item - meter/meter.nan:5 afexralxwp5z2blcuo aezupjutw3satnaczt
+    retired start => origin preserves
+item meter::CEILING meter/meter.nan:7 ahuwccufpeywlwhqxz aey3lvx4exy6e2hrlr
+    pub const CEILING: u64 = bounds::LIMIT * 2
+item meter meter/package.nan:3 afy5popscghsb56qj2 aetl26i6vz7ymqgdtx
+    package meter {
+        language 1
+        targets any
+    } meter
+ok show meter: records 8
+```
+
+```nan
+// file: dial/package.nan
+//! Dial readings.
+
+package dial {
+    language 1
+    targets any
+} dial
+
+// file: dial/dial.nan
+//! Readings of a dial.
+
+pub closed enum Level derives Encode {
+    Low
+    High
+} Level
+
+pub interface Gauge {
+    fn read(self) -> u64
+} Gauge
+
+// file: dial/parts/parts.nan
+//! Dial parts.
+
+pub const STEPS: u64 = 10
+
+// file: panel/package.nan
+//! Panel of dials.
+
+package panel {
+    language 1
+    targets any
+    dep dial "dial"
+} panel
+
+// file: panel/panel.nan
+//! Dials of a panel.
+
+pub fn quiet() -> dial::Level = dial::Level.Low
+```
+
+Once `dial` is published, renaming `Low` keeps its `Encode` key in a tombstone whose old path then reaches `Level` through the tombstones moving and renaming it, and moving or renaming `Level` back removes those:
+
+```text
+$ nan edit rename dial::Level.Low Quiet
+ok edit rename dial::Level.Low Quiet: files 1, errors 0, incomplete 0
+wrote dial/dial.nan
+ok edit rename dial::Level.Low Quiet: files 1, errors 0, incomplete 0
+$ nan edit move dial::Level parts
+ok edit move dial::Level parts: files 2, errors 0, incomplete 0
+wrote dial/dial.nan
+wrote dial/parts/parts.nan
+ok edit move dial::Level parts: files 2, errors 0, incomplete 0
+$ nan edit move dial::parts::Level dial
+ok edit move dial::parts::Level dial: files 2, errors 0, incomplete 0
+wrote dial/dial.nan
+wrote dial/parts/parts.nan
+ok edit move dial::parts::Level dial: files 2, errors 0, incomplete 0
+$ nan edit rename dial::Level Tone
+ok edit rename dial::Level Tone: files 1, errors 0, incomplete 0
+wrote dial/dial.nan
+ok edit rename dial::Level Tone: files 1, errors 0, incomplete 0
+$ nan edit rename dial::Tone Level
+ok edit rename dial::Tone Level: files 1, errors 0, incomplete 0
+wrote dial/dial.nan
+ok edit rename dial::Tone Level: files 1, errors 0, incomplete 0
+$ nan edit rename dial::Gauge.read sample
+ok edit rename dial::Gauge.read sample: files 1, errors 0, incomplete 0
+wrote dial/dial.nan
+ok edit rename dial::Gauge.read sample: files 1, errors 0, incomplete 0
+$ nan show dial
+ok show dial: records 7
+module dial
+    Readings of a dial.
+item - dial/dial.nan:3 aehfnafw4b25cg5jxi af6josm35tingf3ogg
+    retired Level.Low => Level.Quiet preserves
+item dial::Gauge dial/dial.nan:5 ahugnq7oqeuzv5gmnx agsa3t7xkhcbqy6b5v
+    pub interface Gauge {
+        fn sample(self) -> u64
+    } Gauge
+item - dial/dial.nan:9 afc4bnfqov3hiz6juc agvra6plhpgnzc4r6n
+    retired Gauge.read => Gauge.sample preserves
+item dial::Level dial/dial.nan:11 agcyelprhzorsme7td afvku52qwjmsmivgo7
+    pub closed enum Level derives Encode {
+        Quiet
+        High
+    } Level
+item dial dial/package.nan:3 aewxtbsozrifcaapvs ae3zxgwyu4zkem6q5j
+    package dial {
+        language 1
+        targets any
+    } dial
+item parts::STEPS dial/parts/parts.nan:3 agn47kacyncbltxtj3 aflyfqif2whiiohao7
+    pub const STEPS: u64 = 10
+ok show dial: records 7
+```
 
 ## Merge driver
 

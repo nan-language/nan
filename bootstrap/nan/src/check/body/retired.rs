@@ -162,7 +162,7 @@ impl Checker<'_> {
                 let ExprKind::Path { path, args: None } = &base.kind else {
                     return None;
                 };
-                let key = self.db.owner_key(module, path)?;
+                let key = self.db.retired_owner(module, path)?;
                 if let TypeKey::Item(item) = key
                     && let SigKind::Enum { variants } = &self.sig(item).kind
                     && let Some(index) = variants

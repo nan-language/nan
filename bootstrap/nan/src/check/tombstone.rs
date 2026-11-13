@@ -100,7 +100,7 @@ impl Checker<'_> {
         if retired.member.is_none() {
             return false;
         }
-        let Ok(Named::Item(owner)) = self.db.resolve(module, &retired.path) else {
+        let Some(TypeKey::Item(owner)) = self.db.retired_owner(module, &retired.path) else {
             return false;
         };
         let derives = match &self.db.ast(owner).kind {
@@ -112,9 +112,9 @@ impl Checker<'_> {
     }
 
     /// Whether a tombstone in source retires nothing the release its package's history head
-    /// names exports: no item or member consumers see has its old form's canonical path, a
-    /// function with the old head's parameter modes and types for an old head. A tombstone
-    /// keeping an `Encode` key is never unused.
+    /// names exports: no item or member consumers see has its old form's canonical path, or for
+    /// a member the one its path spells as written, a function with the old head's parameter
+    /// modes and types for an old head. A tombstone keeping an `Encode` key is never unused.
     fn unused_tombstone(&self, item: ItemId, retired: &RetiredItem) -> bool {
         let module = self.db.module_of(item);
         if self.db.in_history(item) || self.keeps_encode_key(module, retired) {
@@ -138,12 +138,30 @@ impl Checker<'_> {
                 _ => false,
             };
         }
-        let Some((owner, member)) = form.rsplit_once('.') else {
-            return true;
+        let written = retired.member.as_ref().and_then(|member| {
+            Some(format!(
+                "{}.{}",
+                self.db.spelled(module, &retired.path)?,
+                member.text
+            ))
+        });
+        let package = self.db.package_of(item);
+        !self.head_exports_form(package, &form)
+            && !written.is_some_and(|written| self.head_exports_form(package, &written))
+    }
+
+    /// Whether the release a package's history head names has an item or member visible to
+    /// consumers at a canonical path.
+    pub fn head_exports_form(&self, package: PackageId, form: &str) -> bool {
+        let Some(exported) = self.head_exports(package) else {
+            return false;
         };
-        !exported
-            .get(owner)
-            .is_some_and(|entry| entry.declares(member))
+        exported.contains_key(form)
+            || form.rsplit_once('.').is_some_and(|(owner, member)| {
+                exported
+                    .get(owner)
+                    .is_some_and(|entry| entry.declares(member))
+            })
     }
 
     /// The exported items of the release a package's history head names, from the local store.
@@ -260,7 +278,8 @@ impl Checker<'_> {
         };
         if retired.member.is_some()
             && (member.is_none()
-                || self.db.owner_key(module, &retired.path) != self.db.owner_key(module, path))
+                || self.db.retired_owner(module, &retired.path)
+                    != self.db.retired_owner(module, path))
         {
             return None;
         }
@@ -286,7 +305,7 @@ impl Checker<'_> {
                 _ => preserved(self.db.spelled(module, path)?).then_some((None, None)),
             };
         };
-        let key = self.db.owner_key(module, path)?;
+        let key = self.db.retired_owner(module, path)?;
         let owner = match key {
             TypeKey::Item(owner) => Some(owner),
             _ => None,
@@ -296,7 +315,7 @@ impl Checker<'_> {
             .members(key, member)
             .first()
             .map(|function| self.db.ast(*function).visibility)
-            .or_else(|| self.field_or_variant(owner?, member));
+            .or_else(|| self.member_of(owner?, member));
         match live {
             Some(visibility) => Some((Some(visibility), owner)),
             None => {
@@ -305,9 +324,9 @@ impl Checker<'_> {
         }
     }
 
-    /// The visibility of a field or variant of a struct, layout or enum: a field's the narrower
-    /// of its own and its type's.
-    fn field_or_variant(&self, owner: ItemId, member: &str) -> Option<Visibility> {
+    /// The visibility of a field or variant of a struct, layout or enum, or of a method of an
+    /// interface: a field's the narrower of its own and its type's.
+    fn member_of(&self, owner: ItemId, member: &str) -> Option<Visibility> {
         let own = self.db.ast(owner).visibility;
         match &self.sig(owner).kind {
             SigKind::Struct { fields } | SigKind::Layout { fields, .. } => fields
@@ -317,6 +336,10 @@ impl Checker<'_> {
             SigKind::Enum { variants } => variants
                 .iter()
                 .any(|variant| variant.name == member)
+                .then_some(own),
+            SigKind::Interface { methods } => methods
+                .iter()
+                .any(|method| method.name == member)
                 .then_some(own),
             _ => None,
         }
@@ -333,7 +356,7 @@ impl Checker<'_> {
             }
             if let TKind::Field { base, name } = &expr.kind
                 && let Ty::Item(owner, _) = &base.ty
-                && let Some(visibility) = self.field_or_variant(*owner, name)
+                && let Some(visibility) = self.member_of(*owner, name)
             {
                 named.push(visibility);
             }

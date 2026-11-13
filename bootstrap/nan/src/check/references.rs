@@ -5,11 +5,12 @@ use std::collections::{BTreeSet, HashMap};
 use std::ops::RangeInclusive;
 use std::rc::Rc;
 
-use super::db::{ItemId, ModuleId, TypeKey};
+use super::db::{ItemId, ModuleId, PackageId, TypeKey};
 use super::resolve::Named;
 use super::sig::SigKind;
 use super::ty::Arg;
 use super::{Checker, Member};
+use crate::diagnostic::Replacement;
 use crate::format::bindings::bindings;
 use crate::syntax::ast::{self, ItemKind};
 use crate::syntax::file::SourceFile;
@@ -28,6 +29,18 @@ pub enum Target {
     Field(ItemId, String),
     Variant(ItemId, String),
     Method(ItemId, String),
+}
+
+impl Target {
+    /// The item it is, or holds it.
+    pub fn item(&self) -> ItemId {
+        match self {
+            Target::Item(item)
+            | Target::Field(item, _)
+            | Target::Variant(item, _)
+            | Target::Method(item, _) => *item,
+        }
+    }
 }
 
 /// A name written in a workspace file: the file's path and the name's bytes.
@@ -150,6 +163,93 @@ impl Checker<'_> {
         }
     }
 
+    /// The spans of the old paths of the tombstones in source naming a type that a target is,
+    /// retiring a member of it.
+    pub fn member_tombstone_spans(&self, target: &Target) -> BTreeSet<Span> {
+        let Target::Item(owner) = target else {
+            return BTreeSet::new();
+        };
+        self.member_tombstones(*owner)
+            .into_iter()
+            .map(|(tombstone, path)| self.span(tombstone, path.last().token))
+            .collect()
+    }
+
+    /// The tombstones in source whose old paths name a type, retiring a member of it, with those
+    /// paths.
+    fn member_tombstones(&self, owner: ItemId) -> Vec<(ItemId, &ast::Path)> {
+        let db = &self.db;
+        db.package(db.package_of(owner))
+            .modules
+            .iter()
+            .flat_map(|module| db.module(*module).items.iter().copied())
+            .filter(|item| !db.in_history(*item))
+            .filter_map(|item| match &db.ast(item).kind {
+                ItemKind::Retired(retired)
+                    if retired.member.is_some()
+                        && db.resolve(db.module_of(item), &retired.path)
+                            == Ok(Named::Item(owner)) =>
+                {
+                    Some((item, &retired.path))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The edits removing each rename tombstone in source of a package whose old form is `new`
+    /// and whose rewrite names `current`, which the item or member at `current` takes once at
+    /// `new`.
+    pub fn retaking(
+        &self,
+        package: PackageId,
+        current: &str,
+        new: &str,
+    ) -> Vec<(String, Replacement)> {
+        let db = &self.db;
+        db.retired
+            .get(new)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|tombstone| {
+                !db.in_history(*tombstone)
+                    && db.package_of(*tombstone) == package
+                    && self.rewrite_form(*tombstone).as_deref() == Some(current)
+            })
+            .flat_map(|tombstone| self.fix_deleting_item(tombstone).0)
+            .collect()
+    }
+
+    /// The canonical path the rewrite of a rename tombstone names.
+    fn rewrite_form(&self, tombstone: ItemId) -> Option<String> {
+        let ItemKind::Retired(ast::RetiredItem {
+            head: None,
+            new:
+                ast::RetiredNew::Rewrite {
+                    expr,
+                    preserves: true,
+                },
+            ..
+        }) = &self.db.ast(tombstone).kind
+        else {
+            return None;
+        };
+        let module = self.db.module_of(tombstone);
+        match &expr.kind {
+            ast::ExprKind::Path { path, args: None } => self.db.spelled(module, path),
+            ast::ExprKind::Field { base, name } => match &base.kind {
+                ast::ExprKind::Path { path, args: None } => Some(format!(
+                    "{}.{}",
+                    self.db.type_path(self.db.retired_owner(module, path)?),
+                    name.text
+                )),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// An item with the module its paths are read in.
     fn holder(&self, item: ItemId) -> Holder<'_> {
         let data = self.db.item(item);
@@ -164,12 +264,13 @@ impl Checker<'_> {
         }
     }
 
-    /// The parsed items of the workspace's packages, with the module their paths are read in.
+    /// The parsed items of the workspace's packages outside their histories, with the module
+    /// their paths are read in.
     fn holders(&self) -> Vec<Holder<'_>> {
         let db = &self.db;
         let mut holders: Vec<Holder> = (0..db.items.len())
             .map(|index| ItemId(index as u32))
-            .filter(|item| db.is_reported(*item))
+            .filter(|item| db.is_reported(*item) && !db.in_history(*item))
             .map(|item| self.holder(item))
             .collect();
         for package in db
@@ -555,9 +656,11 @@ pub struct Relocated {
 
 impl Checker<'_> {
     /// The edit moving an item, with the functions named after it and the impl lines naming it in
-    /// its module, to the end of the summary file of another module of its package; none when
-    /// that move is invalid: of a member, of a function named after a type, or into a missing
-    /// module.
+    /// its module, to the end of the summary file of another module of its package, the item
+    /// followed by its rename tombstone when its package's history head has it visible to
+    /// consumers, else the old paths of the tombstones retiring its members respelt, and each
+    /// rename tombstone it then takes removed; none when that move is invalid: of a member, of a
+    /// function named after a type, or into a missing module.
     pub fn moving(&self, target: &Target, module: &str) -> Option<Move> {
         let Target::Item(item) = target else {
             return None;
@@ -677,6 +780,32 @@ impl Checker<'_> {
             .filter(|byte| **byte == b'\n')
             .count() as u32
             + 2;
+        let name = db.ast(*item).name().unwrap_or_default();
+        let tombstone = self
+            .head_exports_form(package, &db.canonical(*item))
+            .then(|| {
+                let old = self.spelling(to, from, &name);
+                (*item, format!("\nretired {old} => {name} preserves\n"))
+            });
+        if tombstone.is_none() {
+            for (retired, path) in self.member_tombstones(*item) {
+                let data = db.item(retired);
+                let tokens = &data.syntax().tokens;
+                in_place.push((
+                    data.file.path.clone(),
+                    crate::diagnostic::Replacement {
+                        start: tokens[path.segments[0].token as usize].start,
+                        end: tokens[path.last().token as usize].end,
+                        text: self.spelling(data.module, to, &name),
+                    },
+                ));
+            }
+        }
+        let retaken = self.retaking(
+            package,
+            &db.canonical(*item),
+            &format!("{}::{name}", db.module_path(to)),
+        );
         let mut relocated = Vec::new();
         let mut appended = String::new();
         let mut moved_in_order = moved.clone();
@@ -722,6 +851,10 @@ impl Checker<'_> {
                 lines: count,
             });
             landing += count + 1;
+            if let Some((_, text)) = tombstone.as_ref().filter(|(retired, _)| *retired == item) {
+                appended.push_str(text);
+                landing += 2;
+            }
             let blank_after = syntax
                 .lines
                 .get(*lines.end() as usize)
@@ -755,6 +888,9 @@ impl Checker<'_> {
                 },
             ));
         }
+        for removed in retaken {
+            removing(&mut in_place, removed);
+        }
         let end = summary_file.syntax.source.len() as u32;
         in_place.push((
             summary,
@@ -780,6 +916,24 @@ impl Checker<'_> {
         let segment = if module.root { package } else { &module.name };
         format!("{segment}::{name}")
     }
+}
+
+/// Adds to an edit's replacements one removing a range: replacing what it removes, and taking in
+/// each removal it overlaps or touches.
+pub fn removing(
+    edits: &mut Vec<(String, Replacement)>,
+    (path, mut removed): (String, Replacement),
+) {
+    edits.retain(|(other, replacement)| {
+        let meets =
+            *other == path && replacement.start <= removed.end && removed.start <= replacement.end;
+        if meets && replacement.text.is_empty() {
+            removed.start = removed.start.min(replacement.start);
+            removed.end = removed.end.max(replacement.end);
+        }
+        !meets
+    });
+    edits.push((path, removed));
 }
 
 /// A parsed item of a workspace package, with the module its paths are read in.

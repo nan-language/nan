@@ -107,7 +107,7 @@ fn Checker.keeps_encode_key(self, module: ty::ModuleId, retired_item: ast::Retir
         return false
     }
     let db = self.db()
-    let Ok(Named.Item(owner)) = db.resolve(module, path: retired_item.path) else {
+    let Some(TypeKey.Item(owner)) = db.retired_owner(module, path: retired_item.path) else {
         return false
     }
     match db.ast(owner).kind {
@@ -118,9 +118,9 @@ fn Checker.keeps_encode_key(self, module: ty::ModuleId, retired_item: ast::Retir
 } Checker.keeps_encode_key
 
 /// Whether a tombstone in source retires nothing the release its package's history head
-/// names exports: no item or member consumers see has its old form's canonical path, a
-/// function with the old head's parameter modes and types for an old head. A tombstone
-/// keeping an `Encode` key is never unused.
+/// names exports: no item or member consumers see has its old form's canonical path, or for
+/// a member the one its path spells as written, a function with the old head's parameter
+/// modes and types for an old head. A tombstone keeping an `Encode` key is never unused.
 fn Checker.unused_tombstone(self, item: ty::ItemId, retired_item: ast::RetiredItem) -> bool {
     let db = self.db()
     let alloc = self.alloc()
@@ -157,20 +157,43 @@ fn Checker.unused_tombstone(self, item: ty::ItemId, retired_item: ast::RetiredIt
         }
         None => {}
     }
-    let Some(dot) = last_dot(form.as_str()) else {
+    let package_id = db.package_of(item)
+    if self.head_exports_form(package_id, form: form.as_str()) {
+        return false
+    }
+    let Some(member) = retired_item.member else {
         return true
+    }
+    let Some(spelt) = db.spelled(module, path: retired_item.path) else {
+        return true
+    }
+    return not self.head_exports_form(package_id, form: form_of(take spelt, member: member.text.as_str()).as_str())
+} Checker.unused_tombstone
+
+/// Whether the release a package's history head names has an item or member visible to
+/// consumers at a canonical path.
+fn Checker.head_exports_form(self, package_id: ty::PackageId, form: Str) -> bool {
+    let Some(exported) = self.head_exports(package_id) else {
+        return false
+    }
+    let held = exported.contents()
+    if held.get_by(fn(key: text::String) => key.as_str().cmp(form)).is_some() {
+        return true
+    }
+    let Some(dot) = last_dot(form) else {
+        return false
     }
     let Some(owner) = form.slice_bytes(0, end: dot) else {
-        return true
+        return false
     }
     let Some(member) = form.slice_bytes(dot + 1, end: form.byte_len()) else {
-        return true
+        return false
     }
     match held.get_by(fn(key: text::String) => key.as_str().cmp(owner)) {
-        Some(entry) => return not entry.declares(member)
-        None => return true
+        Some(entry) => return entry.declares(member)
+        None => return false
     }
-} Checker.unused_tombstone
+} Checker.head_exports_form
 
 /// The exported items of the release a package's history head names, from the local store.
 fn Checker.head_exports(self, package_id: ty::PackageId) -> Option[mem::Shared[mem::Map[text::String, machine::ApiEntry]]] {
@@ -305,9 +328,9 @@ fn Checker.path_rewrite(self, module: ty::ModuleId, retired_item: ast::RetiredIt
     }
 } Checker.path_rewrite
 
-/// The visibility of a field or variant of a struct, layout or enum: a field's the narrower
-/// of its own and its type's.
-fn Checker.field_or_variant(self, owner: ty::ItemId, member: Str) -> Option[ast::Visibility] {
+/// The visibility of a field or variant of a struct, layout or enum, or of a method of an
+/// interface: a field's the narrower of its own and its type's.
+fn Checker.member_of(self, owner: ty::ItemId, member: Str) -> Option[ast::Visibility] {
     let db = self.db()
     let own = db.ast(owner).visibility
     let sig = self.sig(owner)
@@ -328,9 +351,17 @@ fn Checker.field_or_variant(self, owner: ty::ItemId, member: Str) -> Option[ast:
             }
             return None
         }
+        SigKind.Interface(methods: methods) => {
+            for method in methods {
+                if method.name.as_str() == member {
+                    return Some(own)
+                }
+            }
+            return None
+        }
         else => return None
     }
-} Checker.field_or_variant
+} Checker.member_of
 
 /// The visibility of what a typed rewrite names through members: the functions and
 /// interface methods it calls and the fields it reads, its outermost call's callee aside.
@@ -552,7 +583,7 @@ fn Checker.rewrite_through(self, module: ty::ModuleId, retired_item: ast::Retire
         if member.is_none() {
             return None
         }
-        if db.owner_key(module, owner: retired_item.path) != db.owner_key(module, owner: path) {
+        if db.retired_owner(module, path: retired_item.path) != db.retired_owner(module, path) {
             return None
         }
     }
@@ -569,7 +600,7 @@ fn Checker.rewrite_through(self, module: ty::ModuleId, retired_item: ast::Retire
         }
         return None
     }
-    let Some(key) = db.owner_key(module, owner: path) else {
+    let Some(key) = db.retired_owner(module, path) else {
         return None
     }
     let owner = match key {
@@ -583,7 +614,7 @@ fn Checker.rewrite_through(self, module: ty::ModuleId, retired_item: ast::Retire
     } else {
         match owner {
             Some(found) => {
-                live = self.field_or_variant(found, member: member_name)
+                live = self.member_of(found, member: member_name)
             }
             None => {}
         }
@@ -631,7 +662,7 @@ fn Checker.named_member(self, expr: TExpr, mut named: mem::List[ast::Visibility]
     }
     match expr.kind {
         TKind.Field(base: base, name: name) => match self.types().kind(base.contents().ty) {
-            ty::TyKind.Item(item: owner, args: _) => match self.field_or_variant(owner, member: name.as_str()) {
+            ty::TyKind.Item(item: owner, args: _) => match self.member_of(owner, member: name.as_str()) {
                 Some(visibility) => mut named.push(visibility)
                 None => {}
             }

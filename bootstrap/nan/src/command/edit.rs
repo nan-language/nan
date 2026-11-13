@@ -169,8 +169,7 @@ pub fn replace(
 }
 
 /// `nan edit rename <item> <name>`: renames an item or member, its declaration, labels and every
-/// reference of the workspace, writing the rename tombstone a field or variant of a type deriving
-/// `Encode` needs.
+/// reference of the workspace, writing the rename tombstone it needs.
 pub fn rename(
     invocation: &Invocation,
     workspace: &Workspace,
@@ -203,7 +202,8 @@ pub fn rename(
 }
 
 /// `nan edit move <item> <module>`: moves an item, with the functions named after it and the impl
-/// lines naming it in its module, to another module of its package.
+/// lines naming it in its module, to another module of its package, writing the rename tombstone
+/// it needs.
 pub fn move_item(
     invocation: &Invocation,
     workspace: &Workspace,

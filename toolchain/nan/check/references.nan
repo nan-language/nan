@@ -69,6 +69,14 @@ fn RenameTarget.copy(self, alloc: mem::Alloc) -> RenameTarget {
     }
 } RenameTarget.copy
 
+/// The item it is, or holds it.
+fn RenameTarget.item(self) -> ty::ItemId {
+    return match self {
+        RenameTarget.Item(item) => item
+        RenameTarget.Field(owner: owner, name: _) or RenameTarget.Variant(owner: owner, name: _) or RenameTarget.Method(owner: owner, name: _) => owner
+    }
+} RenameTarget.item
+
 /// Whether a member a body names is the target.
 fn RenameTarget.names_member(self, member: Member) -> bool {
     return match self {
@@ -210,13 +218,130 @@ fn Checker.holder(self, item: ty::ItemId) -> HolderItem {
     return HolderItem(item: Some(item), file: data.file, index: data.index, module: data.module)
 } Checker.holder
 
-/// The parsed items of the workspace's packages, with the module their paths are read in.
+/// The spans of the old paths of the tombstones in source naming a type that a target is,
+/// retiring a member of it.
+fn Checker.member_tombstone_spans(self, target: RenameTarget) -> mem::Set[Span] {
+    var spans = mem::Set[Span].empty(self.alloc())
+    let RenameTarget.Item(owner) = target else {
+        return spans
+    }
+    let db = self.db()
+    for tombstone in self.member_tombstones(owner) {
+        let ast::ItemKind.Retired(retired_item) = db.ast(tombstone).kind else {
+            continue
+        }
+        discard mut spans.insert(self.span(tombstone, token: retired_item.path.last().token))
+    }
+    return spans
+} Checker.member_tombstone_spans
+
+/// The tombstones in source whose old paths name a type, retiring a member of it.
+fn Checker.member_tombstones(self, owner: ty::ItemId) -> mem::List[ty::ItemId] {
+    let db = self.db()
+    var found = mem::List[ty::ItemId].empty(self.alloc())
+    for module_id in db.package_data(db.package_of(owner)).modules {
+        for item in db.module(module_id).items {
+            if db.in_history(item) {
+                continue
+            }
+            let ast::ItemKind.Retired(retired_item) = db.ast(item).kind else {
+                continue
+            }
+            if retired_item.member.is_some() and db.resolve(db.module_of(item), path: retired_item.path) == Ok(Named.Item(owner)) {
+                mut found.push(item)
+            }
+        }
+    }
+    return found
+} Checker.member_tombstones
+
+/// The edits removing each rename tombstone in source of a package whose old form is `new`
+/// and whose rewrite names `current`, which the item or member at `current` takes once at
+/// `new`.
+fn Checker.retaking(self, package_id: ty::PackageId, current: Str, new: Str) -> mem::List[diagnostic::Edit] {
+    let db = self.db()
+    let alloc = self.alloc()
+    var removals = mem::List[diagnostic::Edit].empty(alloc)
+    let Some(tombstones) = db.tombstones.get_by(fn(key: text::String) => key.as_str().cmp(new)) else {
+        return removals
+    }
+    for tombstone in tombstones {
+        if db.in_history(tombstone) or db.package_of(tombstone) != package_id {
+            continue
+        }
+        let Some(named) = self.rewrite_form(tombstone) else {
+            continue
+        }
+        if named.as_str() != current {
+            continue
+        }
+        let diagnostic::Fix(edits: deleting) = self.fix_deleting_item(tombstone)
+        for edit in take deleting {
+            mut removals.push(take edit)
+        }
+    }
+    return removals
+} Checker.retaking
+
+/// The canonical path the rewrite of a rename tombstone names.
+fn Checker.rewrite_form(self, tombstone: ty::ItemId) -> Option[text::String] {
+    let db = self.db()
+    let ast::ItemKind.Retired(retired_item) = db.ast(tombstone).kind else {
+        return None
+    }
+    if retired_item.head.is_some() {
+        return None
+    }
+    let ast::RetiredNew.Rewrite(expr: expr, preserves: true) = retired_item.new else {
+        return None
+    }
+    let module = db.module_of(tombstone)
+    match expr.kind {
+        ast::ExprKind.Path(path: path, args: None) => return db.spelled(module, path)
+        ast::ExprKind.Field(base: base, name: name) => {
+            let ast::ExprKind.Path(path: path, args: None) = base.contents().kind else {
+                return None
+            }
+            let Some(key) = db.retired_owner(module, path) else {
+                return None
+            }
+            return Some(form_of(db.type_path(key), member: name.text.as_str()))
+        }
+        else => return None
+    }
+} Checker.rewrite_form
+
+/// Adds to an edit's replacements one removing a range: replacing what it removes, and taking in
+/// each removal it overlaps or touches.
+fn removing(mut edits: mem::List[diagnostic::Edit], removed: diagnostic::Edit, alloc: mem::Alloc) {
+    let path = removed.path.as_str()
+    var start = removed.replacement.start
+    var end = removed.replacement.end
+    var index: usize = 0
+    while index < edits.len() {
+        let low = edits[index].replacement.start
+        let high = edits[index].replacement.end
+        if edits[index].path.as_str() != path or low > end or start > high {
+            index += 1
+            continue
+        }
+        if edits[index].replacement.text.byte_len() == 0 {
+            start = start.min(low)
+            end = end.max(high)
+        }
+        discard mut edits.remove(index)
+    }
+    mut edits.push(diagnostic::Edit(path: text::String.of(path, alloc), replacement: diagnostic::Replacement(start: start, end: end, text: text::String.empty(alloc))))
+} removing
+
+/// The parsed items of the workspace's packages outside their histories, with the module
+/// their paths are read in.
 fn Checker.holders(self) -> mem::List[HolderItem] {
     let db = self.db()
     var holders = mem::List[HolderItem].empty(self.alloc())
     for index in 0..<db.items.len() {
         let item = ty::ItemId(index: u32.fit(index))
-        if db.is_reported(item) {
+        if db.is_reported(item) and not db.in_history(item) {
             mut holders.push(self.holder(item))
         }
     }
@@ -724,17 +849,21 @@ struct InsideRewrite {
 } InsideRewrite
 
 /// What a move rewrites: the replacements of files staying in place, the rewrites inside moved
-/// items, and the private items a module other than theirs names once moved.
+/// items, the private items a module other than theirs names once moved, and the removals of
+/// the rename tombstones the moved item takes.
 struct MoveEdits {
     in_place: mem::List[diagnostic::Edit]
     inside: mem::List[InsideRewrite]
     raised: mem::Set[ty::ItemId]
+    retaken: mem::List[diagnostic::Edit]
 } MoveEdits
 
 /// The edit moving an item, with the functions named after it and the impl lines naming it in
-/// its module, to the end of the summary file of another module of its package; none when
-/// that move is invalid: of a member, of a function named after a type, or into a missing
-/// module.
+/// its module, to the end of the summary file of another module of its package, the item
+/// followed by its rename tombstone when its package's history head has it visible to
+/// consumers, else the old paths of the tombstones retiring its members respelt, and each
+/// rename tombstone it then takes removed; none when that move is invalid: of a member, of a
+/// function named after a type, or into a missing module.
 fn Checker.moving(self, target: RenameTarget, module: Str) -> Option[Move] {
     let RenameTarget.Item(item) = target else {
         return None
@@ -788,7 +917,7 @@ fn Checker.moving(self, target: RenameTarget, module: Str) -> Option[Move] {
             mut moved.push(other)
         }
     }
-    var edits = MoveEdits(in_place: mem::List[diagnostic::Edit].empty(alloc), inside: mem::List[InsideRewrite].empty(alloc), raised: mem::Set[ty::ItemId].empty(alloc))
+    var edits = MoveEdits(in_place: mem::List[diagnostic::Edit].empty(alloc), inside: mem::List[InsideRewrite].empty(alloc), raised: mem::Set[ty::ItemId].empty(alloc), retaken: mem::List[diagnostic::Edit].empty(alloc))
     for holder in self.holders() {
         self.move_holder(holder, moved: moved.view(), to, package_id, mut edits)
     }
@@ -800,8 +929,45 @@ fn Checker.moving(self, target: RenameTarget, module: Str) -> Option[Move] {
             discard mut edits.raised.insert(function)
         }
     }
-    return self.relocated(take edits, moved: take moved, summary: take summary)
+    let tombstone = self.move_tombstones(item, from, to, mut edits)
+    return self.relocated(take edits, moved: take moved, summary: take summary, retiring: item, tombstone)
 } Checker.moving
+
+/// The rename tombstone moving an item from module `from` to `to` writes after it when its
+/// package's history head has it visible to consumers; without one, adds the old paths of the
+/// tombstones retiring its members respelt. Adds the removals of the rename tombstones it then
+/// takes.
+fn Checker.move_tombstones(self, item: ty::ItemId, from: ty::ModuleId, to: ty::ModuleId, mut edits: MoveEdits) -> Option[text::String] {
+    let db = self.db()
+    let alloc = self.alloc()
+    let package_id = db.package_of(item)
+    let name = declared_name_of(db.ast(item), alloc)
+    var tombstone: Option[text::String] = None
+    if self.head_exports_form(package_id, form: db.canonical_text(item)) {
+        var written = text::String.of("\nretired ", alloc)
+        mut written.append(self.spelling(to, to: from, name: name.as_str()).as_str())
+        mut written.append(" => ")
+        mut written.append(name.as_str())
+        mut written.append(" preserves\n")
+        tombstone = Some(take written)
+    } else {
+        for retiring in self.member_tombstones(item) {
+            let ast::ItemKind.Retired(retired_item) = db.ast(retiring).kind else {
+                continue
+            }
+            let syntax = db.syntax(retiring)
+            let first_token = usize.widen(retired_item.path.segments[0].token)
+            let last_token = usize.widen(retired_item.path.last().token)
+            expect first_token < syntax.tokens.len() and last_token < syntax.tokens.len()
+            mut edits.in_place.push(diagnostic::Edit(path: text::String.of(db.item_file(retiring).path.as_str(), alloc), replacement: diagnostic::Replacement(start: syntax.tokens[first_token].start, end: syntax.tokens[last_token].end, text: self.spelling(db.module_of(retiring), to, name: name.as_str()))))
+        }
+    }
+    var landed = db.module_path(to)
+    mut landed.append("::")
+    mut landed.append(name.as_str())
+    edits.retaken = self.retaking(package_id, current: db.canonical_text(item), new: landed.as_str())
+    return tombstone
+} Checker.move_tombstones
 
 /// Adds what a move rewrites in a holder: its paths and doc references naming a moved item, or
 /// naming an item of the package from a moved holder, spelt as their reader writes them.
@@ -887,13 +1053,13 @@ fn Checker.lands(self, other: ty::ItemId, moved: Slice[ty::ItemId], to: ty::Modu
 } Checker.lands
 
 /// The move's edit once its rewrites are known: each moved item, rewritten, appended to the
-/// target module's summary file and removed from its own with the blank line after it, and
-/// `pkg ` before each private item another module names; none when the summary file is
-/// missing.
-fn Checker.relocated(self, take edits: MoveEdits, take moved: mem::List[ty::ItemId], take summary: text::String) -> Option[Move] {
+/// target module's summary file, `retiring` followed by `tombstone`, and removed from its own
+/// with the blank line after it, `pkg ` before each private item another module names, and the
+/// removals of the rename tombstones it takes; none when the summary file is missing.
+fn Checker.relocated(self, take edits: MoveEdits, take moved: mem::List[ty::ItemId], take summary: text::String, retiring: ty::ItemId, tombstone: Option[text::String]) -> Option[Move] {
     let db = self.db()
     let alloc = self.alloc()
-    let MoveEdits(in_place: in_place, inside: inside, raised: raised) = edits
+    let MoveEdits(in_place: in_place, inside: inside, raised: raised, retaken: retaken) = edits
     var replacements = in_place
     let Some(summary_file) = self.summary_file(summary.as_str()) else {
         return None
@@ -920,33 +1086,21 @@ fn Checker.relocated(self, take edits: MoveEdits, take moved: mem::List[ty::Item
         expect lines.low > 0 and lines.low <= lines.high and lines.high < 0xFFFF_FFFF and usize.widen(lines.low) <= syntax.lines.len()
         let start = syntax.lines[usize.widen(lines.low) - 1].start
         let end = line_start_after(syntax, line: lines.high)
-        let head_token = usize.widen(db.ast(item).token)
-        expect head_token < syntax.tokens.len()
-        let head = syntax.tokens[head_token].start
-        var rewrites = mem::List[Rewrite].empty(alloc)
-        for rewrite in inside {
-            if rewrite.item == item {
-                mut rewrites.push(Rewrite(start: rewrite.rewrite.start, end: rewrite.rewrite.end, spelt: text::String.of(rewrite.rewrite.spelt.as_str(), alloc)))
-            }
-        }
-        if raised.contains(item) {
-            mut rewrites.push(Rewrite(start: head, end: head, spelt: text::String.of("pkg ", alloc)))
-        }
-        mut rewrites.sort_by(fn(left: Rewrite, right: Rewrite) => left.cmp(right))
-        var written = text::String.empty(alloc)
-        var at = start
-        for rewrite in rewrites {
-            mut written.append(output::lossy(syntax.source_bytes(at, end: rewrite.start), alloc).as_str())
-            mut written.append(rewrite.spelt.as_str())
-            at = rewrite.end
-        }
-        mut written.append(output::lossy(syntax.source_bytes(at, end), alloc).as_str())
         mut appended.push('\n')
-        mut appended.append(written.as_str())
+        mut appended.append(self.moved_text(item, inside: inside.view(), raised: raised.contains(item), start, end).as_str())
         let count = lines.high - lines.low + 1
         let path = db.item_file(item).path.as_str()
         mut relocated.push(Relocated(from: diagnostic::At(path: text::String.of(path, alloc), line: lines.low), to: diagnostic::At(path: text::String.of(summary.as_str(), alloc), line: landed_line), lines: count))
         landed_line += count + 1
+        if item == retiring {
+            match tombstone {
+                Some(written) => {
+                    mut appended.append(written.as_str())
+                    landed_line += 2
+                }
+                None => {}
+            }
+        }
         var removed_end = end
         if usize.widen(lines.high) < syntax.lines.len() {
             let next = syntax.lines[usize.widen(lines.high)]
@@ -966,10 +1120,43 @@ fn Checker.relocated(self, take edits: MoveEdits, take moved: mem::List[ty::Item
         let head = syntax.tokens[head_token].start
         mut replacements.push(diagnostic::Edit(path: text::String.of(db.item_file(item).path.as_str(), alloc), replacement: diagnostic::Replacement(start: head, end: head, text: text::String.of("pkg ", alloc))))
     }
+    for removed in retaken {
+        removing(mut replacements, removed, alloc)
+    }
     let summary_end = u32.fit(summary_file.syntax.source.len())
     mut replacements.push(diagnostic::Edit(path: take summary, replacement: diagnostic::Replacement(start: summary_end, end: summary_end, text: take appended)))
     return Some(Move(fix: diagnostic::Fix(edits: take replacements), relocated: take relocated))
 } Checker.relocated
+
+/// The text of a moved item from offset `start` to `end` of its file, with its rewrites of
+/// `inside`, and `pkg ` before its head when `raised`.
+fn Checker.moved_text(self, item: ty::ItemId, inside: Slice[InsideRewrite], raised: bool, start: u32, end: u32) -> text::String {
+    let db = self.db()
+    let alloc = self.alloc()
+    let syntax = db.syntax(item)
+    let head_token = usize.widen(db.ast(item).token)
+    expect head_token < syntax.tokens.len()
+    let head = syntax.tokens[head_token].start
+    var rewrites = mem::List[Rewrite].empty(alloc)
+    for rewrite in inside {
+        if rewrite.item == item {
+            mut rewrites.push(Rewrite(start: rewrite.rewrite.start, end: rewrite.rewrite.end, spelt: text::String.of(rewrite.rewrite.spelt.as_str(), alloc)))
+        }
+    }
+    if raised {
+        mut rewrites.push(Rewrite(start: head, end: head, spelt: text::String.of("pkg ", alloc)))
+    }
+    mut rewrites.sort_by(fn(left: Rewrite, right: Rewrite) => left.cmp(right))
+    var written = text::String.empty(alloc)
+    var at = start
+    for rewrite in rewrites {
+        mut written.append(output::lossy(syntax.source_bytes(at, end: rewrite.start), alloc).as_str())
+        mut written.append(rewrite.spelt.as_str())
+        at = rewrite.end
+    }
+    mut written.append(output::lossy(syntax.source_bytes(at, end), alloc).as_str())
+    return written
+} Checker.moved_text
 
 /// The line that text appended to a source after a blank line starts on.
 fn landing_line(source: Slice[u8]) -> u32 {

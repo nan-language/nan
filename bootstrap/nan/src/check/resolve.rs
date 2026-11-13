@@ -4,7 +4,7 @@
 use super::db::{Db, ItemId, ModuleId, TypeKey};
 use super::ty::Scalar;
 use crate::diagnostic::Code;
-use crate::syntax::ast::{ItemKind, Path, RetiredItem, Tok, Visibility};
+use crate::syntax::ast::{ExprKind, ItemKind, Path, RetiredItem, RetiredNew, Tok, Visibility};
 
 /// What a path names at item level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -267,31 +267,74 @@ impl Db<'_> {
         Some(format!("{module}::{name}"))
     }
 
-    /// The canonical path of a tombstone's old form, read in its module.
+    /// The canonical path of a tombstone's old form, read in its module, the type of a member
+    /// read through the tombstones retiring it.
     pub fn old_form(&self, module: ModuleId, retired: &RetiredItem) -> Option<String> {
         let Some(member) = &retired.member else {
             return self.spelled(module, &retired.path);
         };
-        let owner = match self.owner_key(module, &retired.path) {
+        let owner = match self.retired_owner(module, &retired.path) {
             Some(key) => self.type_path(key),
             None => self.spelled(module, &retired.path)?,
         };
         Some(format!("{owner}.{}", member.text))
     }
 
-    /// Links each function named `Type.name` to its type, and each tombstone to the canonical
-    /// path of its old form.
-    pub fn link(&mut self) {
-        let mut tombstones = Vec::new();
-        for (index, data) in self.items.iter().enumerate() {
-            if let ItemKind::Retired(retired) = &data.ast.kind
-                && let Some(form) = self.old_form(data.module, retired)
-            {
-                tombstones.push((ItemId(index as u32), form));
+    /// The type or interface whose members a path written in `module` reaches, directly or
+    /// through the `preserves` tombstones without an old head retiring what it spells into a path.
+    pub fn retired_owner(&self, module: ModuleId, path: &Path) -> Option<TypeKey> {
+        let (mut module, mut path) = (module, path);
+        for _ in 0..=self.retired.len() {
+            if let Some(key) = self.owner_key(module, path) {
+                return Some(key);
             }
+            if let Ok(Named::Item(item)) = self.resolve(module, path)
+                && matches!(self.ast(item).kind, ItemKind::Interface(_))
+            {
+                return Some(TypeKey::Item(item));
+            }
+            let (tombstone, rewrite) = self
+                .retired
+                .get(&self.spelled(module, path)?)?
+                .iter()
+                .find_map(|&tombstone| match &self.ast(tombstone).kind {
+                    ItemKind::Retired(RetiredItem {
+                        member: None,
+                        head: None,
+                        new:
+                            RetiredNew::Rewrite {
+                                expr,
+                                preserves: true,
+                            },
+                        ..
+                    }) => match &expr.kind {
+                        ExprKind::Path { path, args: None } => Some((tombstone, path)),
+                        _ => None,
+                    },
+                    _ => None,
+                })?;
+            module = self.module_of(tombstone);
+            path = rewrite;
         }
-        for (item, form) in tombstones {
-            self.retired.entry(form).or_default().push(item);
+        None
+    }
+
+    /// Links each function named `Type.name` to its type, and each tombstone to the canonical
+    /// path of its old form, those retiring a member after the others.
+    pub fn link(&mut self) {
+        for members in [false, true] {
+            let mut tombstones = Vec::new();
+            for (index, data) in self.items.iter().enumerate() {
+                if let ItemKind::Retired(retired) = &data.ast.kind
+                    && retired.member.is_some() == members
+                    && let Some(form) = self.old_form(data.module, retired)
+                {
+                    tombstones.push((ItemId(index as u32), form));
+                }
+            }
+            for (item, form) in tombstones {
+                self.retired.entry(form).or_default().push(item);
+            }
         }
         self.link_members();
     }

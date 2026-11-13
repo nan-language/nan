@@ -279,12 +279,13 @@ fn Db.spelled(self, from: ty::ModuleId, path: ast::Path) -> Option[text::String]
     return Some(take spelt)
 } Db.spelled
 
-/// The canonical path of a tombstone's old form, read in its module.
+/// The canonical path of a tombstone's old form, read in its module, the type of a member
+/// read through the tombstones retiring it.
 fn Db.old_form(self, module: ty::ModuleId, tombstone: ast::RetiredItem) -> Option[text::String] {
     let Some(member) = tombstone.member else {
         return self.spelled(module, path: tombstone.path)
     }
-    let Some(key) = self.owner_key(module, owner: tombstone.path) else {
+    let Some(key) = self.retired_owner(module, path: tombstone.path) else {
         let Some(spelt) = self.spelled(module, path: tombstone.path) else {
             return None
         }
@@ -292,6 +293,53 @@ fn Db.old_form(self, module: ty::ModuleId, tombstone: ast::RetiredItem) -> Optio
     }
     return Some(form_of(self.type_path(key), member: member.text.as_str()))
 } Db.old_form
+
+/// The type or interface whose members a path written in `module` reaches, directly or
+/// through the `preserves` tombstones without an old head retiring what it spells into a path.
+fn Db.retired_owner(self, module: ty::ModuleId, path: ast::Path) -> Option[TypeKey] {
+    return self.owner_through(module, path, steps: self.tombstones.len())
+} Db.retired_owner
+
+/// The type or interface whose members a path written in `module` reaches, directly or through
+/// at most `steps` tombstones.
+fn Db.owner_through(self, module: ty::ModuleId, path: ast::Path, steps: usize) -> Option[TypeKey] {
+    match self.owner_key(module, owner: path) {
+        Some(key) => return Some(key)
+        None => {}
+    }
+    match self.resolve(module, path) {
+        Ok(Named.Item(item)) => match self.ast(item).kind {
+            ast::ItemKind.Interface(_) => return Some(TypeKey.Item(item))
+            else => {}
+        }
+        else => {}
+    }
+    if steps == 0 {
+        return None
+    }
+    let Some(form) = self.spelled(module, path) else {
+        return None
+    }
+    let Some(tombstones) = self.tombstones.get_by(fn(key: text::String) => key.as_str().cmp(form.as_str())) else {
+        return None
+    }
+    for tombstone in tombstones {
+        let ast::ItemKind.Retired(retired_item) = self.ast(tombstone).kind else {
+            continue
+        }
+        if retired_item.member.is_some() or retired_item.head.is_some() {
+            continue
+        }
+        let ast::RetiredNew.Rewrite(expr: expr, preserves: true) = retired_item.new else {
+            continue
+        }
+        let ast::ExprKind.Path(path: rewrite, args: None) = expr.kind else {
+            continue
+        }
+        return self.owner_through(self.module_of(tombstone), path: rewrite, steps: steps - 1)
+    }
+    return None
+} Db.owner_through
 
 /// The path of a member of an owner: `owner.member`.
 fn form_of(take owner: text::String, member: Str) -> text::String {
@@ -301,13 +349,24 @@ fn form_of(take owner: text::String, member: Str) -> text::String {
 } form_of
 
 /// Links each function named `Type.name` to its type, and each tombstone to the canonical
-/// path of its old form.
+/// path of its old form, those retiring a member after the others.
 fn Db.link(mut self) {
+    mut self.link_tombstones(members: false)
+    mut self.link_tombstones(members: true)
+    mut self.link_members()
+} Db.link
+
+/// Links each tombstone retiring a member, or each other one, to the canonical path of its old
+/// form.
+fn Db.link_tombstones(mut self, members: bool) {
     let alloc = self.session.alloc
     var tombstones = mem::List[OldForm].empty(alloc)
     for index in 0..<self.items.len() {
         let data = self.items[index]
         let ast::ItemKind.Retired(tombstone) = self.declaration(ty::ItemId(index: u32.fit(index))).kind else {
+            continue
+        }
+        if tombstone.member.is_some() != members {
             continue
         }
         let Some(form) = self.old_form(data.module, tombstone) else {
@@ -326,8 +385,7 @@ fn Db.link(mut self) {
         mut held.push(item)
         discard mut self.tombstones.insert(take form, value: take held)
     }
-    mut self.link_members()
-} Db.link
+} Db.link_tombstones
 
 /// A tombstone and the canonical path of its old form.
 struct OldForm {

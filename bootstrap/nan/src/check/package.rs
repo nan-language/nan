@@ -77,13 +77,18 @@ impl Checker<'_> {
     }
 
     /// The modules of a package an item names by a path, with each path's line: a first segment
-    /// naming a module, or the package's name naming its root.
+    /// naming a module, or the package's name naming its root, outside a tombstone's old path.
     fn module_paths(&self, item: ItemId, package: PackageId) -> Vec<(ModuleId, u32)> {
         let data = self.db.item(item);
         let syntax = &data.file.syntax;
         let span = &syntax.items[data.index];
+        let old_path = match &data.ast.kind {
+            ItemKind::Retired(retired) => retired.path.segments.first().map(|first| first.token),
+            _ => None,
+        };
         syntax
             .path_starts(span.first..span.end)
+            .filter(|index| old_path != Some(*index as u32))
             .filter_map(|index| {
                 let module = self.db.module_named(package, syntax.text(index))?;
                 Some((module, syntax.tokens[index].line))

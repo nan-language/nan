@@ -301,6 +301,7 @@ fn Selector.start_block(mut self) {
 } Selector.start_block
 
 fn Selector.finish_block(mut self) {
+    mut self.pair_nan_tests()
     mut self.pair_lane_tests()
     self.current.end = u32.fit(self.code.insts.len())
     let params = u32.fit(self.code.params.len())
@@ -340,6 +341,154 @@ fn Selector.pair_lane_tests(mut self) {
         }
     }
 } Selector.pair_lane_tests
+
+/// Tests two floats of one size for NaNs at once where the block tests one and later the other,
+/// no instruction between reading the first but stores of it, which follow the joined test once
+/// no instruction between them and it writes their registers or memory or loads their bytes.
+fn Selector.pair_nan_tests(mut self) {
+    var at = usize.widen(self.current.begin)
+    while at < self.code.insts.len() {
+        let x64::Inst.CanonNan(size: size, reg: earlier, temp: _) = self.code.insts[at].inst else {
+            at += 1
+            continue
+        }
+        let Some(joined) = self.nan_partner(from: at + 1, size, earlier) else {
+            at += 1
+            continue
+        }
+        var rest = mem::List[VInst[x64::Inst]].empty(self.alloc)
+        for index in (at + 1)..<self.code.insts.len() {
+            mut rest.push(self.code.insts[index])
+        }
+        mut self.code.insts.truncate(at)
+        var moved = mem::List[VInst[x64::Inst]].empty(self.alloc)
+        let later = joined.later - at - 1
+        for index in 0..<later {
+            if joined.stores.position(fn(store: usize) => store == index + at + 1) != None {
+                mut moved.push(rest[index])
+            } else {
+                mut self.code.insts.push(rest[index])
+            }
+        }
+        let x64::Inst.CanonNan(size: _, reg: tested, temp: temp) = rest[later].inst else {
+            expect false
+            return
+        }
+        mut self.code.insts.push(VInst(inst: x64::Inst.CanonNanPair(size: size, left: earlier, right: tested, temp: temp), loc: rest[later].loc))
+        for held in moved {
+            mut self.code.insts.push(held)
+        }
+        for index in (later + 1)..<rest.len() {
+            mut self.code.insts.push(rest[index])
+        }
+    }
+} Selector.pair_nan_tests
+
+/// Where a block's test of `earlier`, a float of `size`, for a NaN joins the next such test from
+/// `from`: that test and the stores of `earlier` before it, none when another instruction before
+/// it reads `earlier`, has an effect, or writes the registers a store reads or, for a load, may
+/// read the bytes a store writes.
+fn Selector.nan_partner(self, from: usize, size: x64::Size, earlier: machinst::Reg) -> Option[NanPartner] {
+    var stores = mem::List[usize].empty(self.alloc)
+    var read = mem::List[machinst::Reg].empty(self.alloc)
+    for index in from..<self.code.insts.len() {
+        let inst = self.code.insts[index].inst
+        match inst {
+            x64::Inst.CanonNan(size: tested, reg: _, temp: _) => {
+                if tested == size {
+                    return Some(NanPartner(later: index, stores: take stores))
+                }
+            }
+            x64::Inst.Store(size: _, src: src, dst: dst) => {
+                if src != earlier {
+                    return None
+                }
+                mut stores.push(index)
+                each_address_reg(dst, visit: fn[mut read](reg: machinst::Reg) {
+                    mut read.push(reg)
+                })
+                continue
+            }
+            x64::Inst.Load(kind: kind, dst: _, src: src) => {
+                for store in stores {
+                    let x64::Inst.Store(size: stored, src: _, dst: dst) = self.code.insts[store].inst else {
+                        continue
+                    }
+                    if may_overlap(dst, size: size_bytes(stored), other: src, other_size: load_bytes(kind)) {
+                        return None
+                    }
+                }
+            }
+            else => {
+                if not inst.is_pure() {
+                    return None
+                }
+            }
+        }
+        var clashes = false
+        discard inst.map_regs(fn[mut clashes](reg: machinst::Reg, role: machinst::Role) -> machinst::Reg {
+            let writes = role != machinst::Role.Use
+            clashes = clashes or reg == earlier or (writes and read.position(fn(held: machinst::Reg) => held == reg) != None)
+            return reg
+        })
+        if clashes {
+            return None
+        }
+    }
+    return None
+} Selector.nan_partner
+
+/// The test of a float for a NaN that joins an earlier one, by instruction index, and the stores
+/// of the earlier float before it that move past the joined test.
+struct NanPartner {
+    later: usize
+    stores: mem::List[usize]
+} NanPartner
+
+/// Shows `visit` the registers a memory operand reads.
+fn each_address_reg(mem: x64::Amode, visit: fn(reg: machinst::Reg)) {
+    let x64::Amode.Mem(base: base, index: index, shift: _, disp: _) = mem else {
+        return
+    }
+    visit(base)
+    match index {
+        Some(held) => visit(held)
+        None => {}
+    }
+} each_address_reg
+
+/// Whether two accesses of `size` and `other_size` bytes may reach a byte in common: always but
+/// for two from different displacements past the same base and index.
+fn may_overlap(mem: x64::Amode, size: i64, other: x64::Amode, other_size: i64) -> bool {
+    let x64::Amode.Mem(base: base, index: index, shift: shift, disp: disp) = mem else {
+        return true
+    }
+    let x64::Amode.Mem(base: other_base, index: other_index, shift: other_shift, disp: other_disp) = other else {
+        return true
+    }
+    if base != other_base or index != other_index or shift != other_shift {
+        return true
+    }
+    return i64.widen(disp) < i64.widen(other_disp) + other_size and i64.widen(other_disp) < i64.widen(disp) + size
+} may_overlap
+
+fn size_bytes(size: x64::Size) -> i64 {
+    return match size {
+        x64::Size.Byte => 1
+        x64::Size.Word => 2
+        x64::Size.Dword => 4
+        x64::Size.Qword => 8
+    }
+} size_bytes
+
+fn load_bytes(kind: x64::LoadKind) -> i64 {
+    return match kind {
+        x64::LoadKind.Zx8 => 1
+        x64::LoadKind.Zx16 => 2
+        x64::LoadKind.Dword or x64::LoadKind.Float32 => 4
+        x64::LoadKind.Qword or x64::LoadKind.Float64 => 8
+    }
+} load_bytes
 
 /// The index of the next test of a float vector's lanes for NaNs on lanes of `size` from
 /// `from`, none when an instruction before it reads or writes `earlier`.

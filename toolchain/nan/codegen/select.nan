@@ -301,6 +301,7 @@ fn Selector.start_block(mut self) {
 } Selector.start_block
 
 fn Selector.finish_block(mut self) {
+    mut self.pair_lane_tests()
     self.current.end = u32.fit(self.code.insts.len())
     let params = u32.fit(self.code.params.len())
     let args = u32.fit(self.code.args.len())
@@ -311,6 +312,61 @@ fn Selector.finish_block(mut self) {
     self.current.succ_count = succs - self.current.succ_start
     mut self.code.blocks.push(self.current)
 } Selector.finish_block
+
+/// Joins each test of a float vector's lanes for NaNs in the block with the next one on lanes of
+/// its size, when no instruction between them reads or writes the earlier vector, so that one
+/// branch tests both.
+fn Selector.pair_lane_tests(mut self) {
+    let begin = usize.widen(self.current.begin)
+    let end = self.code.insts.len()
+    var joined = filled(end - begin, value: false, alloc: self.alloc)
+    for at in begin..<end {
+        let x64::Inst.CanonNanLanes(size: size, reg: earlier, mask: _, canon: _, temp: _) = self.code.insts[at].inst else {
+            continue
+        }
+        let Some(later) = self.next_lane_test(from: at + 1, size, earlier) else {
+            continue
+        }
+        let held = self.code.insts[later]
+        let x64::Inst.CanonNanLanes(size: _, reg: tested, mask: mask, canon: canon, temp: temp) = held.inst else {
+            continue
+        }
+        self.code.insts[later] = VInst(inst: x64::Inst.CanonNanLanePair(size: size, left: earlier, right: tested, mask: mask, canon: canon, temp: temp), loc: held.loc)
+        joined[at - begin] = true
+    }
+    for back in 0..<(end - begin) {
+        if joined[end - begin - 1 - back] {
+            discard mut self.code.insts.remove(end - 1 - back)
+        }
+    }
+} Selector.pair_lane_tests
+
+/// The index of the next test of a float vector's lanes for NaNs on lanes of `size` from
+/// `from`, none when an instruction before it reads or writes `earlier`.
+fn Selector.next_lane_test(self, from: usize, size: x64::Size, earlier: machinst::Reg) -> Option[usize] {
+    for index in from..<self.code.insts.len() {
+        let inst = self.code.insts[index].inst
+        match inst {
+            x64::Inst.CanonNanLanes(size: tested, reg: _, mask: _, canon: _, temp: _) => {
+                if tested == size {
+                    return Some(index)
+                }
+            }
+            else => {}
+        }
+        var touched = false
+        discard inst.map_regs(fn[mut touched](reg: machinst::Reg, role: machinst::Role) -> machinst::Reg {
+            if reg == earlier {
+                touched = true
+            }
+            return reg
+        })
+        if touched {
+            return None
+        }
+    }
+    return None
+} Selector.next_lane_test
 
 fn Selector.select_block(mut self, func: clif::Function, block: clif::Block) {
     mut self.start_block()

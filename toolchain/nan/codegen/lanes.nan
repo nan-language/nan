@@ -1,4 +1,4 @@
-//! Two counts at once: the copy of a versioned loop whose blocks run one path, reading and writing 64-bit floats at addresses advancing 8 bytes a count and computing on them only by addition, subtraction, multiplication and division, gets a vector copy taking two counts an iteration while two are left, entered when no store of the counts left reaches the bytes another of its accesses reads or writes; the scalar copy takes the count left.
+//! Four counts at once: the copy of a versioned loop whose blocks run one path, reading and writing 64-bit floats at addresses advancing 8 bytes a count and computing on them only by addition, subtraction, multiplication and division, gets a vector copy taking four counts an iteration, two to a vector, while four are left, entered when no store of the counts left reaches the bytes another of its accesses reads or writes; each iteration stores once it has computed the floats of all four, and the scalar copy takes the counts left.
 
 /// What a value of a versioned loop stands for in its vector copy: nothing, a value the same on
 /// every count, the counter or the counter plus one, an index, an index scaled by a constant, an
@@ -422,11 +422,14 @@ fn Copier.enter_lanes(mut self, func: clif::Function, scope: Scope, version: u32
     apart = mut self.b.band_not(apart, y: wraps)
     let splats = mut self.splats_of(func, scope, version)
     let rebased = mut self.rebased_of(func, scope, version)
+    let least = mut self.b.iconst(func.value_type(self.versions.list[at].limit), imm: 3)
+    let fourth = mut self.b.umax(limit, y: least)
+    let bound = mut self.b.iadd_imm_s(fourth, y: -3)
     let vector_header = mut self.new_block(predecessors: 2)
     mut self.b.brif(apart, then: vector_header, then_args: passed, otherwise: copy, otherwise_args: passed)
     mut self.reached(vector_header)
     mut self.reached(copy)
-    mut self.copy_vector_loop(func, scope, version, vector_header, copy, last, splats: splats.view(), rebased: rebased.view())
+    mut self.copy_vector_loop(func, scope, version, vector_header, copy, bound, splats: splats.view(), rebased: rebased.view())
 } Copier.enter_lanes
 
 /// An address a vector copy advances from: a base plus a start scaled, the address of count 0.
@@ -495,10 +498,10 @@ fn Copier.disjoint(mut self, reach: Reach, other: Reach) -> clif::Value {
 } Copier.disjoint
 
 /// Builds a versioned loop's vector copy: a header taking the loop's parameters, going on while
-/// the counter is below the last count, so two counts are left, and leaving for the scalar
-/// copy's header otherwise, and a body taking two counts, then jumping back with the counter two
-/// higher.
-fn Copier.copy_vector_loop(mut self, func: clif::Function, scope: Scope, version: u32, vector_header: clif::Block, copy: clif::Block, last: clif::Value, splats: Slice[clif::Value], rebased: Slice[Rebased]) {
+/// the counter is below `bound`, so four counts are left, and leaving for the scalar copy's
+/// header otherwise, and a body taking four counts, two to a vector, storing once it has
+/// computed the floats of all four, then jumping back with the counter four higher.
+fn Copier.copy_vector_loop(mut self, func: clif::Function, scope: Scope, version: u32, vector_header: clif::Block, copy: clif::Block, bound: clif::Value, splats: Slice[clif::Value], rebased: Slice[Rebased]) {
     let at = usize.widen(version)
     let header = clif::Block(index: self.versions.list[at].header)
     let counter = self.versions.list[at].counter
@@ -515,15 +518,21 @@ fn Copier.copy_vector_loop(mut self, func: clif::Function, scope: Scope, version
             count = copied
         }
     }
-    let more = mut self.b.icmp(clif::IntCC.UnsignedLessThan, x: count, y: last)
+    let more = mut self.b.icmp(clif::IntCC.UnsignedLessThan, x: count, y: bound)
     let body = mut self.new_block(predecessors: 1)
     let no_args = mem::List[clif::Value].empty(self.alloc)
     mut self.b.brif(more, then: body, then_args: no_args.view(), otherwise: copy, otherwise_args: copied_params.view())
     mut self.reached(body)
     mut self.reached(copy)
     mut self.b.switch_to_block(body)
-    mut self.copy_lanes(func, scope, version, mut lane_values, count, splats, rebased)
-    let next = mut self.b.iadd_imm_s(count, y: 2)
+    var stores = mem::List[LaneStore].empty(self.alloc)
+    mut self.copy_lanes(func, scope, version, mut lane_values, count, splats, rebased, ahead: 0, mut stores)
+    var later_values = copied_list(lane_values.view(), alloc: self.alloc)
+    mut self.copy_lanes(func, scope, version, lane_values: mut later_values, count, splats, rebased, ahead: 2 * i32.fit(LANE_BYTES), mut stores)
+    for store in stores {
+        mut self.b.store(store.flags, x: store.x, p: store.p, offset: store.offset)
+    }
+    let next = mut self.b.iadd_imm_s(count, y: 4)
     var back = mem::List[clif::Value].empty(self.alloc)
     for index in 0..<params.len() {
         if params[index] == counter {
@@ -536,9 +545,20 @@ fn Copier.copy_vector_loop(mut self, func: clif::Function, scope: Scope, version
     mut self.reached(vector_header)
 } Copier.copy_vector_loop
 
-/// Copies the instructions of a vector copy's body, each value it computes for both counts
-/// standing in `lane_values`, the steady values it reads taken from the scope at the latch.
-fn Copier.copy_lanes(mut self, func: clif::Function, scope: Scope, version: u32, mut lane_values: mem::List[clif::Value], count: clif::Value, splats: Slice[clif::Value], rebased: Slice[Rebased]) {
+/// A store of a vector copy's body: the two floats it writes, its address and offset, and its
+/// flags.
+struct LaneStore derives Copy, Eq {
+    x: clif::Value
+    p: clif::Value
+    offset: i32
+    flags: clif::MemFlags
+} LaneStore
+
+/// Copies the instructions of a vector copy's body for the two counts `ahead` bytes past the
+/// counter's, each value it computes standing in `lane_values` and each store it makes added to
+/// `stores`, the steady values it reads taken from the scope at the latch. Counts past the
+/// counter's read the addresses the counter's computed, at offsets `ahead` bytes further.
+fn Copier.copy_lanes(mut self, func: clif::Function, scope: Scope, version: u32, mut lane_values: mem::List[clif::Value], count: clif::Value, splats: Slice[clif::Value], rebased: Slice[Rebased], ahead: i32, mut stores: mem::List[LaneStore]) {
     let at = usize.widen(version)
     let Some(found) = self.versions.list[at].lanes else {
         return
@@ -552,12 +572,15 @@ fn Copier.copy_lanes(mut self, func: clif::Function, scope: Scope, version: u32,
             clif::InstructionData.Store(opcode: _, flags: flags, x: x, p: p, offset: offset) => {
                 let stored = lane_of(func, lane_values: lane_values.view(), value: x)
                 let address = lane_of(func, lane_values: lane_values.view(), value: p)
-                mut self.b.store(clif::MemFlags(aligned: false, notrap: flags.notrap), x: stored, p: address, offset)
+                mut stores.push(LaneStore(x: stored, p: address, offset: offset + ahead, flags: clif::MemFlags(aligned: false, notrap: flags.notrap)))
             }
             else => {
                 let result = result_of(func, inst, alloc: self.alloc)
-                let copied = mut self.lane_inst(func, scope, data, role: roles[usize.widen(result.index)], lane_values: lane_values.view(), splat_sources: splat_sources.view(), splats, rebased, count)
-                lane_values[usize.widen(result.index)] = copied
+                let role = roles[usize.widen(result.index)]
+                if ahead == 0 or role == Role.Lane {
+                    let copied = mut self.lane_inst(func, scope, data, role, lane_values: lane_values.view(), splat_sources: splat_sources.view(), splats, rebased, count, ahead)
+                    lane_values[usize.widen(result.index)] = copied
+                }
             }
         }
     }
@@ -571,8 +594,9 @@ fn lane_of(func: clif::Function, lane_values: Slice[clif::Value], value: clif::V
 } lane_of
 
 /// The copy in a vector body of an instruction computing an index, a scaled index, an address
-/// advanced from its count 0 by the counter, two loaded floats or arithmetic on two floats.
-fn Copier.lane_inst(mut self, func: clif::Function, scope: Scope, data: clif::InstructionData, role: Role, lane_values: Slice[clif::Value], splat_sources: Slice[clif::Value], splats: Slice[clif::Value], rebased: Slice[Rebased], count: clif::Value) -> clif::Value {
+/// advanced from its count 0 by the counter, two floats loaded `ahead` bytes further or
+/// arithmetic on two floats.
+fn Copier.lane_inst(mut self, func: clif::Function, scope: Scope, data: clif::InstructionData, role: Role, lane_values: Slice[clif::Value], splat_sources: Slice[clif::Value], splats: Slice[clif::Value], rebased: Slice[Rebased], count: clif::Value, ahead: i32) -> clif::Value {
     match role {
         Role.Index(start: start) => {
             let base = mut self.value(scope, func, value: start)
@@ -591,7 +615,7 @@ fn Copier.lane_inst(mut self, func: clif::Function, scope: Scope, data: clif::In
         else => {}
     }
     return match data {
-        clif::InstructionData.Load(opcode: _, flags: flags, arg: arg, offset: offset) => mut self.b.load(clif::Type.Float64x2, flags: clif::MemFlags(aligned: false, notrap: flags.notrap), p: lane_of(func, lane_values, value: arg), offset)
+        clif::InstructionData.Load(opcode: _, flags: flags, arg: arg, offset: offset) => mut self.b.load(clif::Type.Float64x2, flags: clif::MemFlags(aligned: false, notrap: flags.notrap), p: lane_of(func, lane_values, value: arg), offset: offset + ahead)
         clif::InstructionData.Binary(opcode: opcode, x: x, y: y) => mut self.lane_arithmetic(opcode, x: lane_or_splat(func, lane_values, splat_sources, splats, value: x), y: lane_or_splat(func, lane_values, splat_sources, splats, value: y))
         else => NO_VALUE
     }

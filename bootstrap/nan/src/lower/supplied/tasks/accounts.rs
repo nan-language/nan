@@ -52,6 +52,10 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             fx.store(handle, sret, 0);
             supply.done(lo, fx);
         }
+        "task::Account.id" => {
+            let handle = fx.load(PTR, supply.param(0).address(), 0);
+            supply.ret(lo, fx, Held::Scalar(handle));
+        }
         "task::Account.used_ns" => {
             let handle = fx.load(PTR, supply.param(0).address(), 0);
             let state_address = lo.state(fx);

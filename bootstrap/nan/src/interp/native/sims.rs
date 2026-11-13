@@ -113,6 +113,10 @@ pub fn member(
             Val::Struct(interp.ty_item("task", "Account"), Rc::new(vec![exec]))
         }
         ("task::Account", "executor") => interp.deref(&args[0]).fields()[0].clone(),
+        ("task::Account", "id") => {
+            let exec = interp.deref(&args[0]).fields()[0].clone();
+            Val::Int(i128::from(place(&exec.fields()[ENTRY]).extent))
+        }
         ("task::Account", "used_ns") => Val::Int(0),
         ("task::Account", "close") => {
             let exec = interp.deref(&args[0]).fields()[0].clone();

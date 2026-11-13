@@ -1,4 +1,4 @@
-//! Runs every task bound to CPU 0 in 1 ms slices keyed by deadline or weighted time but those of class 3, which CPU 0 steals from CPU 1 by halves while CPU 1 steals from CPU 0 before, idling in `mwait`, waking from a sleep, ordering tasks by deadline, sharing the CPU by weight, passing a serial executor's turn by seed, running tasks of class 1 in slices of 1 ns, which end before they run, and giving the sleeps of class 2 a slack.
+//! Runs every task bound to CPU 0 in 1 ms slices keyed by deadline or weighted time but those of class 3, which CPU 0 steals from CPU 1 by halves while CPU 1 steals from CPU 0 before, idling in `mwait`, waking from a sleep, ordering tasks by deadline, sharing the CPU by weight, passing a serial executor's turn by seed, running tasks of class 1, seen under their account's id, in slices of 1 ns, which end before they run, and giving the sleeps of class 2 a slack.
 
 registers Pl011 {
     data: u8 at 0x0 write
@@ -20,13 +20,15 @@ const LAX_NS: u64 = 10_000_000
 const LAX_SLACK_NS: u64 = 2_000_000_000
 
 /// What the policy records: of the steal run, whether it is armed and CPU 0 has stolen, up to three
-/// tasks of class 3 that ran on CPU 0, and the switches of other tasks onto another CPU; and the
-/// end of the earliest window of a deadline a CPU last idled until.
+/// tasks of class 3 that ran on CPU 0, and the switches of other tasks onto another CPU; the
+/// executor of the task of class 1 it last placed; and the end of the earliest window of a deadline
+/// a CPU last idled until.
 struct Probe {
     armed: core::atomic::AtomicBool
     stole: core::atomic::AtomicBool
     seen: mem::List[core::atomic::AtomicU64]
     strays: core::atomic::AtomicU64
+    brief: core::atomic::AtomicU64
     until: core::atomic::AtomicU64
 } Probe
 
@@ -43,6 +45,9 @@ fn Paced.place(self, t: hw::IrqsDisabled, task: hw::TaskView) -> hw::Placement l
     }
     if task.share.class == 3 {
         return hw::Placement(cpu: 1, key: key, bound: false)
+    }
+    if task.share.class == 1 {
+        discard self.probe.contents().brief.swap(task.executor)
     }
     return hw::Placement(cpu: 0, key: key, bound: true)
 } Paced.place
@@ -153,7 +158,7 @@ fn slots(count: u64, alloc: mem::Alloc) -> mem::List[core::atomic::AtomicU64] {
 fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     let alloc = k.alloc()
     let clock = k.clock()
-    let probe = mem::Shared.of(Probe(armed: core::atomic::AtomicBool.of(false), stole: core::atomic::AtomicBool.of(false), seen: slots(count: 3, alloc), strays: core::atomic::AtomicU64.of(0), until: core::atomic::AtomicU64.of(0)), alloc)
+    let probe = mem::Shared.of(Probe(armed: core::atomic::AtomicBool.of(false), stole: core::atomic::AtomicBool.of(false), seen: slots(count: 3, alloc), strays: core::atomic::AtomicU64.of(0), brief: core::atomic::AtomicU64.of(0), until: core::atomic::AtomicU64.of(0)), alloc)
     mut k.policy(Paced(probe: probe.share()))
     take k.anchor(0u8, run: fn[take probe](exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
         try await clock.sleep_ns(1_000_000)
@@ -231,6 +236,9 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
         say(text: "brief")
         say_digit(value: brief_done.load())
         say(text: "\n")
+        if probe.contents().brief.load() == brief.id() {
+            say(text: "brief account\n")
+        }
         try await steal_run(exec, clock, probe: probe.contents())
         try await slack_run(exec, clock, probe: probe.contents())
     })

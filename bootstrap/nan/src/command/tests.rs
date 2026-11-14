@@ -1,7 +1,7 @@
 use super::*;
 use crate::workspace::tests::Scratch;
 
-pub(super) const MANIFEST: &str =
+pub(crate) const MANIFEST: &str =
     "//! A package.\n\npackage app {\n    language 1\n    targets any\n} app\n";
 
 fn args(line: &str) -> Vec<String> {
@@ -97,7 +97,7 @@ fn command_lines_outside_the_synopsis_are_tool_usage() {
     }
     assert_eq!(
         run_in(&scratch.0, "frobnicate").output,
-        "invalid frobnicate: records 1\nerror tool.usage - -\n    expected: a command: check, verify, test, fix, fmt, holes, show, read, find, context, explain, expand, edit, merge, diff, seal, key, api, dep, publish, upgrade, build, run, primer\n    found: frobnicate\ninvalid frobnicate: records 1\n"
+        "invalid frobnicate: records 1\nerror tool.usage - -\n    expected: a command: check, verify, test, fix, fmt, holes, show, read, find, context, explain, expand, edit, merge, diff, seal, key, api, dep, publish, upgrade, build, run, primer, lsp\n    found: frobnicate\ninvalid frobnicate: records 1\n"
     );
     for (line, found) in [
         ("check --budget 99", "99"),

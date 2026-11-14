@@ -49,6 +49,7 @@ Run `nan` from a directory of NaN packages. Most commands take a scope: a packag
 | `nan test` | Run tests; `--affected` only those changed since they passed, `--replay <token>` a failing run |
 | `nan show <path> --api` | Print an item's head, contracts and digest, std included |
 | `nan primer` | Print the primer |
+| `nan lsp` | Serve the Language Server Protocol on standard input and output, for editors and agent harnesses |
 
 Packages and releases:
 

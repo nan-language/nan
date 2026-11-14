@@ -24,10 +24,11 @@ use crate::workspace::{Arch, Authority};
 /// The std functions that belong to one architecture's machine targets: its privileged
 /// intrinsics other than those both architectures share, and the x86_64 interrupt descriptor
 /// table.
-const INTRINSIC_ARCHS: [(&str, Arch); 30] = [
+const INTRINSIC_ARCHS: [(&str, Arch); 31] = [
     ("hw::Ring0.load_idt", Arch::Amd64),
     ("hw::Ring0.write_cr3", Arch::Amd64),
     ("hw::Ring0.read_msr", Arch::Amd64),
+    ("hw::Ring0.checked_read_msr", Arch::Amd64),
     ("hw::Ring0.write_msr", Arch::Amd64),
     ("hw::Ring0.cpuid", Arch::Amd64),
     ("hw::Ring0.read_tsc", Arch::Amd64),

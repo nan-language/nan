@@ -1,5 +1,10 @@
 //! The out-of-line compiler stubs of the machine targets: fixed machine code each image emits once for the operations Cranelift cannot express, in the bytes of its architecture.
 
+/// The offsets in `RdmsrSafe` of its `rdmsr` and of the code giving 0 in its place.
+const RDMSR_FAULT: i64 = 2
+
+const RDMSR_FIXUP: i64 = 20
+
 /// The compiler stubs. Each takes its integer arguments and gives its integer result in the
 /// registers its architecture's convention names, and returns, but `Halt`, which stops the
 /// processor with maskable interrupts disabled, and `EnterImage`. A port stub, on x86_64 alone, takes the port
@@ -21,7 +26,9 @@
 /// its initial state, on x86_64 by restoring the zeroed area at an address.
 ///
 /// The x86_64 stubs are `Lidt`, which loads an interrupt descriptor table; `Wrmsr` and `Rdmsr`,
-/// which write and read a model-specific register; `ReadCr2`, `ReadCr3` and `WriteCr3`, the
+/// which write and read a model-specific register; `RdmsrSafe`, which reads one at an address
+/// and gives 1, or gives 0 when its `rdmsr` faults, which the dispatcher resumes at
+/// `RDMSR_FIXUP`; `ReadCr2`, `ReadCr3` and `WriteCr3`, the
 /// control registers; `Invlpg`; `LoadTables`, which loads a CPU's descriptor tables through
 /// their pseudo-descriptor; `EnableAvx`, which enables XSAVE and the x87, SSE and AVX state
 /// components where the CPU has AVX; `GigabytePages`, which gives 1 when the CPU maps
@@ -107,6 +114,7 @@ enum Stub derives Copy, Eq, Hash {
     Thread
     Wrmsr
     Rdmsr
+    RdmsrSafe
     ReadCr2
     ReadCr3
     WriteCr3
@@ -225,6 +233,7 @@ proj fn Stub.x64_code(self) -> StubCode {
         Stub.Thread => StubCode(params: 0, returns: 1, bytes: b"\x65\x48\x8b\x04\x25\x00\x00\x00\x00\xc3")
         Stub.Wrmsr => StubCode(params: 2, returns: 0, bytes: b"\x89\xf9\x48\x89\xf0\x48\x89\xf2\x48\xc1\xea\x20\x0f\x30\xc3")
         Stub.Rdmsr => StubCode(params: 1, returns: 1, bytes: b"\x89\xf9\x0f\x32\x48\xc1\xe2\x20\x48\x09\xd0\xc3")
+        Stub.RdmsrSafe => StubCode(params: 2, returns: 1, bytes: b"\x89\xf9\x0f\x32\x48\xc1\xe2\x20\x48\x09\xd0\x48\x89\x06\xb8\x01\x00\x00\x00\xc3\x31\xc0\xc3")
         Stub.ReadCr2 => StubCode(params: 0, returns: 1, bytes: b"\x0f\x20\xd0\xc3")
         Stub.ReadCr3 => StubCode(params: 0, returns: 1, bytes: b"\x0f\x20\xd8\xc3")
         Stub.WriteCr3 => StubCode(params: 1, returns: 0, bytes: b"\x0f\x22\xdf\xc3")
@@ -362,6 +371,7 @@ proj fn Stub.name(self) -> Str
         Stub.Thread => "Thread"
         Stub.Wrmsr => "Wrmsr"
         Stub.Rdmsr => "Rdmsr"
+        Stub.RdmsrSafe => "RdmsrSafe"
         Stub.ReadCr2 => "ReadCr2"
         Stub.ReadCr3 => "ReadCr3"
         Stub.WriteCr3 => "WriteCr3"
@@ -427,9 +437,16 @@ proj fn Stub.name(self) -> Str
     }
 } Stub.name
 
-/// Calls a compiler stub, emitted once per image at its architecture's instruction alignment,
-/// giving its results.
+/// Calls a compiler stub, giving its results.
 fn Lowering.call_stub(mut self, mut fx: Fx, stub: Stub, args: Slice[clif::Value]) -> mem::List[clif::Value] {
+    let id = mut self.stub(stub)
+    let reference = mut self.func_ref(mut fx, id)
+    let stub_call = mut fx.b.call(reference, args)
+    return fx.b.inst_results(stub_call, alloc: fx.alloc)
+} Lowering.call_stub
+
+/// A compiler stub, emitted once per image at its architecture's instruction alignment.
+fn Lowering.stub(mut self, stub: Stub) -> object::FuncId {
     if self.machine_stubs.get(stub).is_none() {
         let arch = match self.ck.db().target.arch() {
             Some(found) => found
@@ -491,11 +508,8 @@ fn Lowering.call_stub(mut self, mut fx: Fx, stub: Stub, args: Slice[clif::Value]
         mut self.module.define_function_bytes(stub_id, align: align, bytes: code.bytes, relocs: mem::List[object::ModuleReloc].empty(self.alloc).view())
         discard mut self.machine_stubs.insert(stub, value: stub_id)
     }
-    let id = self.machine_stubs.at(stub)
-    let reference = mut self.func_ref(mut fx, id)
-    let stub_call = mut fx.b.call(reference, args)
-    return fx.b.inst_results(stub_call, alloc: fx.alloc)
-} Lowering.call_stub
+    return self.machine_stubs.at(stub)
+} Lowering.stub
 
 /// Reads a port through the compiler stub of a width, zero-extended.
 fn Lowering.port_in(mut self, mut fx: Fx, width: u64, port: clif::Value) -> clif::Value {

@@ -7,6 +7,9 @@ const ERROR_CODE_VECTORS: Slice[u8] = b"\x08\x0a\x0b\x0c\x0d\x0e\x11\x15\x1d\x1e
 /// The bytes of one vector's entry stub.
 const VECTOR_STUB: u32 = 12
 
+/// The general-protection exception's vector.
+const GENERAL_PROTECTION: i64 = 13
+
 /// The bytes of one vector's entry stub, which normalises the error code and pushes the vector
 /// number, then jumps to the check at `seam_entry` from the stub's start at `at`.
 fn interrupts_vector_stub(vector: u8, at: u32, seam_entry: u32) -> Array[u8, 12]
@@ -836,6 +839,25 @@ fn Lowering.interrupted_location(mut self, mut fx: Fx) -> clif::Value {
     return located[0]
 } Lowering.interrupted_location
 
+/// Resumes at the `RdmsrSafe` stub's fixup a general-protection exception its `rdmsr` raised.
+fn Lowering.resume_msr_probe(mut self, mut fx: Fx, vector: clif::Value, saved: clif::Value) {
+    let general = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: GENERAL_PROTECTION)
+    mut fx.if_true(general, then: fn[mut self](mut fx1: Fx) {
+        let stub = mut self.stub(Stub.RdmsrSafe)
+        let reference = mut self.func_ref(mut fx1, id: stub)
+        let start = mut fx1.b.func_addr(PTR, func_ref: reference)
+        let ip = mut fx1.load(PTR, addr: saved, offset: FRAME_RIP)
+        let faulting = mut fx1.b.iadd_imm_s(start, y: RDMSR_FAULT)
+        let probing = mut fx1.b.icmp(clif::IntCC.Equal, x: ip, y: faulting)
+        mut fx1.if_true(probing, then: fn(mut fx2: Fx) {
+            let fixup = mut fx2.b.iadd_imm_s(start, y: RDMSR_FIXUP)
+            mut fx2.store(fixup, addr: saved, offset: FRAME_RIP)
+            let resume = mut fx2.ptr(0)
+            mut fx2.b.ret(Array[clif::Value, 1].filled(resume).view())
+        })
+    })
+} Lowering.resume_msr_probe
+
 /// Dispatches a fired vector with its saved frame: calls the interrupt fn the final build binds to
 /// the vector, an interrupt vector's with a new `hw::IrqContext` and an exception vector's with
 /// the `hw::TrapFrame` of the interrupted code, or the one an `hw::IrqShared` binds, or the
@@ -848,7 +870,8 @@ fn Lowering.interrupted_location(mut self, mut fx: Fx) -> clif::Value {
 /// gives `hw::IrqExit.Abandon`, trap a kernel task that ran with maskable interrupts enabled on
 /// its own stack; an exception fn's `Abandon` elsewhere halts the kernel. An unbound timer
 /// interrupt only ends; after an interrupt fn for an abort vector returns, and on any other
-/// unbound vector, the kernel halts at the interrupted instruction.
+/// unbound vector, the kernel halts at the interrupted instruction. On x86_64 a general-protection
+/// exception of the `RdmsrSafe` stub's `rdmsr` is resumed at its fixup before anything else.
 fn Lowering.dispatch_vector(mut self, bound: Slice[Bound], take signature: clif::Signature) -> object::FuncId
     waive length "one dispatcher testing each kind of vector in turn, as the Rust does"
 {
@@ -861,6 +884,9 @@ fn Lowering.dispatch_vector(mut self, bound: Slice[Bound], take signature: clif:
         expect param_values.len() > 1
         let vector = param_values[0]
         let saved = param_values[1]
+        if lo1.machine_arch() == workspace::Arch.Amd64 {
+            mut lo1.resume_msr_probe(mut fx1, vector, saved)
+        }
         match known.stop {
             Some(stop) => {
                 let stopping = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: vector, y: stop)

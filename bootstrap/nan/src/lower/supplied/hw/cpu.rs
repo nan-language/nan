@@ -189,11 +189,12 @@ fn replaced_root(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, replaced: Valu
     supply.ret(lo, fx, some);
 }
 
-/// Gives an `Option[u64]` from a stub that writes a value at an address and gives whether it
-/// found one.
-fn found_value(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, stub: Stub) {
+/// Gives an `Option[u64]` from a stub that takes `args` and an address, writes a value there
+/// and gives whether it found one.
+fn found_value(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, stub: Stub, args: &[Value]) {
     let value = fx.slot(8, 8);
-    let found = lo.call_stub(fx, stub, &[value])[0];
+    let args: Vec<Value> = args.iter().copied().chain([value]).collect();
+    let found = lo.call_stub(fx, stub, &args)[0];
     let option = supply.abi.result.clone();
     let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, found, 0);
     fx.when(missing, |fx| {
@@ -257,6 +258,11 @@ fn ring0_x64(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let value = lo.call_stub(fx, Stub::Rdmsr, &[msr])[0];
             supply.ret(lo, fx, Held::Scalar(value));
         }
+        "checked_read_msr" => {
+            let msr = supply.param(1).scalar();
+            let msr = fx.b.ins().uextend(PTR, msr);
+            found_value(lo, fx, supply, Stub::RdmsrSafe, &[msr]);
+        }
         "write_msr" => {
             let msr = supply.param(1).scalar();
             let msr = fx.b.ins().uextend(PTR, msr);
@@ -296,8 +302,8 @@ fn x64_features(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let written = fx.b.ins().ireduce(types::I8, written);
             supply.ret(lo, fx, Held::Scalar(written));
         }
-        "hardware_random" => found_value(lo, fx, supply, Stub::Rdrand),
-        "hardware_seed" => found_value(lo, fx, supply, Stub::Rdseed),
+        "hardware_random" => found_value(lo, fx, supply, Stub::Rdrand, &[]),
+        "hardware_seed" => found_value(lo, fx, supply, Stub::Rdseed, &[]),
         "enable_protection" => {
             let feature_ty = supply.abi.params[1].0.ty().clone();
             let slot = fx.slot(8, 8);

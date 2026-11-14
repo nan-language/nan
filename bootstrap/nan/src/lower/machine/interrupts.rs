@@ -24,7 +24,7 @@ use super::aarch64;
 use super::cpus::{MAX_CPUS, cpu};
 use super::schedule::HOOK_STACK;
 use super::signal::SIGNAL_VECTOR;
-use super::stubs::Stub;
+use super::stubs::{RDMSR_FAULT, RDMSR_FIXUP, Stub};
 use super::user;
 use crate::check::ty::Ty;
 use crate::interp::{FnVal, Val};
@@ -36,6 +36,9 @@ const ERROR_CODE_VECTORS: [u8; 10] = [8, 10, 11, 12, 13, 14, 17, 21, 29, 30];
 
 /// The bytes of one vector's entry stub.
 const VECTOR_STUB: u32 = 12;
+
+/// The general-protection exception's vector.
+const GENERAL_PROTECTION: i64 = 13;
 
 /// The bytes of one vector's entry stub, which normalises the error code and pushes the vector
 /// number, then jumps to the check at `entry` from the stub's start at `at`.
@@ -818,7 +821,8 @@ impl Lowering<'_, '_> {
     /// that ran with maskable interrupts enabled on its own stack; an exception fn's `Abandon`
     /// elsewhere halts the kernel. An unbound timer interrupt only ends; after an interrupt fn
     /// for an abort vector returns, and on any other unbound vector, the kernel halts at the
-    /// interrupted instruction.
+    /// interrupted instruction. On x86_64 a general-protection exception of the `RdmsrSafe` stub's
+    /// `rdmsr` is resumed at its fixup before anything else.
     fn dispatch_vector(&mut self, bound: &[Bound], signature: Signature) -> FuncId {
         let id = self
             .module
@@ -829,6 +833,9 @@ impl Lowering<'_, '_> {
         self.define(id, signature, super::super::lines::HIDDEN, |lo, fx| {
             let params = fx.entry();
             let (vector, saved) = (params[0], params[1]);
+            if lo.machine_arch() == Arch::Amd64 {
+                lo.resume_msr_probe(fx, vector, saved);
+            }
             if let Some(stop) = vectors.stop {
                 let stopping = fx.b.ins().icmp_imm_s(IntCC::Equal, vector, stop);
                 fx.when(stopping, |fx| lo.stop_if_halting(fx));
@@ -932,6 +939,27 @@ impl Lowering<'_, '_> {
             report::halt(lo, fx, "unbound-vector", location, Some(("vector", vector)));
         });
         id
+    }
+
+    /// Resumes at the `RdmsrSafe` stub's fixup a general-protection exception its `rdmsr` raised.
+    fn resume_msr_probe(&mut self, fx: &mut Fx, vector: Value, saved: Value) {
+        let general =
+            fx.b.ins()
+                .icmp_imm_s(IntCC::Equal, vector, GENERAL_PROTECTION);
+        fx.when(general, |fx| {
+            let stub = self.stub(Stub::RdmsrSafe);
+            let reference = self.func_ref(fx, stub);
+            let start = fx.b.ins().func_addr(PTR, reference);
+            let ip = fx.load(PTR, saved, X64_FRAME.ip);
+            let faulting = fx.b.ins().iadd_imm_s(start, RDMSR_FAULT);
+            let probing = fx.b.ins().icmp(IntCC::Equal, ip, faulting);
+            fx.when(probing, |fx| {
+                let fixup = fx.b.ins().iadd_imm_s(start, RDMSR_FIXUP);
+                fx.store(fixup, saved, X64_FRAME.ip);
+                let resume = fx.ptr(0);
+                fx.b.ins().return_(&[resume]);
+            });
+        });
     }
 
     /// Serves the CPU signal when `vector` is its: a shootdown first on x86_64, then, unless a

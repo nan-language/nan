@@ -2,11 +2,15 @@
 //! once for the operations Cranelift cannot express, in the bytes of its architecture.
 
 use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value};
-use cranelift_module::{Linkage, Module};
+use cranelift_module::{FuncId, Linkage, Module};
 
 use super::super::Lowering;
 use super::super::fx::{Fx, PTR};
 use crate::workspace::Arch;
+
+/// The offsets in `RdmsrSafe` of its `rdmsr` and of the code giving 0 in its place.
+pub const RDMSR_FAULT: i64 = 2;
+pub const RDMSR_FIXUP: i64 = 20;
 
 /// The compiler stubs. Each takes its integer arguments and gives its integer result in the
 /// registers its architecture's convention names, and returns, but `Halt`, which stops the
@@ -29,7 +33,9 @@ use crate::workspace::Arch;
 /// its initial state, on x86_64 by restoring the zeroed area at an address.
 ///
 /// The x86_64 stubs are `Lidt`, which loads an interrupt descriptor table; `Wrmsr` and `Rdmsr`,
-/// which write and read a model-specific register; `ReadCr2`, `ReadCr3` and `WriteCr3`, the
+/// which write and read a model-specific register; `RdmsrSafe`, which reads one at an address
+/// and gives 1, or gives 0 when its `rdmsr` faults, which the dispatcher resumes at
+/// `RDMSR_FIXUP`; `ReadCr2`, `ReadCr3` and `WriteCr3`, the
 /// control registers; `Invlpg`; `LoadTables`, which loads a CPU's descriptor tables through
 /// their pseudo-descriptor; `EnableAvx`, which enables XSAVE and the x87, SSE and AVX state
 /// components where the CPU has AVX; `GigabytePages`, which gives 1 when the CPU maps
@@ -123,6 +129,7 @@ pub enum Stub {
     Lidt,
     Wrmsr,
     Rdmsr,
+    RdmsrSafe,
     ReadCr2,
     ReadCr3,
     WriteCr3,
@@ -278,6 +285,14 @@ impl Stub {
                 1,
                 &[
                     0x89, 0xf9, 0x0f, 0x32, 0x48, 0xc1, 0xe2, 0x20, 0x48, 0x09, 0xd0, 0xc3,
+                ],
+            ),
+            Stub::RdmsrSafe => (
+                2,
+                1,
+                &[
+                    0x89, 0xf9, 0x0f, 0x32, 0x48, 0xc1, 0xe2, 0x20, 0x48, 0x09, 0xd0, 0x48, 0x89,
+                    0x06, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, 0x31, 0xc0, 0xc3,
                 ],
             ),
             Stub::ReadCr2 => (0, 1, &[0x0f, 0x20, 0xd0, 0xc3]),
@@ -1025,6 +1040,7 @@ impl Stub {
             | Stub::Lidt
             | Stub::Wrmsr
             | Stub::Rdmsr
+            | Stub::RdmsrSafe
             | Stub::ReadCr2
             | Stub::ReadCr3
             | Stub::WriteCr3
@@ -1067,10 +1083,17 @@ impl Stub {
 }
 
 impl Lowering<'_, '_> {
-    /// Calls a compiler stub, emitted once per image at its architecture's instruction alignment,
-    /// giving its results.
+    /// Calls a compiler stub, giving its results.
     pub fn call_stub(&mut self, fx: &mut Fx, stub: Stub, args: &[Value]) -> Vec<Value> {
-        let id = match self.machine_stubs.get(&stub) {
+        let id = self.stub(stub);
+        let reference = self.func_ref(fx, id);
+        let call = fx.b.ins().call(reference, args);
+        fx.b.inst_results(call).to_vec()
+    }
+
+    /// A compiler stub, emitted once per image at its architecture's instruction alignment.
+    pub fn stub(&mut self, stub: Stub) -> FuncId {
+        match self.machine_stubs.get(&stub) {
             Some(id) => *id,
             None => {
                 let arch = self.ck.db.target.arch().unwrap_or(Arch::Amd64);
@@ -1096,10 +1119,7 @@ impl Lowering<'_, '_> {
                 self.machine_stubs.insert(stub, id);
                 id
             }
-        };
-        let reference = self.func_ref(fx, id);
-        let call = fx.b.ins().call(reference, args);
-        fx.b.inst_results(call).to_vec()
+        }
     }
 
     /// Reads a port through the compiler stub of a width, zero-extended.

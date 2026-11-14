@@ -121,7 +121,7 @@ pub fn first_byte(source: Slice[u8]) -> u8
 
 ### Trusted primitives
 
-A **trusted primitive** is a std function callable only inside trusted code. The trusted primitives are exactly `hw::Ptr.read`, `write`, `offset`, `cast`, `copy` and the `atomic_` methods of `hw::Ptr` ([pointers](#pointers)), `hw::fence` ([trusted atomics](#trusted-atomics)), `hw::Mmio.map` and `hw::Ports.map` ([register windows](#register-windows)), `hw::Ring0.write_cr3`, `write_cr3_tagged`, `read_msr`, `write_msr`, `write_ttbr0`, `write_ttbr0_tagged`, `write_sysreg`, `invalidate_data_cache` and `firmware_call` ([privileged intrinsics](#privileged-intrinsics)), `hw::TrapFrame.set_ip` ([interrupt functions](24-kernel.md#interrupt-functions)), `boot::Machine.enter` ([hand-off](24-kernel.md#hand-off)), `sys::load::Loader.prepare_unverified` ([loading](24-kernel.md#loading)) and `sys::load::Loader.isolate_unverified` ([isolated spaces](24-kernel.md#isolated-spaces)).
+A **trusted primitive** is a std function callable only inside trusted code. The trusted primitives are exactly `hw::Ptr.read`, `write`, `offset`, `cast`, `copy` and the `atomic_` methods of `hw::Ptr` ([pointers](#pointers)), `hw::fence` ([trusted atomics](#trusted-atomics)), `hw::Mmio.map` and `hw::Ports.map` ([register windows](#register-windows)), `hw::Ring0.write_cr3`, `write_cr3_tagged`, `read_msr`, `checked_read_msr`, `write_msr`, `write_ttbr0`, `write_ttbr0_tagged`, `write_sysreg`, `invalidate_data_cache` and `firmware_call` ([privileged intrinsics](#privileged-intrinsics)), `hw::TrapFrame.set_ip` ([interrupt functions](24-kernel.md#interrupt-functions)), `boot::Machine.enter` ([hand-off](24-kernel.md#hand-off)), `sys::load::Loader.prepare_unverified` ([loading](24-kernel.md#loading)) and `sys::load::Loader.isolate_unverified` ([isolated spaces](24-kernel.md#isolated-spaces)).
 
 - A call of a trusted primitive outside trusted code, or its use as a function value, is an error (`trusted.primitive-outside`).
 - Each primitive has a **soundness condition**, stated with its rules. Its **structured requires** are its `requires` clauses: the part of the condition that [contract terms](18-contracts.md#contract-terms) express. Each is a trusted requirement [obligation](18-contracts.md#obligations) at every call, which the prover proves, a run-time check enforces (`trap.requires`), or an `assume` in the enclosing trusted code makes assumed.
@@ -1097,6 +1097,8 @@ pub fn Ring0.invalidate_pcid_page(self, pcid: u16, page: VirtAddr)
 
 pub fn Ring0.read_msr(self, msr: u32) -> u64
 
+pub fn Ring0.checked_read_msr(self, msr: u32) -> Option[u64]
+
 pub fn Ring0.write_msr(self, msr: u32, value: u64)
 
 pub fn Ring0.cpuid(self, leaf: u32, subleaf: u32) -> CpuidRegs
@@ -1151,6 +1153,7 @@ pub fn Idt.of_vectors() -> Idt limits pure, notrap, terminates
 - `write_cr3_tagged` installs `root` as `write_cr3` does, as a later `write_cr3` or `write_cr3_tagged` returns it, but tags the translations the CPU caches from it with PCID `pcid`. It keeps the translations cached under other PCIDs, and those under `pcid` too when `keep` is true. While the CPU has PCIDs disabled it ignores `pcid` and `keep`. It is a trusted primitive whose soundness condition is that of `write_cr3`, and that each translation cached under `pcid` that it keeps maps as `root` does.
 - `invalidate_pcid_page` removes the running CPU's cached translations of the page holding `page` under `pcid`, and `invalidate_pcid` every one under `pcid`; while the CPU has PCIDs disabled, PCID 0 tags every translation.
 - `read_msr` and `write_msr` read and write the model-specific register `msr`. Both are trusted primitives, with the soundness condition that `msr` exists and that a write leaves every translation, stack and support routine state that code relies on intact. The indirect branch prediction barrier is `write_msr(0x49, value: 1)`.
+- `checked_read_msr` gives `Some` of what `read_msr` reads, or `None` when the CPU raises a general-protection exception on reading `msr`, which the vector seam resumes at the read, before any interrupt fn bound to its vector. It is a trusted primitive, with the soundness condition that reading `msr`, where it exists, changes nothing code relies on, and, where it does not, that the [anchor](24-kernel.md#anchor) is installed.
 - `cpuid` gives the four registers the `cpuid` instruction leaves for `leaf` in `eax` and `subleaf` in `ecx`.
 - `read_tsc` reads the time-stamp counter once every earlier instruction has completed. `read_tscp` reads it as `count` together with `cpu`, the number of the CPU that read it, which the runtime keeps in each CPU's `TSC_AUX` for `rdtscp`; on a CPU without `rdtscp` it reads both with maskable interrupts disabled.
 - `monitor_wait` arms `monitor` on `word` and, when `word` still holds `seen`, waits in `mwait` with `hint` as its C-state hint until `word` may have changed, an interrupt arrives, or for no reason; maskable interrupts stay disabled and an arriving one ends the wait. It returns at once on a CPU whose `mwait` cannot end on an interrupt while they are disabled.

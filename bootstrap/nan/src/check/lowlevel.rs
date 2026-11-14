@@ -28,9 +28,10 @@ const PRIMITIVES: [&str; 13] = [
 ];
 
 /// The privileged intrinsics that are trusted primitives too.
-const PRIVILEGED_PRIMITIVES: [&str; 10] = [
+const PRIVILEGED_PRIMITIVES: [&str; 11] = [
     "write_cr3",
     "read_msr",
+    "checked_read_msr",
     "write_msr",
     "write_cr3_tagged",
     "write_ttbr0",

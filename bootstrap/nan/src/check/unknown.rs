@@ -113,6 +113,45 @@ impl Checker<'_> {
         );
     }
 
+    /// Whether the path written over the tokens `(first, last)` of an item, naming nothing, is
+    /// looked up in a module holding an item the parse abandoned: the module its segments before
+    /// the last name, or the item's module for a path of one segment or whose first segment names
+    /// no module.
+    pub fn path_abandoned(&self, item: ItemId, (first, last): (Tok, Tok)) -> bool {
+        let data = self.db.item(item);
+        let segments: Vec<&str> = (first..=last)
+            .step_by(2)
+            .map(|token| data.text(token))
+            .collect();
+        let package = self.db.module(data.module).package;
+        let mut module = data.module;
+        let mut aliased = None;
+        for (index, segment) in segments[..segments.len() - 1].iter().enumerate() {
+            let named = match (index, aliased) {
+                (0, _) => self.db.module_named(package, segment).or_else(|| {
+                    aliased = self.db.alias(package, segment);
+                    aliased.and_then(|aliased| self.db.package(aliased).root)
+                }),
+                (1, Some(aliased)) => self.db.module_named(aliased, segment),
+                _ => None,
+            };
+            match named {
+                Some(named) => module = named,
+                None if index == 0 => break,
+                None => return false,
+            }
+        }
+        self.db.module(module).abandoned
+    }
+
+    /// Whether a member of a type, naming nothing, is looked up in a module holding an item the
+    /// parse abandoned: the module declaring the type or one holding an impl line targeting it.
+    pub fn member_abandoned(&self, key: TypeKey) -> bool {
+        let abandoned = |item: ItemId| self.db.module(self.db.module_of(item)).abandoned;
+        matches!(key, TypeKey::Item(item) if abandoned(item))
+            || self.impl_lines(key).into_iter().any(abandoned)
+    }
+
     /// The tokens of the path holding `token`: its run of identifiers joined by `::`.
     pub fn path_span(&self, item: ItemId, token: Tok) -> (Tok, Tok) {
         let syntax = self.db.item(item).syntax();

@@ -78,7 +78,9 @@ impl Checker<'_> {
             match error.code {
                 Some(Code::NameUnknown) => {
                     let span = self.path_span(item, error.token);
-                    self.report_unknown(item, span, self.item_candidates(module), None);
+                    if !self.path_abandoned(item, span) {
+                        self.report_unknown(item, span, self.item_candidates(module), None);
+                    }
                 }
                 Some(code) => self.report_problem(item, error.token, code),
                 None => {}
@@ -88,8 +90,10 @@ impl Checker<'_> {
         if let (Some(member), Some(key)) = (&test.member, self.db.owner_key(module, &test.target)) {
             let candidates = self.member_candidates(module, &self.key_ty(key));
             if !candidates.contains(&member.text) {
-                let span = (member.token, member.token);
-                self.report_unknown(item, span, candidates, None);
+                if !self.member_abandoned(key) {
+                    let span = (member.token, member.token);
+                    self.report_unknown(item, span, candidates, None);
+                }
                 return;
             }
         }

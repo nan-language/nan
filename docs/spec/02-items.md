@@ -156,6 +156,24 @@ pub fn triple(level: u32) -> u32 {
 } triple
 ```
 
+```nan
+pub closed struct Counter {
+    pub count: u32
+} Counter
+
+pub fn Counter.tripled(self) -> u32 {
+    return self.count * * 3 // error: syntax.foreign
+} Counter.tripled
+
+pub fn Counter.next(self) -> u32 {
+    return self.tripled() + 1
+} Counter.next
+
+pub fn next(count: u32) -> u32 {
+    return tripled(count) + 1
+} next
+```
+
 ## Order and names
 
 Item order carries no meaning. An item may name any item of its module and any item of another module visible to it, wherever that item is written. Moving an item within its file or to another source file of the same module changes the meaning and acceptance of no item.

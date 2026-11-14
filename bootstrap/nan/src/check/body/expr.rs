@@ -1014,7 +1014,9 @@ impl Body<'_, '_> {
                         },
                     };
                 }
-                self.report(name.token, Code::NameUnknown);
+                if !self.ck.member_abandoned(TypeKey::Item(*item)) {
+                    self.report(name.token, Code::NameUnknown);
+                }
                 return TExpr::failed(token);
             }
             _ => {}
@@ -1125,9 +1127,10 @@ impl Body<'_, '_> {
                     };
                 }
                 let written = self.ck.written(self.item, token, name.token);
-                if !self
-                    .ck
-                    .report_newer_release(self.item, (token, name.token), &written)
+                if !type_key(ty).is_some_and(|key| self.ck.member_abandoned(key))
+                    && !self
+                        .ck
+                        .report_newer_release(self.item, (token, name.token), &written)
                 {
                     self.report(name.token, Code::NameUnknown);
                 }

@@ -73,7 +73,9 @@ impl Checker<'_> {
     pub fn report_problem(&self, item: ItemId, token: Tok, code: Code) {
         if code == Code::NameUnknown {
             let span = self.path_span(item, token);
-            self.report_unknown(item, span, self.type_candidates(item), None);
+            if !self.path_abandoned(item, span) {
+                self.report_unknown(item, span, self.type_candidates(item), None);
+            }
             return;
         }
         let syntax = &self.db.item(item).file.syntax;

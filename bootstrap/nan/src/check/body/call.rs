@@ -9,7 +9,7 @@ use super::retired::Use;
 use super::{Body, Written};
 use crate::check::Member;
 use crate::check::conform::{Candidate, type_key};
-use crate::check::db::ItemId;
+use crate::check::db::{ItemId, TypeKey};
 use crate::check::props::Property;
 use crate::check::resolve::Named;
 use crate::check::sig::{FieldSig, FnSig, ParamSig, Payload, SigKind};
@@ -1476,7 +1476,9 @@ impl Body<'_, '_> {
     ) -> TExpr {
         let _ = base;
         let Some(method) = self.ck.interface_method(interface, &name.text) else {
-            self.report(name.token, Code::NameUnknown);
+            if !self.ck.member_abandoned(TypeKey::Item(interface)) {
+                self.report(name.token, Code::NameUnknown);
+            }
             self.skim_args(args);
             return TExpr::failed(token);
         };

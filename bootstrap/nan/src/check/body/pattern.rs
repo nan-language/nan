@@ -384,7 +384,9 @@ impl Body<'_, '_> {
                             None => member.clone(),
                         };
                         let Some(variant) = position(&member.text) else {
-                            self.report(member.token, Code::NameUnknown);
+                            if !self.ck.member_abandoned(TypeKey::Item(item)) {
+                                self.report(member.token, Code::NameUnknown);
+                            }
                             return failed(self, fields);
                         };
                         self.name_member(member.token, Member::Variant(item, member.text.clone()));

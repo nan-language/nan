@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use super::Checker;
+use super::conform::type_key;
 use super::db::{ItemId, ModuleId};
 use super::decl::{declared_name, fold};
 use super::resolve::PathError;
@@ -361,12 +362,17 @@ impl<'c, 'a> Body<'c, 'a> {
         candidates.extend(self.ck.item_candidates(self.module));
         candidates.extend(super::resolve::core_vocabulary().map(str::to_owned));
         let span = self.ck.path_span(self.item, token);
-        self.ck.report_unknown(self.item, span, candidates, stub);
+        if !self.ck.path_abandoned(self.item, span) {
+            self.ck.report_unknown(self.item, span, candidates, stub);
+        }
     }
 
     /// Reports an unknown member of a type, its candidates the type's members the body's module
     /// may name, or `stub` when none is near.
     pub fn unknown_member(&self, name: &ast::Name, ty: &Ty, stub: Option<String>) {
+        if type_key(ty).is_some_and(|key| self.ck.member_abandoned(key)) {
+            return;
+        }
         let candidates = self.ck.member_candidates(self.module, ty);
         self.ck
             .report_unknown(self.item, (name.token, name.token), candidates, stub);

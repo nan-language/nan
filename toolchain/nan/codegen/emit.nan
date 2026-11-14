@@ -1,7 +1,8 @@
 //! Emission of x86-64 code: the frame and its prologue and epilogue, a block ending in a trap reserving the stack slots when only such blocks reach them, each instruction with its allocated registers and its spilled operands reloaded and stored through scratch registers, a reload left out when its scratch register already holds the slot within the block, the parallel moves of block arguments, a jump to a small block replaced by a copy of it, and the runs of source locations.
 
 /// The frame below the saved frame pointer, from the stack pointer up: the outgoing argument
-/// area, the stack slots, the spill slots, padding, then the pushed callee-saved registers.
+/// area, the stack slots, the spill slots, padding, the saved SSE registers, then the pushed
+/// general-purpose ones.
 struct Frame {
     /// The offset of the spill slots from the stack pointer.
     spills: u32
@@ -23,23 +24,27 @@ struct Frame {
 /// the fewest lines it can.
 const FUNCTION_ALIGN: u32 = 64
 
-/// The callee-saved registers in the order the prologue pushes them.
+/// The general-purpose callee-saved registers in the order the prologue pushes them.
 fn saved_reg(index: u32) -> machinst::Reg {
     return match index {
         0 => x64::RBX
-        1 => x64::R12
-        2 => x64::R13
-        3 => x64::R14
+        1 => x64::RSI
+        2 => x64::RDI
+        3 => x64::R12
+        4 => x64::R13
+        5 => x64::R14
         else => x64::R15
     }
 } saved_reg
 
+const SAVED_REG_COUNT: u32 = 7
+
 /// The bytes the prologue's pushes of callee-saved registers take.
 fn pushed_bytes(saved: machinst::RegSet) -> u32
-    ensures result <= 40
+    ensures result <= 56
 {
     var pushed: u32 = 0
-    for index in 0u32..<5 {
+    for index in 0u32..<SAVED_REG_COUNT {
         invariant pushed <= 8 * index
         if saved.contains(saved_reg(index)) {
             pushed += 8
@@ -48,20 +53,46 @@ fn pushed_bytes(saved: machinst::RegSet) -> u32
     return pushed
 } pushed_bytes
 
+/// The bytes the saved SSE registers take, 16 for each.
+fn vector_bytes(saved: machinst::RegSet) -> u32
+    ensures result <= 256
+{
+    var bytes: u32 = 0
+    for number in 0u32..<16 {
+        invariant bytes <= 16 * number
+        if saved.contains(x64::xmm(number)) {
+            bytes += 16
+        }
+    }
+    return bytes
+} vector_bytes
+
+/// The callee-saved registers the frame saves: those allocation finds the code changes, and the
+/// scratch registers of floats when the code holds a float and its calling convention keeps them.
+fn frame_saved(code: VCode[x64::Inst], allocation: Allocation) -> machinst::RegSet {
+    if code.floats.position(fn(float: bool) => float).is_none() {
+        return allocation.saved
+    }
+    let scratches = machinst::RegSet.of(scratch(true, index: 0)).plus(scratch(true, index: 1))
+    return allocation.saved.union(scratches.intersect(x64::Inst.callee_saved(code.call_conv)))
+} frame_saved
+
 fn Frame.of(code: VCode[x64::Inst], allocation: Allocation) -> Frame {
+    let saved = frame_saved(code, allocation)
     let spills = round_up(code.slots_end, to: 8)
-    let pushed = pushed_bytes(allocation.saved)
+    let pushed = pushed_bytes(saved)
+    let kept = pushed + vector_bytes(saved)
     let used = spills + (8 * allocation.slot_count)
-    let body = round_up(used + pushed, to: 16) - pushed
+    let body = round_up(used + kept, to: 16) - pushed
     var size = u64.widen(16 + pushed + body)
     if code.align > 16 {
         size += u64.widen(code.align - 16)
     }
     if allocation.slot_count > 0 or code.align > 16 or code.slots_end == 0 or not only_traps_address_stack(code) {
-        return Frame(spills: spills, body: body, cold: 0, align: code.align, saved: allocation.saved, size: size)
+        return Frame(spills: spills, body: body, cold: 0, align: code.align, saved: saved, size: size)
     }
-    let hot = round_up(pushed, to: 16) - pushed
-    return Frame(spills: spills, body: hot, cold: body - hot, align: code.align, saved: allocation.saved, size: size)
+    let hot = round_up(kept, to: 16) - pushed
+    return Frame(spills: spills, body: hot, cold: body - hot, align: code.align, saved: saved, size: size)
 } Frame.of
 
 /// Whether only blocks ending in a trap address the stack.
@@ -235,7 +266,7 @@ fn Emitter.prologue(mut self) {
     if self.isa.probes {
         mut self.probe()
     }
-    for index in 0u32..<5 {
+    for index in 0u32..<SAVED_REG_COUNT {
         if self.frame.saved.contains(saved_reg(index)) {
             mut self.put(x64::Inst.Push(reg: saved_reg(index)))
         }
@@ -244,6 +275,7 @@ fn Emitter.prologue(mut self) {
     if body > 0 {
         mut self.put(x64::Inst.AluImm(op: x64::AluOp.Sub, size: x64::Size.Qword, dst: x64::RSP, imm: body))
     }
+    mut self.vector_saves(restore: false)
     let align = i32.fit(self.frame.align)
     if align > 16 {
         mut self.put(x64::Inst.AluImm(op: x64::AluOp.And, size: x64::Size.Qword, dst: x64::RSP, imm: -align))
@@ -280,8 +312,28 @@ fn Emitter.probe(mut self) {
     mut self.put(x64::Inst.AluImm(op: x64::AluOp.Add, size: x64::Size.Qword, dst: x64::RSP, imm: span))
 } Emitter.probe
 
+/// Stores each saved SSE register below the pushed general-purpose ones, or loads it back.
+fn Emitter.vector_saves(mut self, restore: bool) {
+    var below = pushed_bytes(self.frame.saved)
+    for number in 0u32..<16 {
+        invariant below <= 56 + (16 * number)
+        let reg = x64::xmm(number)
+        if not self.frame.saved.contains(reg) {
+            continue
+        }
+        below += 16
+        let place = x64::Amode.at(x64::RBP, disp: -i32.fit(below))
+        if restore {
+            mut self.put(x64::Inst.VectorLoad(dst: reg, src: place))
+        } else {
+            mut self.put(x64::Inst.VectorStore(src: reg, dst: place))
+        }
+    }
+} Emitter.vector_saves
+
 /// Restores the callee-saved registers and the caller's frame, and returns.
 fn Emitter.epilogue(mut self) {
+    mut self.vector_saves(restore: true)
     let pushed = i32.fit(pushed_bytes(self.frame.saved))
     let body = i32.fit(self.frame.body)
     if self.frame.align > 16 {
@@ -289,8 +341,8 @@ fn Emitter.epilogue(mut self) {
     } else if body > 0 {
         mut self.put(x64::Inst.AluImm(op: x64::AluOp.Add, size: x64::Size.Qword, dst: x64::RSP, imm: body))
     }
-    for back in 0u32..<5 {
-        let reg = saved_reg(4 - back)
+    for back in 0u32..<SAVED_REG_COUNT {
+        let reg = saved_reg(SAVED_REG_COUNT - 1 - back)
         if self.frame.saved.contains(reg) {
             mut self.put(x64::Inst.Pop(reg: reg))
         }

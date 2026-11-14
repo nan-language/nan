@@ -302,7 +302,7 @@ fn ArmSelector.call_indirect(mut self, func: clif::Function, inst: clif::Inst, s
 /// where it returns them.
 fn ArmSelector.call_with(mut self, func: clif::Function, inst: clif::Inst, sig: clif::Signature, target: aarch64::CallTarget, args: Slice[clif::Value]) {
     let placed = aarch64::places(sig, alloc: self.alloc)
-    let passed = mut self.pass_all(func, values: args, placed: placed.params.view())
+    let passed = mut self.pass_all(func, values: args, params: sig.params.view(), placed: placed.params.view(), apple: sig.call_conv == clif::CallConv.AppleAarch64)
     var returned = machinst::RegSet.empty()
     for place in placed.returns {
         match place {
@@ -331,17 +331,23 @@ fn ArmSelector.call_with(mut self, func: clif::Function, inst: clif::Inst, sig: 
 } ArmSelector.call_with
 
 /// Moves values where places pass them, two places for a 128-bit one, giving the registers they
-/// pass in.
-fn ArmSelector.pass_all(mut self, func: clif::Function, values: Slice[clif::Value], placed: Slice[aarch64::Place]) -> machinst::RegSet {
+/// pass in. Under Apple's convention, `apple`, each is extended as its parameter says and a
+/// stacked one takes its own size.
+fn ArmSelector.pass_all(mut self, func: clif::Function, values: Slice[clif::Value], params: Slice[clif::AbiParam], placed: Slice[aarch64::Place], apple: bool) -> machinst::RegSet {
     var passed = machinst::RegSet.empty()
     var at: usize = 0
-    for value in values {
+    for index in 0..<values.len() {
+        let value = values[index]
+        var extension = clif::ArgumentExtension.None
+        if apple and index < params.len() {
+            extension = params[index].extension
+        }
         expect at < placed.len()
-        passed = passed.union(mut self.pass(value, func, high: false, place: placed[at]))
+        passed = passed.union(mut self.pass(value, func, high: false, place: placed[at], extension, packed: apple))
         at += 1
         if func.value_type(value) == clif::Type.Int128 {
             expect at < placed.len()
-            passed = passed.union(mut self.pass(value, func, high: true, place: placed[at]))
+            passed = passed.union(mut self.pass(value, func, high: true, place: placed[at], extension, packed: apple))
             at += 1
         }
     }
@@ -349,11 +355,17 @@ fn ArmSelector.pass_all(mut self, func: clif::Function, values: Slice[clif::Valu
 } ArmSelector.pass_all
 
 /// Moves an argument, or a 128-bit one's high half, where a call takes it, giving the register
-/// it passes in.
-fn ArmSelector.pass(mut self, arg: clif::Value, func: clif::Function, high: bool, place: aarch64::Place) -> machinst::RegSet {
+/// it passes in: a narrow integer extended to 64 bits as `extension` says, and stored on the
+/// stack in its own size when `packed`.
+fn ArmSelector.pass(mut self, arg: clif::Value, func: clif::Function, high: bool, place: aarch64::Place, extension: clif::ArgumentExtension, packed: bool) -> machinst::RegSet {
+    let ty = func.value_type(arg)
+    let extended = extension != clif::ArgumentExtension.None and not ty.is_float() and ty.bits() < 64
     var reg = NO_REG
     if high {
         reg = mut self.src_high(arg, func)
+    } else if extended {
+        let narrow = mut self.src(arg, func)
+        reg = mut self.extended(narrow, ty, signed: extension == clif::ArgumentExtension.Sext)
     } else {
         match self.facts.constant(arg, func) {
             Some(bits) => {
@@ -379,7 +391,13 @@ fn ArmSelector.pass(mut self, arg: clif::Value, func: clif::Function, high: bool
         aarch64::Place.Stack(offset) => {
             let dst = aarch64::Amode.at(aarch64::SP, disp: i32.fit(offset))
             if self.code.is_float(reg) {
-                mut self.emit(aarch64::Inst.StrFloat(prec: precision(func.value_type(arg)), src: reg, dst: dst))
+                mut self.emit(aarch64::Inst.StrFloat(prec: precision(ty), src: reg, dst: dst))
+            } else if packed and not extended and not high and ty.bits() < 64 {
+                match ty.bits() {
+                    8 => mut self.emit(aarch64::Inst.StrSized(kind: aarch64::StoreKind.Byte, src: reg, dst: dst))
+                    16 => mut self.emit(aarch64::Inst.StrSized(kind: aarch64::StoreKind.Half, src: reg, dst: dst))
+                    else => mut self.emit(aarch64::Inst.Str(width: aarch64::Width.Bits32, src: reg, dst: dst))
+                }
             } else {
                 mut self.emit(aarch64::Inst.Str(width: aarch64::Width.Bits64, src: reg, dst: dst))
             }
@@ -400,6 +418,6 @@ fn ArmSelector.take_result(mut self, reg: machinst::Reg, place: aarch64::Place) 
 /// A return: the results moved where the function's signature returns them.
 fn ArmSelector.ret(mut self, func: clif::Function, args: Slice[clif::Value]) {
     let placed = aarch64::places(func.signature, alloc: self.alloc)
-    let passed = mut self.pass_all(func, values: args, placed: placed.returns.view())
+    let passed = mut self.pass_all(func, values: args, params: func.signature.returns.view(), placed: placed.returns.view(), apple: false)
     mut self.emit(aarch64::Inst.Return(results: passed))
 } ArmSelector.ret

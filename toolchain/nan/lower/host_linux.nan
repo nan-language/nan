@@ -1,16 +1,9 @@
-//! The Linux targets, everything Linux-specific: the program entry seam `main`, which the C library's start-up code calls; the executor threads, one per processor of the process's affinity set, each with its io_uring; termination requests, which a thread of their own reads from a `signalfd`; the support routines' calls into the system; and linking the image with the target's linker. Only the thread whose ring holds an operation lists it, delivers its completion and submits its cancellation.
+//! The Linux targets, everything Linux-specific: the executor threads, one per processor of the process's affinity set, each with its io_uring; termination requests, which a thread of their own reads from a `signalfd`; the values and layouts of glibc; and linking the image with the target's linker. Only the thread whose ring holds an operation lists it, delivers its completion and submits its cancellation.
 
+/// The `mmap` protection and flags of an io_uring's queues.
 const MMAP_READ_WRITE: i64 = 3
 
-const MMAP_NONE: i64 = 0
-
-const MMAP_PRIVATE_ANONYMOUS: i64 = 0x22
-
-const MMAP_STACK: i64 = 0x2_4022
-
 const MMAP_SHARED_POPULATE: i64 = 0x8001
-
-const MMAP_FAILED: i64 = -1
 
 /// The io_uring system calls, their constants and the opcodes the runtime submits itself.
 const URING_SETUP: i64 = 425
@@ -52,34 +45,17 @@ const RING_CQES: u64 = 72
 
 const RING_SIZE: u64 = 80
 
-/// The signal asking a thread to stop the task it runs, the signal of a fault, and that of an
-/// exceeded processor time limit.
-const SIGURG: i32 = 23
-
+/// The signal of a fault.
 const SIGSEGV: i32 = 11
 
-const SIGXCPU: i32 = 24
+/// The values and layouts of glibc.
+const LINUX_POSIX: Posix = glibc_layouts()
 
-/// The resource limit of processor time, and the seconds a test run may use.
-const RLIMIT_CPU: i64 = 0
-
-const CPU_SECONDS: u64 = 10
-
-/// The `sigaction` flags of the runtime's handlers: given a `siginfo_t` and a context, run on
-/// the thread's signal stack, and restarting interrupted system calls.
-const SA_SIGINFO: i64 = 4
-
-const SA_ONSTACK: i64 = 0x0800_0000
-
-const SA_RESTART: i64 = 0x1000_0000
-
-/// The size of a `struct sigaction` and the offset of its flags.
-const SIGACTION: u64 = 152
-
-const SIGACTION_FLAGS: u64 = 136
-
-/// The offset of the fault address in a `siginfo_t`.
-const FAULT_ADDRESS: u64 = 16
+fn glibc_layouts() -> Posix {
+    var faults = Array[i32, 2].filled(SIGSEGV)
+    faults[1] = 0
+    return Posix(map_anonymous: 0x22, map_stack: 0x2_4022, stop: 23, faults: faults, fault_count: 1, cpu_limit: 24, sigaction: 152, sigaction_flags: 136, siginfo: 4, on_stack: 0x0800_0000, restart: 0x1000_0000, stack_size: 16, stack_flags: 8, fault_address: 16)
+} glibc_layouts
 
 /// The offsets of the registers a stop or fault handler reads and redirects in a `ucontext_t`.
 fn linux_context(target: workspace::Target) -> Context {
@@ -93,238 +69,13 @@ fn linux_context(target: workspace::Target) -> Context {
     }
 } linux_context
 
-/// The size of each thread's signal stack and of its stack for stack overflow reports.
-const LINUX_SIGNAL_STACK: u64 = 65_536
-
-/// The termination request signals and the length of a `signalfd_siginfo`.
-const SIGNALS: Array[i64, 3] = termination_signals()
-
+/// The length of a `signalfd_siginfo`.
 const SIGINFO: u64 = 128
-
-const SIGPIPE: i64 = 13
 
 /// The `getauxval` type of the hardware capabilities, and their AArch64 bit for `PSTATE.DIT`.
 const AT_HWCAP: u64 = 16
 
 const HWCAP_DIT: i64 = 1 << 24
-
-fn termination_signals() -> Array[i64, 3] {
-    var listed = Array[i64, 3].filled(1)
-    listed[1] = 2
-    listed[2] = 15
-    return listed
-} termination_signals
-
-/// The signature of the entry seam `main`: the argument count and vector, the environment, and
-/// the exit status.
-fn main_signature(alloc: mem::Alloc) -> clif::Signature {
-    var signature = clif::Signature.new(CALL_CONV, alloc)
-    mut signature.params.push(clif::AbiParam(value_type: clif::Type.Int32))
-    mut signature.params.push(clif::AbiParam(value_type: PTR))
-    mut signature.params.push(clif::AbiParam(value_type: PTR))
-    mut signature.returns.push(clif::AbiParam(value_type: clif::Type.Int32))
-    return signature
-} main_signature
-
-/// Defines the program entry seam `main` and the glue running the entry function as the first
-/// task.
-fn linux_entry_seam(mut lo: Lowering, program: Program) {
-    let entry = entry_task(mut lo, program)
-    let signature = main_signature(lo.alloc)
-    let id = mut lo.module.declare_function("main", linkage: object::Linkage.Export, signature)
-    mut lo.define(id, signature: take signature, flags: LINES_HIDDEN | LINES_CRITICAL, build: fn(mut seam_lo: Lowering, mut seam_fx: Fx) {
-        let incoming = mut seam_fx.entry()
-        mut seam_lo.check_level(fx: mut seam_fx)
-        system_start(mut seam_lo, fx: mut seam_fx)
-        run_entry(mut seam_lo, fx: mut seam_fx, program, entry, passed: incoming.view())
-    })
-} linux_entry_seam
-
-/// Defines the entry seam `main` of a test image, whose arguments after the program's name are
-/// the texts naming its run.
-fn linux_test_seam(mut lo: Lowering, entry_glue: object::FuncId) {
-    let signature = main_signature(lo.alloc)
-    let id = mut lo.module.declare_function("main", linkage: object::Linkage.Export, signature)
-    mut lo.define(id, signature: take signature, flags: LINES_HIDDEN | LINES_CRITICAL, build: fn(mut seam_lo: Lowering, mut seam_fx: Fx) {
-        let incoming = mut seam_fx.entry()
-        expect incoming.len() > 1
-        system_start(mut seam_lo, fx: mut seam_fx)
-        let widened = mut seam_fx.b.uextend(PTR, x: incoming[0])
-        let count = mut seam_fx.b.iadd_imm_s(widened, y: -1)
-        let texts = mut seam_fx.b.iadd_imm_s(incoming[1], y: 8)
-        start_run(mut seam_lo, fx: mut seam_fx, entry_glue, count, texts)
-    })
-} linux_test_seam
-
-/// Writes a byte range to a descriptor, whole unless the descriptor refuses.
-fn linux_write_all(mut lo: Lowering, mut fx: Fx, fd: i64, text: clif::Value, len: clif::Value) {
-    let fd_value = mut fx.int(clif::Type.Int32, value: fd)
-    var carried = Array[clif::Value, 2].filled(text)
-    carried[1] = len
-    discard mut fx.repeat(carried.view(), body: fn[mut lo](mut pass_fx: Fx, current: Slice[clif::Value]) -> Pass {
-        expect current.len() > 1
-        let at = current[0]
-        let left_bytes = current[1]
-        var write_args = Array[clif::Value, 3].filled(fd_value)
-        write_args[1] = at
-        write_args[2] = left_bytes
-        let written = first_result(mut lo.call_libc(mut pass_fx, name: "write", args: write_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
-        let progressed = mut pass_fx.b.icmp_imm_s(clif::IntCC.SignedGreaterThan, x: written, y: 0)
-        let next_at = mut pass_fx.b.iadd(at, y: written)
-        let remaining = mut pass_fx.b.isub(left_bytes, y: written)
-        let zero_word = mut pass_fx.ptr(0)
-        let next_left = mut pass_fx.b.select(progressed, x: remaining, y: zero_word)
-        let more = mut pass_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: next_left, y: 0)
-        var next = mem::List[clif::Value].empty(pass_fx.alloc)
-        mut next.push(next_at)
-        mut next.push(next_left)
-        return Pass(again: more, next: take next)
-    })
-} linux_write_all
-
-fn linux_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
-    let incoming = mut fx.entry()
-    let no_types = mem::List[clif::Type].empty(fx.alloc)
-    match routine {
-        Routine.RecordAlloc => {
-            let one = mut fx.ptr(1)
-            var calloc_args = Array[clif::Value, 2].filled(one)
-            expect incoming.len() > 0
-            calloc_args[1] = incoming[0]
-            let address = first_result(mut lo.call_libc(mut fx, name: "calloc", args: calloc_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
-            mut fx.b.ret(Array[clif::Value, 1].filled(address).view())
-        }
-        Routine.RecordFree => {
-            expect incoming.len() > 0
-            discard mut lo.call_libc(mut fx, name: "free", args: Array[clif::Value, 1].filled(incoming[0]).view(), returns: no_types.view())
-            mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
-        }
-        Routine.RecordResize => {
-            expect incoming.len() > 1
-            var realloc_args = Array[clif::Value, 2].filled(incoming[0])
-            realloc_args[1] = incoming[1]
-            let address = first_result(mut lo.call_libc(mut fx, name: "realloc", args: realloc_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
-            mut fx.b.ret(Array[clif::Value, 1].filled(address).view())
-        }
-        Routine.Exit => {
-            expect incoming.len() > 0
-            let status = mut fx.b.ireduce(clif::Type.Int32, x: incoming[0])
-            discard mut lo.call_libc(mut fx, name: "_exit", args: Array[clif::Value, 1].filled(status).view(), returns: no_types.view())
-            mut fx.b.trap(clif::TrapCode(user: 1))
-        }
-        Routine.Preempt => {
-            expect incoming.len() > 2
-            linux_preempt(mut lo, mut fx, context: incoming[2])
-        }
-        Routine.Overflow => {
-            expect incoming.len() > 2
-            linux_overflow(mut lo, mut fx, info: incoming[1], context: incoming[2])
-        }
-        Routine.Terminations => {
-            expect incoming.len() > 0
-            terminations(mut lo, mut fx, op: incoming[0])
-        }
-        Routine.CpuLimit => {
-            let status = mut fx.int(clif::Type.Int32, value: i64.widen(TIMED_OUT))
-            discard mut lo.call_libc(mut fx, name: "_exit", args: Array[clif::Value, 1].filled(status).view(), returns: no_types.view())
-            mut fx.b.trap(clif::TrapCode(user: 1))
-        }
-        else => {
-            expect false
-        }
-    }
-} linux_define
-
-/// Records the running thread in its record and gives it a signal stack and a stack for stack
-/// overflow reports; nonzero when the system refuses one.
-fn thread_signals(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value {
-    let no_values = mem::List[clif::Value].empty(fx.alloc)
-    let pthread = first_result(mut lo.call_libc(mut fx, name: "pthread_self", args: no_values.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
-    mut fx.store(pthread, addr: record, offset: THREAD_SYSTEM)
-    let size = mut fx.ptr(LINUX_SIGNAL_STACK)
-    let alt_stack = linux_map_stack(mut lo, mut fx, len: size, guarded: true)
-    let trap_stack = linux_map_stack(mut lo, mut fx, len: size, guarded: true)
-    let no_signal = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: alt_stack, y: 0)
-    let no_trap = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: trap_stack, y: 0)
-    let refused = mut fx.b.bor(no_signal, y: no_trap)
-    let outcome = mut fx.choose_in(mut lo, condition: refused, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
-        var refusal = mem::List[clif::Value].empty(yes_fx.alloc)
-        mut refusal.push(mut yes_fx.int(clif::Type.Int8, value: 1))
-        return refusal
-    }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
-        let top = mut no_fx.b.iadd_imm_s(trap_stack, y: i64.fit(LINUX_SIGNAL_STACK))
-        mut no_fx.store(top, addr: record, offset: THREAD_TRAP_STACK)
-        let stack_record = mut no_fx.slot(24, align: 8)
-        mut no_fx.store(alt_stack, addr: stack_record, offset: 0)
-        let zero_word = mut no_fx.ptr(0)
-        mut no_fx.store(zero_word, addr: stack_record, offset: 8)
-        mut no_fx.store(size, addr: stack_record, offset: 16)
-        var alt_args = Array[clif::Value, 2].filled(stack_record)
-        alt_args[1] = zero_word
-        discard mut cx.call_libc(mut no_fx, name: "sigaltstack", args: alt_args.view(), returns: Array[clif::Type, 1].filled(clif::Type.Int32).view())
-        var installed = mem::List[clif::Value].empty(no_fx.alloc)
-        mut installed.push(mut no_fx.int(clif::Type.Int8, value: 0))
-        return installed
-    })
-    return outcome[0]
-} thread_signals
-
-/// Installs a routine as the handler of a signal, run on the thread's signal stack.
-fn install_handler(mut lo: Lowering, mut fx: Fx, signal_number: i32, routine: Routine, restart: bool) {
-    let action = mut fx.slot(SIGACTION, align: 8)
-    let zero_word = mut fx.ptr(0)
-    let size = mut fx.ptr(SIGACTION)
-    var fill_args = Array[clif::Value, 3].filled(action)
-    fill_args[1] = zero_word
-    fill_args[2] = size
-    discard mut lo.call_routine(mut fx, routine: Routine.Fill, args: fill_args.view())
-    let handler_id = mut lo.routine(routine)
-    let handler_ref = mut lo.func_ref(mut fx, id: handler_id)
-    let handler = mut fx.b.func_addr(PTR, func_ref: handler_ref)
-    mut fx.store(handler, addr: action, offset: 0)
-    var restarting: i64 = 0
-    if restart {
-        restarting = SA_RESTART
-    }
-    let flags = mut fx.int(clif::Type.Int32, value: SA_SIGINFO | SA_ONSTACK | restarting)
-    mut fx.store(flags, addr: action, offset: SIGACTION_FLAGS)
-    let signal_value = mut fx.int(clif::Type.Int32, value: i64.widen(signal_number))
-    var action_args = Array[clif::Value, 3].filled(signal_value)
-    action_args[1] = action
-    action_args[2] = zero_word
-    discard mut lo.call_libc(mut fx, name: "sigaction", args: action_args.view(), returns: Array[clif::Type, 1].filled(clif::Type.Int32).view())
-} install_handler
-
-/// `Preempt(signal, info, context)`: the handler of the stop signal, which stops the task the
-/// thread runs when it may stop there.
-fn linux_preempt(mut lo: Lowering, mut fx: Fx, context: clif::Value) {
-    let ctx = linux_context(lo.ck.db().target)
-    let thread = mut lo.thread(mut fx)
-    let inside = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: thread, y: 0)
-    mut fx.if_true(inside, then: fn[mut lo](mut then_fx: Fx) {
-        stop_interrupted(mut lo, fx: mut then_fx, thread, context, ctx)
-    })
-    mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
-} linux_preempt
-
-/// `Overflow(signal, info, context)`: the handler of a fault. A fault in the guard region of
-/// the running task's stack resumes in `OverflowRaise` on the thread's trap stack; any other
-/// fault restores the default action and faults again.
-fn linux_overflow(mut lo: Lowering, mut fx: Fx, info: clif::Value, context: clif::Value) {
-    let fault = mut fx.load(PTR, addr: info, offset: FAULT_ADDRESS)
-    let thread = mut lo.thread(mut fx)
-    let ctx = linux_context(lo.ck.db().target)
-    let guarded = overflow_interrupted(mut lo, mut fx, thread, fault, context, ctx)
-    let other = mut fx.b.bxor_imm_s(guarded, y: 1)
-    mut fx.if_true(other, then: fn[mut lo](mut then_fx: Fx) {
-        let signal_value = mut then_fx.int(clif::Type.Int32, value: i64.widen(SIGSEGV))
-        let default_handler = mut then_fx.ptr(0)
-        var signal_args = Array[clif::Value, 2].filled(signal_value)
-        signal_args[1] = default_handler
-        discard mut lo.call_libc(mut then_fx, name: "signal", args: signal_args.view(), returns: Array[clif::Type, 1].filled(PTR).view())
-    })
-    mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
-} linux_overflow
 
 /// The executor threads of `Init`: one per processor of the affinity set with its ring, the
 /// calling thread being the first, and the reading of termination requests, after the
@@ -336,7 +87,10 @@ fn start_threads(mut lo: Lowering, mut fx: Fx) {
     linux_constant_time(mut lo, mut fx)
     let state_address = mut lo.state(mut fx)
     if lo.seeded() {
-        start_seeded(mut lo, mut fx)
+        posix_start_seeded(mut lo, mut fx, make_current: fn(mut cx: Lowering, mut current_fx: Fx, record: clif::Value) {
+            let thread_slot = mut cx.thread_slot(mut current_fx)
+            mut current_fx.store(record, addr: thread_slot, offset: 0)
+        })
         return
     }
     let count = processors(mut lo, mut fx)
@@ -371,13 +125,7 @@ fn start_threads(mut lo: Lowering, mut fx: Fx) {
         let refusal = mut then_fx.ptr(1)
         mut then_fx.b.ret(Array[clif::Value, 1].filled(refusal).view())
     })
-    install_handler(mut lo, mut fx, signal_number: SIGURG, routine: Routine.Preempt, restart: true)
-    install_handler(mut lo, mut fx, signal_number: SIGSEGV, routine: Routine.Overflow, restart: false)
-    let ignore = mut fx.ptr(1)
-    let pipe = mut fx.int(clif::Type.Int32, value: SIGPIPE)
-    var pipe_args = Array[clif::Value, 2].filled(pipe)
-    pipe_args[1] = ignore
-    discard mut lo.call_libc(mut fx, name: "signal", args: pipe_args.view(), returns: Array[clif::Type, 1].filled(PTR).view())
+    install_handlers(mut lo, mut fx)
     read_signals(mut lo, mut fx)
     let failed = start_next_thread(mut lo, mut fx, record: first_thread)
     mut fx.if_true(failed, then: fn(mut then_fx: Fx) {
@@ -456,50 +204,6 @@ fn linux_constant_time(mut lo: Lowering, mut fx: Fx) {
         discard mut lo.call_stub(mut fx1, stub: Stub.ConstantTime, args: mem::List[clif::Value].empty(fx1.alloc).view())
     })
 } linux_constant_time
-
-/// The executor of `Init` for the seeded scheduler: the calling thread is the one executor
-/// thread, without a ring; a fault reports a stack overflow, and the run ends with status
-/// `TIMED_OUT` once it has used 10 seconds of processor time.
-fn start_seeded(mut lo: Lowering, mut fx: Fx) {
-    let state_address = mut lo.state(mut fx)
-    let one = mut fx.ptr(1)
-    mut fx.store(one, addr: state_address, offset: STATE_THREAD_COUNT)
-    let eight = mut fx.ptr(8)
-    var threads_args = Array[clif::Value, 2].filled(one)
-    threads_args[1] = eight
-    let threads = first_result(mut lo.call_libc(mut fx, name: "calloc", args: threads_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
-    unavailable_unless(mut fx, address: threads)
-    mut fx.store(threads, addr: state_address, offset: STATE_THREADS)
-    let size = mut fx.ptr(THREAD_SIZE)
-    var record_args = Array[clif::Value, 2].filled(one)
-    record_args[1] = size
-    let record = first_result(mut lo.call_libc(mut fx, name: "calloc", args: record_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
-    unavailable_unless(mut fx, address: record)
-    mut fx.store(record, addr: threads, offset: 0)
-    let thread_slot = mut lo.thread_slot(mut fx)
-    mut fx.store(record, addr: thread_slot, offset: 0)
-    let refused = thread_signals(mut lo, mut fx, record)
-    mut fx.if_true(refused, then: fn(mut then_fx: Fx) {
-        let refusal = mut then_fx.ptr(1)
-        mut then_fx.b.ret(Array[clif::Value, 1].filled(refusal).view())
-    })
-    install_handler(mut lo, mut fx, signal_number: SIGSEGV, routine: Routine.Overflow, restart: false)
-    install_handler(mut lo, mut fx, signal_number: SIGXCPU, routine: Routine.CpuLimit, restart: false)
-    let limit = mut fx.slot(16, align: 8)
-    let soft = mut fx.ptr(CPU_SECONDS)
-    let hard = mut fx.ptr(CPU_SECONDS + 2)
-    mut fx.store(soft, addr: limit, offset: 0)
-    mut fx.store(hard, addr: limit, offset: 8)
-    let cpu = mut fx.int(clif::Type.Int32, value: RLIMIT_CPU)
-    var limit_args = Array[clif::Value, 2].filled(cpu)
-    limit_args[1] = limit
-    discard mut lo.call_libc(mut fx, name: "setrlimit", args: limit_args.view(), returns: Array[clif::Type, 1].filled(clif::Type.Int32).view())
-    let ignore = mut fx.ptr(1)
-    let pipe = mut fx.int(clif::Type.Int32, value: SIGPIPE)
-    var pipe_args = Array[clif::Value, 2].filled(pipe)
-    pipe_args[1] = ignore
-    discard mut lo.call_libc(mut fx, name: "signal", args: pipe_args.view(), returns: Array[clif::Type, 1].filled(PTR).view())
-} start_seeded
 
 /// The number of processors in the process's affinity set, at least 1.
 fn processors(mut lo: Lowering, mut fx: Fx) -> clif::Value {
@@ -1081,99 +785,6 @@ fn woken_next(mut lo: Lowering, mut fx: Fx, threads: clif::Value, current: clif:
     mut stepped.push(mut fx.b.bxor_imm_s(woken, y: 1))
     return stepped
 } woken_next
-
-/// Maps `count` chunks aligned to their size, zero when the system refuses.
-fn linux_map_chunks(mut lo: Lowering, mut fx: Fx, count: clif::Value) -> clif::Value {
-    let chunk = i64.fit(MEMORY_CHUNK)
-    let len = mut fx.b.imul_imm_s(count, y: chunk)
-    let padded = mut fx.b.iadd_imm_s(len, y: chunk)
-    let zero_word = mut fx.ptr(0)
-    let protection = mut fx.int(clif::Type.Int32, value: MMAP_READ_WRITE)
-    let flags = mut fx.int(clif::Type.Int32, value: MMAP_PRIVATE_ANONYMOUS)
-    let no_fd = mut fx.int(clif::Type.Int32, value: -1)
-    var map_args = Array[clif::Value, 6].filled(zero_word)
-    map_args[1] = padded
-    map_args[2] = protection
-    map_args[3] = flags
-    map_args[4] = no_fd
-    let base = first_result(mut lo.call_libc(mut fx, name: "mmap", args: map_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
-    let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: base, y: MMAP_FAILED)
-    let mapped = mut fx.choose_in(mut lo, condition: failed, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
-        var refused = mem::List[clif::Value].empty(yes_fx.alloc)
-        mut refused.push(mut yes_fx.ptr(0))
-        return refused
-    }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
-        expect chunk > 0
-        let bumped = mut no_fx.b.iadd_imm_s(base, y: chunk - 1)
-        let aligned = mut no_fx.b.band_imm_s(bumped, y: ~(chunk - 1))
-        let head = mut no_fx.b.isub(aligned, y: base)
-        let has_head = mut no_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
-        mut no_fx.if_true(has_head, then: fn[mut cx](mut head_fx: Fx) {
-            unmap(mut cx, fx: mut head_fx, address: base, len: head)
-        })
-        let end = mut no_fx.b.iadd(aligned, y: len)
-        let mapped_end = mut no_fx.b.iadd(base, y: padded)
-        let tail = mut no_fx.b.isub(mapped_end, y: end)
-        let has_tail = mut no_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: tail, y: 0)
-        mut no_fx.if_true(has_tail, then: fn[mut cx](mut tail_fx: Fx) {
-            unmap(mut cx, fx: mut tail_fx, address: end, len: tail)
-        })
-        var aligned_base = mem::List[clif::Value].empty(no_fx.alloc)
-        mut aligned_base.push(aligned)
-        return aligned_base
-    })
-    return mapped[0]
-} linux_map_chunks
-
-/// Unmaps memory.
-fn unmap(mut lo: Lowering, mut fx: Fx, address: clif::Value, len: clif::Value) {
-    var unmap_args = Array[clif::Value, 2].filled(address)
-    unmap_args[1] = len
-    discard mut lo.call_libc(mut fx, name: "munmap", args: unmap_args.view(), returns: Array[clif::Type, 1].filled(clif::Type.Int32).view())
-} unmap
-
-/// Maps a stack of `len` bytes, its lowest page an inaccessible guard when `guarded`, zero when
-/// the system refuses.
-fn linux_map_stack(mut lo: Lowering, mut fx: Fx, len: clif::Value, guarded: bool) -> clif::Value {
-    let zero_word = mut fx.ptr(0)
-    let protection = mut fx.int(clif::Type.Int32, value: MMAP_READ_WRITE)
-    let flags = mut fx.int(clif::Type.Int32, value: MMAP_STACK)
-    let no_fd = mut fx.int(clif::Type.Int32, value: -1)
-    var map_args = Array[clif::Value, 6].filled(zero_word)
-    map_args[1] = len
-    map_args[2] = protection
-    map_args[3] = flags
-    map_args[4] = no_fd
-    let base = first_result(mut lo.call_libc(mut fx, name: "mmap", args: map_args.view(), returns: Array[clif::Type, 1].filled(PTR).view()))
-    let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: base, y: MMAP_FAILED)
-    let mapped = mut fx.choose_in(mut lo, condition: failed, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
-        var refused = mem::List[clif::Value].empty(yes_fx.alloc)
-        mut refused.push(mut yes_fx.ptr(0))
-        return refused
-    }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
-        if guarded {
-            linux_protect_guard(mut cx, fx: mut no_fx, base, accessible: false)
-        }
-        var stack_base = mem::List[clif::Value].empty(no_fx.alloc)
-        mut stack_base.push(base)
-        return stack_base
-    })
-    return mapped[0]
-} linux_map_stack
-
-/// Makes the guard region at the base of a stack inaccessible, or accessible again.
-fn linux_protect_guard(mut lo: Lowering, mut fx: Fx, base: clif::Value, accessible: bool) {
-    let guard_size = mut fx.ptr(TASKS_GUARD)
-    var protection_bits = MMAP_NONE
-    if accessible {
-        protection_bits = MMAP_READ_WRITE
-    }
-    let protection = mut fx.int(clif::Type.Int32, value: protection_bits)
-    var protect_args = Array[clif::Value, 3].filled(base)
-    protect_args[1] = guard_size
-    protect_args[2] = protection
-    discard mut lo.call_libc(mut fx, name: "mprotect", args: protect_args.view(), returns: Array[clif::Type, 1].filled(clif::Type.Int32).view())
-} linux_protect_guard
 
 /// A system call through the C library's `syscall`, its arguments padded to six words.
 fn syscall(mut lo: Lowering, mut fx: Fx, call_number: clif::Value, args: Slice[clif::Value]) -> clif::Value {

@@ -263,21 +263,23 @@ const OPERATION_CANCEL: u64 = 32
 const OPERATION_KIND: u64 = 40
 
 /// Its links among its thread's operations in flight; on the seeded scheduler, on a kernel and on
-/// a Windows target, among the timers of its clock or in the queue of the sim it waits in.
+/// a Windows or macOS target, among the timers of its clock or in the queue of the sim it waits
+/// in.
 const OPERATION_NEXT: u64 = 48
 
 const OPERATION_PREVIOUS: u64 = 56
 
 /// For a deadline, the task to wake once it completes, and the next deadline its task armed;
 /// for a wait in a sim, the sim's record; for a Windows request, its handle and the thread
-/// running it, zero for one through the completion port.
+/// running it, zero for one through the completion port; for a wait on a macOS target's
+/// descriptor, its kqueue filter and the descriptor.
 const OPERATION_WAITER: u64 = 64
 
 const OPERATION_LINK: u64 = 72
 
-/// When a deadline is due, and on the seeded scheduler, on a kernel and on a Windows target when a
-/// timer is due and the order in which it was armed; for a wait in a sim, the glue withdrawing it
-/// from the sim, given the record.
+/// When a deadline is due, and on the seeded scheduler, on a kernel and on a Windows or macOS
+/// target when a timer is due and the order in which it was armed; for a wait in a sim, the glue
+/// withdrawing it from the sim, given the record.
 const OPERATION_DUE: u64 = 80
 
 const OPERATION_ORDER: u64 = 88
@@ -568,6 +570,8 @@ fn tasks_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
             var refused = params[0]
             if lo.windows() {
                 refused = windows_thread_start(mut lo, mut fx, record: params[0])
+            } else if lo.macos() {
+                refused = macos_thread_start(mut lo, mut fx, record: params[0])
             } else {
                 let slot = mut lo.thread_slot(mut fx)
                 mut fx.store(params[0], addr: slot, offset: 0)
@@ -884,7 +888,7 @@ fn task_start(mut lo: Lowering, mut fx: Fx) {
         windows_enter_task_stack(mut lo, mut fx, record)
     }
     var signature = clif::Signature.new(CALL_CONV, alloc: fx.alloc)
-    mut signature.params.push(clif::AbiParam(value_type: PTR))
+    mut signature.params.push(clif::AbiParam.new(PTR))
     let imported = mut fx.b.import_signature(take signature)
     let glue = mut fx.load(PTR, addr: record, offset: TASK_GLUE)
     let started = mut fx.b.call_indirect(imported, callee: glue, args: fx.list1(record).view())
@@ -1253,7 +1257,7 @@ fn settle_away(mut lo: Lowering, mut fx: Fx, record: clif::Value, word: clif::Va
         let has_done = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: done, y: 0)
         mut fx1.if_true(has_done, then: fn(mut fx2: Fx) {
             var signature = clif::Signature.new(CALL_CONV, alloc: fx2.alloc)
-            mut signature.params.push(clif::AbiParam(value_type: PTR))
+            mut signature.params.push(clif::AbiParam.new(PTR))
             let imported = mut fx2.b.import_signature(take signature)
             let call = mut fx2.b.call_indirect(imported, callee: done, args: fx2.list1(record).view())
             mut fx2.classify(call, kind: StackKind.Glues(StackFamily.Done))
@@ -1494,7 +1498,8 @@ fn wait_delivered(mut lo: Lowering, mut fx: Fx, op: clif::Value) {
 
 /// Arms a timer that expires `ns` nanoseconds from now: a timeout of the relative time it writes
 /// at `spec` on the running thread's ring, or a timer of the virtual clock on the seeded
-/// scheduler and of the kernel's clock on a kernel.
+/// scheduler, of the kernel's clock on a kernel and of the monotonic clock the runtime keeps on a
+/// Windows or macOS target.
 fn Lowering.arm_timer(mut self, mut fx: Fx, op: clif::Value, ns: clif::Value, spec: clif::Value) {
     if self.seeded() {
         seeded_arm(mut self, fx: mut fx, op, ns)
@@ -1504,8 +1509,8 @@ fn Lowering.arm_timer(mut self, mut fx: Fx, op: clif::Value, ns: clif::Value, sp
         mut self.kernel_arm(mut fx, op, ns)
         return
     }
-    if self.windows() {
-        windows_arm(mut self, mut fx, op, ns)
+    if self.keeps_timers() {
+        discard mut self.call_routine(mut fx, routine: Routine.TimerArm, args: fx.list2(op, b: ns).view())
         return
     }
     let billion = mut fx.ptr(1_000_000_000)
@@ -1526,14 +1531,16 @@ fn Lowering.cancel_operation(mut self, mut fx: Fx, op: clif::Value) {
         mut self.kernel_cancel(mut fx, op)
     } else if self.windows() {
         windows_cancel_operation(mut self, fx: mut fx, op)
+    } else if self.macos() {
+        macos_cancel_operation(mut self, fx: mut fx, op)
     } else {
         cancel_operation(mut self, fx: mut fx, op)
     }
 } Lowering.cancel_operation
 
-/// Delivers the completions that have arrived: those on the running thread's ring or on the
-/// completion port, those the seeded scheduler queued, or the expiries of an isolated space's
-/// timers that are due; a kernel's waits end by wakes alone.
+/// Delivers the completions that have arrived: those on the running thread's ring, on the
+/// completion port or on the kqueue, those the seeded scheduler queued, or the expiries of an
+/// isolated space's timers that are due; a kernel's waits end by wakes alone.
 fn Lowering.reap(mut self, mut fx: Fx) {
     if self.seeded() {
         seeded_reap(mut self, fx: mut fx)
@@ -1541,19 +1548,21 @@ fn Lowering.reap(mut self, mut fx: Fx) {
         space_reap(mut self, mut fx)
     } else if self.windows() {
         windows_take_packets(mut self, fx: mut fx, wait: None)
+    } else if self.macos() {
+        macos_take_events(mut self, fx: mut fx, wait: None)
     } else if not self.kernel() {
         linux_reap(mut self, fx: mut fx, wait: None)
     }
 } Lowering.reap
 
 /// The nanoseconds of the clock that delays count: the monotonic clock, the virtual clock on the
-/// seeded scheduler, or the kernel's clock; a kernel's and a Windows target's through
+/// seeded scheduler, or the kernel's clock; a kernel's and a Windows or macOS target's through
 /// `ClockNow`.
 fn Lowering.now_ns(mut self, mut fx: Fx) -> clif::Value {
     if self.seeded() {
         return seeded_now(mut self, fx: mut fx)
     }
-    if self.kernel() or self.windows() {
+    if self.kernel() or self.keeps_timers() {
         let called = mut self.call_routine(mut fx, routine: Routine.ClockNow, args: mem::List[clif::Value].empty(fx.alloc).view())
         return called[0]
     }

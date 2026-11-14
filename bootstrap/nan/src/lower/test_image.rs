@@ -139,7 +139,7 @@ pub fn lower(ck: &Checker, tests: &Tests) -> Lowered {
     match (lowering.machine(), lowering.windows()) {
         (true, _) => machine_seam(&mut lowering, entry),
         (false, true) => super::host::windows::test_seam(&mut lowering, entry),
-        (false, false) => super::host::linux::test_seam(&mut lowering, entry),
+        (false, false) => super::host::posix::test_seam(&mut lowering, entry),
     }
     lowering.drain();
     lowering.finish(None)

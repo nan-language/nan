@@ -28,7 +28,7 @@ fn machine_object(alloc: mem::Alloc) -> mem::Bytes {
 test link_patches_relative_and_absolute_addresses_and_counts_zeroed_bytes_in_memory_only for link {
     let alloc = testing::world().alloc
     let base: u64 = 0x0010_0000
-    let linked = link(machine_object(alloc).view(), base, imports: Imports.None, alloc)
+    let linked = link(machine_object(alloc).view(), base, align: PAGE, imports: Imports.None, alloc)
     expect linked.segments.len() == 2
     let text = linked.segments[0]
     expect text.address == base and text.access == Access.Execute
@@ -67,7 +67,7 @@ test link_lists_a_relocated_images_absolute_addresses_after_its_segments for lin
     mut module.define_data(table_id, description: take table)
     let base = elf_base(workspace::Arch.Aarch64)
     let object = take module.finish(None, alloc)
-    let linked = link(object.view(), base, imports: Imports.None, alloc)
+    let linked = link(object.view(), base, align: PAGE, imports: Imports.None, alloc)
     expect linked.segments.len() == 4
     let rodata = linked.segments[1]
     let data = linked.segments[2]
@@ -107,3 +107,149 @@ test base_relocations_group_addresses_by_page_and_pad_odd_blocks for base_reloca
     let written = base_relocations(rvas.view(), alloc)
     expect written.view() == expected.view()
 } base_relocations_group_addresses_by_page_and_pad_odd_blocks
+
+/// An object as lowering writes it for a macOS target: `entry`, whose `instructions` load the
+/// address of the imported function `write` through the relocations `relocated` gives, `table`
+/// holding the address of `entry`, and the closure's host sections.
+fn macos_object(target: workspace::Target, instructions: Slice[u8], relocated: fn(callee: object::FuncId) -> mem::List[object::ModuleReloc], alloc: mem::Alloc) -> mem::Bytes {
+    var module = object::Module.new(target, level: None, alloc)
+    let nullary = clif::Signature.new(clif::CallConv.SystemV, alloc)
+    let entry = mut module.declare_function("entry", linkage: object::Linkage.Local, signature: nullary)
+    let imported = mut module.declare_function("write", linkage: object::Linkage.Import, signature: nullary)
+    let relocs = relocated(callee: imported)
+    mut module.define_function_bytes(entry, align: 16, bytes: instructions, relocs: relocs.view())
+    var table = object::DataDescription.new(alloc)
+    mut table.define(mem::Bytes.zeroed(8, alloc))
+    let address = mut table.import_function(entry)
+    mut table.write_function_addr(0, function: address)
+    let table_id = mut module.declare_data("table", linkage: object::Linkage.Local, writable: true, tls: false)
+    mut module.define_data(table_id, description: take table)
+    return take module.finish(Some(object::ClosureSections(artefacts: b"artefacts", tree: b"tree")), alloc)
+} macos_object
+
+/// The offset of an image's first load command of a kind.
+fn load_command(image: Slice[u8], kind: u32) -> usize {
+    var at: usize = 32
+    for _ in 0..<image.u32_le(16) {
+        if image.u32_le(at) == kind {
+            return at
+        }
+        at += usize.widen(image.u32_le(at + 4))
+    }
+    expect false
+    return 0
+} load_command
+
+/// The names of an image's segments, each in 16 bytes.
+fn segment_names(image: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var names = mem::Bytes.empty(alloc)
+    var at: usize = 32
+    for _ in 0..<image.u32_le(16) {
+        if image.u32_le(at) == LC_SEGMENT_64 {
+            for offset in 0..<16usize {
+                mut names.push(image[at + 8 + offset])
+            }
+        }
+        at += usize.widen(image.u32_le(at + 4))
+    }
+    return names
+} segment_names
+
+test sha256_digests_match_the_published_ones for sha256 {
+    let alloc = testing::world().alloc
+    let abc = sha256(b"abc", start: 0, end: 3)
+    expect abc.view() == b"\xba\x78\x16\xbf\x8f\x01\xcf\xea\x41\x41\x40\xde\x5d\xae\x22\x23\xb0\x03\x61\xa3\x96\x17\x7a\x9c\xb4\x10\xff\x61\xf2\x00\x15\xad"
+    var many = mem::Bytes.empty(alloc)
+    for _ in 0..<1000usize {
+        mut many.push(b'a')
+    }
+    let thousand = sha256(many.view(), start: 0, end: many.len())
+    expect thousand.view() == b"\x41\xed\xec\xe4\x2d\x63\xe8\xd9\xbf\x51\x5a\x9b\xa6\x93\x2e\x1c\x20\xcb\xc9\xf5\xa5\xd1\x34\x64\x5a\xdb\x5d\xb1\xb9\x73\x7e\xa3"
+} sha256_digests_match_the_published_ones
+
+test a_macos_image_binds_its_imports_rebases_its_addresses_and_signs_its_pages for macho_write {
+    let alloc = testing::world().alloc
+    let object = macos_object(workspace::Target.X64Macos, instructions: b"\x48\x8b\x05\x00\x00\x00\x00\xc3", relocated: fn(callee: object::FuncId) -> mem::List[object::ModuleReloc] {
+        var relocs = mem::List[object::ModuleReloc].empty(alloc)
+        mut relocs.push(object::ModuleReloc(offset: 3, kind: machinst::RelocKind.GotRelative4, target: object::RelocTarget.Function(callee), addend: -4))
+        return relocs
+    }, alloc)
+    let base = macho_base()
+    let linked = link(object.view(), base, align: MACHO_PAGE, imports: Imports.Got, alloc)
+    expect linked.segments.len() == 3
+    let text = linked.segments[0]
+    let got = linked.segments[1]
+    let data = linked.segments[2]
+    expect text.address == base and got.access == Access.Read
+    expect linked.imports.len() == 1 and linked.imports[0].address == got.address and linked.imports[0].name.as_str() == "write"
+    let displacement = i64.widen(i32.from_bits(text.bytes.view().u32_le(3)))
+    expect i64.from_bits(base) + 7 + displacement == i64.from_bits(got.address)
+    expect linked.absolute.len() == 1 and linked.absolute[0] == data.address
+    let image = macho_write(linked, entry: base, arch: workspace::Arch.Amd64, name: "probe", alloc)
+    let bytes = image.view()
+    expect bytes.u32_le(0) == MH_MAGIC_64
+    var names = mem::Bytes.empty(alloc)
+    name16(mut names, name: "__PAGEZERO")
+    name16(mut names, name: "__TEXT")
+    name16(mut names, name: "__DATA_CONST")
+    name16(mut names, name: "__DATA")
+    name16(mut names, name: "__NAN")
+    name16(mut names, name: "__LINKEDIT")
+    let found = segment_names(bytes, alloc)
+    expect found.view() == names.view()
+    expect bytes.u64_le(load_command(bytes, kind: LC_MAIN) + 8) == MACHO_PAGE
+    let info = load_command(bytes, kind: LC_DYLD_INFO_ONLY)
+    let rebase_at = usize.widen(bytes.u32_le(info + 8))
+    let bind_at = usize.widen(bytes.u32_le(info + 16))
+    for at in 0..<5usize {
+        expect bytes[rebase_at + at] == b"\x11\x23\x00\x51\x00"[at]
+    }
+    let bind = b"\x11\x51\x40_write\x00\x72\x00\x90\x00"
+    expect usize.widen(bytes.u32_le(info + 20)) == bind.len()
+    for at in 0..<bind.len() {
+        expect bytes[bind_at + at] == bind[at]
+    }
+    let sealed = load_command(bytes, kind: LC_CODE_SIGNATURE)
+    let code_end = usize.widen(bytes.u32_le(sealed + 8))
+    expect code_end + usize.widen(bytes.u32_le(sealed + 12)) == bytes.len()
+    let directory = code_end + usize.widen(bytes.u32_be(code_end + 16))
+    let hashes = directory + usize.widen(bytes.u32_be(directory + 16))
+    var hashed: usize = 0
+    while hashed * 4096 < code_end {
+        var end = (hashed + 1) * 4096
+        if end > code_end {
+            end = code_end
+        }
+        let digest = sha256(bytes, start: hashed * 4096, end)
+        for at in 0..<32usize {
+            expect bytes[hashes + 32 * hashed + at] == digest[at]
+        }
+        hashed += 1
+    }
+} a_macos_image_binds_its_imports_rebases_its_addresses_and_signs_its_pages
+
+test a_macos_image_patches_aarch64_loads_of_its_offset_tables_words for link {
+    let alloc = testing::world().alloc
+    let adrp: u32 = 0x9000_0000
+    let ldr: u32 = 0xF940_0000
+    var loads = mem::Bytes.empty(alloc)
+    object::append_u32(mut loads, value: adrp)
+    object::append_u32(mut loads, value: ldr)
+    object::append_u32(mut loads, value: 0xD65F_03C0)
+    let object = macos_object(workspace::Target.Aarch64Macos, instructions: loads.view(), relocated: fn(callee: object::FuncId) -> mem::List[object::ModuleReloc] {
+        var relocs = mem::List[object::ModuleReloc].empty(alloc)
+        mut relocs.push(object::ModuleReloc(offset: 0, kind: machinst::RelocKind.Arm64AdrGotPage, target: object::RelocTarget.Function(callee), addend: 0))
+        mut relocs.push(object::ModuleReloc(offset: 4, kind: machinst::RelocKind.Arm64Ld64GotLo12, target: object::RelocTarget.Function(callee), addend: 0))
+        return relocs
+    }, alloc)
+    let base = macho_base()
+    let linked = link(object.view(), base, align: MACHO_PAGE, imports: Imports.Got, alloc)
+    expect linked.segments.len() == 3
+    let text = linked.segments[0]
+    let got = linked.segments[1]
+    expect linked.imports.len() == 1 and linked.imports[0].address == got.address
+    let pages = u32.truncate(((got.address & ~0xFFFu64) - (base & ~0xFFFu64)) >> 12)
+    let paged = adrp | ((pages & 3) << 29) | ((pages >> 2) << 5)
+    let offset = ldr | (u32.truncate((got.address & 0xFFF) >> 3) << 10)
+    expect text.bytes.view().u32_le(0) == paged and text.bytes.view().u32_le(4) == offset
+} a_macos_image_patches_aarch64_loads_of_its_offset_tables_words

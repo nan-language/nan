@@ -289,8 +289,8 @@ fn kvm_usable(arch: Arch) -> bool {
             .is_ok()
 }
 
-/// Whether a target's images can run on this machine, never a macOS or nanos target's: a Linux
-/// target's when the machine has its architecture and runs the toolchain on Linux, a Windows
+/// Whether a target's images can run on this machine, never a nanos target's: a Linux or macOS
+/// target's when the machine has its architecture and runs the toolchain on its system, a Windows
 /// target's when it has its architecture and runs the toolchain on Windows or Wine runs, and a
 /// machine target's when its emulator can start, the emulator program running and able to end
 /// with the process that starts it, the TPM emulator running, and the firmware present for a UEFI
@@ -300,8 +300,10 @@ pub fn available(target: Target) -> bool {
         return false;
     };
     match target.kind() {
-        Some(Kind::Macos | Kind::Nanos) => return false,
-        Some(Kind::Linux) => return arch == Arch::running() && Kind::running() == Kind::Linux,
+        Some(Kind::Nanos) => return false,
+        Some(kind @ (Kind::Linux | Kind::Macos)) => {
+            return arch == Arch::running() && Kind::running() == kind;
+        }
         Some(Kind::Windows) => {
             return arch == Arch::running()
                 && (Kind::running() == Kind::Windows

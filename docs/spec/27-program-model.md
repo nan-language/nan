@@ -87,7 +87,7 @@ A **descriptor** is the fixed definition of a target. The language version fixes
 
 | Field | `x86_64-linux` | `x86_64-windows` | `x86_64-macos` | `x86_64-uefi` | `x86_64-bare` |
 | --- | --- | --- | --- | --- | --- |
-| Platform | Linux 6.1 or later on x86_64, with glibc 2.35 or later | Windows 10 version 1809 or later on x86_64 | macOS 13 or later on x86_64 | UEFI firmware with boot services, on x86_64 | an x86_64 machine started by the PVH boot protocol |
+| Platform | Linux 6.1 or later on x86_64, with glibc 2.35 or later | Windows 10 version 1809 or later on x86_64 | macOS 15 or later on x86_64 | UEFI firmware with boot services, on x86_64 | an x86_64 machine started by the PVH boot protocol |
 | Default task stack ([task stacks](17-suspension-io.md#task-stacks)) | 64 KiB | 64 KiB | 64 KiB | none | none |
 | Entry task stack ([task stacks](17-suspension-io.md#task-stacks)) | 64 MiB | 64 MiB | 64 MiB | none | none |
 | Stub call bound | 256 bytes | 256 bytes | 256 bytes | 256 bytes | 256 bytes |
@@ -104,7 +104,7 @@ A **descriptor** is the fixed definition of a target. The language version fixes
 
 | Field | `aarch64-linux` | `aarch64-windows` | `aarch64-macos` | `aarch64-uefi` | `aarch64-bare` |
 | --- | --- | --- | --- | --- | --- |
-| Platform | Linux 6.1 or later on AArch64, with glibc 2.35 or later | Windows 10 version 1809 or later on AArch64 | macOS 13 or later on AArch64 | UEFI firmware with boot services, on AArch64 at EL1, on a machine its device tree or ACPI tables describe ([machine discovery](#descriptors)) | an AArch64 machine with a GICv3, entering the image at EL1 or EL2 with the MMU off, the address of a flattened device tree in `x0` and that of a [start information](24-kernel.md#start-information) in `x1`, either zero for none, the device tree or else the ACPI tables the start information names describing the machine ([machine discovery](#descriptors)); with both zero, the device tree lies at `0x4000_0000` |
+| Platform | Linux 6.1 or later on AArch64, with glibc 2.35 or later | Windows 10 version 1809 or later on AArch64 | macOS 15 or later on AArch64 | UEFI firmware with boot services, on AArch64 at EL1, on a machine its device tree or ACPI tables describe ([machine discovery](#descriptors)) | an AArch64 machine with a GICv3, entering the image at EL1 or EL2 with the MMU off, the address of a flattened device tree in `x0` and that of a [start information](24-kernel.md#start-information) in `x1`, either zero for none, the device tree or else the ACPI tables the start information names describing the machine ([machine discovery](#descriptors)); with both zero, the device tree lies at `0x4000_0000` |
 | Default task stack ([task stacks](17-suspension-io.md#task-stacks)) | 64 KiB | 64 KiB | 64 KiB | none | none |
 | Entry task stack ([task stacks](17-suspension-io.md#task-stacks)) | 64 MiB | 64 MiB | 64 MiB | none | none |
 | Stub call bound | 256 bytes | 256 bytes | 256 bytes | 256 bytes | 256 bytes |
@@ -129,7 +129,6 @@ A **descriptor** is the fixed definition of a target. The language version fixes
 - On the emulator, writing a byte v to the **exit port** ends the emulator with exit status (2v + 1) mod 256; on AArch64 the write is a semihosting `SYS_EXIT` call with reason `ADP_Stopped_ApplicationExit` and subcode 2v + 1. On other machines of the platform, writing to it has no effect on x86_64 and stops the CPU with maskable interrupts disabled on AArch64.
 - On `x86_64-uefi` and `x86_64-bare`, the vectors of [`hw::vectors`](25-registries.md#platform-registries) have these classes: `Trap` for 0 to 7, 16, 18 to 20 and 28; `TrapWithCode` for 8, 10 to 13, 17, 21, 29 and 30; `PageFault` for 14; `Irq` for 32 to 255; none for 9, 15, 22 to 27 and 31. Vectors 0 to 31 are the exception vectors and 32 to 255 the interrupt vectors. Vectors 2, 8 and 18 need a nonzero `ist`. Vector `0xFE` is the CPU signal ([cross-CPU operations](24-kernel.md#cross-cpu-operations)), a fixed interrupt of the local APICs.
 - On `aarch64-uefi` and `aarch64-bare`, vector n from 16 to 255 is interrupt n of the interrupt controller, of class `Irq`, except vector `0xFE`, the CPU signal ([cross-CPU operations](24-kernel.md#cross-cpu-operations)), which software-generated interrupt 1 delivers; vectors 0 to 15 are the exception vectors: vector 0, a synchronous exception other than an instruction or data abort, and vector 2, an SError interrupt, have class `TrapWithCode`; vector 1, an instruction or data abort, has class `PageFault`; vectors 3 to 15 have none. Vectors 0 to 15 are the exception vectors and 16 to 255 the interrupt vectors. Every vector's seam runs on its CPU's interrupt stack of `ist` 0, the only `ist` a vector takes.
-- The descriptor of each macOS target names no platform package, and no image of it is built ([final builds](#final-builds)).
 - The descriptor of each nanos target fixes its environment and its root grant, `nanos::World` ([root grants](14-authority.md#root-grants)), and names no platform package. Its codegen is that of the Linux target of its architecture: code holds floats and lane types in the floating-point and vector registers. A task whose entry states no `limits stack N`, the entry task among them, starts with a stack of 64 KiB that [grows](17-suspension-io.md#grown-stacks), and its stub call bound is 256 bytes. Its images are [bundles](30-artefacts.md#bundles) that a bare kernel of its architecture loads and runs on its runtime ([final builds](#final-builds)).
 - The emulator of the Windows targets is Wine, `wine` from the `PATH`, running an image on a machine of the target's architecture with its own diagnostics off, `WINEDEBUG` set to `-all`, when the toolchain runs on Linux; a toolchain running on Windows runs the image as a process of its system.
 - The `any` descriptor fixes only its environment, which restricts nothing.
@@ -438,22 +437,22 @@ fn start(take world: host::World) fails task::Cancelled uses wait {
 
 A program run on a host target is one process of its operating system:
 
-1. On a Linux target, glibc's start-up code calls the program entry seam, whose symbol is `main`; on a Windows target, the system enters the image at the seam. The seam calls the host entry landing fn, which mints `host::World`.
-2. The executor runs tasks on one thread per processor in the process's affinity set at start. The seam starts the entry function, given the `host::World`, as the **entry task**: the first task of the process [domain](11-errors-domains.md#domains).
+1. On a Linux target, glibc's start-up code calls the program entry seam, whose symbol is `main`; on a macOS target, dyld calls the seam, whose symbol is `main`; on a Windows target, the system enters the image at the seam. The seam calls the host entry landing fn, which mints `host::World`.
+2. The executor runs tasks on one thread per processor in the process's affinity set at start, on a macOS target per processor online. The seam starts the entry function, given the `host::World`, as the **entry task**: the first task of the process [domain](11-errors-domains.md#domains).
 3. The process exits when the entry task ends, with the status of the first row of this table matching the outcome.
 
 | Outcome | Exit status |
 | --- | --- |
 | the processor lacks an extension of the image's [codegen level](#codegen-levels) | 71, after writing `nan: codegen `, the level's name, ` unsupported` and a line feed to standard error |
-| the executor threads, the thread reading termination requests or the console control handler, their io_uring instances or completion port, or the entry task's stack cannot be created | 71, after writing `nan: runtime unavailable` and a line feed to standard error |
+| the executor threads, the thread reading termination requests or the console control handler, their io_uring instances, completion port or kqueues, or the entry task's stack cannot be created | 71, after writing `nan: runtime unavailable` and a line feed to standard error |
 | the entry task traps | 70, after writing the [trap report](11-errors-domains.md#trap-reports) to standard error |
-| the entry task returns or fails after a termination request | on a Linux target 128 + n for a request with signal number n, and on a Windows target `0xC000013A` |
+| the entry task returns or fails after a termination request | on a Linux or macOS target 128 + n for a request with signal number n, and on a Windows target `0xC000013A` |
 | it fails with `e` | 1, after writing `error: `, the rendering of `e` within a render budget of 4,096 bytes, and a line feed to standard error; a trap while rendering `e` is a trap of the entry task, with status 70 |
 | it returns, `Unit` form | 0 |
 | it returns `s`, `u8` form | `s` |
 
-- A **termination request** is, on a Linux target, the delivery of `SIGINT`, `SIGTERM` or `SIGHUP` to the process, and on a Windows target a console control event, such as Ctrl+C, which the system passes to the console's control handler. The first one is a cancelling construct ([origin and absorption](11-errors-domains.md#origin-and-absorption)) whose region is the entry task: it cancels that task with [acknowledged cancellation](17-suspension-io.md#acknowledged-cancellation) and absorbs the cancellation. A later one ends the process at once with the status the table gives after one.
-- On a Linux target the runtime ignores `SIGPIPE`.
+- A **termination request** is, on a Linux or macOS target, the delivery of `SIGINT`, `SIGTERM` or `SIGHUP` to the process, and on a Windows target a console control event, such as Ctrl+C, which the system passes to the console's control handler. The first one is a cancelling construct ([origin and absorption](11-errors-domains.md#origin-and-absorption)) whose region is the entry task: it cancels that task with [acknowledged cancellation](17-suspension-io.md#acknowledged-cancellation) and absorbs the cancellation. A later one ends the process at once with the status the table gives after one.
+- On a Linux or macOS target the runtime ignores `SIGPIPE`.
 
 ### Machine runs
 
@@ -551,7 +550,7 @@ A final build proceeds in this order:
 3. It applies every other rule stated for final builds, such as those of [registries](25-registries.md#tables), [stack limits](10-effects-digests.md#stack-limits) and the [closure summary](14-authority.md#authority-summaries).
 4. It [lowers](30-artefacts.md#lowering) the reach and writes the image.
 
-Each step runs only when the steps before it reported no error, and a final build reporting an error writes no image; incompleteness stops nothing. A nanos program's final build is the [bundle build](30-artefacts.md#bundles) against a bare kernel's interface; without one it is an error (`target.bundle-interface`), reported on the root's `package` line before step 1. No image of a macOS target is built: the final build of a macOS program is an error (`target.image-unavailable`), reported on the root's `package` line before step 1.
+Each step runs only when the steps before it reported no error, and a final build reporting an error writes no image; incompleteness stops nothing. A nanos program's final build is the [bundle build](30-artefacts.md#bundles) against a bare kernel's interface; without one it is an error (`target.bundle-interface`), reported on the root's `package` line before step 1.
 
 ```nan
 // file: stats/package.nan
@@ -632,14 +631,14 @@ fn main(take world: host::World) fails task::Cancelled uses wait {
 
 ## Runtime support
 
-No mandatory runtime exists. Before the entry landing fn, only the program entry seam runs, preceded on the Linux targets by glibc's start-up code. Lowered code has no writable static data: consts, literals and registry tables are read-only data of the image, never initialised at run time. An image holds exactly the support routines that its lowered code, compiler stubs and seams call.
+No mandatory runtime exists. Before the entry landing fn, only the program entry seam runs, preceded on the Linux targets by glibc's start-up code and on the macOS targets by dyld's. Lowered code has no writable static data: consts, literals and registry tables are read-only data of the image, never initialised at run time. An image holds exactly the support routines that its lowered code, compiler stubs and seams call.
 
 A **support routine** is one of these fixed routines of the implementation, each with the name its descriptor gives it:
 
 | Name | Does | Targets |
 | --- | --- | --- |
 | `stack_switch` | creates, switches and frees task stacks, and runs each executor's choice of ready tasks | every concrete target |
-| `trap` | stops a trapping domain's tasks, writes the trap report and ends the domain as its kind gives; on the Linux targets it receives a fault in a stack's guard region as `SIGSEGV` on an alternate signal stack, and on the Windows targets as a stack overflow exception in a vectored exception handler, and reports `trap.stack-overflow` | every concrete target |
+| `trap` | stops a trapping domain's tasks, writes the trap report and ends the domain as its kind gives; on the Linux targets it receives a fault in a stack's guard region as `SIGSEGV` and on the macOS targets as `SIGBUS` or `SIGSEGV`, on an alternate signal stack, and on the Windows targets as a stack overflow exception in a vectored exception handler, and reports `trap.stack-overflow` | every concrete target |
 | `settle` | performs [settlement](11-errors-domains.md#settlement) | the host targets |
 | `cap_table` | mints capabilities, revokes, keeps cells, chunk draws and the outbox table, and dispatches each target-dependent operation to the platform function its table entry records ([platform packages](28-stdlib.md#platform-packages)) | every concrete target |
 | `mem_op` | copies, fills and compares byte ranges for lowering | every concrete target |
@@ -648,7 +647,7 @@ A **support routine** is one of these fixed routines of the implementation, each
 
 Each function of a routine is named by the routine's name, `_` and a suffix that belongs to the ABI inside the final closure.
 
-The runtime turns on the data-independent timing mode that [Secret values](15-untrusted.md#constant-time-lowering) rely on where a program can: on the machine targets, on each CPU as it starts, DOITM on x86_64 when `IA32_ARCH_CAPABILITIES` enumerates it and `PSTATE.DIT` on AArch64 when `ID_AA64PFR0_EL1` does; on `aarch64-linux`, `PSTATE.DIT` for every thread of the process before the entry landing fn, when the kernel reports `HWCAP_DIT`. On `x86_64-linux` the mode is the kernel's, which a user process cannot set, and on the Windows targets it is the system's.
+The runtime turns on the data-independent timing mode that [Secret values](15-untrusted.md#constant-time-lowering) rely on where a program can: on the machine targets, on each CPU as it starts, DOITM on x86_64 when `IA32_ARCH_CAPABILITIES` enumerates it and `PSTATE.DIT` on AArch64 when `ID_AA64PFR0_EL1` does; on `aarch64-linux`, `PSTATE.DIT` for every thread of the process before the entry landing fn, when the kernel reports `HWCAP_DIT`; on `aarch64-macos`, `PSTATE.DIT` for each executor thread as it starts, when the system reports `hw.optional.arm.FEAT_DIT`. On `x86_64-linux` and `x86_64-macos` the mode is the kernel's, which a user process cannot set, and on the Windows targets it is the system's.
 
 ### Host I/O backend
 
@@ -667,18 +666,26 @@ On the Windows targets the executor threads share one I/O completion port:
 - The console's control handler runs on a thread of the system's and passes the first termination request to the port, so a later one ends the process whatever the executor threads run.
 - An executor thread with no ready task waits on the port in `GetQueuedCompletionStatusEx`; making a task ready posts a packet to the port when another thread waits there.
 
+On the macOS targets the executor threads share one kqueue:
+
+- A waiting primitive of the platform package waits until a descriptor is ready for its operation, through a one-shot event of the kqueue specific to the wait, then performs the operation on the descriptor, which does not hold its thread when it is not ready. Cancelling a wait deletes its event; once a thread has taken the event, its delivery is the acknowledgement. A standard stream is waited for so when it is a terminal, a pipe or a socket, and is otherwise read and written synchronously, as file operations are, on the executor thread.
+- Sleeps and deadlines are timers of the monotonic clock, `CLOCK_UPTIME_RAW`, which the runtime keeps; an executor thread waiting idle waits no longer than the first one is due.
+- The process ignores the termination request signals, which a thread of the runtime that runs no task reads from a kqueue of its own; it passes the first to the executor threads' kqueue, so a later one ends the process whatever the executor threads run.
+- An executor thread with no ready task waits on the kqueue in `kevent`; making a task ready triggers a user event of the kqueue when another thread waits there.
+
 ## Images
 
 An **image** is the output of a final build:
 
 - On a Linux target, a position-independent ELF64 executable for Linux on the target's architecture, dynamically linked against `libc.so.6` alone and named after the package. The target's **linker** links it from the objects lowering produced: `cc` from the `PATH` when the machine running the toolchain has the target's architecture, and otherwise `x86_64-linux-gnu-gcc` for `x86_64-linux` and `aarch64-linux-gnu-gcc` for `aarch64-linux`, from the `PATH`. It carries the [host sections](30-artefacts.md#host-sections). A failing linker run is an error (`target.link-failed`), reported on the root's `entry` directive and quoting the linker's output in an [envelope](33-toolchain.md#envelopes).
 - On a Windows target, a PE32+ console image for machine type `0x8664` on x86_64 and `0xAA64` on AArch64, with base relocations, named after the package with `.exe`. It imports the functions its support routines call from `kernel32.dll` and `bcryptprimitives.dll`, and each foreign fn it reaches from `kernel32.dll`, by name; the system enters it at the program entry seam under `"win64"`. It carries the [host sections](30-artefacts.md#host-sections).
+- On a macOS target, a position-independent Mach-O executable of CPU type `CPU_TYPE_X86_64` on x86_64 and `CPU_TYPE_ARM64` on AArch64, its segments aligned to 16 KiB, named after the package. It is dynamically linked against `/usr/lib/libSystem.B.dylib` alone: dyld binds, in its global offset table, each function its support routines call and each foreign fn it reaches, from `libSystem` by its symbol, then calls the program entry seam under `"darwin"`. It holds an ad-hoc code signature, which hashes each 4 KiB page before it with SHA-256 and is identified by the package's name, and carries the [host sections](30-artefacts.md#host-sections).
 - On `x86_64-uefi`, a PE32+ image for machine type `0x8664`, subsystem EFI application, with base relocations, named after the package with `.efi`. The firmware calls its entry point, the program entry seam, with the image handle and system table under `"win64"`, and the seam passes both to the entry landing fn.
 - On `aarch64-uefi`, the same with machine type `0xAA64`, its entry point called under `"aapcs64"`.
 - On `x86_64-bare`, a statically linked ELF64 executable with no interpreter or dynamic segment, its segments loaded at their physical addresses from `0x0010_0000`, or all moved by one multiple of 2 MiB below 4 GiB, named after the package with `.elf`. A `XEN_ELFNOTE_PHYS32_ENTRY` note names the program entry seam, which a PVH loader enters, moved with the segments, in 32-bit protected mode with paging disabled and `ebx` holding the physical address of the start information. The seam adjusts each absolute address the image holds by the distance it was moved, maps all physical memory the start information lists at its physical addresses, in page tables the image reserves, enables long mode and passes the `ebx` value to the entry landing fn.
 - On `aarch64-bare`, a statically linked ELF64 executable for AArch64 with no interpreter or dynamic segment, its segments loaded at their physical addresses from `0x4020_0000`, or all moved by one multiple of 2 MiB below 512 GiB, named after the package with `.elf`. Its entry point is the program entry seam, which the platform enters at EL1 or EL2 with the MMU off. The seam continues at EL1, enables floating point, installs a root mapping the gigabytes the image spans as normal memory and the rest of the first 512 GiB as device memory, turns the MMU and caches on, adjusts each absolute address the image holds by the distance it was moved, and passes `x0`, `0x4000_0000` when `x0` and `x1` are both zero, and `x1` to the entry landing fn.
 
-The implementation's own image writer builds the images of the Windows and machine targets. A kernel exporting its load ABI ([loading](24-kernel.md#loading)) also has its [interface file](30-artefacts.md#interface-files) beside its image.
+The implementation's own image writer builds the images of the Windows, macOS and machine targets. A kernel exporting its load ABI ([loading](24-kernel.md#loading)) also has its [interface file](30-artefacts.md#interface-files) beside its image.
 
 Every image keeps frame pointers in every function, stubs and support routines included, and holds line tables mapping each instruction of lowered code to its source path, line and item. The trap routine reads both to write [trap reports](11-errors-domains.md#trap-reports); their encoding belongs to the ABI inside the final closure, which is unspecified.
 
@@ -691,6 +698,5 @@ Every image keeps frame pointers in every function, stubs and support routines i
 | `target.component-entry` | error | [Entry](#entry) |
 | `target.entry-head` | error | [Entry](#entry) |
 | `target.entry-missing` | error | [Entry](#entry) |
-| `target.image-unavailable` | error | [Final builds](#final-builds) |
 | `target.link-failed` | error | [Images](#images) |
 | `target.program-targets` | error | [Programs and libraries](#programs-and-libraries) |

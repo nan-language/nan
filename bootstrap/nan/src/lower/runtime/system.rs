@@ -1,9 +1,10 @@
 //! The system the runtime runs on: the memory of its records and of the chunks cells draw, task
-//! stacks, idling, its standard streams, its start and its exit. On a Linux target the Linux
-//! module provides them over the C library and Linux, and on a Windows target the Windows module
-//! over `kernel32.dll`; on a machine target the machine module does, over the boot heap, the
-//! serial and exit ports and the CPUs; in an isolated space's runtime the space module does, over
-//! the boot heap whose chunks it draws and the system calls its kernel serves.
+//! stacks, idling, its standard streams, its start and its exit. On a Linux or macOS target the
+//! POSIX module provides them over the C library, with the Linux or macOS module for its threads
+//! and idling, and on a Windows target the Windows module over `kernel32.dll`; on a machine
+//! target the machine module does, over the boot heap, the serial and exit ports and the CPUs; in
+//! an isolated space's runtime the space module does, over the boot heap whose chunks it draws
+//! and the system calls its kernel serves.
 
 use cranelift_codegen::ir::{InstBuilder, TrapCode, Value, condcodes::IntCC};
 
@@ -55,7 +56,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         }
         (_, true) => heap::define(lo, fx, routine),
         (_, false) if lo.windows() => host::windows::define(lo, fx, routine),
-        (_, false) => host::linux::define(lo, fx, routine),
+        (_, false) => host::posix::define(lo, fx, routine),
     }
 }
 
@@ -92,6 +93,7 @@ fn init(lo: &mut Lowering, fx: &mut Fx) {
         (true, true) => space::init(lo, fx),
         (true, false) => lo.machine_init(fx),
         (false, _) if lo.windows() => host::windows::start_threads(lo, fx),
+        (false, _) if lo.macos() => host::macos::start_threads(lo, fx),
         (false, _) => host::linux::start_threads(lo, fx),
     }
     let zero = fx.ptr(0);
@@ -144,7 +146,7 @@ pub fn write_stream(lo: &mut Lowering, fx: &mut Fx, fd: i64, text: Value, len: V
         (true, false) => lo.serial_write(fx, text, len),
         (true, true) => {}
         (false, _) if lo.windows() => host::windows::write_all(lo, fx, fd, text, len),
-        (false, _) => host::linux::write_all(lo, fx, fd, text, len),
+        (false, _) => host::posix::write_all(lo, fx, fd, text, len),
     }
 }
 
@@ -153,7 +155,7 @@ pub fn map_chunks(lo: &mut Lowering, fx: &mut Fx, count: Value) -> Value {
     match lo.machine() {
         true => heap::map_chunks(lo, fx, count),
         false if lo.windows() => host::windows::map_chunks(lo, fx, count),
-        false => host::linux::map_chunks(lo, fx, count),
+        false => host::posix::map_chunks(lo, fx, count),
     }
 }
 
@@ -164,7 +166,7 @@ pub fn unmap_chunks(lo: &mut Lowering, fx: &mut Fx, base: Value, count: Value) {
         false if lo.windows() => host::windows::unmap(lo, fx, base),
         false => {
             let len = fx.b.ins().imul_imm_s(count, memory::CHUNK as i64);
-            host::linux::unmap(lo, fx, base, len);
+            host::posix::unmap(lo, fx, base, len);
         }
     }
 }
@@ -180,7 +182,7 @@ pub fn map_stack(lo: &mut Lowering, fx: &mut Fx, len: Value, guarded: bool) -> V
             stack
         }
         false if lo.windows() => host::windows::map_stack(lo, fx, len, guarded),
-        false => host::linux::map_stack(lo, fx, len, guarded),
+        false => host::posix::map_stack(lo, fx, len, guarded),
     }
 }
 
@@ -192,7 +194,7 @@ pub fn unmap_stack(lo: &mut Lowering, fx: &mut Fx, stack: Value, len: Value) {
             lo.record_free(fx, stack);
         }
         false if lo.windows() => host::windows::unmap(lo, fx, stack),
-        false => host::linux::unmap(lo, fx, stack, len),
+        false => host::posix::unmap(lo, fx, stack, len),
     }
 }
 
@@ -202,13 +204,14 @@ pub fn protect_guard(lo: &mut Lowering, fx: &mut Fx, base: Value, accessible: bo
     match (lo.machine(), lo.windows()) {
         (true, _) => {}
         (false, true) => host::windows::protect_guard(lo, fx, base, accessible),
-        (false, false) => host::linux::protect_guard(lo, fx, base, accessible),
+        (false, false) => host::posix::protect_guard(lo, fx, base, accessible),
     }
 }
 
-/// Waits until a task may be ready: on a Linux target in the running thread's ring and on a
-/// Windows target on the completion port, handling the completions that arrive; on a machine
-/// target the CPU halts until an interrupt; in an isolated space until its first timer is due.
+/// Waits until a task may be ready: on a Linux target in the running thread's ring, on a Windows
+/// target on the completion port and on a macOS target on the kqueue, handling what arrives; on a
+/// machine target the CPU halts until an interrupt; in an isolated space until its first timer is
+/// due.
 pub fn idle(lo: &mut Lowering, fx: &mut Fx) {
     match (lo.machine(), lo.user()) {
         (true, false) => {
@@ -216,6 +219,7 @@ pub fn idle(lo: &mut Lowering, fx: &mut Fx) {
         }
         (true, true) => space::idle(lo, fx),
         (false, _) if lo.windows() => host::windows::idle(lo, fx),
+        (false, _) if lo.macos() => host::macos::idle(lo, fx),
         (false, _) => host::linux::idle(lo, fx),
     }
 }
@@ -226,6 +230,7 @@ pub fn wake_idle(lo: &mut Lowering, fx: &mut Fx) {
     match (lo.machine(), lo.windows()) {
         (true, _) => {}
         (false, true) => host::windows::wake_idle(lo, fx),
+        (false, false) if lo.macos() => host::macos::wake_idle(lo, fx),
         (false, false) => host::linux::wake_idle(lo, fx),
     }
 }

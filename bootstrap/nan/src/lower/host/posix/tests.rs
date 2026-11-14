@@ -2,6 +2,7 @@ use std::process::Command;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use crate::workspace::Target;
 use crate::workspace::tests::Scratch;
 
 /// Sends `SIGTERM` to a process.
@@ -15,11 +16,12 @@ fn terminate(pid: u32) {
 
 #[test]
 fn a_second_termination_request_ends_a_program_that_never_waits() {
+    let target = Target::running_host().name();
+    let manifest = format!(
+        "//! Counts forever.\n\npackage spin {{\n    language 1\n    targets {target}\n    entry main\n}} spin\n"
+    );
     let scratch = Scratch::new(&[
-        (
-            "spin/package.nan",
-            "//! Counts forever.\n\npackage spin {\n    language 1\n    targets x86_64-linux\n    entry main\n} spin\n",
-        ),
+        ("spin/package.nan", manifest.as_str()),
         (
             "spin/spin.nan",
             "//! A count that never ends.\n\nfn main(take world: host::World) -> u8 fails task::Cancelled uses wait {\n    var count: u64 = 0\n    loop {\n        count = count.wrapping_add(1)\n    }\n} main\n",
@@ -27,7 +29,7 @@ fn a_second_termination_request_ends_a_program_that_never_waits() {
     ]);
     let built = crate::run(&["build".to_owned()], &scratch.0);
     assert_eq!(built.status, 0, "{}", built.output);
-    let mut child = Command::new(scratch.0.join(".nan/images/x86_64-linux/spin"))
+    let mut child = Command::new(scratch.0.join(".nan/images").join(target).join("spin"))
         .spawn()
         .expect("start the program");
     sleep(Duration::from_millis(300));

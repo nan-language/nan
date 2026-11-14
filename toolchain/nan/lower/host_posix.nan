@@ -1,0 +1,404 @@
+//! What the Linux and macOS targets share as systems whose C library calls into them: the program entry seam `main`, which the system's start-up code calls; the runtime's records, exit and standard stream writes; the memory of chunks and task stacks with their guard regions; each thread's signal stack; and the handlers of the stop signal, of faults and of an exceeded processor time limit. Each system's file gives the values and layouts its C library has.
+
+/// The symbol of the program entry seam, which the system's start-up code calls with the
+/// program's arguments and environment.
+pkg const POSIX_ENTRY: Str = "main"
+
+/// What the C libraries of the systems lay out or number apart where the routines they share
+/// call them: the `mmap` flags of private anonymous memory and of a task stack; the signal asking
+/// a thread to stop the task it runs, the first `fault_count` of `faults`, the signals of a fault
+/// in a stack's guard region, and the signal of an exceeded processor time limit; the size of a
+/// `struct sigaction`, the offset of its flags, and the flags of the runtime's handlers: given a
+/// `siginfo_t` and a context, run on the thread's signal stack, and restarting interrupted
+/// system calls; the offsets of the size and flags of a `stack_t`; and the offset of the fault
+/// address in a `siginfo_t`.
+struct Posix derives Copy {
+    map_anonymous: i64
+    map_stack: i64
+    stop: i32
+    faults: Array[i32, 2]
+    fault_count: usize
+    cpu_limit: i32
+    sigaction: u64
+    sigaction_flags: u64
+    siginfo: i64
+    on_stack: i64
+    restart: i64
+    stack_size: u64
+    stack_flags: u64
+    fault_address: u64
+} Posix
+
+/// The values and layouts of the target's system.
+fn posix_of(lo: Lowering) -> Posix {
+    if lo.macos() {
+        return MACOS_POSIX
+    }
+    return LINUX_POSIX
+} posix_of
+
+/// The signal asking a thread of the target's system to stop the task it runs.
+fn posix_stop_signal(lo: Lowering) -> i32 = posix_of(lo).stop
+
+/// Where a handler's context saved the interrupted thread's registers, and their offsets there.
+struct SavedRegisters derives Copy {
+    at: clif::Value
+    offsets: Context
+} SavedRegisters
+
+const MAP_FAILED: i64 = -1
+
+const PROTECT_READ_WRITE: i64 = 3
+
+const PROTECT_NONE: i64 = 0
+
+/// The resource limit of processor time, and the seconds a test run may use.
+const RLIMIT_CPU: i64 = 0
+
+const CPU_SECONDS: u64 = 10
+
+/// The size of each thread's signal stack and of its stack for stack overflow reports.
+const POSIX_SIGNAL_STACK: u64 = 65_536
+
+const SIGPIPE: i64 = 13
+
+/// The termination request signals: a hang-up, an interrupt and a termination.
+const SIGNALS: Array[i64, 3] = termination_signals()
+
+fn termination_signals() -> Array[i64, 3] {
+    var listed = Array[i64, 3].filled(1)
+    listed[1] = 2
+    listed[2] = 15
+    return listed
+} termination_signals
+
+/// The signature of the entry seam `main`: the argument count and vector, the environment, and
+/// the exit status.
+fn main_signature(alloc: mem::Alloc) -> clif::Signature {
+    var signature = clif::Signature.new(CALL_CONV, alloc)
+    mut signature.params.push(clif::AbiParam.new(clif::Type.Int32))
+    mut signature.params.push(clif::AbiParam.new(PTR))
+    mut signature.params.push(clif::AbiParam.new(PTR))
+    mut signature.returns.push(clif::AbiParam.new(clif::Type.Int32))
+    return signature
+} main_signature
+
+/// Defines the program entry seam `main` and the glue running the entry function as the first
+/// task.
+fn posix_entry_seam(mut lo: Lowering, program: Program) {
+    let entry = entry_task(mut lo, program)
+    let signature = main_signature(lo.alloc)
+    let id = mut lo.module.declare_function(POSIX_ENTRY, linkage: object::Linkage.Export, signature)
+    mut lo.define(id, signature: take signature, flags: LINES_HIDDEN | LINES_CRITICAL, build: fn(mut seam_lo: Lowering, mut seam_fx: Fx) {
+        let incoming = mut seam_fx.entry()
+        mut seam_lo.check_level(fx: mut seam_fx)
+        system_start(mut seam_lo, fx: mut seam_fx)
+        run_entry(mut seam_lo, fx: mut seam_fx, program, entry, passed: incoming.view())
+    })
+} posix_entry_seam
+
+/// Defines the entry seam `main` of a test image, whose arguments after the program's name are
+/// the texts naming its run.
+fn posix_test_seam(mut lo: Lowering, entry_glue: object::FuncId) {
+    let signature = main_signature(lo.alloc)
+    let id = mut lo.module.declare_function(POSIX_ENTRY, linkage: object::Linkage.Export, signature)
+    mut lo.define(id, signature: take signature, flags: LINES_HIDDEN | LINES_CRITICAL, build: fn(mut seam_lo: Lowering, mut seam_fx: Fx) {
+        let incoming = mut seam_fx.entry()
+        expect incoming.len() > 1
+        system_start(mut seam_lo, fx: mut seam_fx)
+        let widened = mut seam_fx.b.uextend(PTR, x: incoming[0])
+        let count = mut seam_fx.b.iadd_imm_s(widened, y: -1)
+        let texts = mut seam_fx.b.iadd_imm_s(incoming[1], y: 8)
+        start_run(mut seam_lo, fx: mut seam_fx, entry_glue, count, texts)
+    })
+} posix_test_seam
+
+/// Writes a byte range to a descriptor, whole unless the descriptor refuses.
+fn posix_write_all(mut lo: Lowering, mut fx: Fx, fd: i64, text: clif::Value, len: clif::Value) {
+    let fd_value = mut fx.int(clif::Type.Int32, value: fd)
+    discard mut fx.repeat(fx.list2(text, b: len).view(), body: fn[mut lo](mut pass_fx: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() > 1
+        let at = current[0]
+        let left_bytes = current[1]
+        let written = first_result(mut lo.call_libc(mut pass_fx, name: "write", args: pass_fx.list3(fd_value, b: at, c: left_bytes).view(), returns: pass_fx.types1(PTR).view()))
+        let progressed = mut pass_fx.b.icmp_imm_s(clif::IntCC.SignedGreaterThan, x: written, y: 0)
+        let next_at = mut pass_fx.b.iadd(at, y: written)
+        let remaining = mut pass_fx.b.isub(left_bytes, y: written)
+        let zero_word = mut pass_fx.ptr(0)
+        let next_left = mut pass_fx.b.select(progressed, x: remaining, y: zero_word)
+        let more = mut pass_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: next_left, y: 0)
+        return Pass(again: more, next: pass_fx.list2(next_at, b: next_left))
+    })
+} posix_write_all
+
+/// Defines the record routines over the C library's heap, `Exit`, and the handlers of the stop
+/// signal, of faults and of an exceeded processor time limit; the system's file defines how
+/// termination requests are read.
+fn posix_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
+    let incoming = mut fx.entry()
+    let no_types = mem::List[clif::Type].empty(fx.alloc)
+    match routine {
+        Routine.RecordAlloc => {
+            let one = mut fx.ptr(1)
+            expect incoming.len() > 0
+            let address = first_result(mut lo.call_libc(mut fx, name: "calloc", args: fx.list2(one, b: incoming[0]).view(), returns: fx.types1(PTR).view()))
+            mut fx.b.ret(fx.list1(address).view())
+        }
+        Routine.RecordFree => {
+            expect incoming.len() > 0
+            discard mut lo.call_libc(mut fx, name: "free", args: fx.list1(incoming[0]).view(), returns: no_types.view())
+            mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+        }
+        Routine.RecordResize => {
+            expect incoming.len() > 1
+            let address = first_result(mut lo.call_libc(mut fx, name: "realloc", args: fx.list2(incoming[0], b: incoming[1]).view(), returns: fx.types1(PTR).view()))
+            mut fx.b.ret(fx.list1(address).view())
+        }
+        Routine.Exit => {
+            expect incoming.len() > 0
+            let status = mut fx.b.ireduce(clif::Type.Int32, x: incoming[0])
+            discard mut lo.call_libc(mut fx, name: "_exit", args: fx.list1(status).view(), returns: no_types.view())
+            mut fx.b.trap(clif::TrapCode(user: 1))
+        }
+        Routine.Preempt => {
+            expect incoming.len() > 2
+            posix_preempt(mut lo, mut fx, context: incoming[2])
+        }
+        Routine.Overflow => posix_overflow(mut lo, mut fx, params: incoming.view())
+        Routine.Terminations => {
+            expect incoming.len() > 0
+            if lo.macos() {
+                macos_terminations(mut lo, mut fx, queue: incoming[0])
+            } else {
+                terminations(mut lo, mut fx, op: incoming[0])
+            }
+        }
+        Routine.CpuLimit => {
+            let status = mut fx.int(clif::Type.Int32, value: i64.widen(TIMED_OUT))
+            discard mut lo.call_libc(mut fx, name: "_exit", args: fx.list1(status).view(), returns: no_types.view())
+            mut fx.b.trap(clif::TrapCode(user: 1))
+        }
+        else => {
+            expect false
+        }
+    }
+} posix_define
+
+/// The address of the registers a handler's context saved, and their offsets there.
+fn posix_registers(mut lo: Lowering, mut fx: Fx, context: clif::Value) -> SavedRegisters {
+    if lo.macos() {
+        return macos_registers(mut lo, mut fx, context)
+    }
+    return SavedRegisters(at: context, offsets: linux_context(lo.ck.db().target))
+} posix_registers
+
+/// Gives the running thread a signal stack and a stack for stack overflow reports, recording it
+/// in its record; nonzero when the system refuses one.
+fn thread_signals(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value {
+    let posix = posix_of(lo)
+    let pthread = first_result(mut lo.call_libc(mut fx, name: "pthread_self", args: mem::List[clif::Value].empty(fx.alloc).view(), returns: fx.types1(PTR).view()))
+    mut fx.store(pthread, addr: record, offset: THREAD_SYSTEM)
+    let size = mut fx.ptr(POSIX_SIGNAL_STACK)
+    let alt_stack = posix_map_stack(mut lo, mut fx, len: size, guarded: true)
+    let trap_stack = posix_map_stack(mut lo, mut fx, len: size, guarded: true)
+    let no_signal = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: alt_stack, y: 0)
+    let no_trap = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: trap_stack, y: 0)
+    let refused = mut fx.b.bor(no_signal, y: no_trap)
+    let outcome = mut fx.choose_in(mut lo, condition: refused, results: fx.types1(clif::Type.Int8).view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
+        let refusal = mut yes_fx.int(clif::Type.Int8, value: 1)
+        return yes_fx.list1(refusal)
+    }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
+        let top = mut no_fx.b.iadd_imm_s(trap_stack, y: i64.fit(POSIX_SIGNAL_STACK))
+        mut no_fx.store(top, addr: record, offset: THREAD_TRAP_STACK)
+        let stack_record = mut no_fx.slot(24, align: 8)
+        mut no_fx.store(alt_stack, addr: stack_record, offset: 0)
+        let zero_word = mut no_fx.ptr(0)
+        mut no_fx.store(zero_word, addr: stack_record, offset: posix.stack_flags)
+        mut no_fx.store(size, addr: stack_record, offset: posix.stack_size)
+        discard mut cx.call_libc(mut no_fx, name: "sigaltstack", args: no_fx.list2(stack_record, b: zero_word).view(), returns: no_fx.types1(clif::Type.Int32).view())
+        let installed = mut no_fx.int(clif::Type.Int8, value: 0)
+        return no_fx.list1(installed)
+    })
+    return outcome[0]
+} thread_signals
+
+/// Installs a routine as the handler of a signal, run on the thread's signal stack.
+fn install_handler(mut lo: Lowering, mut fx: Fx, signal_number: i32, routine: Routine, restart: bool) {
+    let posix = posix_of(lo)
+    let action = mut fx.slot(posix.sigaction, align: 8)
+    let zero_word = mut fx.ptr(0)
+    let size = mut fx.ptr(posix.sigaction)
+    discard mut lo.call_routine(mut fx, routine: Routine.Fill, args: fx.list3(action, b: zero_word, c: size).view())
+    let handler_id = mut lo.routine(routine)
+    let handler_ref = mut lo.func_ref(mut fx, id: handler_id)
+    let handler = mut fx.b.func_addr(PTR, func_ref: handler_ref)
+    mut fx.store(handler, addr: action, offset: 0)
+    var restarting: i64 = 0
+    if restart {
+        restarting = posix.restart
+    }
+    let flags = mut fx.int(clif::Type.Int32, value: posix.siginfo | posix.on_stack | restarting)
+    mut fx.store(flags, addr: action, offset: posix.sigaction_flags)
+    let signal_value = mut fx.int(clif::Type.Int32, value: i64.widen(signal_number))
+    discard mut lo.call_libc(mut fx, name: "sigaction", args: fx.list3(signal_value, b: action, c: zero_word).view(), returns: fx.types1(clif::Type.Int32).view())
+} install_handler
+
+/// Installs the handlers of the stop signal and of faults, and ignores `SIGPIPE`.
+fn install_handlers(mut lo: Lowering, mut fx: Fx) {
+    let posix = posix_of(lo)
+    install_handler(mut lo, mut fx, signal_number: posix.stop, routine: Routine.Preempt, restart: true)
+    for index in 0..<posix.fault_count {
+        install_handler(mut lo, mut fx, signal_number: posix.faults[index], routine: Routine.Overflow, restart: false)
+    }
+    ignore_broken_pipes(mut lo, mut fx)
+} install_handlers
+
+/// Ignores `SIGPIPE`, so that a write to a closed pipe or connection fails instead.
+fn ignore_broken_pipes(mut lo: Lowering, mut fx: Fx) {
+    let ignore = mut fx.ptr(1)
+    let pipe = mut fx.int(clif::Type.Int32, value: SIGPIPE)
+    discard mut lo.call_libc(mut fx, name: "signal", args: fx.list2(pipe, b: ignore).view(), returns: fx.types1(PTR).view())
+} ignore_broken_pipes
+
+/// `Preempt(signal, info, context)`: the handler of the stop signal, which stops the task the
+/// thread runs when it may stop there.
+fn posix_preempt(mut lo: Lowering, mut fx: Fx, context: clif::Value) {
+    let thread = mut lo.thread(mut fx)
+    let inside = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: thread, y: 0)
+    mut fx.if_true(inside, then: fn[mut lo](mut then_fx: Fx) {
+        let saved = posix_registers(mut lo, fx: mut then_fx, context)
+        stop_interrupted(mut lo, fx: mut then_fx, thread, context: saved.at, ctx: saved.offsets)
+    })
+    mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+} posix_preempt
+
+/// `Overflow(signal, info, context)`: the handler of a fault. A fault in the guard region of
+/// the running task's stack resumes in `OverflowRaise` on the thread's trap stack; any other
+/// fault restores the signal's default action and faults again.
+fn posix_overflow(mut lo: Lowering, mut fx: Fx, params: Slice[clif::Value]) {
+    expect params.len() > 2
+    let fault = mut fx.load(PTR, addr: params[1], offset: posix_of(lo).fault_address)
+    let thread = mut lo.thread(mut fx)
+    let saved = posix_registers(mut lo, mut fx, context: params[2])
+    let guarded = overflow_interrupted(mut lo, mut fx, thread, fault, context: saved.at, ctx: saved.offsets)
+    let other = mut fx.b.bxor_imm_s(guarded, y: 1)
+    let given = params[0]
+    let macos = lo.macos()
+    mut fx.if_true(other, then: fn[mut lo](mut then_fx: Fx) {
+        var signal_value = given
+        if not macos {
+            signal_value = mut then_fx.int(clif::Type.Int32, value: i64.widen(SIGSEGV))
+        }
+        let default_handler = mut then_fx.ptr(0)
+        discard mut lo.call_libc(mut then_fx, name: "signal", args: then_fx.list2(signal_value, b: default_handler).view(), returns: then_fx.types1(PTR).view())
+    })
+    mut fx.b.ret(mem::List[clif::Value].empty(fx.alloc).view())
+} posix_overflow
+
+/// The executor of `Init` for the seeded scheduler: the calling thread is the one executor
+/// thread, which `make_current` makes the record's; a fault reports a stack overflow, and the
+/// run ends with status `TIMED_OUT` once it has used 10 seconds of processor time.
+fn posix_start_seeded(mut lo: Lowering, mut fx: Fx, make_current: fn(mut cx: Lowering, mut fx: Fx, record: clif::Value)) {
+    let posix = posix_of(lo)
+    let state_address = mut lo.state(mut fx)
+    let one = mut fx.ptr(1)
+    mut fx.store(one, addr: state_address, offset: STATE_THREAD_COUNT)
+    let eight = mut fx.ptr(8)
+    let threads = first_result(mut lo.call_libc(mut fx, name: "calloc", args: fx.list2(one, b: eight).view(), returns: fx.types1(PTR).view()))
+    unavailable_unless(mut fx, address: threads)
+    mut fx.store(threads, addr: state_address, offset: STATE_THREADS)
+    let size = mut fx.ptr(THREAD_SIZE)
+    let record = first_result(mut lo.call_libc(mut fx, name: "calloc", args: fx.list2(one, b: size).view(), returns: fx.types1(PTR).view()))
+    unavailable_unless(mut fx, address: record)
+    mut fx.store(record, addr: threads, offset: 0)
+    make_current(mut lo, mut fx, record)
+    let refused = thread_signals(mut lo, mut fx, record)
+    mut fx.if_true(refused, then: fn(mut then_fx: Fx) {
+        let refusal = mut then_fx.ptr(1)
+        mut then_fx.b.ret(then_fx.list1(refusal).view())
+    })
+    for index in 0..<posix.fault_count {
+        install_handler(mut lo, mut fx, signal_number: posix.faults[index], routine: Routine.Overflow, restart: false)
+    }
+    install_handler(mut lo, mut fx, signal_number: posix.cpu_limit, routine: Routine.CpuLimit, restart: false)
+    let limit = mut fx.slot(16, align: 8)
+    let soft = mut fx.ptr(CPU_SECONDS)
+    let hard = mut fx.ptr(CPU_SECONDS + 2)
+    mut fx.store(soft, addr: limit, offset: 0)
+    mut fx.store(hard, addr: limit, offset: 8)
+    let cpu = mut fx.int(clif::Type.Int32, value: RLIMIT_CPU)
+    discard mut lo.call_libc(mut fx, name: "setrlimit", args: fx.list2(cpu, b: limit).view(), returns: fx.types1(clif::Type.Int32).view())
+    ignore_broken_pipes(mut lo, mut fx)
+} posix_start_seeded
+
+/// Maps `count` chunks aligned to their size, zero when the system refuses.
+fn posix_map_chunks(mut lo: Lowering, mut fx: Fx, count: clif::Value) -> clif::Value {
+    let chunk = i64.fit(MEMORY_CHUNK)
+    let len = mut fx.b.imul_imm_s(count, y: chunk)
+    let padded = mut fx.b.iadd_imm_s(len, y: chunk)
+    let zero_word = mut fx.ptr(0)
+    let protection = mut fx.int(clif::Type.Int32, value: PROTECT_READ_WRITE)
+    let flags = mut fx.int(clif::Type.Int32, value: posix_of(lo).map_anonymous)
+    let no_fd = mut fx.int(clif::Type.Int32, value: -1)
+    let base = first_result(mut lo.call_libc(mut fx, name: "mmap", args: fx.list6(zero_word, b: padded, c: protection, d: flags, e: no_fd, f: zero_word).view(), returns: fx.types1(PTR).view()))
+    let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: base, y: MAP_FAILED)
+    let mapped = mut fx.choose_in(mut lo, condition: failed, results: fx.types1(PTR).view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
+        let refused = mut yes_fx.ptr(0)
+        return yes_fx.list1(refused)
+    }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
+        expect chunk > 0
+        let bumped = mut no_fx.b.iadd_imm_s(base, y: chunk - 1)
+        let aligned = mut no_fx.b.band_imm_s(bumped, y: ~(chunk - 1))
+        let head = mut no_fx.b.isub(aligned, y: base)
+        let has_head = mut no_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: head, y: 0)
+        mut no_fx.if_true(has_head, then: fn[mut cx](mut head_fx: Fx) {
+            unmap(mut cx, fx: mut head_fx, address: base, len: head)
+        })
+        let end = mut no_fx.b.iadd(aligned, y: len)
+        let mapped_end = mut no_fx.b.iadd(base, y: padded)
+        let tail = mut no_fx.b.isub(mapped_end, y: end)
+        let has_tail = mut no_fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: tail, y: 0)
+        mut no_fx.if_true(has_tail, then: fn[mut cx](mut tail_fx: Fx) {
+            unmap(mut cx, fx: mut tail_fx, address: end, len: tail)
+        })
+        return no_fx.list1(aligned)
+    })
+    return mapped[0]
+} posix_map_chunks
+
+/// Unmaps memory.
+fn unmap(mut lo: Lowering, mut fx: Fx, address: clif::Value, len: clif::Value) {
+    discard mut lo.call_libc(mut fx, name: "munmap", args: fx.list2(address, b: len).view(), returns: fx.types1(clif::Type.Int32).view())
+} unmap
+
+/// Maps a stack of `len` bytes, its lowest page an inaccessible guard when `guarded`, zero when
+/// the system refuses.
+fn posix_map_stack(mut lo: Lowering, mut fx: Fx, len: clif::Value, guarded: bool) -> clif::Value {
+    let zero_word = mut fx.ptr(0)
+    let protection = mut fx.int(clif::Type.Int32, value: PROTECT_READ_WRITE)
+    let flags = mut fx.int(clif::Type.Int32, value: posix_of(lo).map_stack)
+    let no_fd = mut fx.int(clif::Type.Int32, value: -1)
+    let base = first_result(mut lo.call_libc(mut fx, name: "mmap", args: fx.list6(zero_word, b: len, c: protection, d: flags, e: no_fd, f: zero_word).view(), returns: fx.types1(PTR).view()))
+    let failed = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: base, y: MAP_FAILED)
+    let mapped = mut fx.choose_in(mut lo, condition: failed, results: fx.types1(PTR).view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
+        let refused = mut yes_fx.ptr(0)
+        return yes_fx.list1(refused)
+    }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
+        if guarded {
+            posix_protect_guard(mut cx, fx: mut no_fx, base, accessible: false)
+        }
+        return no_fx.list1(base)
+    })
+    return mapped[0]
+} posix_map_stack
+
+/// Makes the guard region at the base of a stack inaccessible, or accessible again.
+fn posix_protect_guard(mut lo: Lowering, mut fx: Fx, base: clif::Value, accessible: bool) {
+    let guard_size = mut fx.ptr(TASKS_GUARD)
+    var protection_bits = PROTECT_NONE
+    if accessible {
+        protection_bits = PROTECT_READ_WRITE
+    }
+    let protection = mut fx.int(clif::Type.Int32, value: protection_bits)
+    discard mut lo.call_libc(mut fx, name: "mprotect", args: fx.list3(base, b: guard_size, c: protection).view(), returns: fx.types1(clif::Type.Int32).view())
+} posix_protect_guard

@@ -39,7 +39,7 @@ impl Lowering<'_, '_> {
     /// as software-generated interrupt 1 on AArch64.
     fn send_signal(&mut self, fx: &mut Fx, record: Value) {
         let id = fx.load(PTR, record, cpu::HARDWARE_ID);
-        match self.machine_arch() {
+        match self.arch() {
             Arch::Amd64 => {
                 let flags = self.call_stub(fx, Stub::IrqSave, &[])[0];
                 self.send_ipi(fx, id, IPI_SIGNAL);
@@ -59,7 +59,7 @@ impl Lowering<'_, '_> {
     /// signal and invalidates its own translations; it then waits, with them enabled, until
     /// each has served the shootdown, and releases the lock.
     pub fn invalidate_everywhere(&mut self, fx: &mut Fx, scope: Value) {
-        if self.machine_arch() == Arch::Aarch64 {
+        if self.arch() == Arch::Aarch64 {
             self.call_stub(fx, Stub::TlbiBroadcast, &[scope]);
             return;
         }

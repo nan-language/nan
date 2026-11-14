@@ -1,9 +1,12 @@
 //! The host targets, whose programs run as processes of an operating system: the glue running a
 //! program's entry function as its entry task, and what a stop or a stack overflow does to an
-//! interrupted thread's saved registers. `linux` holds everything Linux-specific and `windows`
-//! everything Windows-specific.
+//! interrupted thread's saved registers. `linux` holds everything Linux-specific, `windows`
+//! everything Windows-specific and `macos` everything macOS-specific; `posix` holds what the
+//! Linux and macOS targets share through their C libraries.
 
 pub mod linux;
+pub mod macos;
+pub mod posix;
 pub mod windows;
 
 use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, TrapCode, Value, condcodes::IntCC};

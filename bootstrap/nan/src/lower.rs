@@ -430,9 +430,11 @@ enum Pending {
 /// one with SSE2 or the A64 one of Armv8.0-A, with the extensions of its codegen level, frame
 /// pointers in every function, Cranelift's stack switching where it has it, and the canonical NaN
 /// as the NaN every float operation returns. A Linux image is position-independent and links
-/// against glibc; a Windows or machine image is linked at a fixed address, which the image writer
-/// records how to move, so its code reaches its own functions and data directly, with no global
-/// offset table. A host image has inline stack probes for its guard pages; a machine image none.
+/// against glibc, and a macOS image is position-independent and reaches the functions it imports
+/// through a global offset table the image writer lays out; a Windows or machine image is linked
+/// at a fixed address, which the image writer records how to move, so its code reaches its own
+/// functions and data directly, with no global offset table. A host image has inline stack probes
+/// for its guard pages; a machine image none.
 fn isa(target: Target, level: Option<Level>) -> OwnedTargetIsa {
     let mut flags = settings::builder();
     let linux = target.kind() == Some(Kind::Linux);
@@ -442,7 +444,11 @@ fn isa(target: Target, level: Option<Level>) -> OwnedTargetIsa {
         (_, true) => "x86_64-unknown-linux-gnu",
         (_, false) => "x86_64-unknown-none-elf",
     };
-    let pic = if linux { "true" } else { "false" };
+    let pic = if linux || target.kind() == Some(Kind::Macos) {
+        "true"
+    } else {
+        "false"
+    };
     let probes = if target.is_host() { "true" } else { "false" };
     for (name, value) in [
         ("opt_level", "speed"),
@@ -479,7 +485,7 @@ pub fn lower(ck: &Checker, program: &Program) -> Lowered {
     );
     match lowering.windows() {
         true => host::windows::entry_seam(&mut lowering, program),
-        false => host::linux::entry_seam(&mut lowering, program),
+        false => host::posix::entry_seam(&mut lowering, program),
     }
     lowering.drain();
     lowering.finish(Some((&program.section, &program.tree)))
@@ -633,6 +639,38 @@ impl<'c, 'a> Lowering<'c, 'a> {
     /// Whether the image is a Windows target's.
     pub fn windows(&self) -> bool {
         self.ck.db.target.kind() == Some(Kind::Windows)
+    }
+
+    /// The architecture of the image's concrete target.
+    pub fn arch(&self) -> Arch {
+        self.ck
+            .db
+            .target
+            .arch()
+            .expect("a concrete target's architecture")
+    }
+
+    /// Whether the image is a macOS target's.
+    pub fn macos(&self) -> bool {
+        self.ck.db.target.kind() == Some(Kind::Macos)
+    }
+
+    /// Whether the runtime keeps the timers of the monotonic clock of a host target's system
+    /// itself, as on Windows and macOS.
+    pub fn keeps_timers(&self) -> bool {
+        self.windows() || self.macos()
+    }
+
+    /// The calling convention of the functions of a host target's system: the System V one on
+    /// Linux and on x86_64 macOS, Apple's on AArch64 macOS, and on Windows that of 64-bit
+    /// Windows.
+    pub fn system_convention(&self) -> CallConv {
+        let arch = self.ck.db.target.arch();
+        match self.ck.db.target.kind() {
+            Some(Kind::Windows) => host::windows::convention(arch.expect("a Windows architecture")),
+            Some(Kind::Macos) if arch == Some(Arch::Aarch64) => CallConv::AppleAarch64,
+            _ => CALL_CONV,
+        }
     }
 
     /// Whether the image's code runs on a machine's runtime: an image of a UEFI or bare target, or

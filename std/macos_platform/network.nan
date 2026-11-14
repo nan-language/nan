@@ -1,0 +1,278 @@
+//! The network operations of `sys::Net`, `sys::net::Listener` and `sys::net::Conn` over sockets.
+
+/// An `addrinfo` of libSystem: a resolved address and the next one.
+layout AddressInfo: bytes 48 le {
+    flags: i32 at 0
+    family: i32 at 4
+    kind: i32 at 8
+    protocol: i32 at 12
+    address_len: u32 at 16
+    padding: u32 at 20
+    canonical_name: u64 at 24
+    address: u64 at 32
+    next: u64 at 40
+} AddressInfo
+
+/// An IPv6 socket address. With `flow` and `address` zero, its first 16 bytes are the IPv4 socket
+/// address of every local address when `len` is 16 and `family` is `AF_INET`.
+layout Inet6Address: bytes 28 le {
+    len: u8 at 0
+    family: u8 at 1
+    port: u16 at 2
+    flow: u32 at 4
+    address: Array[u8, 16] at 8
+    scope: u32 at 24
+} Inet6Address
+
+/// The `linger` option of a socket.
+layout Linger: bytes 8 le {
+    enabled: i32 at 0
+    seconds: i32 at 4
+} Linger
+
+foreign fn socket(domain: i32, kind: i32, protocol: i32) -> i32 convention "darwin"
+
+foreign fn setsockopt(fd: i32, level: i32, name: i32, value: hw::Ptr[u8], len: u32) -> i32 convention "darwin"
+
+foreign fn getsockopt(fd: i32, level: i32, name: i32, value: hw::Ptr[u8], len: hw::Ptr[u32]) -> i32 convention "darwin"
+
+foreign fn bind(fd: i32, address: hw::Ptr[Inet6Address], len: u32) -> i32 convention "darwin"
+
+foreign fn listen(fd: i32, backlog: i32) -> i32 convention "darwin"
+
+foreign fn accept(fd: i32, address: u64, len: u64) -> i32 convention "darwin"
+
+foreign fn connect(fd: i32, address: u64, len: u32) -> i32 convention "darwin"
+
+foreign fn shutdown(fd: i32, how: i32) -> i32 convention "darwin"
+
+foreign fn getaddrinfo(node: hw::Ptr[u8], service: hw::Ptr[u8], hints: hw::Ptr[AddressInfo], found: hw::Ptr[u64]) -> i32 convention "darwin"
+
+foreign fn freeaddrinfo(found: hw::Ptr[AddressInfo]) convention "darwin"
+
+/// The address families of IPv4 and IPv6, and the stream socket type.
+const AF_INET: i32 = 2
+
+const AF_INET6: i32 = 30
+
+const STREAM: i32 = 1
+
+/// The levels and names of the socket options this platform sets and reads: `IPV6_V6ONLY`,
+/// `SO_REUSEADDR`, `SO_LINGER` and `SO_ERROR`.
+const LEVEL_SOCKET: i32 = 0xFFFF
+
+const LEVEL_IPV6: i32 = 41
+
+const V6_ONLY: i32 = 27
+
+const REUSE_ADDRESS: i32 = 0x4
+
+const LINGER_OPTION: i32 = 0x80
+
+const SOCKET_ERROR: i32 = 0x1007
+
+/// The shutdown of a socket's sending side, and the error numbers of a connection aborted
+/// before its accept and of a socket that is not connected.
+const SEND_SIDE: i32 = 1
+
+const ECONNABORTED: i32 = 53
+
+const ENOTCONN: i32 = 57
+
+/// The failure of an error number of a network operation.
+fn net_failure(code: i32) -> sys::net::NetError {
+    return match code {
+        61 => sys::net::NetError.Refused
+        32 or 53 or 54 or 57 => sys::net::NetError.Reset
+        51 or 60 or 65 => sys::net::NetError.Unreachable
+        48 => sys::net::NetError.AddressInUse
+        else => sys::net::NetError.Denied
+    }
+} net_failure
+
+/// A port with its bytes in network order.
+fn network_order(port: u16) -> u16 {
+    return (port << 8) | (port >> 8)
+} network_order
+
+/// Sets an integer option of a socket.
+fn set_option(fd: i32, level: i32, name: i32, value: i32) {
+    var held = Array[i32, 1].filled(value)
+    let address: hw::Ptr[u8] = trusted "an i32 is read as its bytes" { hw::Ptr[u8].cast(hw::Ptr.of_view_mut(mut held.view_mut())) }
+    discard setsockopt(fd, level, name, value: address, len: 4)
+} set_option
+
+/// The error number the connect a socket started ended with, 0 once connected.
+fn connect_error(fd: i32) -> i32 {
+    var held = Array[i32, 1].filled(0)
+    var len = Array[u32, 1].filled(4)
+    let address: hw::Ptr[u8] = trusted "an i32 is written as its bytes" { hw::Ptr[u8].cast(hw::Ptr.of_view_mut(mut held.view_mut())) }
+    if getsockopt(fd, level: LEVEL_SOCKET, name: SOCKET_ERROR, value: address, len: hw::Ptr.of_view_mut(mut len.view_mut())) != 0 {
+        return last_error()
+    }
+    return held[0]
+} connect_error
+
+pkg fn net_listen(port: u16) -> i32 fails sys::net::NetError {
+    if port == 0 {
+        fail sys::net::NetError.Denied
+    }
+    var family = AF_INET6
+    var fd = socket(AF_INET6, kind: STREAM, protocol: 0)
+    if fd < 0 {
+        family = AF_INET
+        fd = socket(AF_INET, kind: STREAM, protocol: 0)
+    }
+    if fd < 0 {
+        fail sys::net::NetError.Denied
+    }
+    if not unblock(fd) {
+        release(fd)
+        fail sys::net::NetError.Denied
+    }
+    if family == AF_INET6 {
+        set_option(fd, level: LEVEL_IPV6, name: V6_ONLY, value: 0)
+    }
+    set_option(fd, level: LEVEL_SOCKET, name: REUSE_ADDRESS, value: 1)
+    var address = Inet6Address(len: 28, family: 30, port: network_order(port), flow: 0, address: Array[u8, 16].filled(0), scope: 0)
+    var len: u32 = 28
+    if family == AF_INET {
+        address.len = 16
+        address.family = 2
+        len = 16
+    }
+    if bind(fd, address: hw::Ptr.of_mut(mut address), len) < 0 {
+        release(fd)
+        fail sys::net::NetError.AddressInUse
+    }
+    if listen(fd, backlog: 128) < 0 {
+        release(fd)
+        fail sys::net::NetError.Denied
+    }
+    return fd
+} net_listen
+
+pkg fn net_connect(host: Str, port: u16) -> i32 fails sys::net::NetError uses wait {
+    if port == 0 {
+        fail sys::net::NetError.Denied
+    }
+    var name = Array[u8, 256].filled(0)
+    let bytes = host.as_bytes()
+    if bytes.len() >= 256 {
+        fail sys::net::NetError.Unreachable
+    }
+    for at in 0..<bytes.len() {
+        name[at] = bytes[at]
+    }
+    var hints = AddressInfo(flags: 0, family: 0, kind: STREAM, protocol: 0, address_len: 0, padding: 0, canonical_name: 0, address: 0, next: 0)
+    var found = Array[u64, 1].filled(0)
+    let node = hw::Ptr.of_view(name.view())
+    let answers = hw::Ptr.of_view_mut(mut found.view_mut())
+    if getaddrinfo(node, service: hw::Ptr.of_addr(0), hints: hw::Ptr.of_mut(mut hints), found: answers) != 0 {
+        fail sys::net::NetError.Unreachable
+    }
+    let head: hw::Ptr[AddressInfo] = hw::Ptr.of_addr(usize.widen(found[0]))
+    let info = trusted "getaddrinfo succeeded, so its first result is a live addrinfo" { head.read() }
+    let socket_address = hw::Ptr[u16].of_addr(usize.widen(info.address))
+    trusted "the result's address is a socket address whose port lies at byte 2" {
+        socket_address.offset(1).write(network_order(port))
+    }
+    let fd = socket(info.family, kind: STREAM, protocol: 0)
+    if fd < 0 {
+        freeaddrinfo(head)
+        fail sys::net::NetError.Denied
+    }
+    if not unblock(fd) {
+        freeaddrinfo(head)
+        release(fd)
+        fail sys::net::NetError.Denied
+    }
+    let started = connect(fd, address: info.address, len: info.address_len)
+    let code = last_error()
+    freeaddrinfo(head)
+    if started < 0 and code != EINPROGRESS {
+        release(fd)
+        fail net_failure(code)
+    }
+    if started < 0 {
+        match attempt await watch(fd, filter: WRITABLE) {
+            Ok(_) => {}
+            Err(cancelled) => {
+                release(fd)
+                fail cancelled
+            }
+        }
+        let ended = connect_error(fd)
+        if ended != 0 {
+            release(fd)
+            fail net_failure(ended)
+        }
+    }
+    return fd
+} net_connect
+
+pkg fn listener_accept(fd: i32) -> i32 fails sys::net::NetError uses wait {
+    loop {
+        let accepted = accept(fd, address: 0, len: 0)
+        if accepted >= 0 {
+            if not unblock(accepted) {
+                release(accepted)
+                fail sys::net::NetError.Denied
+            }
+            return accepted
+        }
+        let code = last_error()
+        if code == EAGAIN {
+            discard try await watch(fd, filter: READABLE)
+        } else if code != EINTR and code != ECONNABORTED {
+            fail net_failure(code)
+        }
+    }
+} listener_accept
+
+pkg fn conn_read(fd: i32, address: u64, len: usize) -> usize fails sys::net::NetError uses wait {
+    loop {
+        let count = read(fd, buffer: address, count: len)
+        if count >= 0 {
+            return usize.fit(count)
+        }
+        let code = last_error()
+        if code == EAGAIN {
+            discard try await watch(fd, filter: READABLE)
+        } else if code != EINTR {
+            fail net_failure(code)
+        }
+    }
+} conn_read
+
+pkg fn conn_write(fd: i32, data: Slice[u8]) -> usize fails sys::net::NetError uses wait {
+    loop {
+        let count = write(fd, buffer: hw::Ptr.of_view(data), count: data.len())
+        if count >= 0 {
+            return usize.fit(count)
+        }
+        let code = last_error()
+        if code == EAGAIN {
+            discard try await watch(fd, filter: WRITABLE)
+        } else if code != EINTR {
+            fail net_failure(code)
+        }
+    }
+} conn_write
+
+pkg fn conn_close(fd: i32) fails sys::net::NetError {
+    defer release(fd)
+    if shutdown(fd, how: SEND_SIDE) < 0 {
+        let code = last_error()
+        if code != ENOTCONN {
+            fail net_failure(code)
+        }
+    }
+} conn_close
+
+pkg fn conn_abandon(fd: i32) {
+    var linger = Linger(enabled: 1, seconds: 0)
+    let address: hw::Ptr[u8] = trusted "a linger option is read as its bytes" { hw::Ptr[u8].cast(hw::Ptr.of_mut(mut linger)) }
+    discard setsockopt(fd, level: LEVEL_SOCKET, name: LINGER_OPTION, value: address, len: 8)
+    release(fd)
+} conn_abandon

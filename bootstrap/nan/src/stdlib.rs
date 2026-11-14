@@ -14,9 +14,10 @@ pub const PACKAGES: [&str; 10] = [
 ];
 
 /// The platform packages, which no alias names.
-pub const PLATFORMS: [&str; 4] = [
+pub const PLATFORMS: [&str; 5] = [
     "linux_platform",
     "windows_platform",
+    "macos_platform",
     "uefi_platform",
     "bare_platform",
 ];

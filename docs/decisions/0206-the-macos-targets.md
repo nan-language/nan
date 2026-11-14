@@ -1,6 +1,6 @@
 # 0206. The macOS targets
 
-Status: accepted
+Status: superseded by 0208
 
 ## Context
 

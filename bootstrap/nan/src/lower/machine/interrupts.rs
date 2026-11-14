@@ -337,18 +337,9 @@ impl Lowering<'_, '_> {
         Some(self.callable_instance(fn_ref, false))
     }
 
-    /// The architecture of the machine target being lowered for.
-    pub(super) fn machine_arch(&self) -> Arch {
-        self.ck
-            .db
-            .target
-            .arch()
-            .expect("a machine target's architecture")
-    }
-
     /// What the dispatcher knows of the target's vectors.
     pub(super) fn vectors(&self) -> Vectors {
-        match self.machine_arch() {
+        match self.arch() {
             Arch::Amd64 => X64_VECTORS,
             Arch::Aarch64 => aarch64::VECTORS,
         }
@@ -356,7 +347,7 @@ impl Lowering<'_, '_> {
 
     /// The layout of the frame the target's vector seam saves.
     pub fn saved_frame(&self) -> SavedFrame {
-        match self.machine_arch() {
+        match self.arch() {
             Arch::Amd64 => X64_FRAME,
             Arch::Aarch64 => aarch64::FRAME,
         }
@@ -367,7 +358,7 @@ impl Lowering<'_, '_> {
     /// state clear on AArch64.
     fn interrupts_were_enabled(&mut self, fx: &mut Fx, saved: Value) -> Value {
         let state = fx.load(PTR, saved, self.saved_frame().state);
-        match self.machine_arch() {
+        match self.arch() {
             Arch::Amd64 => {
                 let enabled = fx.b.ins().band_imm_s(state, INTERRUPTS_ENABLED);
                 fx.b.ins().icmp_imm_s(IntCC::NotEqual, enabled, 0)
@@ -382,7 +373,7 @@ impl Lowering<'_, '_> {
     /// The address a page fault faulted at: `cr2` on x86_64, the fault address register the
     /// AArch64 seam saved in the frame.
     fn fault_address(&mut self, fx: &mut Fx, saved: Value) -> Value {
-        match self.machine_arch() {
+        match self.arch() {
             Arch::Amd64 => self.call_stub(fx, Stub::ReadCr2, &[])[0],
             Arch::Aarch64 => fx.load(PTR, saved, aarch64::frame::FAR),
         }
@@ -394,7 +385,7 @@ impl Lowering<'_, '_> {
     /// starts its local APIC and timer. Maskable interrupts stay disabled until the executor
     /// enables them.
     pub fn interrupt_setup(&mut self, fx: &mut Fx) -> FuncId {
-        if self.machine_arch() == Arch::Aarch64 {
+        if self.arch() == Arch::Aarch64 {
             return self.aarch64_interrupt_setup(fx);
         }
         let idt = self.reserved(fx, IDT);
@@ -632,7 +623,7 @@ impl Lowering<'_, '_> {
 
     /// The vector seam, which holds the user path, and the path's offset in it.
     pub(super) fn user_path(&mut self) -> (FuncId, u32) {
-        match self.machine_arch() {
+        match self.arch() {
             Arch::Amd64 => (self.seam(), USER_AT),
             Arch::Aarch64 => (self.aarch64_seam(), aarch64::USER_AT),
         }
@@ -678,7 +669,7 @@ impl Lowering<'_, '_> {
     fn exception_trap(&mut self, fx: &mut Fx, frame: Value) {
         let layout = self.saved_frame();
         let code = fx.load(PTR, frame, layout.code);
-        let vector = match self.machine_arch() {
+        let vector = match self.arch() {
             Arch::Amd64 => fx.load(PTR, frame, frame::VECTOR),
             Arch::Aarch64 => aarch64::exception_vector(fx, code),
         };
@@ -753,7 +744,7 @@ impl Lowering<'_, '_> {
         let dispatch = self.dispatch_vector(bound, signature.clone());
         self.define(id, signature, super::super::lines::HIDDEN, |lo, fx| {
             let mut params = fx.entry();
-            if lo.machine_arch() == Arch::Aarch64 {
+            if lo.arch() == Arch::Aarch64 {
                 params[0] = lo.aarch64_vector(fx, params[0], params[1]);
             }
             let record = lo.running_cpu(fx);
@@ -833,7 +824,7 @@ impl Lowering<'_, '_> {
         self.define(id, signature, super::super::lines::HIDDEN, |lo, fx| {
             let params = fx.entry();
             let (vector, saved) = (params[0], params[1]);
-            if lo.machine_arch() == Arch::Amd64 {
+            if lo.arch() == Arch::Amd64 {
                 lo.resume_msr_probe(fx, vector, saved);
             }
             if let Some(stop) = vectors.stop {
@@ -973,7 +964,7 @@ impl Lowering<'_, '_> {
         saved: Value,
         preempting: bool,
     ) {
-        let shooting = self.machine_arch() == Arch::Amd64;
+        let shooting = self.arch() == Arch::Amd64;
         let signal_bound = bound.iter().any(|entry| entry.vector == SIGNAL_VECTOR);
         if !shooting && signal_bound {
             return;
@@ -1165,7 +1156,7 @@ impl Lowering<'_, '_> {
     pub fn current_vector(&mut self, fx: &mut Fx) -> Value {
         let record = self.running_cpu(fx);
         let mut vector = fx.load(PTR, record, cpu::VECTOR);
-        if self.machine_arch() == Arch::Aarch64 {
+        if self.arch() == Arch::Aarch64 {
             let lpi = fx.b.ins().icmp_imm_s(
                 IntCC::UnsignedGreaterThanOrEqual,
                 vector,
@@ -1345,7 +1336,7 @@ impl Lowering<'_, '_> {
     /// Ends the interrupt the running CPU serves, which `hw::IrqContext.complete` reaches: the
     /// local APIC's end-of-interrupt register on x86_64, and the GIC CPU interface's on AArch64.
     pub fn end_of_interrupt(&mut self, fx: &mut Fx) {
-        match self.machine_arch() {
+        match self.arch() {
             Arch::Amd64 => {
                 let zero = fx.ptr(0);
                 self.apic_write(fx, APIC_EOI, zero);
@@ -1414,7 +1405,7 @@ impl Lowering<'_, '_> {
         fx.when(later, |fx| {
             // The non-maskable interrupt reaches a halted x86_64 CPU, which then counts itself;
             // an AArch64 CPU halts with the stop interrupt masked, so it counts itself first.
-            match self.machine_arch() {
+            match self.arch() {
                 Arch::Amd64 => {
                     self.call_stub(fx, Stub::Halt, &[]);
                 }
@@ -1444,7 +1435,7 @@ impl Lowering<'_, '_> {
     /// interrupts do not hold back: a non-maskable interrupt on x86_64, and on AArch64 the
     /// software interrupt the interrupt controller delivers as a fast interrupt.
     fn send_stop(&mut self, fx: &mut Fx) {
-        match self.machine_arch() {
+        match self.arch() {
             Arch::Amd64 => {
                 let all = fx.ptr(0);
                 self.send_ipi(fx, all, IPI_NMI_OTHERS);
@@ -1465,7 +1456,7 @@ impl Lowering<'_, '_> {
     /// Counts the running CPU among the stopped and halts it. An AArch64 CPU masks fast
     /// interrupts first, so that a stop interrupt arriving meanwhile cannot count it twice.
     pub(super) fn stop_cpu(&mut self, fx: &mut Fx) {
-        if self.machine_arch() == Arch::Aarch64 {
+        if self.arch() == Arch::Aarch64 {
             self.call_stub(fx, Stub::FiqOff, &[]);
         }
         let state_address = self.state(fx);

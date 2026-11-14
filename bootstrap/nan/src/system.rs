@@ -1,6 +1,7 @@
-//! What the bootstrap does differently on the systems it runs on, Linux and Windows: the running
-//! user and home directory, the owners and modes of the user directory's files, the sync of a
-//! directory's entries, handing this process over to a program, and the signal ending a process.
+//! What the bootstrap does differently on the systems it runs on, Linux, macOS and Windows: the
+//! running user and home directory, the owners and modes of the user directory's files, the mode
+//! of an executable it writes, the sync of a directory's entries, handing this process over to a
+//! program, and the signal ending a process.
 
 use std::fs::{DirBuilder, Metadata, OpenOptions};
 use std::io;
@@ -8,8 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 /// The id of the user running this process: on Linux the real user id the kernel's status gives,
-/// and 0 on Windows, where the toolchain compares no owners.
-#[cfg(unix)]
+/// on macOS, which has no such status, the one `/usr/bin/id` prints, and 0 on Windows, where the
+/// toolchain compares no owners.
+#[cfg(target_os = "linux")]
 pub fn running_user() -> io::Result<u32> {
     std::fs::read_to_string("/proc/self/status")?
         .lines()
@@ -18,14 +20,24 @@ pub fn running_user() -> io::Result<u32> {
         .ok_or_else(|| io::Error::other("/proc/self/status gives no user id"))
 }
 
+#[cfg(target_os = "macos")]
+pub fn running_user() -> io::Result<u32> {
+    let printed = Command::new("/usr/bin/id").arg("-ru").output()?;
+    String::from_utf8_lossy(&printed.stdout)
+        .trim()
+        .parse()
+        .map_err(|_| io::Error::other("/usr/bin/id -ru prints no user id"))
+}
+
 #[cfg(windows)]
 pub fn running_user() -> io::Result<u32> {
     Ok(0)
 }
 
-/// The home directory of the user `uid`: on Linux the one the system's user database gives, and
-/// on Windows the running user's profile directory, which `USERPROFILE` names.
-#[cfg(unix)]
+/// The home directory of the user `uid`: on Linux the one the system's user database gives, on
+/// macOS, whose user database is no file, the directory `HOME` names, and on Windows the running
+/// user's profile directory, which `USERPROFILE` names.
+#[cfg(target_os = "linux")]
 pub fn home(uid: u32) -> io::Result<Option<PathBuf>> {
     let users = match std::fs::read_to_string("/etc/passwd") {
         Ok(users) => users,
@@ -37,6 +49,11 @@ pub fn home(uid: u32) -> io::Result<Option<PathBuf>> {
         (fields.len() == 7 && fields[2].parse() == Ok(uid) && !fields[5].is_empty())
             .then(|| PathBuf::from(fields[5]))
     }))
+}
+
+#[cfg(target_os = "macos")]
+pub fn home(_uid: u32) -> io::Result<Option<PathBuf>> {
+    Ok(std::env::var_os("HOME").map(PathBuf::from))
 }
 
 #[cfg(windows)]
@@ -68,6 +85,19 @@ pub fn private_file() -> OpenOptions {
 #[cfg(windows)]
 pub fn private_file() -> OpenOptions {
     OpenOptions::new()
+}
+
+/// Makes a file an executable its owner may write and everyone may read and run, by its mode on
+/// Linux; on Windows a file's name makes it one.
+#[cfg(unix)]
+pub fn make_executable(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+}
+
+#[cfg(windows)]
+pub fn make_executable(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// Whether a user other than `uid` owns a file or may write it, as its owner and mode say on

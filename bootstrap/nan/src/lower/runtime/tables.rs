@@ -107,8 +107,14 @@ const RECORD_SIZE: u64 = entry::STATE + 24;
 const RECORD_WORDS: i64 = 16;
 const ROOT_SHARE: u64 = 1;
 
-/// The working directory's descriptor for the `*at` system calls.
-const WORKING_DIRECTORY: i64 = -100;
+/// The working directory's descriptor for the `*at` functions of the system's C library: glibc's
+/// on Linux, `libSystem`'s on macOS; a Windows target's platform ignores it.
+fn working_directory(lo: &Lowering) -> i64 {
+    match lo.macos() {
+        true => -2,
+        false => -100,
+    }
+}
 
 pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
     let params = fx.entry();
@@ -888,7 +894,7 @@ fn mint_root(lo: &mut Lowering, fx: &mut Fx, world: Value) {
         let record = entry_at(lo, fx, handle);
         handles.push((field, handle, record));
     }
-    let directory = fx.int(PTR, WORKING_DIRECTORY);
+    let directory = fx.int(PTR, working_directory(lo));
     fx.store(directory, handles[0].2, entry::STATE);
     fx.store(now, handles[2].2, entry::STATE);
     fx.store(cell, handles[6].2, entry::STATE);
@@ -1051,6 +1057,7 @@ impl Lowering<'_, '_> {
     fn platform_function(&self, name: &str) -> ItemId {
         let platform = match self.ck.db.target.kind() {
             Some(Kind::Windows) => "windows_platform",
+            Some(Kind::Macos) => "macos_platform",
             Some(Kind::Uefi) => "uefi_platform",
             Some(Kind::Bare) => "bare_platform",
             _ => "linux_platform",

@@ -212,18 +212,19 @@ pub mod operation {
     pub const CANCEL: u64 = 32;
     pub const KIND: u64 = 40;
     /// Its links among its thread's operations in flight; on the seeded scheduler, on a
-    /// kernel and on a Windows target, among the timers of its clock or in the queue of the sim
-    /// it waits in.
+    /// kernel and on a Windows or macOS target, among the timers of its clock or in the queue of
+    /// the sim it waits in.
     pub const NEXT: u64 = 48;
     pub const PREVIOUS: u64 = 56;
     /// For a deadline, the task to wake once it completes, and the next deadline its task
     /// armed; for a wait in a sim, the sim's record; for a Windows request, its handle and the
-    /// thread running it, zero for one through the completion port.
+    /// thread running it, zero for one through the completion port; for a wait on a macOS
+    /// target's descriptor, its kqueue filter and the descriptor.
     pub const WAITER: u64 = 64;
     pub const LINK: u64 = 72;
-    /// When a deadline is due, and on the seeded scheduler, on a kernel and on a Windows target
-    /// when a timer is due and the order in which it was armed; for a wait in a sim, the glue
-    /// withdrawing it from the sim, given the record.
+    /// When a deadline is due, and on the seeded scheduler, on a kernel and on a Windows or macOS
+    /// target when a timer is due and the order in which it was armed; for a wait in a sim, the
+    /// glue withdrawing it from the sim, given the record.
     pub const DUE: u64 = 80;
     pub const ORDER: u64 = 88;
     pub const WITHDRAW: u64 = 96;
@@ -365,13 +366,14 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         Routine::Schedule => schedule(lo, fx),
         Routine::ThreadMain => {
             let params = fx.entry();
-            let refused = match lo.windows() {
-                true => host::windows::thread_start(lo, fx, params[0]),
-                false => {
-                    let slot = lo.thread_slot(fx);
-                    fx.store(params[0], slot, 0);
-                    host::linux::thread_signals(lo, fx, params[0])
-                }
+            let refused = if lo.windows() {
+                host::windows::thread_start(lo, fx, params[0])
+            } else if lo.macos() {
+                host::macos::thread_start(lo, fx, params[0])
+            } else {
+                let slot = lo.thread_slot(fx);
+                fx.store(params[0], slot, 0);
+                host::posix::thread_signals(lo, fx, params[0])
             };
             fx.when(refused, |fx| {
                 let status = fx.ptr(70);
@@ -390,6 +392,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
             let record = match (lo.machine(), lo.windows()) {
                 (true, _) => lo.thread(fx),
                 (false, true) => host::windows::current_thread(lo, fx),
+                (false, false) if lo.macos() => host::macos::current_thread(lo, fx),
                 (false, false) => {
                     let slot = lo.thread_slot(fx);
                     fx.load(PTR, slot, 0)
@@ -1451,7 +1454,8 @@ pub fn wait_delivered(lo: &mut Lowering, fx: &mut Fx, op: Value) {
 impl Lowering<'_, '_> {
     /// Arms a timer that expires `ns` nanoseconds from now: a timeout of the relative time it
     /// writes at `spec` on the running thread's ring, or a timer of the virtual clock on the
-    /// seeded scheduler and of the kernel's clock on a kernel.
+    /// seeded scheduler, of the kernel's clock on a kernel and of the monotonic clock the runtime
+    /// keeps on a Windows or macOS target.
     pub fn arm_timer(&mut self, fx: &mut Fx, op: Value, ns: Value, spec: Value) {
         if self.seeded() {
             super::seeded::arm(self, fx, op, ns);
@@ -1461,8 +1465,8 @@ impl Lowering<'_, '_> {
             self.kernel_arm(fx, op, ns);
             return;
         }
-        if self.windows() {
-            host::windows::arm(self, fx, op, ns);
+        if self.keeps_timers() {
+            self.call_routine(fx, Routine::TimerArm, &[op, ns]);
             return;
         }
         let billion = fx.ptr(1_000_000_000);
@@ -1483,14 +1487,16 @@ impl Lowering<'_, '_> {
             self.kernel_cancel(fx, op);
         } else if self.windows() {
             host::windows::cancel_operation(self, fx, op);
+        } else if self.macos() {
+            host::macos::cancel_operation(self, fx, op);
         } else {
             host::linux::cancel_operation(self, fx, op);
         }
     }
 
-    /// Delivers the completions that have arrived: those on the running thread's ring or on the
-    /// completion port, those the seeded scheduler queued, or the expiries of an isolated space's
-    /// timers that are due; a kernel's waits end by wakes alone.
+    /// Delivers the completions that have arrived: those on the running thread's ring, on the
+    /// completion port or on the kqueue, those the seeded scheduler queued, or the expiries of an
+    /// isolated space's timers that are due; a kernel's waits end by wakes alone.
     pub fn reap(&mut self, fx: &mut Fx) {
         if self.seeded() {
             super::seeded::reap(self, fx);
@@ -1498,19 +1504,21 @@ impl Lowering<'_, '_> {
             super::space::reap(self, fx);
         } else if self.windows() {
             host::windows::take_packets(self, fx, None);
+        } else if self.macos() {
+            host::macos::take_events(self, fx, None);
         } else if !self.kernel() {
             host::linux::reap(self, fx, None);
         }
     }
 
     /// The nanoseconds of the clock that delays count: the monotonic clock, the virtual clock
-    /// on the seeded scheduler, or the kernel's clock; a kernel's and a Windows target's through
-    /// `ClockNow`.
+    /// on the seeded scheduler, or the kernel's clock; a kernel's and a Windows or macOS
+    /// target's through `ClockNow`.
     pub fn now_ns(&mut self, fx: &mut Fx) -> Value {
         if self.seeded() {
             return super::seeded::now(self, fx);
         }
-        match self.kernel() || self.windows() {
+        match self.kernel() || self.keeps_timers() {
             true => self.call_routine(fx, Routine::ClockNow, &[])[0],
             false => self.platform_call(fx, "now_ns", &[]).result.scalar(),
         }

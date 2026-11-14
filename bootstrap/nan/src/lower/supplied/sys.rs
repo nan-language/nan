@@ -93,6 +93,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "sys::revocable" | "sys::Revoker" => revocation(lo, fx, supply),
         "linux_platform::submit" => submit(lo, fx, supply),
         path if path.starts_with("windows_platform::") => windows_platform(lo, fx, supply),
+        "macos_platform::watch" => watch(lo, fx, supply),
         _ => return false,
     }
     true
@@ -481,12 +482,12 @@ fn clock(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
                 supply.done(lo, fx);
             });
             let delay = clock_delay(lo, fx, minted, resolution, ns);
-            if lo.seeded() || lo.kernel() || lo.windows() {
+            if lo.seeded() || lo.kernel() || lo.keeps_timers() {
                 let cancelled = sims::wait(lo, fx, None, |lo, fx, op| {
                     if lo.seeded() {
                         seeded::arm(lo, fx, op, delay);
-                    } else if lo.windows() {
-                        host::windows::arm(lo, fx, op, delay);
+                    } else if lo.keeps_timers() {
+                        lo.call_routine(fx, Routine::TimerArm, &[op, delay]);
                     } else {
                         lo.kernel_arm(fx, op, delay);
                     }
@@ -998,6 +999,18 @@ fn revocation(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         }
         member => panic!("no lowering of sys::Revoker.{member}"),
     }
+}
+
+/// `macos_platform::watch(fd, filter)`, which the platform declares without a body: the wait of
+/// the running task until a descriptor is ready for a kqueue filter, whose result it gives.
+fn watch(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let args = [supply.param(0).scalar(), supply.param(1).scalar()];
+    let results = lo.call_routine(fx, Routine::Watch, &args);
+    fx.when(results[0], |fx| {
+        let origin = super::tasks::origin(lo, fx);
+        super::tasks::fail_cancelled(lo, fx, supply, origin);
+    });
+    supply.ret(lo, fx, Held::Scalar(results[1]));
 }
 
 /// The operations `windows_platform` declares without a body: `call`, a call of the function

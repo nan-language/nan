@@ -994,22 +994,10 @@ impl Lowering<'_, '_> {
             Repr::Empty => Returned::Empty,
             Repr::Address => panic!("a foreign fn returning a value in memory"),
         };
-        let convention = match self.windows() {
-            true => {
-                let arch = self
-                    .ck
-                    .db
-                    .target
-                    .arch()
-                    .expect("a Windows target's architecture");
-                super::host::windows::convention(arch)
-            }
-            false => super::CALL_CONV,
-        };
-        let mut signature = Signature::new(convention);
-        for repr in &params {
+        let mut signature = Signature::new(self.system_convention());
+        for (param, repr) in sig.params.iter().zip(&params) {
             if let Repr::Scalar(ty) = repr {
-                signature.params.push(AbiParam::new(*ty));
+                signature.params.push(self.foreign_param(&param.ty, *ty));
             }
         }
         if let Returned::Scalar(ty) = returned {
@@ -1021,6 +1009,21 @@ impl Lowering<'_, '_> {
             .declare_function(&name, Linkage::Import, &signature)
             .expect("a foreign symbol");
         (id, params, returned)
+    }
+}
+
+impl Lowering<'_, '_> {
+    /// A foreign fn's parameter of a type held as `ty`: under `"darwin"`, whose caller extends an
+    /// argument narrower than 32 bits, extended by its signedness.
+    fn foreign_param(&self, param: &Ty, ty: ir::Type) -> AbiParam {
+        let abi = AbiParam::new(ty);
+        if !self.macos() || ty.bits() >= 32 {
+            return abi;
+        }
+        match param.scalar() {
+            Some(scalar) if scalar.is_signed() => abi.sext(),
+            _ => abi.uext(),
+        }
     }
 }
 

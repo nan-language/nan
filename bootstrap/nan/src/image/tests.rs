@@ -113,7 +113,7 @@ fn aarch64_object() -> Vec<u8> {
 #[test]
 fn link_patches_relative_and_absolute_addresses_and_counts_zeroed_bytes_in_memory_only() {
     let base = 0x0010_0000;
-    let linked = link(&object(), base, Imports::None);
+    let linked = link(&object(), base, PAGE, Imports::None);
     let [text, data] = &linked.segments[..] else {
         panic!("{} segments", linked.segments.len());
     };
@@ -133,7 +133,7 @@ fn link_patches_relative_and_absolute_addresses_and_counts_zeroed_bytes_in_memor
 #[test]
 fn link_patches_aarch64_branches_pages_and_page_offsets() {
     let base = elf::base(workspace::Arch::Aarch64);
-    let linked = link(&aarch64_object(), base, Imports::None);
+    let linked = link(&aarch64_object(), base, PAGE, Imports::None);
     let [text, data] = &linked.segments[..] else {
         panic!("{} segments", linked.segments.len());
     };
@@ -180,6 +180,7 @@ fn link_lists_a_relocated_images_absolute_addresses_after_its_segments() {
     let linked = link(
         &module.finish().emit().expect("an object"),
         base,
+        PAGE,
         Imports::None,
     );
     let [_, header, data, listed] = &linked.segments[..] else {
@@ -259,7 +260,7 @@ fn a_console_program_imports_each_function_from_its_library_through_its_table() 
         .expect("the entry");
     let object = module.finish().emit().expect("an object");
     let base = pe::base(pe::Program::Console);
-    let linked = link(&object, base, Imports::Table);
+    let linked = link(&object, base, PAGE, Imports::Table);
     let [text, table] = &linked.segments[..] else {
         panic!("{} segments", linked.segments.len());
     };
@@ -373,7 +374,7 @@ fn a_console_program_holds_the_objects_unallocated_sections_after_its_relocation
     }
     let object = product.emit().expect("an object");
     let base = pe::base(pe::Program::Console);
-    let linked = link(&object, base, Imports::Table);
+    let linked = link(&object, base, PAGE, Imports::Table);
     let image = pe::write(&linked, base, workspace::Arch::Amd64, pe::Program::Console);
     let u32_at = |at: usize| u32::from_le_bytes(image[at..at + 4].try_into().expect("four bytes"));
     let count = u16::from_le_bytes([image[0x46], image[0x47]]) as usize;
@@ -408,4 +409,190 @@ fn a_console_program_holds_the_objects_unallocated_sections_after_its_relocation
     }
     assert!(artefacts.2 > relocations.2 && tree.2 > artefacts.2);
     assert_eq!(u32_at(optional + 56), (tree.2 + 4).next_multiple_of(0x1000));
+}
+
+/// The A64 instruction `ldr x0, [x0]`, its offset 0.
+const LDR_X0: u32 = 0xF940_0000;
+
+/// An object as lowering writes it for a macOS target of the architecture of `triple`: `entry`,
+/// whose `code` loads the address of the imported function `write` through `relocations`,
+/// `table` holding the address of `entry`, and the host sections `.nan` and `.nan.tree`.
+fn macos_object(triple: &str, code: &[u8], relocations: &[(u32, Reloc, i64)]) -> Vec<u8> {
+    let mut module = module(triple);
+    let signature = module.make_signature();
+    let entry = module
+        .declare_function("entry", Linkage::Local, &signature)
+        .expect("a function");
+    let write = module
+        .declare_function("write", Linkage::Import, &signature)
+        .expect("an import");
+    let relocations: Vec<ModuleReloc> = relocations
+        .iter()
+        .map(|(offset, kind, addend)| ModuleReloc {
+            offset: *offset,
+            kind: *kind,
+            name: write.into(),
+            addend: *addend,
+        })
+        .collect();
+    module
+        .define_function_bytes(entry, 16, code, &relocations)
+        .expect("the entry");
+    let mut table = DataDescription::new();
+    table.define(vec![0; 8].into_boxed_slice());
+    let address = module.declare_func_in_data(entry, &mut table);
+    table.write_function_addr(0, address);
+    let id = module
+        .declare_data("table", Linkage::Local, true, false)
+        .expect("a data object");
+    module.define_data(id, &table).expect("a data object");
+    let mut product = module.finish();
+    for (name, bytes) in [(".nan", &b"artefacts"[..]), (".nan.tree", &b"tree"[..])] {
+        let id = product.object.add_section(
+            Vec::new(),
+            name.as_bytes().to_vec(),
+            cranelift_object::object::SectionKind::Other,
+        );
+        product.object.append_section_data(id, bytes, 1);
+    }
+    product.emit().expect("an object")
+}
+
+#[test]
+fn sha256_digests_match_the_published_ones() {
+    let hex =
+        |digest: [u8; 32]| -> String { digest.iter().map(|byte| format!("{byte:02x}")).collect() };
+    assert_eq!(
+        hex(macho::sha256(b"abc")),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(
+        hex(macho::sha256(&[b'a'; 1000])),
+        "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3"
+    );
+}
+
+#[test]
+fn a_macos_image_binds_its_imports_rebases_its_addresses_and_signs_its_pages() {
+    let code = [0x48, 0x8b, 0x05, 0, 0, 0, 0, 0xc3];
+    let object = macos_object(
+        "x86_64-unknown-none-elf",
+        &code,
+        &[(3, Reloc::X86GOTPCRel4, -4)],
+    );
+    let base = macho::base();
+    let linked = link(&object, base, macho::PAGE, Imports::Got);
+    let [text, got, data] = &linked.segments[..] else {
+        panic!("{} segments", linked.segments.len());
+    };
+    assert_eq!((text.address, got.access), (base, Access::Read));
+    assert_eq!(linked.imports, [(got.address, "write".to_owned())]);
+    let displacement = i32::from_le_bytes(text.bytes[3..7].try_into().expect("four bytes"));
+    assert_eq!(base + 7 + displacement as u64, got.address);
+    assert_eq!(linked.absolute, [data.address]);
+    let image = macho::write(&linked, base, workspace::Arch::Amd64, "probe");
+    let u32_at = |at: usize| u32::from_le_bytes(image[at..at + 4].try_into().expect("four bytes"));
+    let u64_at = |at: usize| u64::from_le_bytes(image[at..at + 8].try_into().expect("8 bytes"));
+    assert_eq!(u32_at(0), 0xFEED_FACF);
+    let mut segments = Vec::new();
+    let mut commands = Vec::new();
+    let mut at = 32;
+    for _ in 0..u32_at(16) {
+        let kind = u32_at(at);
+        commands.push(kind);
+        if kind == 0x19 {
+            let name = image[at + 8..at + 24]
+                .split(|byte| *byte == 0)
+                .next()
+                .expect("a name");
+            let sections = (0..u32_at(at + 64) as usize)
+                .map(|index| {
+                    let section = at + 72 + 80 * index;
+                    (u64_at(section + 40), u32_at(section + 48))
+                })
+                .collect::<Vec<_>>();
+            segments.push((String::from_utf8_lossy(name).into_owned(), sections));
+        }
+        at += u32_at(at + 4) as usize;
+    }
+    let names: Vec<&str> = segments.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "__PAGEZERO",
+            "__TEXT",
+            "__DATA_CONST",
+            "__DATA",
+            "__NAN",
+            "__LINKEDIT"
+        ]
+    );
+    let [(artefacts_size, artefacts_at), (tree_size, tree_at)] = segments[4].1[..] else {
+        panic!("the host sections");
+    };
+    let held = |at: u32, size: u64| &image[at as usize..at as usize + size as usize];
+    assert_eq!(held(artefacts_at, artefacts_size), b"artefacts");
+    assert_eq!(held(tree_at, tree_size), b"tree");
+    let command = |kind: u32| {
+        let mut at = 32;
+        for _ in 0..u32_at(16) {
+            if u32_at(at) == kind {
+                return at;
+            }
+            at += u32_at(at + 4) as usize;
+        }
+        panic!("no load command {kind:#x}");
+    };
+    assert_eq!(u64_at(command(0x8000_0028) + 8), macho::PAGE, "LC_MAIN");
+    let info = command(0x8000_0022);
+    let opcodes = |at: usize| held(u32_at(info + at), u64::from(u32_at(info + at + 4)));
+    let mut bind = vec![0x11, 0x51, 0x40];
+    bind.extend_from_slice(b"_write\0");
+    bind.extend_from_slice(&[0x72, 0x00, 0x90, 0x00]);
+    assert_eq!(opcodes(8), [0x11, 0x23, 0x00, 0x51, 0x00]);
+    assert_eq!(opcodes(16), bind);
+    let signature = command(0x1D);
+    let (code_end, size) = (
+        u32_at(signature + 8) as usize,
+        u32_at(signature + 12) as usize,
+    );
+    assert_eq!(code_end + size, image.len());
+    let blob = &image[code_end..];
+    let be = |at: usize| u32::from_be_bytes(blob[at..at + 4].try_into().expect("four bytes"));
+    assert_eq!(
+        (be(0), be(4), be(20)),
+        (0xFADE_0CC0, size as u32, 0xFADE_0C02)
+    );
+    let directory = be(16) as usize;
+    let hashes = directory + be(directory + 16) as usize;
+    let identifier = directory + be(directory + 20) as usize;
+    assert_eq!(&blob[identifier..identifier + 6], b"probe\0");
+    for (index, page) in image[..code_end].chunks(4_096).enumerate() {
+        let at = hashes + 32 * index;
+        assert_eq!(blob[at..at + 32], macho::sha256(page), "page {index}");
+    }
+}
+
+#[test]
+fn a_macos_image_patches_aarch64_loads_of_its_offset_tables_words() {
+    let code = code(&[ADRP_X0, LDR_X0, RET]);
+    let relocations = [
+        (0, Reloc::Aarch64AdrGotPage21, 0),
+        (4, Reloc::Aarch64Ld64GotLo12Nc, 0),
+    ];
+    let object = macos_object("aarch64-unknown-none-elf", &code, &relocations);
+    let base = macho::base();
+    let linked = link(&object, base, macho::PAGE, Imports::Got);
+    let [text, got, _] = &linked.segments[..] else {
+        panic!("{} segments", linked.segments.len());
+    };
+    assert_eq!(linked.imports, [(got.address, "write".to_owned())]);
+    let pages = ((got.address & !0xFFF) - (base & !0xFFF)) >> 12;
+    let words: Vec<u32> = text.bytes[..8]
+        .chunks(4)
+        .map(|word| u32::from_le_bytes(word.try_into().expect("four bytes")))
+        .collect();
+    let page = ADRP_X0 | ((pages as u32 & 3) << 29) | ((pages as u32 >> 2) << 5);
+    let offset = LDR_X0 | (((got.address & 0xFFF) as u32 >> 3) << 10);
+    assert_eq!(words, [page, offset]);
 }

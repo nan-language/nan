@@ -1,13 +1,13 @@
 //! The timers of the clocks the runtime keeps itself, the seeded scheduler's virtual clock, a
-//! kernel's clock and a Windows target's monotonic clock: one list of operations ordered by the
-//! nanosecond each is due, then by the order in which they were armed. A kernel's CPUs and a
-//! Windows target's executor threads share the list behind the timer lock.
+//! kernel's clock and a Windows or macOS target's monotonic clock: one list of operations ordered
+//! by the nanosecond each is due, then by the order in which they were armed. A kernel's CPUs and
+//! a Windows or macOS target's executor threads share the list behind the timer lock.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
 use super::super::Lowering;
 use super::super::fx::{Fx, PTR};
-use super::tasks::operation;
+use super::tasks::{self, operation};
 use super::{Routine, seeded, state};
 
 /// The nanoseconds of a millisecond.
@@ -108,6 +108,72 @@ pub fn disarm(lo: &mut Lowering, fx: &mut Fx, op: Value) {
     );
     let has_next = fx.b.ins().icmp_imm_s(IntCC::NotEqual, next, 0);
     fx.when(has_next, |fx| fx.store(previous, next, operation::PREVIOUS));
+}
+
+/// Arms a timer of the monotonic clock due `ns` nanoseconds from now in the timers a host
+/// target's executor threads share.
+pub fn arm_shared(lo: &mut Lowering, fx: &mut Fx, op: Value, ns: Value) {
+    let state_address = lo.state(fx);
+    let lock = fx.offset(state_address, state::TIMER_LOCK);
+    lo.call_routine(fx, Routine::Lock, &[lock]);
+    let now = lo.now_ns(fx);
+    let due = due_after(fx, now, ns);
+    arm(lo, fx, op, due);
+    lo.call_routine(fx, Routine::Unlock, &[lock]);
+}
+
+/// Whether a timer is armed in the timers a host target's executor threads share, and the
+/// nanoseconds until the first is due, zero once it is.
+pub fn first_due_in(lo: &mut Lowering, fx: &mut Fx) -> (Value, Value) {
+    let state_address = lo.state(fx);
+    let lock = fx.offset(state_address, state::TIMER_LOCK);
+    lo.call_routine(fx, Routine::Lock, &[lock]);
+    let first = fx.load(PTR, state_address, state::TIMERS);
+    let armed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, first, 0);
+    let due = fx.choose(
+        armed,
+        &[PTR],
+        |fx| vec![fx.load(PTR, first, operation::DUE)],
+        |fx| vec![fx.int(PTR, -1)],
+    )[0];
+    lo.call_routine(fx, Routine::Unlock, &[lock]);
+    let now = lo.now_ns(fx);
+    let ahead = fx.b.ins().icmp(IntCC::UnsignedGreaterThan, due, now);
+    let left = fx.b.ins().isub(due, now);
+    let zero = fx.ptr(0);
+    (armed, fx.b.ins().select(ahead, left, zero))
+}
+
+/// Takes each timer due out of the timers a host target's executor threads share, one at a
+/// time under the timer lock, and delivers its expiry outside it.
+pub fn expire(lo: &mut Lowering, fx: &mut Fx) {
+    let now = lo.now_ns(fx);
+    fx.repeat(&[], |fx, _| {
+        let state_address = lo.state(fx);
+        let lock = fx.offset(state_address, state::TIMER_LOCK);
+        lo.call_routine(fx, Routine::Lock, &[lock]);
+        let first = fx.load(PTR, state_address, state::TIMERS);
+        let armed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, first, 0);
+        let due = fx.choose(
+            armed,
+            &[types::I8],
+            |fx| {
+                let due = fx.load(PTR, first, operation::DUE);
+                vec![fx.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, due, now)]
+            },
+            |fx| vec![fx.int(types::I8, 0)],
+        )[0];
+        fx.when(due, |fx| {
+            disarm(lo, fx, first);
+            claim(fx, first);
+        });
+        lo.call_routine(fx, Routine::Unlock, &[lock]);
+        fx.when(due, |fx| {
+            let expired = fx.int(types::I32, tasks::EXPIRED);
+            tasks::deliver(lo, fx, first, expired);
+        });
+        (due, Vec::new())
+    });
 }
 
 /// The nanosecond `delay` after `now`, the latest one when that is past it.

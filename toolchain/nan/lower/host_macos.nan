@@ -1,0 +1,596 @@
+//! The macOS targets, everything macOS-specific: the executor threads, one per processor online, which all wait on the process's kqueue for the descriptors tasks wait on and for the wakes of the user events each thread has there; termination requests, which a thread of their own reads from a kqueue of its own; the timers of the monotonic clock, which the runtime keeps; the running executor thread's record, a thread-specific value; and the values and layouts of `libSystem`. A wait on a descriptor is a one-shot event of the executors' kqueue specific to its operation record, whose `WAITER` field holds the event's filter and `LINK` field the descriptor; deleting the event cancels the wait only while no thread has taken it from the kqueue, so exactly one of the cancellation and the thread taking it delivers its completion.
+
+/// The signal of a bus error, which a fault in a stack's protected guard region gives as a
+/// segmentation violation can.
+const SIGBUS: i32 = 10
+
+/// The values and layouts of `libSystem`.
+const MACOS_POSIX: Posix = libsystem_layouts()
+
+fn libsystem_layouts() -> Posix {
+    var faults = Array[i32, 2].filled(SIGBUS)
+    faults[1] = SIGSEGV
+    return Posix(map_anonymous: 0x1002, map_stack: 0x1002, stop: 16, faults: faults, fault_count: 2, cpu_limit: 24, sigaction: 16, sigaction_flags: 12, siginfo: 0x40, on_stack: 0x1, restart: 0x2, stack_size: 8, stack_flags: 16, fault_address: 24)
+} libsystem_layouts
+
+/// The offset in a `ucontext_t` of the address of its machine context.
+const MACHINE_CONTEXT: u64 = 48
+
+/// The offsets in a machine context of the registers a stop or fault handler reads and
+/// redirects, after its exception state.
+fn macos_context(arch: workspace::Arch) -> Context {
+    return match arch {
+        workspace::Arch.Amd64 => Context(arg: 16 + 4 * 8u64, fp: 16 + 6 * 8u64, sp: 16 + 7 * 8u64, ip: 16 + 16 * 8u64, link: None)
+        workspace::Arch.Aarch64 => Context(arg: 16, fp: 16 + 29 * 8u64, sp: 16 + 31 * 8u64, ip: 16 + 32 * 8u64, link: Some(16 + 30 * 8u64))
+    }
+} macos_context
+
+/// The address of the registers a handler's `ucontext_t` saved, and their offsets there.
+fn macos_registers(mut lo: Lowering, mut fx: Fx, context: clif::Value) -> SavedRegisters {
+    let saved = mut fx.load(PTR, addr: context, offset: MACHINE_CONTEXT)
+    return SavedRegisters(at: saved, offsets: macos_context(lo.arch()))
+} macos_registers
+
+/// The filters, flags and notes of the kqueue events the runtime registers, and the layout of a
+/// `struct kevent`.
+const EVENT_SIGNAL: i64 = -6
+
+const EVENT_USER: i64 = -10
+
+const EVENT_ADD: i64 = 0x1
+
+const EVENT_DELETE: i64 = 0x2
+
+const EVENT_ONESHOT: i64 = 0x10
+
+const EVENT_CLEAR: i64 = 0x20
+
+const EVENT_UDATA_SPECIFIC: i64 = 0x100
+
+const EVENT_ERROR: i64 = 0x4000
+
+const EVENT_TRIGGER: i64 = 0x0100_0000
+
+const EVENT_IDENT: u64 = 0
+
+const EVENT_FILTER: u64 = 8
+
+const EVENT_FLAGS: u64 = 10
+
+const EVENT_FFLAGS: u64 = 12
+
+const EVENT_DATA: u64 = 16
+
+const EVENT_UDATA: u64 = 24
+
+const EVENT_SIZE: u64 = 32
+
+/// The user event of the first termination request; executor thread i's is i + 1.
+const TERMINATION_EVENT: i64 = 0
+
+/// The events a thread takes from the kqueue at once, and the longest it waits there, a day,
+/// which the system accepts whatever the first timer.
+const KQUEUE_EVENTS: u64 = 16
+
+const LONGEST_WAIT: u64 = 86_400_000_000_000
+
+/// The `sysconf` name of the number of processors online, and the clock `clock_gettime_nsec_np`
+/// reads as the monotonic clock: the system's uptime, which stops while it sleeps.
+const SC_NPROCESSORS_ONLN: i64 = 58
+
+const CLOCK_UPTIME_RAW: i64 = 8
+
+/// The system setting reporting `PSTATE.DIT`.
+const FEAT_DIT: Str = "hw.optional.arm.FEAT_DIT"
+
+/// The system setting `name` as a 32-bit integer, zero when the system has none.
+fn Lowering.system_setting(mut self, mut fx: Fx, name: Str) -> clif::Value {
+    var spelt = mem::Bytes.empty(self.alloc)
+    mut spelt.append(name.as_bytes())
+    mut spelt.push(0)
+    let literal = mut self.view_literal(mut fx, contents: spelt.view())
+    let name_at = mut fx.load(PTR, addr: literal.address_value(), offset: 0)
+    let value = mut fx.slot(16, align: 8)
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: value, offset: 0)
+    let size = mut fx.b.iadd_imm_s(value, y: 8)
+    let four = mut fx.ptr(4)
+    mut fx.store(four, addr: size, offset: 0)
+    discard mut self.call_libc(mut fx, name: "sysctlbyname", args: fx.list5(name_at, b: value, c: size, d: zero, e: zero).view(), returns: fx.types1(clif::Type.Int32).view())
+    return mut fx.load(clif::Type.Int32, addr: value, offset: 0)
+} Lowering.system_setting
+
+/// Makes a record the running thread's: the thread-specific value of the key `Init` created.
+fn macos_make_current(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let state_address = mut lo.state(mut fx)
+    let key = mut fx.load(PTR, addr: state_address, offset: STATE_TLS_INDEX)
+    discard mut lo.call_libc(mut fx, name: "pthread_setspecific", args: fx.list2(key, b: record).view(), returns: fx.types1(clif::Type.Int32).view())
+} macos_make_current
+
+/// The record of the executor thread running the caller, zero outside one.
+fn macos_current_thread(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let state_address = mut lo.state(mut fx)
+    let key = mut fx.load(PTR, addr: state_address, offset: STATE_TLS_INDEX)
+    return first_result(mut lo.call_libc(mut fx, name: "pthread_getspecific", args: fx.list1(key).view(), returns: fx.types1(PTR).view()))
+} macos_current_thread
+
+/// Makes a record the running thread's, turns on its data-independent timing where the
+/// processor has it, and gives it a signal stack and a stack for stack overflow reports;
+/// nonzero when the system refuses one.
+fn macos_thread_start(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value {
+    macos_make_current(mut lo, mut fx, record)
+    macos_constant_time(mut lo, mut fx)
+    return thread_signals(mut lo, mut fx, record)
+} macos_thread_start
+
+/// Turns on `PSTATE.DIT` for the running thread on a processor that has it, which threads do not
+/// inherit; an x86_64 process cannot turn on DOITM, which is the system's.
+fn macos_constant_time(mut lo: Lowering, mut fx: Fx) {
+    if lo.arch() != workspace::Arch.Aarch64 {
+        return
+    }
+    let dit = mut lo.system_setting(mut fx, name: FEAT_DIT)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: dit, y: 0)
+    mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+        discard mut lo.call_stub(mut fx1, stub: Stub.ConstantTime, args: mem::List[clif::Value].empty(fx1.alloc).view())
+    })
+} macos_constant_time
+
+/// The executor threads of `Init`: one per processor online, the calling thread being the
+/// first, which all wait on the process's kqueue, after the handlers of the stop signal and of
+/// faults and the thread reading termination requests; returns 1 from `Init` when the system
+/// refuses one.
+fn macos_start_threads(mut lo: Lowering, mut fx: Fx) {
+    let state_address = mut lo.state(mut fx)
+    let key = mut fx.slot(8, align: 8)
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: key, offset: 0)
+    let created = first_result(mut lo.call_libc(mut fx, name: "pthread_key_create", args: fx.list2(key, b: zero).view(), returns: fx.types1(clif::Type.Int32).view()))
+    let no_key = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: created, y: 0)
+    unavailable_if(mut fx, condition: no_key)
+    let key_value = mut fx.load(PTR, addr: key, offset: 0)
+    mut fx.store(key_value, addr: state_address, offset: STATE_TLS_INDEX)
+    if lo.seeded() {
+        posix_start_seeded(mut lo, mut fx, make_current: fn(mut cx: Lowering, mut current_fx: Fx, record: clif::Value) {
+            macos_make_current(mut cx, fx: mut current_fx, record)
+            macos_constant_time(mut cx, fx: mut current_fx)
+        })
+        return
+    }
+    let port = first_result(mut lo.call_libc(mut fx, name: "kqueue", args: mem::List[clif::Value].empty(fx.alloc).view(), returns: fx.types1(clif::Type.Int32).view()))
+    let no_port = mut fx.b.icmp_imm_s(clif::IntCC.SignedLessThan, x: port, y: 0)
+    unavailable_if(mut fx, condition: no_port)
+    let port_word = mut fx.b.sextend(PTR, x: port)
+    mut fx.store(port_word, addr: state_address, offset: STATE_PORT)
+    let online = mut fx.int(clif::Type.Int32, value: SC_NPROCESSORS_ONLN)
+    let processors_online = first_result(mut lo.call_libc(mut fx, name: "sysconf", args: fx.list1(online).view(), returns: fx.types1(PTR).view()))
+    let reported = mut fx.b.icmp_imm_s(clif::IntCC.SignedGreaterThan, x: processors_online, y: 0)
+    let one = mut fx.ptr(1)
+    let count = mut fx.b.select(reported, x: processors_online, y: one)
+    mut fx.store(count, addr: state_address, offset: STATE_THREAD_COUNT)
+    let size = mut fx.b.imul_imm_s(count, y: 8)
+    let threads = mut lo.record_alloc(mut fx, size)
+    unavailable_unless(mut fx, address: threads)
+    mut fx.store(threads, addr: state_address, offset: STATE_THREADS)
+    let termination_ident = mut fx.int(PTR, value: TERMINATION_EVENT)
+    let no_event = macos_add_user_event(mut lo, mut fx, ident: termination_ident)
+    unavailable_if(mut fx, condition: no_event)
+    mut fx.each(zero, end: count, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+        let record_size = mut fx1.ptr(THREAD_SIZE)
+        let record = mut lo.record_alloc(mut fx1, size: record_size)
+        unavailable_unless(mut fx1, address: record)
+        mut fx1.store(index, addr: record, offset: THREAD_INDEX)
+        let offset = mut fx1.b.imul_imm_s(index, y: 8)
+        let slot = mut fx1.b.iadd(threads, y: offset)
+        mut fx1.store(record, addr: slot, offset: 0)
+        let ident = mut fx1.b.iadd_imm_s(index, y: 1)
+        let refused = macos_add_user_event(mut lo, fx: mut fx1, ident)
+        unavailable_if(mut fx1, condition: refused)
+    })
+    let first_thread = mut fx.load(PTR, addr: threads, offset: 0)
+    let refused = macos_thread_start(mut lo, mut fx, record: first_thread)
+    unavailable_if(mut fx, condition: refused)
+    install_handlers(mut lo, mut fx)
+    macos_read_signals(mut lo, mut fx)
+    let thread_main_id = mut lo.routine(Routine.ThreadMain)
+    let thread_main_ref = mut lo.func_ref(mut fx, id: thread_main_id)
+    let thread_main = mut fx.b.func_addr(PTR, func_ref: thread_main_ref)
+    mut fx.each(one, end: count, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+        let offset = mut fx1.b.imul_imm_s(index, y: 8)
+        let slot = mut fx1.b.iadd(threads, y: offset)
+        let record = mut fx1.load(PTR, addr: slot, offset: 0)
+        let no_thread = macos_spawn(mut lo, fx: mut fx1, start: thread_main, argument: record)
+        unavailable_if(mut fx1, condition: no_thread)
+    })
+} macos_start_threads
+
+/// Starts a thread running `start` with an argument; nonzero when the system refuses.
+fn macos_spawn(mut lo: Lowering, mut fx: Fx, start: clif::Value, argument: clif::Value) -> clif::Value {
+    let id = mut fx.slot(8, align: 8)
+    let zero = mut fx.ptr(0)
+    let started = first_result(mut lo.call_libc(mut fx, name: "pthread_create", args: fx.list4(id, b: zero, c: start, d: argument).view(), returns: fx.types1(clif::Type.Int32).view()))
+    return mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: started, y: 0)
+} macos_spawn
+
+/// Writes a `struct kevent` of an identifier, a filter, flags, filter flags and user data.
+fn event_of(mut fx: Fx, at: clif::Value, ident: clif::Value, filter: clif::Value, flags: i64, notes: i64, data: clif::Value) {
+    mut fx.store(ident, addr: at, offset: EVENT_IDENT)
+    mut fx.store(filter, addr: at, offset: EVENT_FILTER)
+    let flag_bits = mut fx.int(clif::Type.Int16, value: flags)
+    mut fx.store(flag_bits, addr: at, offset: EVENT_FLAGS)
+    let note_bits = mut fx.int(clif::Type.Int32, value: notes)
+    mut fx.store(note_bits, addr: at, offset: EVENT_FFLAGS)
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: at, offset: EVENT_DATA)
+    mut fx.store(data, addr: at, offset: EVENT_UDATA)
+} event_of
+
+/// Applies one change to a kqueue, giving `kevent`'s result: 0, or -1 when the change fails.
+fn macos_change(mut lo: Lowering, mut fx: Fx, queue: clif::Value, change: clif::Value) -> clif::Value {
+    let one = mut fx.int(clif::Type.Int32, value: 1)
+    let none = mut fx.ptr(0)
+    let zero = mut fx.int(clif::Type.Int32, value: 0)
+    return first_result(mut lo.call_libc(mut fx, name: "kevent", args: fx.list6(queue, b: change, c: one, d: none, e: zero, f: none).view(), returns: fx.types1(clif::Type.Int32).view()))
+} macos_change
+
+/// The executors' kqueue.
+fn macos_port(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let state_address = mut lo.state(mut fx)
+    let port = mut fx.load(PTR, addr: state_address, offset: STATE_PORT)
+    return mut fx.b.ireduce(clif::Type.Int32, x: port)
+} macos_port
+
+/// Adds a user event of an identifier to the executors' kqueue, cleared once taken; nonzero
+/// when the system refuses.
+fn macos_add_user_event(mut lo: Lowering, mut fx: Fx, ident: clif::Value) -> clif::Value {
+    let at = mut fx.slot(EVENT_SIZE, align: 8)
+    let filter = mut fx.int(clif::Type.Int16, value: EVENT_USER)
+    let zero = mut fx.ptr(0)
+    event_of(mut fx, at, ident, filter, flags: EVENT_ADD | EVENT_CLEAR, notes: 0, data: zero)
+    let port = macos_port(mut lo, mut fx)
+    let result = macos_change(mut lo, mut fx, queue: port, change: at)
+    return mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: result, y: 0)
+} macos_add_user_event
+
+/// Triggers the user event of an identifier, which wakes a thread waiting on the executors'
+/// kqueue.
+fn macos_trigger(mut lo: Lowering, mut fx: Fx, ident: clif::Value) {
+    let at = mut fx.slot(EVENT_SIZE, align: 8)
+    let filter = mut fx.int(clif::Type.Int16, value: EVENT_USER)
+    let zero = mut fx.ptr(0)
+    event_of(mut fx, at, ident, filter, flags: 0, notes: EVENT_TRIGGER, data: zero)
+    let port = macos_port(mut lo, mut fx)
+    discard macos_change(mut lo, mut fx, queue: port, change: at)
+} macos_trigger
+
+/// Ignores the termination request signals, which a kqueue still reports, and starts the thread
+/// reading them from a kqueue of its own.
+fn macos_read_signals(mut lo: Lowering, mut fx: Fx) {
+    let queue = first_result(mut lo.call_libc(mut fx, name: "kqueue", args: mem::List[clif::Value].empty(fx.alloc).view(), returns: fx.types1(clif::Type.Int32).view()))
+    let no_queue = mut fx.b.icmp_imm_s(clif::IntCC.SignedLessThan, x: queue, y: 0)
+    unavailable_if(mut fx, condition: no_queue)
+    let at = mut fx.slot(EVENT_SIZE, align: 8)
+    for number in SIGNALS {
+        let ignore = mut fx.ptr(1)
+        let signal_value = mut fx.int(clif::Type.Int32, value: number)
+        discard mut lo.call_libc(mut fx, name: "signal", args: fx.list2(signal_value, b: ignore).view(), returns: fx.types1(PTR).view())
+        let ident = mut fx.ptr(u64.fit(number))
+        let filter = mut fx.int(clif::Type.Int16, value: EVENT_SIGNAL)
+        let zero = mut fx.ptr(0)
+        event_of(mut fx, at, ident, filter, flags: EVENT_ADD, notes: 0, data: zero)
+        let result = macos_change(mut lo, mut fx, queue, change: at)
+        let refused = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: result, y: 0)
+        unavailable_if(mut fx, condition: refused)
+    }
+    let start_id = mut lo.routine(Routine.Terminations)
+    let start_ref = mut lo.func_ref(mut fx, id: start_id)
+    let start = mut fx.b.func_addr(PTR, func_ref: start_ref)
+    let queue_word = mut fx.b.sextend(PTR, x: queue)
+    let no_thread = macos_spawn(mut lo, mut fx, start, argument: queue_word)
+    unavailable_if(mut fx, condition: no_thread)
+} macos_read_signals
+
+/// `Terminations(queue)`: reads each termination request from its kqueue: the first records the
+/// status a request with its signal number n ends the process with, 128 + n, and triggers the
+/// user event the executor threads cancel the entry task's construct on; a later one ends the
+/// process at once, whatever the executor threads run.
+fn macos_terminations(mut lo: Lowering, mut fx: Fx, queue: clif::Value) {
+    let queue32 = mut fx.b.ireduce(clif::Type.Int32, x: queue)
+    let taken = mut fx.slot(EVENT_SIZE, align: 8)
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        let none = mut fx1.ptr(0)
+        let zero = mut fx1.int(clif::Type.Int32, value: 0)
+        let one = mut fx1.int(clif::Type.Int32, value: 1)
+        let count = first_result(mut lo.call_libc(mut fx1, name: "kevent", args: fx1.list6(queue32, b: none, c: zero, d: taken, e: one, f: none).view(), returns: fx1.types1(clif::Type.Int32).view()))
+        let read = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: count, y: 1)
+        mut fx1.if_true(read, then: fn[mut lo](mut fx2: Fx) {
+            macos_requested(mut lo, fx: mut fx2, taken)
+        })
+        let again = mut fx1.int(clif::Type.Int8, value: 1)
+        return Pass(again: again, next: mem::List[clif::Value].empty(fx1.alloc))
+    })
+    mut fx.b.trap(clif::TrapCode(user: 1))
+} macos_terminations
+
+/// Takes a termination request whose signal event is at `taken`: the first records the status it
+/// ends the process with and triggers the user event of the first request, a later one ends the
+/// process at once.
+fn macos_requested(mut lo: Lowering, mut fx: Fx, taken: clif::Value) {
+    let signal_number = mut fx.load(PTR, addr: taken, offset: EVENT_IDENT)
+    let status = mut fx.b.iadd_imm_s(signal_number, y: 128)
+    let state_address = mut lo.state(mut fx)
+    let word = mut fx.offset(state_address, offset: STATE_TERMINATION)
+    let zero = mut fx.ptr(0)
+    let before = mut fx.b.atomic_cas(clif::MemFlags.owned(), p: word, e: zero, x: status)
+    let later = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: before, y: 0)
+    mut fx.if_true(later, then: fn[mut lo](mut fx1: Fx) {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Exit, args: fx1.list1(status).view())
+    })
+    let first_request = mut fx.int(PTR, value: TERMINATION_EVENT)
+    macos_trigger(mut lo, mut fx, ident: first_request)
+} macos_requested
+
+/// `Watch(fd, filter) -> (refused, result)`: parks the running task until the descriptor `fd` is
+/// ready for the kqueue filter `filter`, and gives the event's data, the bytes or room it reports,
+/// or the negated error number of a wait the system refuses; a task cancelled when it starts
+/// waits for nothing, and one cancelled while it waits deletes the event. Gives whether the task's
+/// cancellation refused the wait.
+fn macos_define_watch(mut lo: Lowering, mut fx: Fx) {
+    let params = mut fx.entry()
+    expect params.len() == 2
+    let record = current_task(mut lo, mut fx)
+    let region = mut fx.load(PTR, addr: record, offset: TASKS_TASK_REGION)
+    let origin_before = regions_origin(mut fx, region)
+    let early = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin_before, y: 0)
+    mut fx.if_true(early, then: fn(mut fx1: Fx) {
+        let yes = mut fx1.int(clif::Type.Int8, value: 1)
+        let nothing = mut fx1.int(clif::Type.Int64, value: 0)
+        mut fx1.b.ret(fx1.list2(yes, b: nothing).view())
+    })
+    let op = mut fx.slot(OPERATION_SIZE, align: 8)
+    let zero = mut fx.ptr(0)
+    let size = mut fx.ptr(OPERATION_SIZE)
+    discard mut lo.call_routine(mut fx, routine: Routine.Fill, args: fx.list3(op, b: zero, c: size).view())
+    mut fx.store(record, addr: op, offset: OPERATION_TASK)
+    let wait = mut fx.ptr(u64.fit(TASKS_KIND_WAIT))
+    mut fx.store(wait, addr: op, offset: OPERATION_KIND)
+    let filter = mut fx.b.sextend(PTR, x: params[1])
+    mut fx.store(filter, addr: op, offset: OPERATION_WAITER)
+    let fd = mut fx.b.sextend(PTR, x: params[0])
+    mut fx.store(fd, addr: op, offset: OPERATION_LINK)
+    let word = mut fx.offset(record, offset: TASK_IO)
+    mut fx.atomic_store(op, addr: word)
+    let at = mut fx.slot(EVENT_SIZE, align: 8)
+    let filter16 = mut fx.b.ireduce(clif::Type.Int16, x: filter)
+    event_of(mut fx, at, ident: fd, filter: filter16, flags: EVENT_ADD | EVENT_ONESHOT | EVENT_UDATA_SPECIFIC, notes: 0, data: op)
+    let port = macos_port(mut lo, mut fx)
+    let added = macos_change(mut lo, mut fx, queue: port, change: at)
+    let refused = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: added, y: 0)
+    mut fx.if_true(refused, then: fn[mut lo](mut fx1: Fx) {
+        release_io(mut lo, fx: mut fx1, word, op)
+        let error = macos_last_error(mut lo, fx: mut fx1)
+        let no = mut fx1.int(clif::Type.Int8, value: 0)
+        mut fx1.b.ret(fx1.list2(no, b: error).view())
+    })
+    let origin_started = regions_origin(mut fx, region)
+    let cancelled = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin_started, y: 0)
+    mut fx.if_true(cancelled, then: fn[mut lo](mut fx1: Fx) {
+        mut lo.cancel_operation(mut fx1, op)
+    })
+    wait_delivered(mut lo, mut fx, op)
+    release_io(mut lo, mut fx, word, op)
+    let result = mut fx.load(clif::Type.Int32, addr: op, offset: OPERATION_RESULT)
+    let refused_wait = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: result, y: CANCELED)
+    let origin_after = regions_origin(mut fx, region)
+    let cancelled_after = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin_after, y: 0)
+    let failed = mut fx.b.band(refused_wait, y: cancelled_after)
+    let wide = mut fx.b.sextend(clif::Type.Int64, x: result)
+    mut fx.b.ret(fx.list2(failed, b: wide).view())
+} macos_define_watch
+
+/// The negated number of the calling thread's last error.
+fn macos_last_error(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let error = first_result(mut lo.call_libc(mut fx, name: "__error", args: mem::List[clif::Value].empty(fx.alloc).view(), returns: fx.types1(PTR).view()))
+    let number = mut fx.load(clif::Type.Int32, addr: error, offset: 0)
+    let wide = mut fx.b.sextend(clif::Type.Int64, x: number)
+    return mut fx.b.ineg(wide)
+} macos_last_error
+
+/// Asks once for the cancellation of an operation whose record stays valid during the call: a
+/// timer armed and not expired leaves the timers and completes cancelled at once, and a wait on a
+/// descriptor whose event no thread has taken has it deleted and completes cancelled at once.
+fn macos_cancel_operation(mut lo: Lowering, mut fx: Fx, op: clif::Value) {
+    let claimed = claim_armed(mut lo, mut fx, op)
+    mut fx.if_true(claimed, then: fn[mut lo](mut fx1: Fx) {
+        deliver_cancelled(mut lo, fx: mut fx1, op)
+    })
+    let kind = mut fx.load(PTR, addr: op, offset: OPERATION_KIND)
+    let wait = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: kind, y: TASKS_KIND_WAIT)
+    let filter = mut fx.load(PTR, addr: op, offset: OPERATION_WAITER)
+    let has_filter = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: filter, y: 0)
+    let watched = mut fx.b.band(wait, y: has_filter)
+    mut fx.if_true(watched, then: fn[mut lo](mut fx1: Fx) {
+        macos_unwatch(mut lo, fx: mut fx1, op, filter)
+    })
+} macos_cancel_operation
+
+/// Asks once for the cancellation of a wait on a descriptor of the kqueue `filter`: deletes its
+/// event, completing it cancelled when no thread had taken it.
+fn macos_unwatch(mut lo: Lowering, mut fx: Fx, op: clif::Value, filter: clif::Value) {
+    let flag = mut fx.offset(op, offset: OPERATION_CANCEL)
+    let zero = mut fx.ptr(0)
+    let requested = mut fx.ptr(u64.fit(OPERATION_REQUESTED))
+    let previous = mut fx.b.atomic_cas(clif::MemFlags.owned(), p: flag, e: zero, x: requested)
+    let unrequested = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: previous, y: 0)
+    mut fx.if_true(unrequested, then: fn[mut lo](mut fx1: Fx) {
+        let at = mut fx1.slot(EVENT_SIZE, align: 8)
+        let fd = mut fx1.load(PTR, addr: op, offset: OPERATION_LINK)
+        let filter16 = mut fx1.b.ireduce(clif::Type.Int16, x: filter)
+        event_of(mut fx1, at, ident: fd, filter: filter16, flags: EVENT_DELETE | EVENT_UDATA_SPECIFIC, notes: 0, data: op)
+        let port = macos_port(mut lo, fx: mut fx1)
+        let result = macos_change(mut lo, fx: mut fx1, queue: port, change: at)
+        let deleted = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: result, y: 0)
+        mut fx1.if_true(deleted, then: fn[mut lo](mut fx2: Fx) {
+            deliver_cancelled(mut lo, fx: mut fx2, op)
+        })
+    })
+} macos_unwatch
+
+/// Waits idle on the executors' kqueue until an event arrives, unless a task is ready, then
+/// handles the events taken.
+fn macos_idle(mut lo: Lowering, mut fx: Fx) {
+    let current = mut lo.thread(mut fx)
+    let idle = mut fx.offset(current, offset: THREAD_IDLE)
+    let one = mut fx.ptr(1)
+    mut fx.atomic_store(one, addr: idle)
+    let state_address = mut lo.state(mut fx)
+    let head_at = mut fx.offset(state_address, offset: STATE_READY_HEAD)
+    let head = mut fx.b.atomic_load(PTR, flags: clif::MemFlags.owned(), p: head_at)
+    let empty = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: head, y: 0)
+    macos_take_events(mut lo, mut fx, wait: Some(empty))
+    let zero = mut fx.ptr(0)
+    mut fx.atomic_store(zero, addr: idle)
+} macos_idle
+
+/// Takes the events the executors' kqueue holds, when `wait` is given and nonzero waiting for one
+/// until the first timer is due, and handles them, then delivers the expiries of the timers due.
+fn macos_take_events(mut lo: Lowering, mut fx: Fx, wait: Option[clif::Value]) {
+    let events = mut fx.slot(KQUEUE_EVENTS * EVENT_SIZE, align: 8)
+    let timeout = mut fx.slot(16, align: 8)
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: timeout, offset: 0)
+    mut fx.store(zero, addr: timeout, offset: 8)
+    let bound = match wait {
+        Some(waiting) => first_result(mut fx.choose_in(mut lo, condition: waiting, results: fx.types1(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+            let due = first_due_in(mut lo1, fx: mut fx1)
+            let longest = mut fx1.ptr(LONGEST_WAIT)
+            let left = mut fx1.b.umin(due.left, y: longest)
+            let billion = mut fx1.ptr(1_000_000_000)
+            let seconds = mut fx1.b.udiv(left, y: billion)
+            let nanoseconds = mut fx1.b.urem(left, y: billion)
+            mut fx1.store(seconds, addr: timeout, offset: 0)
+            mut fx1.store(nanoseconds, addr: timeout, offset: 8)
+            let forever = mut fx1.ptr(0)
+            let chosen = mut fx1.b.select(due.armed, x: timeout, y: forever)
+            return fx1.list1(chosen)
+        }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+            return fx1.list1(timeout)
+        }))
+        None => timeout
+    }
+    let port = macos_port(mut lo, mut fx)
+    let none = mut fx.ptr(0)
+    let nothing = mut fx.int(clif::Type.Int32, value: 0)
+    let room = mut fx.int(clif::Type.Int32, value: i64.fit(KQUEUE_EVENTS))
+    let taken = first_result(mut lo.call_libc(mut fx, name: "kevent", args: fx.list6(port, b: none, c: nothing, d: events, e: room, f: bound).view(), returns: fx.types1(clif::Type.Int32).view()))
+    let taken_word = mut fx.b.sextend(PTR, x: taken)
+    let some = mut fx.b.icmp_imm_s(clif::IntCC.SignedGreaterThan, x: taken_word, y: 0)
+    let count = mut fx.b.select(some, x: taken_word, y: zero)
+    mut fx.each(zero, end: count, body: fn[mut lo](mut fx1: Fx, index: clif::Value) {
+        let offset = mut fx1.b.imul_imm_s(index, y: i64.fit(EVENT_SIZE))
+        let event = mut fx1.b.iadd(events, y: offset)
+        macos_handle_event(mut lo, fx: mut fx1, taken: event)
+    })
+    expire_timers(mut lo, mut fx)
+} macos_take_events
+
+/// Handles an event taken from the executors' kqueue: a descriptor's readiness is delivered to
+/// the wait its user data names, and the first termination request cancels the entry task's
+/// construct; a wake needs nothing more.
+fn macos_handle_event(mut lo: Lowering, mut fx: Fx, taken: clif::Value) {
+    let filter = mut fx.load(clif::Type.Int16, addr: taken, offset: EVENT_FILTER)
+    let filter_word = mut fx.b.sextend(PTR, x: filter)
+    let user = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: filter_word, y: EVENT_USER)
+    discard mut fx.choose_in(mut lo, condition: user, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let ident = mut fx1.load(PTR, addr: taken, offset: EVENT_IDENT)
+        let termination = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: ident, y: TERMINATION_EVENT)
+        mut fx1.if_true(termination, then: fn[mut lo1](mut fx2: Fx) {
+            let state_address = mut lo1.state(mut fx2)
+            let root = mut fx2.load(PTR, addr: state_address, offset: STATE_ROOT)
+            discard mut lo1.call_routine(mut fx2, routine: Routine.Cancel, args: fx2.list1(root).view())
+        })
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        macos_ready(mut lo1, fx: mut fx1, taken)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+} macos_handle_event
+
+/// Delivers a descriptor's readiness, whose event is at `taken`, to the wait its user data names:
+/// the event's data or, for an event in error, the negated error number it holds.
+fn macos_ready(mut lo: Lowering, mut fx: Fx, taken: clif::Value) {
+    let op = mut fx.load(PTR, addr: taken, offset: EVENT_UDATA)
+    let flag_bits = mut fx.load(clif::Type.Int16, addr: taken, offset: EVENT_FLAGS)
+    let flags = mut fx.b.uextend(PTR, x: flag_bits)
+    let error_bit = mut fx.b.band_imm_s(flags, y: EVENT_ERROR)
+    let failed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: error_bit, y: 0)
+    let data = mut fx.load(PTR, addr: taken, offset: EVENT_DATA)
+    let negated = mut fx.b.ineg(data)
+    let given = mut fx.b.select(failed, x: negated, y: data)
+    let most = mut fx.ptr(0x7FFF_FFFF)
+    let over = mut fx.b.icmp(clif::IntCC.SignedGreaterThan, x: given, y: most)
+    let bounded = mut fx.b.select(over, x: most, y: given)
+    let result = mut fx.b.ireduce(clif::Type.Int32, x: bounded)
+    deliver(mut lo, mut fx, op, result)
+} macos_ready
+
+/// `ClockNow`: the nanoseconds of the monotonic clock, the system's uptime.
+fn macos_define_clock_now(mut lo: Lowering, mut fx: Fx) {
+    discard mut fx.entry()
+    let clock = mut fx.int(clif::Type.Int32, value: CLOCK_UPTIME_RAW)
+    let now = first_result(mut lo.call_libc(mut fx, name: "clock_gettime_nsec_np", args: fx.list1(clock).view(), returns: fx.types1(PTR).view()))
+    mut fx.b.ret(fx.list1(now).view())
+} macos_define_clock_now
+
+/// The body of `TimerArm`: arms the timer in the timers the runtime keeps, and wakes a thread
+/// waiting idle, so that it waits no longer than the timer.
+fn macos_arm_timer(mut lo: Lowering, mut fx: Fx, op: clif::Value, ns: clif::Value) {
+    arm_shared(mut lo, mut fx, op, ns)
+    let first_thread = mut fx.ptr(1)
+    macos_trigger(mut lo, mut fx, ident: first_thread)
+} macos_arm_timer
+
+/// Wakes an executor thread waiting idle, other than the running one, so a task made ready runs:
+/// the trigger of its user event, which whichever thread waits on the kqueue may take. Each thread
+/// clears its own idle flag once its wait ends, so an event another thread took leaves a thread
+/// still waiting marked idle.
+fn macos_wake_idle(mut lo: Lowering, mut fx: Fx) {
+    let state_address = mut lo.state(mut fx)
+    let threads = mut fx.load(PTR, addr: state_address, offset: STATE_THREADS)
+    let count = mut fx.load(PTR, addr: state_address, offset: STATE_THREAD_COUNT)
+    let current = mut lo.thread(mut fx)
+    let zero = mut fx.ptr(0)
+    discard mut fx.repeat(fx.list1(zero).view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() == 1
+        let index = state[0]
+        let inside = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: index, y: count)
+        let next = mut fx1.choose_in(mut lo, condition: inside, results: fx1.types2(PTR, b: clif::Type.Int8).view(), then: fn(mut lo1: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let offset = mut fx2.b.imul_imm_s(index, y: 8)
+            let slot = mut fx2.b.iadd(threads, y: offset)
+            let record = mut fx2.load(PTR, addr: slot, offset: 0)
+            let other = mut fx2.b.icmp(clif::IntCC.NotEqual, x: record, y: current)
+            let idle = mut fx2.offset(record, offset: THREAD_IDLE)
+            let woken = mut fx2.choose(other, results: fx2.types1(clif::Type.Int8).view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let nothing = mut fx3.ptr(0)
+                let seen = fetch_add(mut fx3, address: idle, amount: nothing)
+                let waiting = mut fx3.b.icmp_imm_s(clif::IntCC.Equal, x: seen, y: 1)
+                return fx3.list1(waiting)
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let no = mut fx3.int(clif::Type.Int8, value: 0)
+                return fx3.list1(no)
+            })
+            mut fx2.if_true(woken[0], then: fn[mut lo1](mut fx3: Fx) {
+                let ident = mut fx3.b.iadd_imm_s(index, y: 1)
+                macos_trigger(mut lo1, fx: mut fx3, ident)
+            })
+            let following = mut fx2.b.iadd_imm_s(index, y: 1)
+            let unwoken = mut fx2.b.bxor_imm_s(woken[0], y: 1)
+            return fx2.list2(following, b: unwoken)
+        }, otherwise: fn(mut lo1: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let stop = mut fx2.int(clif::Type.Int8, value: 0)
+            return fx2.list2(index, b: stop)
+        })
+        expect next.len() == 2
+        return Pass(again: next[1], next: fx1.list1(next[0]))
+    })
+} macos_wake_idle

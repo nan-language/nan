@@ -35,6 +35,14 @@ const LEVEL_PF_ARM_ATOMICS: i64 = 34
 
 const LEVEL_PF_ARM_DOT_PRODUCT: i64 = 43
 
+/// The macOS system settings reporting LSE atomics and the dot product instructions, and
+/// AVX-512, whose register state macOS enables in a thread once it first uses it.
+const LEVEL_FEAT_LSE: Str = "hw.optional.arm.FEAT_LSE"
+
+const LEVEL_FEAT_DOTPROD: Str = "hw.optional.arm.FEAT_DotProd"
+
+const LEVEL_AVX512F: Str = "hw.optional.avx512f"
+
 /// The encoding of `ID_AA64ISAR0_EL1` for the `ReadSysReg` stub, and its fields: atomics at bit
 /// 20, at least 2 with LSE, and dot product at bit 44, at least 1 with it.
 const LEVEL_ID_AA64ISAR0_EL1: u16 = 0x4030
@@ -109,6 +117,15 @@ fn Lowering.level_missing(mut self, mut fx: Fx, level: workspace::Level) -> clif
         }
         return missing
     }
+    if self.macos() {
+        let none = mut fx.int(clif::Type.Int8, value: 0)
+        let atomics = mut self.system_setting(mut fx, name: LEVEL_FEAT_LSE)
+        let no_atomics = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: atomics, y: 0)
+        let missing = mut fx.b.bor(none, y: no_atomics)
+        let dot = mut self.system_setting(mut fx, name: LEVEL_FEAT_DOTPROD)
+        let no_dot = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: dot, y: 0)
+        return mut fx.b.bor(missing, y: no_dot)
+    }
     let kind = mut fx.ptr(LEVEL_AT_HWCAP)
     let returns = Array[clif::Type, 1].filled(PTR)
     let hwcap = mut self.call_libc(mut fx, name: "getauxval", args: fx.list1(kind).view(), returns: returns.view())
@@ -117,7 +134,9 @@ fn Lowering.level_missing(mut self, mut fx: Fx, level: workspace::Level) -> clif
 } Lowering.level_missing
 
 /// Whether the processor lacks an extension of an x86_64 level, or on a host target the operating
-/// system leaves the register state of its AVX or AVX-512 extensions disabled.
+/// system leaves the register state of its AVX or AVX-512 extensions disabled; on macOS, which
+/// enables the AVX-512 state of a thread once it first uses it, whether the system reports
+/// AVX-512.
 fn Lowering.x64_missing(mut self, mut fx: Fx, level: workspace::Level) -> clif::Value {
     let bits = level_bits(level, alloc: fx.alloc)
     let words = mut fx.slot(16, align: 4)
@@ -160,9 +179,9 @@ fn Lowering.x64_missing(mut self, mut fx: Fx, level: workspace::Level) -> clif::
         }
     }
     if not self.machine() {
-        let state = match level {
+        let state = match first level {
             workspace::Level.X64v2 => 0i64
-            workspace::Level.X64v4 => LEVEL_AVX512_STATE
+            workspace::Level.X64v4 if not self.macos() => LEVEL_AVX512_STATE
             else => LEVEL_AVX_STATE
         }
         if state != 0 {
@@ -170,6 +189,11 @@ fn Lowering.x64_missing(mut self, mut fx: Fx, level: workspace::Level) -> clif::
             expect xcr0.len() > 0
             let disabled = level_lacks(mut fx, word: xcr0[0], mask: state)
             missing = mut fx.b.bor(missing, y: disabled)
+        }
+        if level == workspace::Level.X64v4 and self.macos() {
+            let reported = mut self.system_setting(mut fx, name: LEVEL_AVX512F)
+            let absent = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: reported, y: 0)
+            missing = mut fx.b.bor(missing, y: absent)
         }
     }
     return missing

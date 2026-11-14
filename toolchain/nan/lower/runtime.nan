@@ -149,11 +149,15 @@ enum Routine derives Copy, Eq, Hash {
     /// `(kind, handle, a, b, c) -> (cancelled, result)`: runs a Windows request on a handle and
     /// waits for its completion or its acknowledged cancellation.
     Request
+    /// `(fd, filter) -> (cancelled, result)`: waits on a macOS target's kqueue until a
+    /// descriptor is ready for a filter, or for its acknowledged cancellation.
+    Watch
     /// `() -> Never`: runs the executor's scheduler on the calling thread.
     Schedule
     /// `(thread) -> Never`: the start routine of an executor thread.
     ThreadMain
-    /// `(operation) -> Never`: the start routine of the thread reading termination requests.
+    /// `(operation) -> Never`: the start routine of the thread reading termination requests, given
+    /// on a macOS target its kqueue.
     Terminations
     /// `(size) -> region`: a cancelling construct's new record of `size` bytes, enclosed by
     /// the running task's region.
@@ -180,10 +184,10 @@ enum Routine derives Copy, Eq, Hash {
     Yield
     /// `(seed, stream, index) -> value`: value `index` of a stream of a seed.
     Stream
-    /// `() -> nanoseconds`: a kernel's clock, or a Windows target's monotonic clock.
+    /// `() -> nanoseconds`: a kernel's clock, or a Windows or macOS target's monotonic clock.
     ClockNow
-    /// `(op, ns)`: arms a timer of a kernel's clock, or of a Windows target's monotonic clock,
-    /// expiring `ns` nanoseconds from now.
+    /// `(op, ns)`: arms a timer of a kernel's clock, or of a Windows or macOS target's monotonic
+    /// clock, expiring `ns` nanoseconds from now.
     TimerArm
     /// `(choices, low, high, signed) -> value`: a draw of a property test's case.
     Draw
@@ -268,6 +272,7 @@ proj fn Routine.name(self) -> Str
         Routine.Nested => "_NSstack_switch_nested"
         Routine.IoSubmit => "_NSstack_switch_io_submit"
         Routine.Request => "_NSstack_switch_request"
+        Routine.Watch => "_NSstack_switch_watch"
         Routine.Schedule => "_NSstack_switch_schedule"
         Routine.ThreadMain => "_NSstack_switch_thread_main"
         Routine.Terminations => "_NSstack_switch_terminations"
@@ -325,6 +330,7 @@ fn Routine.types(self, alloc: mem::Alloc) -> RoutineTypes {
         Routine.Origin or Routine.Init or Routine.Thread or Routine.ClockNow => RoutineTypes(params: type_list(None, count: 0, trailing: None, alloc), returns: type_list(None, count: 1, trailing: None, alloc))
         Routine.IoSubmit => RoutineTypes(params: type_list(None, count: 1, trailing: None, alloc), returns: type_list(Some(int8), count: 0, trailing: Some(int32), alloc))
         Routine.Request => RoutineTypes(params: type_list(None, count: 5, trailing: None, alloc), returns: type_list(Some(int8), count: 0, trailing: Some(clif::Type.Int64), alloc))
+        Routine.Watch => RoutineTypes(params: type_list(Some(int32), count: 0, trailing: Some(clif::Type.Int16), alloc), returns: type_list(Some(int8), count: 0, trailing: Some(clif::Type.Int64), alloc))
     }
 } Routine.types
 
@@ -352,10 +358,10 @@ fn Routine.signature(self, alloc: mem::Alloc) -> clif::Signature {
     let types = self.types(alloc)
     var signature = clif::Signature.new(CALL_CONV, alloc)
     for param in types.params {
-        mut signature.params.push(clif::AbiParam(value_type: param))
+        mut signature.params.push(clif::AbiParam.new(param))
     }
     for returned in types.returns {
-        mut signature.returns.push(clif::AbiParam(value_type: returned))
+        mut signature.returns.push(clif::AbiParam.new(returned))
     }
     return signature
 } Routine.signature
@@ -552,7 +558,8 @@ const STATE_PCI_REMOVAL_LOCK: u64 = 536
 const STATE_LEFT: u64 = 544
 
 /// On a Windows target, the process's I/O completion port and the index of the thread-local slot
-/// holding the running executor thread's record.
+/// holding the running executor thread's record; on a macOS target, the executors' kqueue and the
+/// key of the thread-specific value holding that record.
 const STATE_PORT: u64 = 552
 
 const STATE_TLS_INDEX: u64 = 560
@@ -696,6 +703,9 @@ fn Lowering.thread_inline(mut self, mut fx: Fx) -> clif::Value {
     if self.windows() {
         return windows_current_thread(mut self, mut fx)
     }
+    if self.macos() {
+        return macos_current_thread(mut self, mut fx)
+    }
     let slot = mut self.thread_slot(mut fx)
     return mut fx.load(PTR, addr: slot, offset: 0)
 } Lowering.thread_inline
@@ -703,12 +713,12 @@ fn Lowering.thread_inline(mut self, mut fx: Fx) -> clif::Value {
 /// A C library function, by name, which only a host image links.
 fn Lowering.libc(mut self, name: Str, params: Slice[clif::Type], returns: Slice[clif::Type]) -> object::FuncId {
     expect not self.machine()
-    var signature = clif::Signature.new(CALL_CONV, alloc: self.alloc)
+    var signature = clif::Signature.new(self.system_convention(), alloc: self.alloc)
     for param in params {
-        mut signature.params.push(clif::AbiParam(value_type: param))
+        mut signature.params.push(clif::AbiParam.new(param))
     }
     for returned in returns {
-        mut signature.returns.push(clif::AbiParam(value_type: returned))
+        mut signature.returns.push(clif::AbiParam.new(returned))
     }
     return mut self.module.declare_function(name, linkage: object::Linkage.Import, signature)
 } Lowering.libc
@@ -800,6 +810,8 @@ fn runtime_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
         Routine.ClockNow => {
             if lo.windows() {
                 windows_define_clock_now(mut lo, mut fx)
+            } else if lo.macos() {
+                macos_define_clock_now(mut lo, mut fx)
             } else {
                 define_clock_now(mut lo, mut fx)
             }
@@ -811,6 +823,8 @@ fn runtime_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
             let ns = params[1]
             if lo.windows() {
                 windows_arm_timer(mut lo, mut fx, op, ns)
+            } else if lo.macos() {
+                macos_arm_timer(mut lo, mut fx, op, ns)
             } else {
                 mut lo.arm_clock(mut fx, op, ns)
             }
@@ -822,8 +836,9 @@ fn runtime_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
         Routine.Extended => mut lo.define_extended(mut fx)
         Routine.ExtendedOwn => mut lo.define_extended_own(mut fx)
         Routine.Init or Routine.Exit or Routine.RecordAlloc or Routine.RecordFree or Routine.RecordResize => system_define(mut lo, mut fx, routine)
-        Routine.Preempt or Routine.Overflow or Routine.CpuLimit or Routine.Terminations => linux_define(mut lo, mut fx, routine)
+        Routine.Preempt or Routine.Overflow or Routine.CpuLimit or Routine.Terminations => posix_define(mut lo, mut fx, routine)
         Routine.Request => windows_define_request(mut lo, mut fx)
+        Routine.Watch => macos_define_watch(mut lo, mut fx)
     }
 } runtime_define
 

@@ -1,0 +1,66 @@
+//! Reads and writes on descriptors: standard streams, files and connections.
+
+foreign fn read(fd: i32, buffer: u64, count: usize) -> isize convention "darwin"
+
+foreign fn write(fd: i32, buffer: hw::Ptr[u8], count: usize) -> isize convention "darwin"
+
+foreign fn isatty(fd: i32) -> i32 convention "darwin"
+
+foreign fn lseek(fd: i32, offset: i64, whence: i32) -> i64 convention "darwin"
+
+/// The positions `lseek` sets an offset from: the start, the current position and the end.
+const SEEK_START: i32 = 0
+
+const SEEK_CURRENT: i32 = 1
+
+const SEEK_END: i32 = 2
+
+/// Whether a task waits for a standard stream on the kqueue before reading or writing it: a
+/// terminal's, a pipe's or a socket's, which the system may keep waiting, rather than a file's
+/// or a device's, whose readiness a kqueue reports only before its end, if at all.
+fn waits_on(fd: i32) -> bool {
+    return isatty(fd) == 1 or lseek(fd, offset: 0, whence: SEEK_CURRENT) < 0
+} waits_on
+
+pkg fn stdio_read(fd: i32, address: u64, len: usize) -> usize fails sys::StdioError uses wait {
+    let waits = waits_on(fd)
+    loop {
+        if waits {
+            discard try await watch(fd, filter: READABLE)
+        }
+        let count = read(fd, buffer: address, count: len)
+        if count >= 0 {
+            return usize.fit(count)
+        }
+        let code = last_error()
+        if code != EINTR and code != EAGAIN {
+            fail sys::StdioError.Closed
+        }
+    }
+} stdio_read
+
+pkg fn stdio_write(fd: i32, data: Slice[u8]) fails sys::StdioError uses wait {
+    let waits = waits_on(fd)
+    var done: usize = 0
+    while done < data.len() {
+        let Some(parts) = data.split_at(done) else {
+            return
+        }
+        var room = parts.tail.len()
+        if waits {
+            let ready = try await watch(fd, filter: WRITABLE)
+            if ready > 0 and u64.fit(ready) < u64.widen(room) {
+                room = usize.fit(ready)
+            }
+        }
+        let count = write(fd, buffer: hw::Ptr.of_view(parts.tail), count: room)
+        if count > 0 {
+            done += usize.fit(count)
+        } else {
+            let code = last_error()
+            if count == 0 or (code != EINTR and code != EAGAIN) {
+                fail sys::StdioError.Closed
+            }
+        }
+    }
+} stdio_write

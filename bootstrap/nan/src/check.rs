@@ -5,6 +5,7 @@
 mod api;
 mod approval;
 mod author;
+mod authoring;
 mod authority;
 mod body;
 mod changes;
@@ -78,6 +79,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 pub use approval::{approvals, authority_summaries, is_unapproved};
+pub use authoring::{Class, Offered, classes, completions, signature, type_hints};
 pub use changes::{Change, changes, semantic_conflicts};
 pub use compatible::{compatible, encode_class, schema_records};
 pub use context::{Context, Green, context_gaps, contexts, greens, greens_after};

@@ -44,20 +44,26 @@ fn width(byte: u8) -> usize {
 
 /// The position of a byte offset in a text, an offset past the text's end being its end.
 pub fn position(text: &[u8], offset: u32, encoding: Encoding) -> Json {
+    let (line, character) = line_character(text, offset, encoding);
+    Json::object(vec![
+        ("line", Json::number(u64::from(line))),
+        ("character", Json::number(u64::from(character))),
+    ])
+}
+
+/// The line, from 0, and character of a byte offset in a text.
+pub fn line_character(text: &[u8], offset: u32, encoding: Encoding) -> (u32, u32) {
     let offset = (offset as usize).min(text.len());
     let start = text[..offset]
         .iter()
         .rposition(|byte| *byte == b'\n')
         .map_or(0, |at| at + 1);
-    let line = text[..start].iter().filter(|byte| **byte == b'\n').count();
-    let character: u32 = text[start..offset]
+    let line = text[..start].iter().filter(|byte| **byte == b'\n').count() as u32;
+    let character = text[start..offset]
         .iter()
         .map(|byte| encoding.units(*byte))
         .sum();
-    Json::object(vec![
-        ("line", Json::number(line as u64)),
-        ("character", Json::number(u64::from(character))),
-    ])
+    (line, character)
 }
 
 /// The range of the bytes from `start` to `end` of a text.

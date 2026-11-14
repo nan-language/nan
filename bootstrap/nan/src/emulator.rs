@@ -161,7 +161,7 @@ fn base_args(arch: Arch, kvm: bool, kept: Option<bool>) -> Vec<String> {
             "-accel",
             "tcg",
             "-cpu",
-            "max",
+            "max,-monitor",
         ],
         (Arch::Aarch64, _) => &[
             "-machine",

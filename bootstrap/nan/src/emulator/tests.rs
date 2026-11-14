@@ -27,7 +27,7 @@ fn the_x86_64_machine_has_its_iommu_first_and_the_host_cpu_under_kvm() {
     )));
     assert_eq!(kvm.find("-device"), kvm.find("-device intel-iommu"));
     let tcg = written(Arch::Amd64, false, None);
-    assert!(tcg.contains(&format!("{iommu}-accel tcg -cpu max ")));
+    assert!(tcg.contains(&format!("{iommu}-accel tcg -cpu max,-monitor ")));
     assert!(tcg.contains("-device tpm-crb,tpmdev=tpm "));
 }
 

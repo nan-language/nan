@@ -823,7 +823,7 @@ fn Resolver.changes(self, lock: machine::Lock, appended: Slice[CurrentEntry]) ->
                 mut widenings.push(entry.copy(alloc))
             }
         }
-        mut changes.push(Change(package_name: text::String.of(name, alloc), old: old, new: new, class: self.change_class(old, new), epochs: self.epochs(old, new), widenings: take widenings))
+        mut changes.push(Change(package_name: text::String.of(name, alloc), old: old, new: new, class: self.change_class(old, new, appended), epochs: self.epochs(old, new), widenings: take widenings))
     }
     return changes
 } Resolver.changes
@@ -907,35 +907,47 @@ fn Resolver.authority(self, lock: machine::Lock, appended: Slice[CurrentEntry], 
     return session.authority_summaries(package_index: 0, names)
 } Resolver.authority
 
-/// The class of a package's new release with its old one as its parent: the class its publish
-/// summary records when it was published on that parent, else as their exported items compare.
-fn Resolver.change_class(self, old: Option[hashing::HashValue], new: Option[hashing::HashValue]) -> store::Class {
-    let alloc = self.alloc
-    let grammar = self.session.grammar.contents()
-    let new_at = self.entry_at(new)
-    let old_at = self.entry_at(old)
-    match new_at {
+/// The entry holding a release, by its code root: the store's, else that of a path release in
+/// `appended`.
+fn Resolver.held_entry(self, root: Option[hashing::HashValue], appended: Slice[CurrentEntry]) -> Option[mem::Shared[store::Entry]] {
+    let Some(wanted) = root else {
+        return None
+    }
+    match self.entry_at(root) {
         Some(at) => {
             expect at < self.entries.len()
-            let entry = self.entries[at].contents()
-            if entry.parent == old {
-                match entry.summary {
-                    Some(summary) => return summary.class
-                    None => {}
-                }
-            }
+            return Some(self.entries[at].share())
         }
         None => {}
     }
-    let Some(parent_at) = old_at else {
+    for fresh in appended {
+        if fresh.root == wanted {
+            return Some(fresh.entry.share())
+        }
+    }
+    return None
+} Resolver.held_entry
+
+/// The class of a package's new release with its old one as its parent, either read from the
+/// store or from the path releases in `appended`: the class its publish summary records when it
+/// was published on that parent, else as their exported items compare.
+fn Resolver.change_class(self, old: Option[hashing::HashValue], new: Option[hashing::HashValue], appended: Slice[CurrentEntry]) -> store::Class {
+    let alloc = self.alloc
+    let grammar = self.session.grammar.contents()
+    let Some(release_held) = self.held_entry(new, appended) else {
         return store::Class.Additive
     }
-    let Some(release_at) = new_at else {
+    let release = release_held.contents()
+    if release.parent == old {
+        match release.summary {
+            Some(summary) => return summary.class
+            None => {}
+        }
+    }
+    let Some(parent_held) = self.held_entry(old, appended) else {
         return store::Class.Additive
     }
-    expect parent_at < self.entries.len()
-    let parent = self.entries[parent_at].contents()
-    let release = self.entries[release_at].contents()
+    let parent = parent_held.contents()
     let classes = release::classes(release::exported(parent.artefact.view(), grammar, alloc), release: release::exported(release.artefact.view(), grammar, alloc), epochs: fn(path: Str) -> release::EpochPair {
         return release::EpochPair(old: release::epoch(parent.summary, path), new: release::epoch(release.summary, path))
     }, forwarded: release::forwards(release.artefact.view(), alloc), compatible: mem::Set[text::String].empty(alloc), alloc)

@@ -622,9 +622,12 @@ impl Resolver<'_> {
             Some(current) => self.authority(current, HashMap::new(), &names)?,
             None => BTreeMap::new(),
         };
-        let after = self.authority(lock, appended, &names)?;
+        let after = self.authority(lock, appended.clone(), &names)?;
         let entry = |root: Option<&Hash>| {
-            root.and_then(|root| self.entries.iter().find(|entry| entry.root() == *root))
+            root.and_then(|root| {
+                (self.entries.iter().find(|entry| entry.root() == *root))
+                    .or_else(|| appended.get(root))
+            })
         };
         Ok(names
             .into_iter()

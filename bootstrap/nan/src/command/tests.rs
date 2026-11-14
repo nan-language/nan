@@ -548,6 +548,32 @@ fn meter_and_app() -> Scratch {
     scratch
 }
 
+#[test]
+fn a_sync_classes_each_new_path_release_against_the_locked_one() {
+    let scratch = meter_and_app();
+    let synced = |meter: &str| {
+        fs::write(scratch.0.join("meter/meter.nan"), meter).expect("write meter");
+        let output = run_in(&scratch.0, "dep sync app").output;
+        let record = output
+            .lines()
+            .find(|line| line.starts_with("release meter "));
+        record
+            .and_then(|line| line.rsplit(' ').next())
+            .map(str::to_owned)
+    };
+    let changed =
+        "//! Meters.\n\n/// One.\npub fn one() -> u64 = 1\n\n/// Two.\npub fn two() -> u32 = 2\n";
+    assert_eq!(
+        synced("//! Meters.\n\n/// One.\npub fn one() -> u64 = 1\n").as_deref(),
+        Some("breaking")
+    );
+    assert_eq!(synced(changed).as_deref(), Some("additive"));
+    assert_eq!(
+        synced(&format!("{changed}\npkg const THREE: u32 = 3\n")).as_deref(),
+        Some("identical")
+    );
+}
+
 /// The code and location of each diagnostic record of an output.
 pub(super) fn records(output: &str) -> Vec<String> {
     (output.lines())

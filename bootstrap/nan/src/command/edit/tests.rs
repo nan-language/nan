@@ -97,3 +97,24 @@ fn move_respells_paths_and_raises_what_another_module_then_names() {
             .contains("\nerror edit.move-invalid app/app.nan:3 app::doubled\n")
     );
 }
+
+#[test]
+fn move_of_the_items_ending_a_file_leaves_no_blank_line_at_its_end() {
+    let scratch = Scratch::new(&[
+        ("app/package.nan", MANIFEST),
+        (
+            "app/app.nan",
+            "//! Totals.\n\npub fn start() -> u64 = 0\n\npub closed struct Counter {\n    pub count: u64\n} Counter\n\npub fn Counter.total(self) -> u64 = self.count\n",
+        ),
+        (
+            "app/units/units.nan",
+            "//! Units.\n\npub const UNIT: u32 = 1\n",
+        ),
+    ]);
+    let run = run_in(&scratch.0, "edit move app::Counter units");
+    assert_eq!(run.status, 0, "{}", run.output);
+    assert_eq!(
+        read(&scratch, "app/app.nan"),
+        "//! Totals.\n\npub fn start() -> u64 = 0\n"
+    );
+}

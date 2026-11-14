@@ -868,14 +868,30 @@ impl Checker<'_> {
             } else {
                 end
             };
-            in_place.push((
-                data.file.path.clone(),
-                crate::diagnostic::Replacement {
-                    start,
-                    end: removed_end,
-                    text: String::new(),
-                },
-            ));
+            removing(
+                &mut in_place,
+                (
+                    data.file.path.clone(),
+                    crate::diagnostic::Replacement {
+                        start,
+                        end: removed_end,
+                        text: String::new(),
+                    },
+                ),
+            );
+            let (_, removed) = in_place.last_mut().expect("removing adds the removal");
+            if removed.end as usize == syntax.source.len() {
+                let line = syntax
+                    .lines
+                    .partition_point(|line| line.start < removed.start);
+                if let Some(blank) = line
+                    .checked_sub(1)
+                    .map(|before| &syntax.lines[before])
+                    .filter(|before| before.start == before.end)
+                {
+                    removed.start = blank.start;
+                }
+            }
         }
         for &item in raised.iter().filter(|item| !moved.contains(item)) {
             let data = db.item(item);

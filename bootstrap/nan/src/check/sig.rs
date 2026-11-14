@@ -289,7 +289,7 @@ impl Checker<'_> {
             return sig.clone();
         }
         let head = self.db.item(item).head_line();
-        let sig = Rc::new(self.db.about(Some(item), || {
+        let sig = Rc::new(self.about(Some(item), || {
             self.db.on_line(head, || self.compute_sig(item))
         }));
         self.sigs.borrow_mut().insert(item, sig.clone());
@@ -802,7 +802,7 @@ impl Checker<'_> {
         };
         let module = self.db.module_of(function);
         let name = &head.label.name.text;
-        self.db.about(Some(function), || {
+        self.about(Some(function), || {
             self.db
                 .module(module)
                 .items

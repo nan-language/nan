@@ -330,6 +330,9 @@ pub struct Program {
     pub prefixes: HashMap<String, String>,
     /// The content of the image's `.nan` section.
     pub section: Vec<u8>,
+    /// The content of its `.nan.tree` section: the hash of the code roots of the artefacts of
+    /// `.nan`, in order.
+    pub tree: crate::hash::Hash,
     /// The codegen level of the program's manifest for the target's architecture.
     pub level: Option<Level>,
     /// A kernel's interface, when it exports the load ABI, and the loaded registries of its
@@ -475,7 +478,7 @@ pub fn lower(ck: &Checker, program: &Program) -> Lowered {
     );
     host::entry_seam(&mut lowering, program);
     lowering.drain();
-    lowering.finish(Some(&program.section))
+    lowering.finish(Some((&program.section, &program.tree)))
 }
 
 /// Lowers the reach of a final build for a machine target: the entry function and the target's
@@ -1096,8 +1099,9 @@ impl<'c, 'a> Lowering<'c, 'a> {
         self.layouts.of(self.ck, ty)
     }
 
-    /// The object of the lowering, holding a `.nan` section with `section` when given.
-    fn finish(mut self, section: Option<&[u8]>) -> Lowered {
+    /// The object of the lowering, holding a `.nan` section and a `.nan.tree` section with
+    /// `sections` when given.
+    fn finish(mut self, sections: Option<(&[u8], &crate::hash::Hash)>) -> Lowered {
         let entry_stacks = runtime::tasks::emit_entry_stacks(&mut self);
         let glues = self.finish_reserve();
         lines::emit(&mut self, entry_stacks, glues);
@@ -1118,13 +1122,15 @@ impl<'c, 'a> Lowering<'c, 'a> {
             })
             .collect();
         let mut product = self.module.finish();
-        if let Some(section) = section {
-            let id = product.object.add_section(
-                Vec::new(),
-                b".nan".to_vec(),
-                cranelift_object::object::SectionKind::Other,
-            );
-            product.object.append_section_data(id, section, 1);
+        if let Some((artefacts, tree)) = sections {
+            for (name, data) in [(&b".nan"[..], artefacts), (b".nan.tree", &tree.0[..])] {
+                let id = product.object.add_section(
+                    Vec::new(),
+                    name.to_vec(),
+                    cranelift_object::object::SectionKind::Other,
+                );
+                product.object.append_section_data(id, data, 1);
+            }
         }
         Lowered {
             object: product.emit().expect("an object file"),

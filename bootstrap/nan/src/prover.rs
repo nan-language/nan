@@ -74,10 +74,11 @@ impl Checker<'_> {
     /// examples have none.
     pub fn obligations(&self, item: ItemId) -> Rc<Vec<Obligated>> {
         self.db.note(item);
+        self.trace_read(item);
         if let Some(done) = self.obligations.borrow().get(&item) {
             return done.clone();
         }
-        let sites = self.db.about(Some(item), || match self.unit(item) {
+        let sites = self.about(Some(item), || match self.unit(item) {
             Some(unit) if !self.db.is_carried(item) => self.decide_unit(item, &unit),
             _ => Vec::new(),
         });

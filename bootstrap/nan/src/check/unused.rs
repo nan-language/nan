@@ -56,6 +56,7 @@ pub struct Usage {
 
 /// A `label: value` naming a field in a construction or struct pattern of an item: its tokens,
 /// and whether its value is a place, a literal or `_`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FieldLabel {
     pub item: ItemId,
     pub first: Tok,
@@ -67,6 +68,7 @@ impl Checker<'_> {
     /// Records that a body reads a field, when it is a struct's.
     pub fn record_read(&self, owner: ItemId, field: &str) {
         if matches!(self.db.declaration(owner).kind, ItemKind::Struct(_)) {
+            self.kept_field_read(owner, field);
             self.fields_read
                 .borrow_mut()
                 .insert((owner, field.to_owned()));
@@ -75,7 +77,9 @@ impl Checker<'_> {
 
     /// Records a `label: value` naming a field, when it is a struct's.
     pub fn record_label(&self, owner: ItemId, field: &str, label: FieldLabel) {
-        if matches!(self.db.declaration(owner).kind, ItemKind::Struct(_)) {
+        if matches!(self.db.declaration(owner).kind, ItemKind::Struct(_))
+            && self.kept.labelled(owner, field, label)
+        {
             self.field_labels
                 .borrow_mut()
                 .entry((owner, field.to_owned()))
@@ -151,9 +155,7 @@ impl Checker<'_> {
         self.check_unused_dependencies(package, &unused_grants);
         let path = &self.db.package(package).source.files[0].path;
         for (line, _) in unused_grants {
-            self.unused
-                .borrow_mut()
-                .push(Diagnostic::at(Code::UnusedGrant, path, line));
+            self.push_unused(Diagnostic::at(Code::UnusedGrant, path, line));
         }
     }
 
@@ -204,7 +206,7 @@ impl Checker<'_> {
                 .next()
                 .map(|first| (first.start, tokens.next_back().unwrap_or(first).end));
             let fixes = self.fix_dependency_deleted(package, alias);
-            self.unused.borrow_mut().push(Diagnostic {
+            self.push_unused(Diagnostic {
                 span,
                 fixes: fixes.into_iter().collect(),
                 ..Diagnostic::at(Code::UnusedDependency, &file.path, dep.line)

@@ -71,7 +71,7 @@ impl Checker<'_> {
     fn closure(&self, item: ItemId) -> Vec<ItemId> {
         let db = &self.db;
         self.package.set(Some(db.package_of(item)));
-        db.about(Some(item), || {
+        self.about(Some(item), || {
             self.check_item(item);
             self.check_elaborated(item);
         });
@@ -322,10 +322,53 @@ pub struct Green {
 /// scope without `lines`, otherwise of those in the closure sets of `lines`, each once, by path.
 pub fn greens(workspace: &Workspace, scope: &Scope, lines: &[(String, u32)]) -> Vec<Green> {
     let std = crate::stdlib::packages();
-    let checkers = scope_checkers(workspace, std, scope);
+    greens_of(
+        workspace,
+        &scope_checkers(workspace, std, scope),
+        scope,
+        lines,
+    )
+}
+
+/// The last-green entries `greens` gives, after keeping the snapshot of each checker of the
+/// scope's check in the build cache: from those checkers when no line is given and they reject
+/// no item, as fresh checkers then judge each item alone as they judged it with every item;
+/// otherwise from fresh checkers, which replace them.
+pub fn greens_after(
+    workspace: &Workspace,
+    checkers: Vec<(Target, Checker)>,
+    scope: &Scope,
+    lines: &[(String, u32)],
+) -> Vec<Green> {
+    let rejects = checkers
+        .iter()
+        .any(|(_, checker)| !checker.rejections.borrow().is_empty());
+    if rejects || !lines.is_empty() {
+        for (_, checker) in &checkers {
+            checker.keep();
+        }
+        drop(checkers);
+        return greens(workspace, scope, lines);
+    }
+    for (_, checker) in &checkers {
+        checker.package.set(None);
+    }
+    let found = greens_of(workspace, &checkers, scope, lines);
+    for (_, checker) in &checkers {
+        checker.keep();
+    }
+    found
+}
+
+fn greens_of(
+    workspace: &Workspace,
+    checkers: &[(Target, Checker)],
+    scope: &Scope,
+    lines: &[(String, u32)],
+) -> Vec<Green> {
     let mut found: Vec<Green> = Vec::new();
     let mut listed: HashSet<(String, u32)> = HashSet::new();
-    for (_, checker) in &checkers {
+    for (_, checker) in checkers {
         let db = &checker.db;
         if !lines.is_empty() {
             db.record();
@@ -362,8 +405,9 @@ pub fn greens(workspace: &Workspace, scope: &Scope, lines: &[(String, u32)]) -> 
             if !listed.insert((data.file.path.clone(), data.head_line())) {
                 continue;
             }
-            let mut api = checker.api_lines(item, true, None);
-            api.extend(digest_lines(&checkers, checker, item));
+            let greened = checker.greened(item);
+            let mut api = greened.api;
+            api.extend(digest_lines(checkers, checker, item));
             found.push(Green {
                 path: checker
                     .canonical_path(item)
@@ -371,7 +415,7 @@ pub fn greens(workspace: &Workspace, scope: &Scope, lines: &[(String, u32)]) -> 
                     .unwrap_or_default(),
                 file: data.file.path.clone(),
                 line: data.head_line(),
-                interface: checker.hashes(item).interface,
+                interface: greened.interface,
                 api,
             });
         }

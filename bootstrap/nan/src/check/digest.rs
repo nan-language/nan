@@ -163,7 +163,7 @@ pub enum Brought {
 /// outermost member's is computed, which joins theirs.
 #[derive(Default)]
 pub struct Digests {
-    done: HashMap<ItemId, Rc<Digest>>,
+    pub(super) done: HashMap<ItemId, Rc<Digest>>,
     /// The functions whose digests are being computed, outermost first.
     computing: Vec<Computing>,
     /// The functions whose digests are computed while a member of their cycle's is still being
@@ -243,7 +243,7 @@ pub struct Cycles {
     /// Whether each component holds a cycle: several functions, or one depending on itself.
     cyclic: Vec<bool>,
     /// Whether components are being found, during which a query searches the dependencies.
-    finding: bool,
+    pub(super) finding: bool,
 }
 
 impl Checker<'_> {
@@ -271,7 +271,7 @@ impl Checker<'_> {
         }
     }
 
-    fn uncompensated_digest(&self, item: ItemId) -> Rc<Digest> {
+    pub(super) fn uncompensated_digest(&self, item: ItemId) -> Rc<Digest> {
         self.db.note(item);
         let mut digests = self.digests.borrow_mut();
         if let Some(digest) = digests.done.get(&item) {
@@ -283,7 +283,7 @@ impl Checker<'_> {
             return digest;
         }
         drop(digests);
-        self.db.about(Some(item), || self.compute_digest(item))
+        self.about(Some(item), || self.compute_digest(item))
     }
 
     fn compute_digest(&self, item: ItemId) -> Rc<Digest> {

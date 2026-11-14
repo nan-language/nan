@@ -62,6 +62,7 @@ impl Checker<'_> {
 
     /// Records an operation of an authority that an item's module performs directly.
     pub fn perform(&self, item: ItemId, authority: Authority) {
+        self.kept.performed(item, &authority);
         self.performed
             .borrow_mut()
             .insert((self.db.module_of(item), authority));

@@ -16,7 +16,7 @@ use crate::output::{self, Output, Record, Verdict};
 use crate::scope::Scope;
 use crate::syntax::grammar::Rule;
 use crate::syntax::items::Item;
-use crate::workspace::Workspace;
+use crate::workspace::{Target, Workspace};
 
 /// The codes whose fixes `nan fix --propagate` keeps applying.
 const PROPAGATED: [Code; 6] = [
@@ -58,7 +58,14 @@ pub fn run(
     let workspace = fixed.as_ref().unwrap_or(workspace);
     let wrote: Vec<(String, Vec<u8>)> = wrote.into_iter().collect();
     journal::write(&workspace.root, &wrote)?;
-    let mut diagnostics = check::reported(workspace, &scope);
+    let checkers = match invocation.name {
+        Name::Check => Some(check::checked_scope(workspace, &scope)),
+        _ => None,
+    };
+    let mut diagnostics = match &checkers {
+        Some(checkers) => check::reported_by(workspace, checkers, &scope),
+        None => check::reported(workspace, &scope),
+    };
     fix::offer(workspace, current, invocation.scope(), &mut diagnostics);
     let count = |class: Class| {
         diagnostics
@@ -71,13 +78,13 @@ pub fn run(
         .iter()
         .map(|diagnostic| record(workspace, &scope, diagnostic))
         .collect();
-    if invocation.name == Name::Check {
+    if let Some(checkers) = checkers {
         let errors: Vec<(String, u32)> = diagnostics
             .iter()
             .filter(|diagnostic| diagnostic.code.class() == Class::Error)
             .filter_map(|diagnostic| Some((diagnostic.path.clone()?, diagnostic.line?)))
             .collect();
-        records.extend(last_green(workspace, &scope, agent, &errors)?);
+        records.extend(last_green(workspace, checkers, &scope, agent, &errors)?);
     }
     if invocation.flag("--radius") {
         records.extend(radii(workspace, &scope));
@@ -194,6 +201,7 @@ pub(super) fn changed(
 /// closure sets of the lines holding one whose interface hash differs from its entry.
 fn last_green(
     workspace: &Workspace,
+    checkers: Vec<(Target, check::Checker)>,
     scope: &Scope,
     agent: &str,
     errors: &[(String, u32)],
@@ -203,7 +211,7 @@ fn last_green(
         let writer = scope.package(workspace).and_then(|package| package.name());
         return Ok(changed(
             &entries,
-            &check::greens(workspace, scope, errors),
+            &check::greens_after(workspace, checkers, scope, errors),
             writer,
         ));
     }
@@ -211,7 +219,7 @@ fn last_green(
         let (file, line) = entry.location.rsplit_once(':').unwrap_or_default();
         !scope.holds(workspace, file, line.parse().ok())
     });
-    for green in check::greens(workspace, scope, &[]) {
+    for green in check::greens_after(workspace, checkers, scope, &[]) {
         entries.insert(
             green.path.clone(),
             Entry {

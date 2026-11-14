@@ -70,7 +70,12 @@ pub fn judge(workspace: &Workspace, index: usize, functions: &[Synthetic]) -> Ve
         return functions.iter().map(|_| None).collect();
     };
     let checker = checked(&judged, closure, crate::stdlib::packages(), target);
-    let found = checker.found.borrow().clone();
+    let found: Vec<crate::diagnostic::Diagnostic> = checker
+        .found
+        .borrow()
+        .iter()
+        .map(|found| found.diagnostic.clone())
+        .collect();
     let items: HashMap<String, ItemId> = (0..checker.db.items.len())
         .map(|index| ItemId(index as u32))
         .filter(|item| checker.db.item(*item).file.path.ends_with("/.judged.nan"))

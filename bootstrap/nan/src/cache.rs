@@ -131,6 +131,17 @@ impl Cache {
         }
     }
 
+    /// Deletes a cache entry, if there.
+    pub fn remove(&self, key: &Hash) -> io::Result<()> {
+        let Some(dir) = &self.dir else {
+            return Ok(());
+        };
+        match fs::remove_file(dir.join(format!("entry-{}", key.full()))) {
+            Err(error) if error.kind() != ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        }
+    }
+
     /// The contents of a cache record, none when it is missing or its digest does not match.
     pub fn record(&self, name: &str) -> io::Result<Result<Option<Vec<u8>>, Exposed>> {
         let Some(dir) = &self.dir else {

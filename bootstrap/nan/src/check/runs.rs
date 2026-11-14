@@ -42,7 +42,7 @@ impl Checker<'_> {
         }
         self.evaluating.borrow_mut().push(item);
         let muted = self.muted.replace(0);
-        let value = self.db.about(Some(item), || self.evaluate(item));
+        let value = self.about(Some(item), || self.evaluate(item));
         self.muted.set(muted);
         self.evaluating.borrow_mut().pop();
         self.const_values.borrow_mut().insert(item, value.clone());
@@ -121,7 +121,7 @@ impl Checker<'_> {
                 continue;
             }
             let mut interpreter = Interpreter::new(self);
-            let end = self.db.about(Some(item), || {
+            let end = self.about(Some(item), || {
                 interpreter.run(
                     item,
                     crate::nir::Role::Example,

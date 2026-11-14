@@ -68,5 +68,6 @@ A **measurement** is a quantity taken, on the build of the bootstrap on which th
 | Task closures outside [lexical spawns](16-concurrency.md#joins), with their `take` captures | M2, M6 | none |
 | Time of a [machine seam](23-low-level.md#machine-seams)'s round trip and of a thread switch ([scheduling](24-kernel.md#scheduling)) | M4 | none |
 | Time of a generation check in a [capability table](14-authority.md#capability-tables) | M2, M4 | none |
+| Time of `nan check .` after an edit to a function body, the previous state's results in the build cache ([latency](33-toolchain.md#query-engine)) | M5 | none |
 | Nanbench's metrics | the bootstrap | none |
 | Token count of each [primer tier](39-primer.md#primer-tiers) | the primer | its cap |

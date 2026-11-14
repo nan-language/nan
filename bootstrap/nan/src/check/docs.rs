@@ -491,7 +491,7 @@ impl Checker<'_> {
             let (start, text) = line_text(syntax, summary);
             let lines = [(syntax.tokens[summary].line, start, text)];
             let report = |line: u32, span: Option<(u32, u32)>, (code, fixes): Problem| {
-                self.found.borrow_mut().push(Diagnostic {
+                self.push_found(Diagnostic {
                     span,
                     fixes,
                     ..Diagnostic::at(code, &file.path, line)

@@ -16,7 +16,7 @@ use crate::check;
 use crate::check::db::{ItemId, PackageId};
 use crate::diagnostic::{Class, Code, Diagnostic, Reason};
 use crate::encoding::{bytes, list};
-use crate::hash::checksummed_base32;
+use crate::hash::{Hash, checksummed_base32};
 use crate::lower;
 use crate::workspace::{Kind, Level, Member, Package, Target, Workspace};
 
@@ -178,6 +178,7 @@ fn lower_program(
         roots: vec![root],
         prefixes: prefixes(artefacts),
         section: section(artefacts),
+        tree: tree(artefacts),
         level,
         interface: kernel.as_ref().map(|kernel| kernel.interface.clone()),
         loaded: kernel
@@ -519,6 +520,17 @@ pub fn prefixes(artefacts: &BTreeMap<String, Vec<u8>>) -> HashMap<String, String
             ))
         })
         .collect()
+}
+
+/// The content of an image's `.nan.tree` section: the hash of the list of the code roots of its
+/// `.nan` section's artefacts, in that section's order.
+fn tree(artefacts: &BTreeMap<String, Vec<u8>>) -> Hash {
+    let mut out = Vec::new();
+    list(&mut out, artefacts.values(), |out, artefact| {
+        let decoded = artefact::decode(artefact).expect("an artefact of the final closure");
+        bytes(out, &decoded.code_root)
+    });
+    Hash::of(&out)
 }
 
 /// The content of an image's `.nan` section: each package's artefact, in byte order of package

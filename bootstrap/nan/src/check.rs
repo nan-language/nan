@@ -27,6 +27,7 @@ pub(crate) mod generation;
 mod head;
 mod identity;
 mod interface;
+mod kept;
 mod kernel;
 mod kinds;
 pub(crate) mod ledger;
@@ -69,6 +70,7 @@ mod unknown;
 mod untrusted;
 mod unused;
 
+use std::borrow::Cow;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
@@ -77,7 +79,7 @@ use std::sync::Arc;
 pub use approval::{approvals, authority_summaries, is_unapproved};
 pub use changes::{Change, changes, semantic_conflicts};
 pub use compatible::{compatible, encode_class, schema_records};
-pub use context::{Context, Green, context_gaps, contexts, greens};
+pub use context::{Context, Green, context_gaps, contexts, greens, greens_after};
 use db::{Db, ItemId, ModuleId, PackageId};
 pub use edits::{identity, moved, renamed};
 pub use elaborate::EnsuresClause;
@@ -106,7 +108,9 @@ pub struct Checker<'a> {
     pub db: Db<'a>,
     shapes: RefCell<HashMap<ItemId, Rc<Vec<GenericDef>>>>,
     sigs: RefCell<HashMap<ItemId, Rc<Sig>>>,
-    found: RefCell<Vec<Diagnostic>>,
+    found: RefCell<Vec<Found>>,
+    /// The item whose own work is being computed, if any.
+    traced: Cell<Option<ItemId>>,
     /// The package being checked.
     package: Cell<Option<PackageId>>,
     /// The impl lines, by the type they target, once indexed.
@@ -181,7 +185,7 @@ pub struct Checker<'a> {
     instantiations: RefCell<Vec<(ItemId, Tok, ItemId, crate::check::ty::Args)>>,
     /// The diagnostics of unused code found under the target, reported once found under every
     /// target checking their file.
-    unused: RefCell<Vec<Diagnostic>>,
+    unused: RefCell<Vec<Found>>,
     /// The diagnostics found on the items of quiet packages, which no command reports.
     quiet: RefCell<Vec<Diagnostic>>,
     /// The fields of structs the bodies checked read.
@@ -204,6 +208,15 @@ pub struct Checker<'a> {
     /// While the prover is compared with the proof cache, the obligation hashes whose held
     /// result differs from the procedure's.
     pub(crate) compared: RefCell<Option<Vec<Hash>>>,
+    /// What the build cache keeps of the check and gives back to it.
+    kept: kept::Kept,
+}
+
+/// A diagnostic found, with the item whose own work found it; none for a rule relating items.
+#[derive(Clone)]
+pub(crate) struct Found {
+    pub owner: Option<ItemId>,
+    pub diagnostic: Diagnostic,
 }
 
 /// The exported items of a release, by canonical path.
@@ -236,6 +249,7 @@ impl<'a> Checker<'a> {
             shapes: RefCell::new(HashMap::new()),
             sigs: RefCell::new(HashMap::new()),
             found: RefCell::new(Vec::new()),
+            traced: Cell::new(None),
             package: Cell::new(None),
             impls: RefCell::new(None),
             muted: Cell::new(0),
@@ -281,6 +295,41 @@ impl<'a> Checker<'a> {
             store_entries: OnceCell::new(),
             head_exports: RefCell::new(HashMap::new()),
             compared: RefCell::new(None),
+            kept: kept::Kept::default(),
+        }
+    }
+
+    /// Computes a query about `subject`, or about no item: its reads recorded as that subject's,
+    /// and the subject's own work.
+    pub fn about<T>(&self, subject: Option<ItemId>, compute: impl FnOnce() -> T) -> T {
+        self.db.about(subject, || match subject {
+            Some(item) => self.traced_as(item, compute),
+            None => compute(),
+        })
+    }
+
+    /// Computes part of an item's own work, as the item whose own work is traced.
+    fn traced_as<T>(&self, item: ItemId, compute: impl FnOnce() -> T) -> T {
+        let outer = self.traced.replace(Some(item));
+        let computed = compute();
+        self.traced.set(outer);
+        computed
+    }
+
+    /// Appends a diagnostic to those found, owned by the item whose own work reports it; one
+    /// whose owner's outcome the build cache gives is dropped.
+    fn push_found(&self, diagnostic: Diagnostic) {
+        let owner = self.traced.get();
+        if !self.is_restored(owner) {
+            self.found.borrow_mut().push(Found { owner, diagnostic });
+        }
+    }
+
+    /// Records a diagnostic of unused code as `push_found` records a found one.
+    fn push_unused(&self, diagnostic: Diagnostic) {
+        let owner = self.traced.get();
+        if !self.is_restored(owner) {
+            self.unused.borrow_mut().push(Found { owner, diagnostic });
         }
     }
 
@@ -428,14 +477,17 @@ impl<'a> Checker<'a> {
         let before = self.found.borrow().len();
         let result = probe();
         let withheld = self.found.borrow_mut().split_off(before);
-        (result, withheld)
+        (
+            result,
+            withheld.into_iter().map(|found| found.diagnostic).collect(),
+        )
     }
 
     /// Whether a diagnostic is reported on the construct starting at one of an item's tokens.
     fn reported_at(&self, item: ItemId, token: Tok) -> bool {
         let data = self.db.item(item);
         let start = data.file.syntax.tokens[token as usize].start;
-        self.found.borrow().iter().any(|diagnostic| {
+        self.found.borrow().iter().any(|Found { diagnostic, .. }| {
             diagnostic.path.as_deref() == Some(data.file.path.as_str())
                 && diagnostic.span.is_some_and(|(at, _)| at == start)
         })
@@ -444,7 +496,7 @@ impl<'a> Checker<'a> {
     fn report_diagnostic(&self, item: ItemId, diagnostic: Diagnostic) {
         if let Some(diagnostic) = self.on_item(item, diagnostic) {
             match self.db.is_reported(item) {
-                true => self.found.borrow_mut().push(diagnostic),
+                true => self.push_found(diagnostic),
                 false => self.quiet.borrow_mut().push(diagnostic),
             }
         }
@@ -458,7 +510,7 @@ impl<'a> Checker<'a> {
             && self.db.is_reported(item)
             && declared.contains(&self.db.target)
         {
-            self.unused.borrow_mut().push(diagnostic);
+            self.push_unused(diagnostic);
         }
     }
 
@@ -513,7 +565,7 @@ impl<'a> Checker<'a> {
 
     /// Reports a diagnostic on a line of a file with the fixes its rule names.
     pub fn report_file_fixed(&self, path: &str, line: u32, code: Code, fixes: Vec<Fix>) {
-        self.found.borrow_mut().push(Diagnostic {
+        self.push_found(Diagnostic {
             fixes,
             ..Diagnostic::at(code, path, line)
         });
@@ -528,12 +580,17 @@ pub fn reported(workspace: &Workspace, scope: &Scope) -> Vec<Diagnostic> {
 
 /// The checkers of what checking a scope runs, each under its target, once checked: of the
 /// package the scope lies in, checked alone, or of every closure for a scope holding several.
+/// Each checker is checked from the build cache's snapshot when that gives what a full check
+/// gives.
 pub fn checked_scope<'a>(workspace: &'a Workspace, scope: &Scope) -> Vec<(Target, Checker<'a>)> {
-    let checkers = scope_checkers(workspace, crate::stdlib::packages(), scope);
-    for (_, checker) in &checkers {
-        checker.check_all();
-    }
-    checkers
+    let std = crate::stdlib::packages();
+    scope_closures(workspace, scope)
+        .into_iter()
+        .map(|(closure, target, narrowed)| {
+            let checker = kept::kept_checked(workspace, &closure, std, target, narrowed);
+            (target, checker)
+        })
+        .collect()
 }
 
 /// The checker of a check under a target whose closure checks each workspace package of
@@ -689,7 +746,7 @@ impl Checker<'_> {
             let quieted = self.quiet.borrow().len();
             let (muted, package) = (self.muted.replace(0), self.package.get());
             self.package.set(Some(self.db.package_of(item)));
-            self.db.about(Some(item), || self.check_item(item));
+            self.about(Some(item), || self.check_item(item));
             self.muted.set(muted);
             self.package.set(package);
             let data = self.db.item(item);
@@ -703,7 +760,9 @@ impl Checker<'_> {
                     && diagnostic.path.as_deref() == Some(data.file.path.as_str())
                     && diagnostic.line.is_some_and(error)
             };
-            let failed = self.found.borrow()[reported..].iter().any(on_item)
+            let failed = self.found.borrow()[reported..]
+                .iter()
+                .any(|found| on_item(&found.diagnostic))
                 || self.quiet.borrow()[quieted..].iter().any(on_item)
                 || data.file.syntax.diagnostics.iter().any(|diagnostic| {
                     diagnostic.code.class() == crate::diagnostic::Class::Error
@@ -712,6 +771,7 @@ impl Checker<'_> {
             if failed {
                 self.rejections.borrow_mut().insert(item);
             }
+            self.kept.judged_alone(item, failed);
         }
     }
 
@@ -725,6 +785,7 @@ impl Checker<'_> {
         let quiet = self.quiet.borrow();
         let reported = found
             .iter()
+            .map(|found| &found.diagnostic)
             .chain(quiet.iter())
             .chain(workspace.diagnostics().collect::<Vec<_>>().iter())
             .filter(|diagnostic| diagnostic.code.class() == crate::diagnostic::Class::Error)
@@ -824,7 +885,9 @@ impl Checker<'_> {
         for (_, package) in checked_packages(self) {
             for &module in &self.db.package(package).modules {
                 for &item in &self.db.module(module).items {
-                    self.check_elaborated(item);
+                    if !self.is_restored(Some(item)) {
+                        self.traced_as(item, || self.check_elaborated(item));
+                    }
                 }
             }
             self.check_tables(package);
@@ -886,8 +949,33 @@ fn scope_checkers<'a>(
     std: &'a [Arc<Package>],
     scope: &Scope,
 ) -> Vec<(Target, Checker<'a>)> {
+    scope_closures(workspace, scope)
+        .into_iter()
+        .map(|(closure, target, narrowed)| {
+            let mut checker = unchecked(workspace, &closure, std, target);
+            checker.narrowed = narrowed;
+            (target, checker)
+        })
+        .collect()
+}
+
+/// What checking a scope runs: each closure under each target its packages are checked for, or
+/// for a scope lying in one package, the part of the closure checking it that it reaches under
+/// each target it declares, narrowed to it.
+fn scope_closures<'w>(
+    workspace: &'w Workspace,
+    scope: &Scope,
+) -> Vec<(Cow<'w, Closure>, Target, Option<usize>)> {
     let Some(index) = scope.package_index(workspace) else {
-        return checkers(workspace, std);
+        return workspace
+            .closures
+            .iter()
+            .flat_map(|closure| {
+                closure_targets(workspace, closure)
+                    .into_iter()
+                    .map(move |target| (Cow::Borrowed(closure), target, None))
+            })
+            .collect();
     };
     let package = &workspace.packages[index];
     let Some(closure) = workspace.closure_of(package) else {
@@ -898,11 +986,7 @@ fn scope_checkers<'a>(
     closure_targets(workspace, closure)
         .into_iter()
         .filter(|target| declared.contains(target))
-        .map(|target| {
-            let mut checker = unchecked(workspace, &reached, std, target);
-            checker.narrowed = Some(index);
-            (target, checker)
-        })
+        .map(|target| (Cow::Owned(reached.clone()), target, Some(index)))
         .collect()
 }
 
@@ -937,7 +1021,7 @@ fn diagnostics(checkers: &[(Target, Checker)]) -> Vec<Diagnostic> {
             }
         }
         let mut emitted: Vec<Diagnostic> = Vec::new();
-        for diagnostic in checker.unused.borrow().iter() {
+        for Found { diagnostic, .. } in checker.unused.borrow().iter() {
             if !emitted.contains(diagnostic) {
                 emitted.push(diagnostic.clone());
             }
@@ -948,7 +1032,13 @@ fn diagnostics(checkers: &[(Target, Checker)]) -> Vec<Diagnostic> {
                 None => unused.push((diagnostic, 1)),
             }
         }
-        found.extend(checker.found.borrow().iter().cloned());
+        found.extend(
+            checker
+                .found
+                .borrow()
+                .iter()
+                .map(|found| found.diagnostic.clone()),
+        );
     }
     found.extend(
         unused
@@ -1084,6 +1174,7 @@ pub fn closure_errors(workspace: &Workspace, closure: &Closure) -> Vec<Diagnosti
                 .found
                 .into_inner()
                 .into_iter()
+                .map(|found| found.diagnostic)
                 .chain(checker.quiet.into_inner())
                 .filter(|diagnostic| diagnostic.code.class() == crate::diagnostic::Class::Error),
         );

@@ -37,7 +37,7 @@ impl Checker<'_> {
         if let Some(known) = self.may_traps.borrow().get(&item) {
             return *known;
         }
-        self.db.about(Some(item), || self.compute_may_trap(item))
+        self.about(Some(item), || self.compute_may_trap(item))
     }
 
     fn compute_may_trap(&self, item: ItemId) -> bool {
@@ -104,6 +104,10 @@ impl Checker<'_> {
 
     /// The functions of a function's cycle, itself included.
     fn cycle_of(&self, item: ItemId) -> Vec<ItemId> {
+        let searching = self.db.recording() || self.cycles.borrow().finding;
+        if !searching && !self.in_cycle(item) {
+            return vec![item];
+        }
         let mut reachable = vec![item];
         let mut listed = HashSet::from([item]);
         let mut index = 0;

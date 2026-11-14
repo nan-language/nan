@@ -1,10 +1,11 @@
 //! The measurements of the freeze taken over the workspace packages of each milestone's
-//! scenario: what checking gives, the ledger `nan explain` lists and the closure radii
-//! `nan check --radius` reports.
+//! scenario: what checking gives, the ledger `nan explain` lists, the closure radii
+//! `nan check --radius` reports and the time of a check after a function-body edit.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::timing::Times;
 
@@ -37,6 +38,9 @@ pub struct Scenario {
     /// The tasks of the scenario's programs and test images, for the milestones whose stacks
     /// are measured.
     pub tasks: Vec<nan::TaskStack>,
+    /// The time of a check after a function-body edit, with the workspace's source lines, for
+    /// the milestones whose check latency is measured.
+    pub recheck: Option<(Duration, usize)>,
 }
 
 /// Runs `nan` in a workspace and gives its output, which must start with `ok`.
@@ -132,6 +136,10 @@ fn scenario(milestone: &'static str, label: &'static str, root: &Path) -> Result
         true => nan::task_stacks(root).map_err(|error| error.to_string())?,
         false => Vec::new(),
     };
+    let recheck = match milestone == "M5" {
+        true => Some(recheck(root)?),
+        false => None,
+    };
     Ok(Scenario {
         milestone,
         label,
@@ -140,7 +148,61 @@ fn scenario(milestone: &'static str, label: &'static str, root: &Path) -> Result
         waivers,
         radii,
         tasks,
+        recheck,
     })
+}
+
+/// The time of `nan check .` after a blank line is added to the first function body of the
+/// workspace's source files, by path, once the previous state's results are in the build cache,
+/// with the workspace's source lines.
+fn recheck(root: &Path) -> Result<(Duration, usize), String> {
+    let fault = |error: std::io::Error| error.to_string();
+    let mut files = Vec::new();
+    for package in packages(root)? {
+        sources(&root.join(package), &mut files).map_err(fault)?;
+    }
+    files.sort();
+    let mut lines = 0;
+    let mut edit = None;
+    for path in &files {
+        let text = fs::read_to_string(path).map_err(fault)?;
+        lines += text.lines().count();
+        if edit.is_some() {
+            continue;
+        }
+        let mut at = 0;
+        for line in text.split_inclusive('\n') {
+            at += line.len();
+            if line.contains("fn ") && line.ends_with("{\n") && !line.starts_with(' ') {
+                edit = Some((path.clone(), format!("{}\n{}", &text[..at], &text[at..])));
+                break;
+            }
+        }
+    }
+    let (path, edited) = edit.ok_or("no function body to edit")?;
+    ok(root, &["check"])?;
+    fs::write(path, edited).map_err(fault)?;
+    let started = Instant::now();
+    ok(root, &["check"])?;
+    Ok((started.elapsed(), lines))
+}
+
+/// Adds the paths of the source files under a directory, those of its `.nan` directory aside.
+fn sources(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.file_name().is_some_and(|name| name == ".nan") {
+            continue;
+        }
+        match path.is_dir() {
+            true => sources(&path, files)?,
+            false if path.extension().is_some_and(|extension| extension == "nan") => {
+                files.push(path);
+            }
+            false => {}
+        }
+    }
+    Ok(())
 }
 
 /// The names of the packages of a workspace: its directories holding a `package.nan`.
@@ -320,6 +382,16 @@ pub fn sections(scenarios: &[Scenario], times: &Times, radii: &mut String) -> (S
         nanoseconds(times.host.get("generation")),
         nanoseconds(times.kernel.get("generation"))
     ));
+    text.push_str("\n## Time of a check after a function-body edit\n\n`nan check .` after a blank line is added to a function body, the previous state's results in the build cache.\n\n| Milestone | Source lines | Time |\n| --- | ---: | ---: |\n");
+    for scenario in scenarios {
+        if let Some((time, lines)) = scenario.recheck {
+            text.push_str(&format!(
+                "| {} | {lines} | {} ms |\n",
+                scenario.label,
+                time.as_millis()
+            ));
+        }
+    }
     text.push_str("\n## Nanbench's metrics\n\nIn `nanbench.md`.\n\n## Token count of each primer tier\n\nIn `primer.md`.\n");
     (text, within)
 }

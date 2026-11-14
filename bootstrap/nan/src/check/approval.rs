@@ -107,9 +107,9 @@ impl Checker<'_> {
         let source = self.db.package(root).source;
         if let Some(lock) = source.machine.lock() {
             let needed = self.needed(root);
-            self.found
-                .borrow_mut()
-                .extend(unapproved(source, &needed, lock));
+            for diagnostic in unapproved(source, &needed, lock) {
+                self.push_found(diagnostic);
+            }
         }
     }
 }

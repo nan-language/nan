@@ -9,7 +9,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub use closure::{
     Closure, Member, Release, Store as ReleaseStore, Unconfirmed, holds_sources, reaching_directive,
@@ -116,6 +117,35 @@ pub fn root(current: &Path) -> PathBuf {
         Some(outermost) => outermost.parent().unwrap_or(outermost).to_path_buf(),
         None => current.to_path_buf(),
     }
+}
+
+/// The results of `work` on each index below `count`, in order, computed on the machine's
+/// processors, at most eight.
+pub fn on_processors<T: Send>(count: usize, work: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let threads = std::thread::available_parallelism().map_or(1, |found| found.get().min(8));
+    let next = AtomicUsize::new(0);
+    let results: Vec<Mutex<Option<T>>> = (0..count).map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..threads.min(count) {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(result) = results.get(index) else {
+                        break;
+                    };
+                    let computed = work(index);
+                    *result.lock().expect("a result") = Some(computed);
+                }
+            });
+        }
+    });
+    results
+        .into_iter()
+        .map(|result| {
+            let computed = result.into_inner().expect("a result");
+            computed.expect("a result of each index")
+        })
+        .collect()
 }
 
 /// Whether a directory under `root`, outside every name starting with `.`, holds a `package.nan`.
@@ -829,13 +859,19 @@ impl Package {
             modules::assign(&found.dir, package_name.as_deref(), &found.sources);
         let std = package_name.as_deref().is_some_and(crate::stdlib::is_std);
         if manifest.as_ref().is_none_or(|manifest| manifest.supported) {
-            for (path, module) in found.sources.iter().zip(assigned) {
-                let source = source(path)?;
-                let syntax = if std {
-                    parse_std(source)
-                } else {
-                    parse(source)
-                };
+            let sources: Vec<Mutex<Vec<u8>>> = found
+                .sources
+                .iter()
+                .map(|path| source(path).map(Mutex::new))
+                .collect::<io::Result<_>>()?;
+            let parsed = on_processors(sources.len(), |index| {
+                let source = std::mem::take(&mut *sources[index].lock().expect("a source"));
+                match std {
+                    true => parse_std(source),
+                    false => parse(source),
+                }
+            });
+            for ((path, module), syntax) in found.sources.iter().zip(assigned).zip(parsed) {
                 files.push(File::new(path.clone(), Some(module), syntax));
             }
         }

@@ -42,12 +42,13 @@ impl Checker<'_> {
     /// tombstone, or an item whose elaboration faulted, which reports an internal error.
     pub fn unit(&self, item: ItemId) -> Option<Rc<Unit>> {
         self.db.note(item);
+        self.trace_read(item);
         if let Some(unit) = self.units.borrow().get(&item) {
             return unit.clone();
         }
         let unit = match self.rejected(item) {
             true => None,
-            false => match self.db.about(Some(item), || self.elaborate(item)) {
+            false => match self.about(Some(item), || self.elaborate(item)) {
                 Ok(unit) => unit.map(Rc::new),
                 Err(Fault::Failed) => None,
                 Err(Fault::Unsupported(fault)) => {
@@ -155,12 +156,12 @@ impl Checker<'_> {
     /// without reporting.
     pub fn typed(&self, item: ItemId) -> Option<Rc<TBody>> {
         self.db.note(item);
+        self.trace_read(item);
         if let Some(body) = self.bodies.borrow().get(&item) {
             return Some(body.clone());
         }
         self.muted.set(self.muted.get() + 1);
         let body = self
-            .db
             .about(Some(item), || self.check_bodies(item))
             .map(Rc::new);
         self.muted.set(self.muted.get() - 1);

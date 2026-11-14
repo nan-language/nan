@@ -322,6 +322,7 @@ impl Checker<'_> {
     /// with its Env's abandon method for one naming `sys::Component`. It reads no other item's
     /// facts as a subject's.
     pub fn names(&self, item: ItemId) -> Rc<BTreeSet<ItemId>> {
+        self.trace_read(item);
         if let Some(named) = self.named.borrow().get(&item) {
             return named.clone();
         }
@@ -522,7 +523,7 @@ impl Checker<'_> {
                 continue;
             };
             let start = data.syntax().tokens[token as usize].start;
-            for diagnostic in self.found.borrow_mut().iter_mut() {
+            for super::Found { diagnostic, .. } in self.found.borrow_mut().iter_mut() {
                 if diagnostic.code == crate::diagnostic::Code::NameCase
                     && diagnostic.path.as_deref() == Some(data.file.path.as_str())
                     && diagnostic.span.is_some_and(|(at, _)| at == start)

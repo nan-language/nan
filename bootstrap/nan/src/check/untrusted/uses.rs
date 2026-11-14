@@ -110,6 +110,7 @@ impl Checker<'_> {
     /// until the outermost one's are the same as its last walk's.
     fn body_uses(&self, unit: Unit) -> Rc<Uses> {
         self.db.note(unit.0);
+        self.trace_read(unit.0);
         {
             let mut cache = self.body_uses.borrow_mut();
             if let Some(done) = cache.done.get(&unit) {
@@ -123,7 +124,7 @@ impl Checker<'_> {
             cache.open.push((unit, Rc::new(Uses::default()), None));
         }
         loop {
-            let found = Rc::new(self.db.about(Some(unit.0), || self.walk_uses(unit)));
+            let found = Rc::new(self.about(Some(unit.0), || self.walk_uses(unit)));
             let mut cache = self.body_uses.borrow_mut();
             let position = cache.open.len() - 1;
             let (_, last, low) = cache.open.last_mut().expect("the body computed");

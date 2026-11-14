@@ -25,6 +25,7 @@ pub enum Member {
 
 /// A dependency closure: its members by package name, the workspace packages checked and
 /// reported in it, and the member each alias of each member names.
+#[derive(Clone)]
 pub struct Closure {
     pub members: BTreeMap<String, Member>,
     pub checked: Vec<usize>,

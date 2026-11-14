@@ -1,6 +1,6 @@
 # 0052. The source tree hash recorded in the image
 
-Status: accepted; its bootstrap being frozen superseded by 0120
+Status: accepted; its bootstrap being frozen superseded by 0120, the bootstrap's images holding no such section by 0197
 
 ## Context
 

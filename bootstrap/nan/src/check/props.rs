@@ -448,9 +448,7 @@ impl Checker<'_> {
             None => {}
         }
         let number = self.deciding.borrow_mut().start(key);
-        let props = self
-            .db
-            .about(Some(item), || self.compute_definition_props(item));
+        let props = self.about(Some(item), || self.compute_definition_props(item));
         if self.deciding.borrow_mut().finish(key, number, props) {
             self.definitions.borrow_mut().insert(key, props);
         }

@@ -1132,54 +1132,57 @@ impl Checker<'_> {
         let mut judged: Vec<(ItemId, Tok)> = Vec::new();
         let instantiations = self.instantiations.borrow().clone();
         for (holder, token, target, args) in instantiations {
-            if judged.contains(&(holder, token)) || self.rejected(holder) {
+            if judged.contains(&(holder, token))
+                || self.is_restored(Some(holder))
+                || self.rejected(holder)
+            {
                 continue;
             }
             judged.push((holder, token));
-            let Some(unit) = self.unit(target) else {
-                continue;
-            };
-            let conditions: Vec<u32> = unit
-                .functions
-                .iter()
-                .filter(|function| function.role == Role::Where)
-                .map(|function| function.index)
-                .collect();
-            if conditions.is_empty() {
-                continue;
-            }
-            let generics = self.sig(target).generics.clone();
-            let consts: Vec<(Scalar, &Arg)> = generics
-                .iter()
-                .zip(args.iter())
-                .filter_map(|(def, arg)| def.constant.map(|scalar| (scalar, arg)))
-                .collect();
-            let values: Option<Vec<Val>> = consts
-                .iter()
-                .map(|(_, arg)| match arg {
-                    Arg::Const(Const::Int(value)) => Some(Val::Int(*value)),
-                    Arg::Const(Const::Bool(value)) => Some(Val::Bool(*value)),
-                    _ => None,
-                })
-                .collect();
-            let met = match values {
-                Some(values) => conditions.iter().all(|index| {
-                    matches!(
-                        Interpreter::new(self).run(
-                            target,
-                            Role::Where,
-                            *index,
-                            values.clone(),
-                            &args
-                        ),
-                        End::Value(Val::Bool(true))
-                    )
-                }),
-                None => self.wheres_entailed(holder, target, &unit, &conditions, &args, &consts),
-            };
-            if !met {
-                self.report(holder, token, Code::GenericWhereUnmet);
-            }
+            self.traced_as(holder, || {
+                if !self.where_met(holder, target, &args) {
+                    self.report(holder, token, Code::GenericWhereUnmet);
+                }
+            });
+        }
+    }
+
+    /// Whether an instantiation of `target` that `holder` writes meets its `where` conditions.
+    fn where_met(&self, holder: ItemId, target: ItemId, args: &Args) -> bool {
+        let Some(unit) = self.unit(target) else {
+            return true;
+        };
+        let conditions: Vec<u32> = unit
+            .functions
+            .iter()
+            .filter(|function| function.role == Role::Where)
+            .map(|function| function.index)
+            .collect();
+        if conditions.is_empty() {
+            return true;
+        }
+        let generics = self.sig(target).generics.clone();
+        let consts: Vec<(Scalar, &Arg)> = generics
+            .iter()
+            .zip(args.iter())
+            .filter_map(|(def, arg)| def.constant.map(|scalar| (scalar, arg)))
+            .collect();
+        let values: Option<Vec<Val>> = consts
+            .iter()
+            .map(|(_, arg)| match arg {
+                Arg::Const(Const::Int(value)) => Some(Val::Int(*value)),
+                Arg::Const(Const::Bool(value)) => Some(Val::Bool(*value)),
+                _ => None,
+            })
+            .collect();
+        match values {
+            Some(values) => conditions.iter().all(|index| {
+                matches!(
+                    Interpreter::new(self).run(target, Role::Where, *index, values.clone(), args),
+                    End::Value(Val::Bool(true))
+                )
+            }),
+            None => self.wheres_entailed(holder, target, &unit, &conditions, args, &consts),
         }
     }
 }

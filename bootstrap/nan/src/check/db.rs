@@ -145,6 +145,15 @@ impl<'a> Db<'a> {
         };
         let mut members: Vec<Member> = closure.members.values().copied().collect();
         members.sort();
+        let files: Vec<&File> = members
+            .iter()
+            .map(|member| workspace.member(*member))
+            .chain(std.iter().map(|package| &**package))
+            .flat_map(|package| package.files.iter().chain(&package.history))
+            .collect();
+        crate::workspace::on_processors(files.len(), |index| {
+            files[index].lowered();
+        });
         for member in &members {
             let package = workspace.member(*member);
             if package.manifest.is_none() {

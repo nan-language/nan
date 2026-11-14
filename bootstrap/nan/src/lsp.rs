@@ -22,7 +22,6 @@ const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
-const INTERNAL_ERROR: i64 = -32603;
 const SERVER_NOT_INITIALIZED: i64 = -32002;
 
 /// A document the client opened in the workspace.
@@ -136,14 +135,12 @@ impl Server {
         let Some(handler) = handler(method) else {
             return Err((METHOD_NOT_FOUND, format!("no method {method}")));
         };
-        match crate::command::caught(|| handler(self, params)) {
-            Ok(Some(result)) => Ok(result),
-            Ok(None) => Err((
+        handler(self, params).ok_or_else(|| {
+            (
                 INVALID_PARAMS,
                 format!("the params of {method} do not read"),
-            )),
-            Err(panicked) => Err((INTERNAL_ERROR, panicked)),
-        }
+            )
+        })
     }
 
     /// Takes the client's workspace folder, or its root, and the position encoding, and gives

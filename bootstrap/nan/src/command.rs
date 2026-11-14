@@ -534,7 +534,7 @@ thread_local! {
 
 /// Runs a command's body, or describes the panic ending it: `panic at` and the location of the
 /// panic, then its message.
-pub(crate) fn caught<T>(body: impl FnOnce() -> T) -> Result<T, String> {
+fn caught<T>(body: impl FnOnce() -> T) -> Result<T, String> {
     static HOOK: Once = Once::new();
     HOOK.call_once(|| {
         let previous = panic::take_hook();

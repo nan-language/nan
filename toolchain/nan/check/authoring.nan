@@ -1,0 +1,1090 @@
+//! What the language server offers while code is written: the names that may follow a position, the head of the function a call being written calls, the types of bindings written without one, and the class of each name of a file.
+
+/// What a completion offers.
+pkg enum Offered derives Copy, Eq {
+    Local
+    Field
+    Variant
+    Function
+    Method
+    Module
+    Struct
+    Enum
+    Interface
+    Const
+    Keyword
+} Offered
+
+/// A name that may follow a position: its text, what it names, and a line describing it.
+pkg struct Completion {
+    pkg label: text::String
+    pkg offered: Offered
+    pkg detail: text::String
+} Completion
+
+/// The head of the function a call being written calls, its parameters as written in it, and
+/// the parameter the argument being written takes.
+pkg struct Signature {
+    pkg label: text::String
+    pkg parameters: mem::List[text::String]
+    pkg active: usize
+} Signature
+
+/// A binding's type, after its name.
+pkg struct TypeHint {
+    pkg at: u32
+    pkg shown: text::String
+} TypeHint
+
+/// The class of a name, for highlighting.
+pkg enum NameClass derives Copy, Eq {
+    Namespace
+    Type
+    Struct
+    Enum
+    Interface
+    Parameter
+    Variable
+    Property
+    EnumMember
+    Function
+    Method
+    Keyword
+    Comment
+    Text
+    Number
+} NameClass
+
+/// A run of a file's bytes as highlighting classes it, with whether it declares a name and
+/// whether that name names a const.
+pkg struct Classed derives Copy {
+    pkg start: u32
+    pkg end: u32
+    pkg class: NameClass
+    pkg declaration: bool
+    pkg readonly: bool
+} Classed
+
+/// How a name a token writes is classed.
+struct TokenClass derives Copy {
+    class: NameClass
+    declaration: bool
+    readonly: bool
+} TokenClass
+
+/// The names that may follow a byte of a workspace file, the identifier ending there written in
+/// part: after `.`, the members of the type before it; after `::`, the items of the module the
+/// path before it names; otherwise the locals bound before it, the items of its module, the
+/// names starting a path, the core vocabulary and the keywords. Each once, by label, the folded
+/// label starting with the folded part written.
+pkg fn Session.completions(self, path: Str, at: u32) -> mem::List[Completion] {
+    let alloc = self.alloc
+    var listed = mem::List[Completion].empty(alloc)
+    let held = self.workspace.contents()
+    let Some(source) = held.bytes(path) else {
+        return listed
+    }
+    var end = usize.widen(at)
+    if end > source.len() {
+        end = source.len()
+    }
+    var start = end
+    while start > 0 and is_name_byte(source[start - 1]) {
+        start -= 1
+    }
+    var part = text::String.empty(alloc)
+    for index in start..<end {
+        match char.checked_from_bits(u32.widen(source[index])) {
+            Some(c) => mut part.push(c)
+            None => {}
+        }
+    }
+    let written = fold(part.as_str(), alloc)
+    let closed = self.closed_session(path, source, end: start)
+    let Some(checker) = closed.file_checker(path) else {
+        return listed
+    }
+    let found = match checker.item_holding(path, at: u32.fit(start)) {
+        None => keyword_completions(alloc)
+        Some(item) => checker.context_completions(item, source, start)
+    }
+    var by_label = mem::Map[text::String, Completion].empty(alloc)
+    for completion in take found {
+        if not fold(completion.label.as_str(), alloc).starts_with(written.as_str()) {
+            continue
+        }
+        if not by_label.contains(completion.label) {
+            discard mut by_label.insert(text::String.of(completion.label.as_str(), alloc), value: take completion)
+        }
+    }
+    for pair in take by_label {
+        mut listed.push(take pair.value)
+    }
+    return listed
+} Session.completions
+
+/// The session with a workspace file holding the source completion reads up to a byte of it.
+fn Session.closed_session(self, path: Str, source: Slice[u8], end: usize) -> Session {
+    let alloc = self.alloc
+    var changed = mem::Map[text::String, mem::Bytes].empty(alloc)
+    discard mut changed.insert(text::String.of(path, alloc), value: closed_source(source, end, grammar: self.grammar.contents(), alloc))
+    let overlaid = self.workspace.contents().overlaid(changed, grammar: self.grammar.contents(), alloc)
+    return self.over(mem::Shared.of(take overlaid, alloc: alloc), alloc)
+} Session.closed_session
+
+/// Whether a byte may be part of an identifier.
+fn is_name_byte(byte: u8) -> bool {
+    return (byte >= b'a' and byte <= b'z') or (byte >= b'A' and byte <= b'Z') or (byte >= b'0' and byte <= b'9') or byte == b'_'
+} is_name_byte
+
+/// The names that may follow a byte of an item where an identifier starts: after `::`, `.`, or
+/// elsewhere.
+fn Checker.context_completions(self, item: ty::ItemId, source: Slice[u8], start: usize) -> mem::List[Completion] {
+    if start >= 2 and source[start - 1] == b':' and source[start - 2] == b':' {
+        return self.path_completions(item, before: source, end: start - 2)
+    }
+    if start >= 1 and source[start - 1] == b'.' {
+        return self.member_completions(item, dot: u32.fit(start - 1))
+    }
+    return self.name_completions(item, at: u32.fit(start))
+} Checker.context_completions
+
+/// The head of the function the call written at a byte of a workspace file calls, when the byte
+/// lies within that call's parentheses: its first line as consumers see it.
+pkg fn Session.signature(self, path: Str, at: u32) -> Option[Signature] {
+    let held = self.workspace.contents()
+    let Some(found) = held.file(path) else {
+        return None
+    }
+    let syntax = held.file_at(found).syntax()
+    let Some(call) = opened_call(syntax, at) else {
+        return None
+    }
+    let Some(callee) = syntax.previous(call.open) else {
+        return None
+    }
+    if syntax.tokens[callee].kind != syntax::TokenKind.Ident {
+        return None
+    }
+    var spaced = mem::Bytes.empty(self.alloc)
+    for index in 0..<usize.widen(at) {
+        mut spaced.push(syntax.source[index])
+    }
+    mut spaced.push(b' ')
+    for index in usize.widen(at)..<syntax.source.len() {
+        mut spaced.push(syntax.source[index])
+    }
+    let closed = self.closed_session(path, source: spaced.view(), end: usize.widen(at) + 1)
+    let Some(checker) = closed.file_checker(path) else {
+        return None
+    }
+    let Some(named) = checker.named_at(path, at: syntax.tokens[callee].start) else {
+        return None
+    }
+    let NameAt.Target(RenameTarget.Item(function)) = named.named else {
+        return None
+    }
+    return checker.signature_of(function, syntax, callee, call, at)
+} Session.signature
+
+/// The `(` opening the call a byte lies within, and the commas separating its arguments before
+/// the byte.
+struct OpenedCall derives Copy {
+    open: usize
+    commas: usize
+} OpenedCall
+
+/// The call whose parentheses hold a byte, found among the tokens of its item before it.
+fn opened_call(syntax: syntax::SourceFile, at: u32) -> Option[OpenedCall] {
+    var depth: usize = 0
+    var commas: usize = 0
+    var token = syntax.tokens.len()
+    while token > 0 {
+        token -= 1
+        let found = syntax.tokens[token]
+        if found.end > at or found.kind.is_virtual() {
+            if found.kind == syntax::TokenKind.Col0 and found.start < at {
+                return None
+            }
+            continue
+        }
+        match found.kind {
+            syntax::TokenKind.Punct(syntax::Punct.RParen) or syntax::TokenKind.Punct(syntax::Punct.RBracket) => {
+                depth += 1
+            }
+            syntax::TokenKind.Punct(syntax::Punct.LParen) => {
+                if depth == 0 {
+                    return Some(OpenedCall(open: token, commas: commas))
+                }
+                depth -= 1
+            }
+            syntax::TokenKind.Punct(syntax::Punct.LBracket) => {
+                depth = depth.saturating_sub(1)
+            }
+            syntax::TokenKind.Punct(syntax::Punct.LBrace) or syntax::TokenKind.Punct(syntax::Punct.RBrace) => return None
+            syntax::TokenKind.Punct(syntax::Punct.Comma) => {
+                if depth == 0 {
+                    commas += 1
+                }
+            }
+            else => {}
+        }
+    }
+    return None
+} opened_call
+
+/// The signature of a function called at a token, its active parameter the one the argument
+/// being written names by its label, or else its position, a receiver counting as `self`.
+fn Checker.signature_of(self, function: ty::ItemId, syntax: syntax::SourceFile, callee: usize, call: OpenedCall, at: u32) -> Option[Signature] {
+    let ast::ItemKind.Fn(head) = self.db().ast(function).kind else {
+        return None
+    }
+    let lines = self.interface_text(function, viewer: None)
+    let Some(label) = lines.get(0) else {
+        return None
+    }
+    let listed = written_parameters(label.as_str(), alloc: self.alloc())
+    var implied: usize = 0
+    let receiver = match syntax.previous(callee) {
+        Some(dot) => syntax.tokens[dot].kind == syntax::TokenKind.Punct(syntax::Punct.Dot) and value_before(syntax, dot)
+        None => false
+    }
+    let takes_self = match head.head.params.get(0) {
+        Some(first_param) => first_param.is_self()
+        None => false
+    }
+    if receiver and takes_self {
+        implied = 1
+    }
+    var active = call.commas + implied
+    match argument_label(syntax, open: call.open, at) {
+        Some(token) => {
+            for index in 0..<head.head.params.len() {
+                if head.head.params[index].name() == syntax.text(token) {
+                    active = index
+                    break
+                }
+            }
+        }
+        None => {}
+    }
+    return Some(Signature(label: text::String.of(label.as_str(), alloc: self.alloc()), parameters: take listed, active: active))
+} Checker.signature_of
+
+/// Whether the token before a `.` writes a value rather than a type, by the case of its first
+/// letter.
+fn value_before(syntax: syntax::SourceFile, dot: usize) -> bool {
+    let Some(before) = syntax.previous(dot) else {
+        return false
+    }
+    let written = syntax.text(before).as_bytes()
+    return written.len() == 0 or not (written[0] >= b'A' and written[0] <= b'Z')
+} value_before
+
+/// The token of the label the argument being written up to a byte gives itself, when it starts
+/// with one.
+fn argument_label(syntax: syntax::SourceFile, open: usize, at: u32) -> Option[usize] {
+    var start = open
+    var depth: usize = 0
+    for token in (open + 1)..<syntax.tokens.len() {
+        let found = syntax.tokens[token]
+        if found.start >= at {
+            break
+        }
+        match found.kind {
+            syntax::TokenKind.Punct(syntax::Punct.LParen) or syntax::TokenKind.Punct(syntax::Punct.LBracket) => {
+                depth += 1
+            }
+            syntax::TokenKind.Punct(syntax::Punct.RParen) or syntax::TokenKind.Punct(syntax::Punct.RBracket) => {
+                depth = depth.saturating_sub(1)
+            }
+            syntax::TokenKind.Punct(syntax::Punct.Comma) => {
+                if depth == 0 {
+                    start = token
+                }
+            }
+            else => {}
+        }
+    }
+    let name = syntax.next(start + 1)
+    let colon = syntax.next(name + 1)
+    if colon >= syntax.tokens.len() {
+        return None
+    }
+    let labelled = syntax.tokens[name].kind == syntax::TokenKind.Ident and syntax.tokens[colon].kind == syntax::TokenKind.Punct(syntax::Punct.Colon) and syntax.tokens[colon].end <= at
+    if labelled {
+        return Some(name)
+    }
+    return None
+} argument_label
+
+/// The parameters a head's text writes between its parentheses, separated at its top-level
+/// commas.
+fn written_parameters(head: Str, alloc: mem::Alloc) -> mem::List[text::String] {
+    var parameters = mem::List[text::String].empty(alloc)
+    let bytes = head.as_bytes()
+    var open = bytes.len()
+    for index in 0..<bytes.len() {
+        if bytes[index] == b'(' {
+            open = index
+            break
+        }
+    }
+    if open == bytes.len() {
+        return parameters
+    }
+    var depth: usize = 0
+    var start = open + 1
+    for index in (open + 1)..<bytes.len() {
+        let byte = bytes[index]
+        if byte == b'(' or byte == b'[' {
+            depth += 1
+        } else if byte == b']' or (byte == b')' and depth > 0) {
+            depth = depth.saturating_sub(1)
+        } else if (byte == b')' or byte == b',') and depth == 0 {
+            push_parameter(mut parameters, head, start, end: index, alloc)
+            start = index + 1
+            if byte == b')' {
+                break
+            }
+        }
+    }
+    return parameters
+} written_parameters
+
+/// Adds the text of a head's bytes `start..<end` without the spaces around it, when it is not
+/// empty.
+fn push_parameter(mut parameters: mem::List[text::String], head: Str, start: usize, end: usize, alloc: mem::Alloc) {
+    var from = start
+    var to = end
+    let bytes = head.as_bytes()
+    while from < to and bytes[from] == b' ' {
+        from += 1
+    }
+    while to > from and bytes[to - 1] == b' ' {
+        to -= 1
+    }
+    if from == to {
+        return
+    }
+    let Some(written) = head.slice_bytes(from, end: to) else {
+        return
+    }
+    mut parameters.push(text::String.of(written, alloc))
+} push_parameter
+
+/// The bindings of a workspace file's items overlapping bytes, `let`, `var` and `for` bindings
+/// written without a type, each with the byte after its name and its type, by position.
+pkg fn Session.type_hints(self, path: Str, start: u32, end: u32) -> mem::List[TypeHint] {
+    var hints = mem::List[TypeHint].empty(self.alloc)
+    let Some(checker) = self.file_checker(path) else {
+        return hints
+    }
+    let db = checker.db()
+    for index in 0..<db.items.len() {
+        let item = ty::ItemId(index: u32.fit(index))
+        if db.item_file(item).path.as_str() != path {
+            continue
+        }
+        let span = checker.item_span(item)
+        if span.end < start or span.start > end {
+            continue
+        }
+        checker.hint_item(item, start, end, mut hints)
+    }
+    mut hints.sort_by(fn(left: TypeHint, right: TypeHint) -> core::Ordering {
+        let by_place = left.at.cmp(right.at)
+        if by_place != core::Ordering.Equal {
+            return by_place
+        }
+        return left.shown.cmp(right.shown)
+    })
+    return hints
+} Session.type_hints
+
+/// Adds the type hints of an item's bindings written without a type whose names end between
+/// two bytes.
+fn Checker.hint_item(self, item: ty::ItemId, start: u32, end: u32, mut hints: mem::List[TypeHint]) {
+    let Some(held) = self.typed(item) else {
+        return
+    }
+    let body = held.contents()
+    var bound = mem::List[LocalId].empty(self.alloc())
+    match body.root {
+        Some(root) => collect_bound(root, found: mut bound)
+        None => {}
+    }
+    for clause in body.clauses {
+        collect_bound(clause.expr, found: mut bound)
+    }
+    let db = self.db()
+    let syntax = db.syntax(item)
+    for id in bound {
+        let local = body.local(id)
+        let token = syntax.tokens[usize.widen(local.token)]
+        let next = syntax.next(usize.widen(local.token) + 1)
+        let typed = next < syntax.tokens.len() and syntax.tokens[next].kind == syntax::TokenKind.Punct(syntax::Punct.Colon)
+        if not typed and token.end >= start and token.end <= end {
+            mut hints.push(TypeHint(at: token.end, shown: self.show(local.ty, from: db.item(item).module)))
+        }
+    }
+} Checker.hint_item
+
+/// Adds the locals the `let` and `for` statements of an expression's blocks bind as their whole
+/// pattern, and those its `var` statements bind.
+fn collect_bound(expr: TExpr, mut found: mem::List[LocalId]) {
+    match expr.kind {
+        TKind.Block(block) => bound_in_block(block, mut found)
+        TKind.If(condition: _, then: then, otherwise: _) => bound_in_block(then, mut found)
+        else => {}
+    }
+    expr.each_child(fn[mut found](child: TExpr) => collect_bound(child, mut found))
+} collect_bound
+
+/// Adds the locals a block's statements bind, those of their own blocks included.
+fn bound_in_block(block: TBlock, mut found: mem::List[LocalId]) {
+    for stmt in block.stmts {
+        match stmt.kind {
+            TStmtKind.Let(pattern: pattern, value: _, otherwise: otherwise) => {
+                pattern_bound(pattern.contents(), mut found)
+                match otherwise {
+                    Some(otherwise_block) => bound_in_block(otherwise_block, mut found)
+                    None => {}
+                }
+            }
+            TStmtKind.Var(local: local, value: _) => mut found.push(local)
+            TStmtKind.For(pattern: pattern, mode: _, iterated: _, cursor: _, invariants: _, body: body) => {
+                pattern_bound(pattern.contents(), mut found)
+                bound_in_block(body, mut found)
+            }
+            TStmtKind.While(condition: _, invariants: _, body: body) or TStmtKind.Loop(invariants: _, body: body) => bound_in_block(body, mut found)
+            else => {}
+        }
+    }
+} bound_in_block
+
+/// Adds the local a pattern binds as a whole.
+fn pattern_bound(pattern: TPattern, mut found: mem::List[LocalId]) {
+    match pattern.kind {
+        TPatternKind.Binding(local) => mut found.push(local)
+        else => {}
+    }
+} pattern_bound
+
+/// The names of a workspace file classed for highlighting, its keywords, literals and comments,
+/// by position.
+pkg fn Session.classes(self, path: Str) -> mem::List[Classed] {
+    let alloc = self.alloc
+    var classed = mem::List[Classed].empty(alloc)
+    let held = self.workspace.contents()
+    let Some(found) = held.file(path) else {
+        return classed
+    }
+    let syntax = held.file_at(found).syntax()
+    var named = mem::HashMap[u32, TokenClass].empty(seed: 0, alloc)
+    match self.file_checker(path) {
+        Some(checker) => checker.class_file(path, mut named)
+        None => {}
+    }
+    for index in 0..<syntax.tokens.len() {
+        let token = syntax.tokens[index]
+        let Some(class) = token_class(token.kind, named: named.get(u32.fit(index))) else {
+            continue
+        }
+        mut classed.push(Classed(start: token.start, end: token.end, class: class.class, declaration: class.declaration, readonly: class.readonly))
+    }
+    for line in syntax.lines {
+        match line.comment {
+            Some(comment) => mut classed.push(Classed(start: comment, end: line.end, class: NameClass.Comment, declaration: false, readonly: false))
+            None => {}
+        }
+    }
+    mut classed.sort_by(fn(left: Classed, right: Classed) => left.start.cmp(right.start))
+    return classed
+} Session.classes
+
+/// The class of a token: of its kind for keywords, literals and doc comments, of the name it
+/// writes for an identifier.
+fn token_class(kind: syntax::TokenKind, named: Option[TokenClass]) -> Option[TokenClass] {
+    return match kind {
+        syntax::TokenKind.Keyword(_) => Some(plain_class(NameClass.Keyword))
+        syntax::TokenKind.Int or syntax::TokenKind.Float => Some(plain_class(NameClass.Number))
+        syntax::TokenKind.Text or syntax::TokenKind.Bytes or syntax::TokenKind.Char or syntax::TokenKind.Byte or syntax::TokenKind.TextLine => Some(plain_class(NameClass.Text))
+        syntax::TokenKind.Doc or syntax::TokenKind.FileDoc => Some(plain_class(NameClass.Comment))
+        syntax::TokenKind.Ident => named
+        else => None
+    }
+} token_class
+
+/// A class neither declaring nor naming a const.
+fn plain_class(class: NameClass) -> TokenClass {
+    return TokenClass(class: class, declaration: false, readonly: false)
+} plain_class
+
+/// Classes the names each item of a workspace file writes.
+fn Checker.class_file(self, path: Str, mut named: mem::HashMap[u32, TokenClass]) {
+    let db = self.db()
+    for index in 0..<db.items.len() {
+        let item = ty::ItemId(index: u32.fit(index))
+        if db.item_file(item).path.as_str() == path {
+            self.class_names(item, mut named)
+        }
+    }
+} Checker.class_file
+
+/// The keywords, offered where no item holds a position.
+fn keyword_completions(alloc: mem::Alloc) -> mem::List[Completion] {
+    var found = mem::List[Completion].empty(alloc)
+    var index: usize = 0
+    loop {
+        let Some(keyword) = syntax::Keyword.from_index(index) else {
+            return found
+        }
+        mut found.push(Completion(label: text::String.of(keyword.spelling(), alloc), offered: Offered.Keyword, detail: text::String.empty(alloc)))
+        index += 1
+    }
+} keyword_completions
+
+/// The source a file's completion reads up to a byte: the text before it closed, then the
+/// file's lines from the first after the byte's line that starts at column 0 with neither `}`
+/// nor a blank, which start the items after the one holding the byte.
+fn closed_source(source: Slice[u8], end: usize, grammar: syntax::Grammar, alloc: mem::Alloc) -> mem::Bytes {
+    var kept_end = end
+    if kept_end > source.len() {
+        kept_end = source.len()
+    }
+    let Some(prefix) = source.prefix(kept_end) else {
+        return mem::Bytes.empty(alloc)
+    }
+    var closed = syntax::close_prefix(prefix, grammar, alloc).source
+    if closed.len() == 0 or closed[closed.len() - 1] != b'\n' {
+        mut closed.push(b'\n')
+    }
+    var at = end
+    while at < source.len() and source[at] != b'\n' {
+        at += 1
+    }
+    at += 1
+    while at < source.len() {
+        let byte = source[at]
+        if byte != b' ' and byte != b'}' and byte != b'\n' and byte != b'\r' and byte != b'\t' {
+            mut closed.push(b'\n')
+            match source.split_at(at) {
+                Some(parts) => mut closed.append(parts.tail)
+                None => {}
+            }
+            return closed
+        }
+        while at < source.len() and source[at] != b'\n' {
+            at += 1
+        }
+        at += 1
+    }
+    return closed
+} closed_source
+
+/// What an item names, offered as a completion.
+fn Checker.offered(self, item: ty::ItemId) -> Option[Completion] {
+    let alloc = self.alloc()
+    let declared = self.db().ast(item)
+    let offered = match declared.kind {
+        ast::ItemKind.Fn(function) => match function.label.owner.is_some() {
+            true => Offered.Method
+            false => Offered.Function
+        }
+        ast::ItemKind.Struct(_) or ast::ItemKind.Layout(_) or ast::ItemKind.Registers(_) => Offered.Struct
+        ast::ItemKind.Enum(_) => Offered.Enum
+        ast::ItemKind.Interface(_) or ast::ItemKind.Protocol(_) => Offered.Interface
+        ast::ItemKind.Const(_) or ast::ItemKind.Registry(_) or ast::ItemKind.Contribute(_) => Offered.Const
+        else => return None
+    }
+    let Some(name) = declared.name(alloc) else {
+        return None
+    }
+    let bytes = name.as_bytes()
+    var cut: usize = 0
+    for index in 0..<bytes.len() {
+        if bytes[index] == b'.' {
+            cut = index + 1
+        }
+    }
+    let Some(label) = name.slice_bytes(cut, end: bytes.len()) else {
+        return None
+    }
+    return Some(Completion(label: text::String.of(label, alloc), offered: offered, detail: self.head_written(item)))
+} Checker.offered
+
+/// The first line of an item's head as written, without a trailing `{`.
+fn Checker.head_written(self, item: ty::ItemId) -> text::String {
+    let db = self.db()
+    let line = output::printable(db.syntax(item).line_text(db.head_line(item)), alloc: self.alloc())
+    return trimmed_head(line.as_str(), alloc: self.alloc())
+} Checker.head_written
+
+/// A line without the spaces around it and a trailing `{`, nor the spaces before that.
+fn trimmed_head(line: Str, alloc: mem::Alloc) -> text::String {
+    let bytes = line.as_bytes()
+    var from: usize = 0
+    var to = bytes.len()
+    while from < to and bytes[from] == b' ' {
+        from += 1
+    }
+    while to > from and bytes[to - 1] == b' ' {
+        to -= 1
+    }
+    while to > from and bytes[to - 1] == b'{' {
+        to -= 1
+    }
+    while to > from and bytes[to - 1] == b' ' {
+        to -= 1
+    }
+    let Some(kept) = line.slice_bytes(from, end: to) else {
+        return text::String.empty(alloc)
+    }
+    return text::String.of(kept, alloc)
+} trimmed_head
+
+/// The members the type before a `.` at a byte of an item offers: a type path's variants and the
+/// functions named after it; a value's fields its module sees and the functions named after its
+/// type that take `self`.
+fn Checker.member_completions(self, item: ty::ItemId, dot: u32) -> mem::List[Completion] {
+    let module = self.db().item(item).module
+    match self.type_before(item, at: dot) {
+        Some(owner) => {
+            var found = self.variants(owner)
+            for completion in take self.functions_after(TypeKey.Item(owner), module, methods: false) {
+                mut found.push(take completion)
+            }
+            return found
+        }
+        None => {}
+    }
+    var found = mem::List[Completion].empty(self.alloc())
+    let Some(held) = self.typed(item) else {
+        return found
+    }
+    let body = held.contents()
+    var receiver: Option[Receiver] = None
+    match body.root {
+        Some(root) => self.receiver_ending(item, expr: root, dot, mut receiver)
+        None => {}
+    }
+    let Some(found_receiver) = receiver else {
+        return found
+    }
+    let Some(key) = self.type_key(found_receiver.ty) else {
+        return found
+    }
+    match key {
+        TypeKey.Item(owner) => {
+            found = self.fields(owner, module)
+        }
+        else => {}
+    }
+    for completion in take self.functions_after(key, module, methods: true) {
+        mut found.push(take completion)
+    }
+    return found
+} Checker.member_completions
+
+/// An expression ending at a byte: its first token and its type.
+struct Receiver derives Copy {
+    token: u32
+    ty: ty::Ty
+} Receiver
+
+/// Keeps as the receiver the shortest expression ending at a byte that an expression holds.
+fn Checker.receiver_ending(self, item: ty::ItemId, expr: TExpr, dot: u32, mut receiver: Option[Receiver]) {
+    let syntax = self.db().syntax(item)
+    let ends = syntax.tokens[usize.widen(expr.last)].end == dot
+    let shorter = match receiver {
+        Some(known) => expr.token > known.token
+        None => true
+    }
+    if ends and shorter {
+        receiver = Some(Receiver(token: expr.token, ty: expr.ty))
+    }
+    expr.each_child(fn[mut receiver](child: TExpr) => self.receiver_ending(item, expr: child, dot, mut receiver))
+} Checker.receiver_ending
+
+/// The struct or enum the path an item writes ending before a byte names.
+fn Checker.type_before(self, item: ty::ItemId, at: u32) -> Option[ty::ItemId] {
+    let holder = self.holder(item)
+    let syntax = self.holder_syntax(holder)
+    for written in holder.paths(self) {
+        if syntax.tokens[usize.widen(written.path.last().token)].end != at {
+            continue
+        }
+        let Ok(Named.Item(found)) = self.db().resolve(holder.module, path: written.path) else {
+            continue
+        }
+        match self.db().ast(found).kind {
+            ast::ItemKind.Struct(_) or ast::ItemKind.Enum(_) => return Some(found)
+            else => {}
+        }
+    }
+    return None
+} Checker.type_before
+
+/// The variants of an enum.
+fn Checker.variants(self, owner: ty::ItemId) -> mem::List[Completion] {
+    let alloc = self.alloc()
+    var found = mem::List[Completion].empty(alloc)
+    let ast::ItemKind.Enum(enumeration) = self.db().ast(owner).kind else {
+        return found
+    }
+    let syntax = self.db().syntax(owner)
+    for variant in enumeration.variants {
+        let line = output::printable(syntax.line_text(syntax.tokens[usize.widen(variant.name.token)].line), alloc)
+        mut found.push(Completion(label: text::String.of(variant.name.text.as_str(), alloc), offered: Offered.Variant, detail: trimmed_head(line.as_str(), alloc)))
+    }
+    return found
+} Checker.variants
+
+/// The fields of a struct a module sees.
+fn Checker.fields(self, owner: ty::ItemId, module: ty::ModuleId) -> mem::List[Completion] {
+    let alloc = self.alloc()
+    let db = self.db()
+    var found = mem::List[Completion].empty(alloc)
+    let ast::ItemKind.Struct(structure) = db.ast(owner).kind else {
+        return found
+    }
+    let syntax = db.syntax(owner)
+    let own_module = db.module_of(owner) == module
+    let own_package = db.package_of(owner) == db.module(module).package_id
+    for field in structure.fields() {
+        let seen = match field.visibility {
+            ast::Visibility.Pub => true
+            ast::Visibility.Pkg => own_package
+            ast::Visibility.Private => own_module
+        }
+        if not seen {
+            continue
+        }
+        let line = output::printable(syntax.line_text(syntax.tokens[usize.widen(field.name.token)].line), alloc)
+        mut found.push(Completion(label: text::String.of(field.name.text.as_str(), alloc), offered: Offered.Field, detail: trimmed_head(line.as_str(), alloc)))
+    }
+    return found
+} Checker.fields
+
+/// The functions named after a type that a module sees, those taking `self` alone when
+/// `methods` holds.
+fn Checker.functions_after(self, key: TypeKey, module: ty::ModuleId, methods: bool) -> mem::List[Completion] {
+    var found = mem::List[Completion].empty(self.alloc())
+    let db = self.db()
+    let Some(members) = db.member_table.get(key) else {
+        return found
+    }
+    for entry in members {
+        for function in entry.value() {
+            if not db.visible(module, item: function) {
+                continue
+            }
+            if not methods or self.takes_self(function) {
+                match self.offered(function) {
+                    Some(completion) => mut found.push(take completion)
+                    None => {}
+                }
+            }
+            break
+        }
+    }
+    return found
+} Checker.functions_after
+
+/// Whether a function's first parameter is `self`.
+fn Checker.takes_self(self, function: ty::ItemId) -> bool {
+    let ast::ItemKind.Fn(head) = self.db().ast(function).kind else {
+        return false
+    }
+    return match head.head.params.get(0) {
+        Some(first_param) => first_param.is_self()
+        None => false
+    }
+} Checker.takes_self
+
+/// The items and modules of the module the path before a `::` names, as an item's module sees
+/// them.
+fn Checker.path_completions(self, item: ty::ItemId, before: Slice[u8], end: usize) -> mem::List[Completion] {
+    let alloc = self.alloc()
+    let module = self.db().item(item).module
+    var segments = mem::List[ast::Name].empty(alloc)
+    var last = end
+    loop {
+        var start = last
+        while start > 0 and is_name_byte(before[start - 1]) {
+            start -= 1
+        }
+        if start == last {
+            break
+        }
+        var segment = text::String.empty(alloc)
+        for index in start..<last {
+            match char.checked_from_bits(u32.widen(before[index])) {
+                Some(c) => mut segment.push(c)
+                None => {}
+            }
+        }
+        mut segments.insert(0, value: ast::Name(text: take segment, token: 0))
+        if start < 2 or before[start - 1] != b':' or before[start - 2] != b':' {
+            break
+        }
+        last = start - 2
+    }
+    let Ok(Named.Module(named)) = self.db().resolve(module, path: ast::Path(segments: take segments)) else {
+        return mem::List[Completion].empty(alloc)
+    }
+    var found = self.module_items(named, seeing: module)
+    if self.db().module(named).root {
+        for completion in take self.modules_of(self.db().module(named).package_id) {
+            mut found.push(take completion)
+        }
+    }
+    return found
+} Checker.path_completions
+
+/// The items a module declares that another module sees, each name once.
+fn Checker.module_items(self, declaring: ty::ModuleId, seeing: ty::ModuleId) -> mem::List[Completion] {
+    var found = mem::List[Completion].empty(self.alloc())
+    let db = self.db()
+    for entry in db.module(declaring).names {
+        for item in entry.value() {
+            if not db.visible(seeing, item) {
+                continue
+            }
+            match self.offered(item) {
+                Some(completion) => mut found.push(take completion)
+                None => {}
+            }
+            break
+        }
+    }
+    return found
+} Checker.module_items
+
+/// A package's modules below its root.
+fn Checker.modules_of(self, package_id: ty::PackageId) -> mem::List[Completion] {
+    let alloc = self.alloc()
+    let db = self.db()
+    var found = mem::List[Completion].empty(alloc)
+    for module in db.package_data(package_id).modules {
+        if db.module(module).root {
+            continue
+        }
+        mut found.push(Completion(label: text::String.of(db.module(module).name.as_str(), alloc), offered: Offered.Module, detail: db.module_path(module)))
+    }
+    return found
+} Checker.modules_of
+
+/// The names that may start an expression at a byte of an item: the locals bound before it, the
+/// items of its module, the aliases and modules a path may start with, the core vocabulary, the
+/// scalar types and the keywords.
+fn Checker.name_completions(self, item: ty::ItemId, at: u32) -> mem::List[Completion] {
+    let alloc = self.alloc()
+    let db = self.db()
+    let module = db.item(item).module
+    var found = self.local_completions(item, at)
+    for completion in take self.module_items(module, seeing: module) {
+        mut found.push(take completion)
+    }
+    let package_id = db.module(module).package_id
+    for entry in db.package_data(package_id).deps {
+        mut found.push(Completion(label: text::String.of(entry.key().as_str(), alloc), offered: Offered.Module, detail: text::String.empty(alloc)))
+    }
+    for entry in db.std {
+        mut found.push(Completion(label: text::String.of(entry.key().as_str(), alloc), offered: Offered.Module, detail: text::String.empty(alloc)))
+    }
+    for completion in take self.modules_of(package_id) {
+        mut found.push(take completion)
+    }
+    match db.package_data(db.core()).root {
+        Some(core) => {
+            for completion in take self.module_items(core, seeing: module) {
+                mut found.push(take completion)
+            }
+        }
+        None => {}
+    }
+    for scalar in ty::Scalar.all(alloc) {
+        mut found.push(Completion(label: text::String.of(scalar.name(), alloc), offered: Offered.Struct, detail: text::String.empty(alloc)))
+    }
+    for completion in take keyword_completions(alloc) {
+        mut found.push(take completion)
+    }
+    return found
+} Checker.name_completions
+
+/// The locals an item binds before a byte, each by the token first binding it, in order, with
+/// its type.
+fn Checker.local_completions(self, item: ty::ItemId, at: u32) -> mem::List[Completion] {
+    let alloc = self.alloc()
+    var found = mem::List[Completion].empty(alloc)
+    let holder = self.holder(item)
+    let syntax = self.holder_syntax(holder)
+    let Some(tree) = self.holder_tree(holder) else {
+        return found
+    }
+    var firsts = mem::List[u32].empty(alloc)
+    for entry in format::Bindings.collect(syntax, tree, alloc).of {
+        mut firsts.push(entry.value())
+    }
+    mut firsts.sort_by(fn(left: u32, right: u32) => left.cmp(right))
+    let typed = self.typed(item)
+    var previous: Option[u32] = None
+    for introduced in firsts {
+        if previous == Some(introduced) or syntax.tokens[usize.widen(introduced)].end > at {
+            previous = Some(introduced)
+            continue
+        }
+        previous = Some(introduced)
+        let detail = self.binding_type(typed, token: introduced, module: self.db().item(item).module)
+        mut found.push(Completion(label: text::String.of(syntax.text(usize.widen(introduced)), alloc), offered: Offered.Local, detail: take detail))
+    }
+    return found
+} Checker.local_completions
+
+/// The type of the local a typed body binds at a token, as a module writes it; empty for none.
+fn Checker.binding_type(self, typed: Option[mem::Shared[TBody]], token: u32, module: ty::ModuleId) -> text::String {
+    let Some(held) = typed else {
+        return text::String.empty(self.alloc())
+    }
+    for local in held.contents().locals {
+        if local.token == token {
+            return self.show(local.ty, from: module)
+        }
+    }
+    return text::String.empty(self.alloc())
+} Checker.binding_type
+
+/// Classes the names an item writes, by token: its declared names and members, its labels, its
+/// bindings, the members its bodies name and the items and modules its paths name.
+fn Checker.class_names(self, item: ty::ItemId, mut named: mem::HashMap[u32, TokenClass]) {
+    let holder = self.holder(item)
+    for written in holder.paths(self) {
+        self.class_path(holder, path: written.path, mut named)
+    }
+    discard self.typed(item)
+    for record in self.state.contents().members_named.cursor() {
+        if record.item != item {
+            continue
+        }
+        let class = match record.member {
+            Member.Function(function) => match self.item_class(function) {
+                Some(found) => found.class
+                None => continue
+            }
+            Member.Method(owner: _, name: _) => NameClass.Method
+            Member.Field(owner: _, name: _) => NameClass.Property
+            Member.Variant(owner: _, name: _) => NameClass.EnumMember
+        }
+        discard mut named.insert(record.token, value: TokenClass(class: class, declaration: false, readonly: false))
+    }
+    let Some(tree) = self.holder_tree(holder) else {
+        return
+    }
+    let bound = format::Bindings.collect(self.holder_syntax(holder), tree, alloc: self.alloc())
+    for entry in bound.of {
+        let class = match bound.parameters.contains(entry.value()) {
+            true => NameClass.Parameter
+            false => NameClass.Variable
+        }
+        discard mut named.insert(entry.key(), value: TokenClass(class: class, declaration: entry.key() == entry.value(), readonly: false))
+    }
+    self.class_declared(item, holder, mut named)
+} Checker.class_names
+
+/// Classes each segment of a path an item writes, by what the segments up to it name.
+fn Checker.class_path(self, holder: HolderItem, path: ast::Path, mut named: mem::HashMap[u32, TokenClass]) {
+    let alloc = self.alloc()
+    var segments = mem::List[ast::Name].empty(alloc)
+    for segment in path.segments {
+        mut segments.push(segment.copy(alloc))
+        let resolved = self.db().resolve(holder.module, path: ast::Path(segments: copied_names(segments.view(), alloc)))
+        let class = match resolved {
+            Ok(Named.Module(_)) => Some(TokenClass(class: NameClass.Namespace, declaration: false, readonly: false))
+            Ok(Named.Item(found)) => self.item_class(found)
+            Ok(Named.Variant(item: _, index: _)) => Some(TokenClass(class: NameClass.EnumMember, declaration: false, readonly: false))
+            Ok(Named.Scalar(_)) or Ok(Named.Unit) or Ok(Named.Never) or Ok(Named.Dyn) => Some(TokenClass(class: NameClass.Type, declaration: false, readonly: false))
+            Err(_) => None
+        }
+        match class {
+            Some(found) => {
+                discard mut named.insert(segment.token, value: found)
+            }
+            None => {}
+        }
+    }
+} Checker.class_path
+
+/// Copies of names.
+fn copied_names(names: Slice[ast::Name], alloc: mem::Alloc) -> mem::List[ast::Name] {
+    var copied = mem::List[ast::Name].empty(alloc)
+    for name in names {
+        mut copied.push(name.copy(alloc))
+    }
+    return copied
+} copied_names
+
+/// Classes an item's own name, the last names of its labels, and the names of the fields,
+/// variants and interface methods it declares.
+fn Checker.class_declared(self, item: ty::ItemId, holder: HolderItem, mut named: mem::HashMap[u32, TokenClass]) {
+    let Some(own) = self.item_class(item) else {
+        self.class_members(item, mut named)
+        return
+    }
+    for label in holder.labels(self) {
+        if label.len() > 0 {
+            discard mut named.insert(label[label.len() - 1], value: own)
+        }
+    }
+    match declared_name(self.db().ast(item), alloc: self.alloc()) {
+        Some(name) => {
+            discard mut named.insert(name.token, value: TokenClass(class: own.class, declaration: true, readonly: own.readonly))
+        }
+        None => {}
+    }
+    self.class_members(item, mut named)
+} Checker.class_declared
+
+/// Classes the names of the fields, variants and interface methods an item declares.
+fn Checker.class_members(self, item: ty::ItemId, mut named: mem::HashMap[u32, TokenClass]) {
+    match self.db().ast(item).kind {
+        ast::ItemKind.Struct(structure) => {
+            for field in structure.fields() {
+                discard mut named.insert(field.name.token, value: TokenClass(class: NameClass.Property, declaration: true, readonly: false))
+            }
+        }
+        ast::ItemKind.Enum(enumeration) => {
+            for variant in enumeration.variants {
+                discard mut named.insert(variant.name.token, value: TokenClass(class: NameClass.EnumMember, declaration: true, readonly: false))
+            }
+        }
+        ast::ItemKind.Interface(declaring) => {
+            for method in declaring.methods {
+                discard mut named.insert(method.name.token, value: TokenClass(class: NameClass.Method, declaration: true, readonly: false))
+            }
+        }
+        else => {}
+    }
+} Checker.class_members
+
+/// The class of the names naming an item, with whether it names a const.
+fn Checker.item_class(self, item: ty::ItemId) -> Option[TokenClass] {
+    let class = match self.db().ast(item).kind {
+        ast::ItemKind.Fn(function) => match function.label.owner.is_some() {
+            true => NameClass.Method
+            false => NameClass.Function
+        }
+        ast::ItemKind.Test(_) => NameClass.Function
+        ast::ItemKind.Struct(_) or ast::ItemKind.Layout(_) or ast::ItemKind.Registers(_) => NameClass.Struct
+        ast::ItemKind.Enum(_) => NameClass.Enum
+        ast::ItemKind.Interface(_) or ast::ItemKind.Protocol(_) => NameClass.Interface
+        ast::ItemKind.Const(_) or ast::ItemKind.Registry(_) or ast::ItemKind.Contribute(_) => NameClass.Variable
+        else => return None
+    }
+    let readonly = match self.db().ast(item).kind {
+        ast::ItemKind.Const(_) => true
+        else => false
+    }
+    return Some(TokenClass(class: class, declaration: false, readonly: readonly))
+} Checker.item_class

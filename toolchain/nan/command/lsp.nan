@@ -1,0 +1,579 @@
+//! `nan lsp`: the language server, answering the Language Server Protocol from check-time queries.
+
+const PARSE_ERROR: i64 = -32_700
+const INVALID_REQUEST: i64 = -32_600
+const METHOD_NOT_FOUND: i64 = -32_601
+const INVALID_PARAMS: i64 = -32_602
+const SERVER_NOT_INITIALIZED: i64 = -32_002
+
+/// A document the client opened in the workspace.
+struct Document {
+    uri: text::String
+    source: mem::Bytes
+} Document
+
+/// Where the server stands in the protocol's lifecycle.
+enum Stage derives Copy, Eq {
+    Starting
+    Running
+    ShutDown
+} Stage
+
+/// The server: the directory it runs in, the workspace root once the client named its folder,
+/// the encoding positions count in, the open documents of the workspace by workspace path, the
+/// workspace paths whose diagnostics were last published not empty, and what each check shares.
+pkg struct Server {
+    current: text::String
+    root: text::String
+    encoding: Encoding
+    stage: Stage
+    documents: mem::Map[text::String, Document]
+    published: mem::Set[text::String]
+    home: Option[cache::HomeOverride]
+    std: workspace::CarriedStd
+    grammar: mem::Shared[syntax::Grammar]
+    crew: mem::Shared[check::Crew]
+    parsing: mem::Shared[workspace::Parsing]
+} Server
+
+/// A request's result, or its error's code and message.
+enum Answer {
+    Done(Json)
+    Refused(code: i64, message: text::String)
+} Answer
+
+/// Serves the messages of standard input until the client's `exit` or the end of the input,
+/// writing to standard output, the checks' batches posted to `crew` and the workspace's parses
+/// to `parsing`. Returns the status the server exits with: 0 after a `shutdown` request, else 1.
+pkg fn serve(
+    current: Str,
+    home: Option[cache::HomeOverride],
+    take crew: mem::Shared[check::Crew],
+    take parsing: mem::Shared[workspace::Parsing],
+    alloc: mem::Alloc,
+    ) -> u8 {
+    let grammar = mem::Shared.of(syntax::Grammar.load(alloc), alloc: alloc)
+    let std = workspace::CarriedStd.unloaded(parsing: parsing.share(), alloc)
+    std.parse_ahead(grammar, given: home, alloc)
+    var server = Server(current: text::String.of(current, alloc), root: text::String.of(current, alloc), encoding: Encoding.Utf16, stage: Stage.Starting, documents: mem::Map[text::String, Document].empty(alloc), published: mem::Set[text::String].empty(alloc), home: cache::copied_override(home, alloc), std: take std, grammar: take grammar, crew: take crew, parsing: take parsing)
+    var input = Input.empty(alloc)
+    loop {
+        let Ok(Some(content)) = attempt mut input.message(alloc) else {
+            return server.status()
+        }
+        let Some(message) = parse(content.view(), alloc) else {
+            let rejected = Answer.Refused(code: PARSE_ERROR, message: text::String.of("the message is not JSON", alloc))
+            match attempt respond(Json.Null, answer: take rejected, alloc) {
+                Ok(_) => continue
+                Err(_) => return 1
+            }
+        }
+        if message.method() == Some("exit") {
+            return server.status()
+        }
+        match attempt mut server.handle(message, alloc) {
+            Ok(_) => {}
+            Err(_) => return 1
+        }
+    }
+} serve
+
+fn Server.status(self) -> u8 {
+    if self.stage == Stage.ShutDown {
+        return 0
+    }
+    return 1
+} Server.status
+
+/// A message's method, none for a response.
+proj fn Json.method(self) -> Option[Str] {
+    let Some(method) = self.get("method") else {
+        return None
+    }
+    return method.as_str()
+} Json.method
+
+/// Answers a request, or acts on a notification; a response from the client is dropped.
+fn Server.handle(mut self, message: Json, alloc: mem::Alloc) fails platform::IoError {
+    let Some(method) = message.method() else {
+        return
+    }
+    let params = match message.get("params") {
+        Some(given) => given.copy(alloc)
+        None => Json.Null
+    }
+    let Some(id) = message.get("id") else {
+        try mut self.notified(method, params, alloc)
+        return
+    }
+    let answer = mut self.request(method, params, alloc)
+    try respond(id.copy(alloc), answer: take answer, alloc)
+} Server.handle
+
+fn refusing(code: i64, message: Str, alloc: mem::Alloc) -> Answer {
+    return Answer.Refused(code: code, message: text::String.of(message, alloc))
+} refusing
+
+fn Server.request(mut self, method: Str, params: Json, alloc: mem::Alloc) -> Answer {
+    match self.stage {
+        Stage.Starting => {
+            if method == "initialize" {
+                return Answer.Done(mut self.initialize(params, alloc))
+            }
+            return refusing(SERVER_NOT_INITIALIZED, message: "the server is not initialized", alloc)
+        }
+        Stage.ShutDown => return refusing(INVALID_REQUEST, message: "the server is shut down", alloc)
+        Stage.Running => {}
+    }
+    if method == "initialize" {
+        return refusing(INVALID_REQUEST, message: "the server is initialized", alloc)
+    }
+    if method == "shutdown" {
+        self.stage = Stage.ShutDown
+        return Answer.Done(Json.Null)
+    }
+    return self.answer(method, params, alloc)
+} Server.request
+
+/// The answer of a method the server serves, by its handler.
+fn Server.answer(self, method: Str, params: Json, alloc: mem::Alloc) -> Answer {
+    let found = match method {
+        "textDocument/codeAction" => self.code_actions(params, alloc)
+        "textDocument/formatting" => self.formatting(params, alloc)
+        "textDocument/definition" => self.definition(params, alloc)
+        "textDocument/references" => self.references(params, alloc)
+        "textDocument/hover" => self.hover(params, alloc)
+        "textDocument/documentSymbol" => self.document_symbols(params, alloc)
+        "workspace/symbol" => self.workspace_symbols(params, alloc)
+        "textDocument/implementation" => self.implementations(params, alloc)
+        "textDocument/prepareCallHierarchy" => self.prepare_calls(params, alloc)
+        "callHierarchy/incomingCalls" => self.incoming_calls(params, alloc)
+        "callHierarchy/outgoingCalls" => self.outgoing_calls(params, alloc)
+        "textDocument/completion" => self.completion(params, alloc)
+        "textDocument/signatureHelp" => self.signature_help(params, alloc)
+        "textDocument/inlayHint" => self.inlay_hints(params, alloc)
+        "textDocument/semanticTokens/full" => self.semantic_tokens(params, alloc)
+        else => {
+            var message = text::String.of("no method ", alloc)
+            mut message.append(method)
+            return Answer.Refused(code: METHOD_NOT_FOUND, message: take message)
+        }
+    }
+    let Some(result) = found else {
+        var message = text::String.of("the params of ", alloc)
+        mut message.append(method)
+        mut message.append(" do not read")
+        return Answer.Refused(code: INVALID_PARAMS, message: take message)
+    }
+    return Answer.Done(take result)
+} Server.answer
+
+/// Takes the client's workspace folder, or its root, and the position encoding, and gives the
+/// server's capabilities.
+fn Server.initialize(mut self, params: Json, alloc: mem::Alloc) -> Json {
+    let folder = match uri_folder(params, alloc) {
+        Some(found) => found
+        None => match path_folder(params, alloc) {
+            Some(found) => found
+            None => text::String.of(self.current.as_str(), alloc)
+        }
+    }
+    self.root = workspace::root_of(folder.as_str(), alloc)
+    if offers_utf8(params) {
+        self.encoding = Encoding.Utf8
+    }
+    self.stage = Stage.Running
+    var info = mem::List[Member].empty(alloc)
+    mut info.push(Member.of("name", value: Json.text("nan", alloc), alloc))
+    var members = mem::List[Member].empty(alloc)
+    mut members.push(Member.of("capabilities", value: capabilities(self.encoding, alloc), alloc))
+    mut members.push(Member.of("serverInfo", value: Json.Object(take info), alloc))
+    return Json.Object(take members)
+} Server.initialize
+
+/// The URI of the first workspace folder of `initialize` params, or else their root URI.
+proj fn Json.root_uri(self) -> Option[Json] {
+    let Some(folders) = self.get("workspaceFolders") else {
+        return self.get("rootUri")
+    }
+    let Some(listed) = folders.elements() else {
+        return self.get("rootUri")
+    }
+    if listed.len() == 0 {
+        return self.get("rootUri")
+    }
+    let Some(uri) = listed[0].get("uri") else {
+        return self.get("rootUri")
+    }
+    return Some(uri)
+} Json.root_uri
+
+/// The path the folder URI of `initialize` params names.
+fn uri_folder(params: Json, alloc: mem::Alloc) -> Option[text::String] {
+    let Some(uri) = params.root_uri() else {
+        return None
+    }
+    let Some(written) = uri.as_str() else {
+        return None
+    }
+    return uri_path(written, alloc)
+} uri_folder
+
+/// The root path of `initialize` params.
+fn path_folder(params: Json, alloc: mem::Alloc) -> Option[text::String] {
+    let Some(given) = params.get("rootPath") else {
+        return None
+    }
+    let Some(written) = given.as_str() else {
+        return None
+    }
+    return Some(text::String.of(written, alloc))
+} path_folder
+
+/// Whether the client offers positions counting UTF-8 code units.
+fn offers_utf8(params: Json) -> bool {
+    let Some(general) = params.at("capabilities", inner: "general") else {
+        return false
+    }
+    let Some(encodings) = general.get("positionEncodings") else {
+        return false
+    }
+    let Some(offered) = encodings.elements() else {
+        return false
+    }
+    for offer in offered {
+        if offer.as_str() == Some("utf-8") {
+            return true
+        }
+    }
+    return false
+} offers_utf8
+
+/// The URI of the document a notification's or request's params name.
+fn document_uri(params: Json, alloc: mem::Alloc) -> Option[text::String] {
+    let Some(uri) = params.at("textDocument", inner: "uri") else {
+        return None
+    }
+    let Some(written) = uri.as_str() else {
+        return None
+    }
+    return Some(text::String.of(written, alloc))
+} document_uri
+
+/// Acts on a notification while running: a document opened, changed, saved or closed has the
+/// diagnostics of its package published.
+fn Server.notified(mut self, method: Str, params: Json, alloc: mem::Alloc) fails platform::IoError {
+    if self.stage != Stage.Running {
+        return
+    }
+    let Some(uri) = document_uri(params, alloc) else {
+        return
+    }
+    let Some(path) = self.workspace_path(uri.as_str(), alloc) else {
+        return
+    }
+    match method {
+        "textDocument/didOpen" => {
+            let Some(opened) = opened_text(params, alloc) else {
+                return
+            }
+            discard mut self.documents.insert(text::String.of(path.as_str(), alloc), value: Document(uri: take uri, source: take opened))
+        }
+        "textDocument/didChange" => mut self.change(path.as_str(), params, alloc)
+        "textDocument/didClose" => {
+            discard mut self.documents.remove(path)
+        }
+        "textDocument/didSave" => {}
+        else => return
+    }
+    try mut self.publish(path.as_str(), alloc)
+} Server.notified
+
+/// The text of a `didOpen` notification's document.
+fn opened_text(params: Json, alloc: mem::Alloc) -> Option[mem::Bytes] {
+    let Some(given) = params.at("textDocument", inner: "text") else {
+        return None
+    }
+    let Some(written) = given.as_str() else {
+        return None
+    }
+    var source = mem::Bytes.empty(alloc)
+    mut source.append(written.as_bytes())
+    return Some(take source)
+} opened_text
+
+/// Applies the changes of a `didChange` notification to an open document.
+fn Server.change(mut self, path: Str, params: Json, alloc: mem::Alloc) {
+    let encoding = self.encoding
+    let key = text::String.of(path, alloc)
+    if not self.documents.contains(key) {
+        return
+    }
+    let Some(changes) = params.get("contentChanges") else {
+        return
+    }
+    let Some(listed) = changes.elements() else {
+        return
+    }
+    var document = mut self.documents.at_mut(key)
+    for change in listed {
+        apply_change(mut document.source, change, encoding, alloc)
+    }
+} Server.change
+
+/// Publishes the diagnostics `nan check` reports on the package holding a workspace path, per
+/// file, and empty diagnostics for each of its files that no longer has any.
+fn Server.publish(mut self, path: Str, alloc: mem::Alloc) fails platform::IoError {
+    let Some(session) = self.session(alloc) else {
+        return
+    }
+    let held = session.workspace.contents()
+    let Some(at) = held.file(path) else {
+        return
+    }
+    let index = at.package_index
+    var dir = text::String.of(held.packages[index].contents().dir.as_str(), alloc)
+    mut dir.push('/')
+    var found = mem::Map[text::String, mem::List[Json]].empty(alloc)
+    for marked in self.published {
+        if marked.starts_with(dir.as_str()) {
+            discard mut found.insert(text::String.of(marked.as_str(), alloc), value: mem::List[Json].empty(alloc))
+        }
+    }
+    for reported in of_package(session, index, alloc) {
+        let Some(reported_path) = reported.path else {
+            continue
+        }
+        let written = self.diagnostic_json(session, index, reported, alloc)
+        let key = text::String.of(reported_path.as_str(), alloc)
+        if not found.contains(key) {
+            discard mut found.insert(text::String.of(reported_path.as_str(), alloc), value: mem::List[Json].empty(alloc))
+        }
+        mut (mut found.at_mut(key)).push(take written)
+    }
+    for pair in take found {
+        try mut self.published_file(pair.key.as_str(), written: take pair.value, alloc)
+    }
+} Server.publish
+
+/// Sends the diagnostics of one file and records whether they are empty.
+fn Server.published_file(mut self, path: Str, take written: mem::List[Json], alloc: mem::Alloc) fails platform::IoError {
+    if written.len() == 0 {
+        discard mut self.published.remove(text::String.of(path, alloc))
+    } else {
+        discard mut self.published.insert(text::String.of(path, alloc))
+    }
+    var params = mem::List[Member].empty(alloc)
+    mut params.push(Member.of("uri", value: Json.Text(self.uri(path, alloc)), alloc))
+    mut params.push(Member.of("diagnostics", value: Json.Array(take written), alloc))
+    try notify("textDocument/publishDiagnostics", params: Json.Object(take params), alloc)
+} Server.published_file
+
+/// The session over the workspace with the open documents' texts in place of their files; none
+/// when the root holds no package or does not read.
+fn Server.session(self, alloc: mem::Alloc) -> Option[check::Session] {
+    let root = self.root.as_str()
+    let Ok(holds) = attempt workspace::holds_package(root, alloc) else {
+        return None
+    }
+    if not holds {
+        return None
+    }
+    let Ok(lock) = attempt journal::Lock.acquire(root, exclusive: false, alloc) else {
+        return None
+    }
+    defer take lock.release()
+    let read = mem::Arena[text::String].empty(alloc)
+    let Ok(loaded) = attempt workspace::Workspace.load_ahead(root, read, given: self.home, grammar: self.grammar.share(), parsing: self.parsing.contents(), alloc) else {
+        return None
+    }
+    var open = mem::Map[text::String, mem::Bytes].empty(alloc)
+    for held_document in self.documents {
+        var source = mem::Bytes.empty(alloc)
+        mut source.append(held_document.value().source.view())
+        discard mut open.insert(text::String.of(held_document.key().as_str(), alloc), value: take source)
+    }
+    let shown = match open.len() > 0 {
+        true => loaded.overlaid(open, grammar: self.grammar.contents(), alloc)
+        false => loaded
+    }
+    var session = check::Session.of(mem::Shared.of(take shown, alloc: alloc), std: self.std.share(), grammar: self.grammar.share(), home: cache::copied_override(self.home, alloc), alloc)
+    session.crew = self.crew.share()
+    return Some(take session)
+} Server.session
+
+/// The workspace path a URI names, none for one outside the workspace.
+fn Server.workspace_path(self, uri: Str, alloc: mem::Alloc) -> Option[text::String] {
+    let Some(path) = uri_path(uri, alloc) else {
+        return None
+    }
+    return workspace_relative(self.root.as_str(), path: path.as_str(), alloc)
+} Server.workspace_path
+
+/// The URI of a workspace path: the client's for an open document.
+fn Server.uri(self, path: Str, alloc: mem::Alloc) -> text::String {
+    match self.documents.get_by(fn(key: text::String) => key.as_str().cmp(path)) {
+        Some(document) => return text::String.of(document.uri.as_str(), alloc)
+        None => {}
+    }
+    let absolute = platform::join(self.root.as_str(), name: path, alloc)
+    return path_uri(absolute.as_str(), alloc)
+} Server.uri
+
+/// The session of the document a request's params name, with its workspace path.
+fn Server.document(self, params: Json, alloc: mem::Alloc) -> Option[Opened] {
+    let Some(uri) = document_uri(params, alloc) else {
+        return None
+    }
+    let Some(path) = self.workspace_path(uri.as_str(), alloc) else {
+        return None
+    }
+    let Some(session) = self.session(alloc) else {
+        return None
+    }
+    return Some(Opened(path: take path, session: take session))
+} Server.document
+
+/// A document of the workspace a request names, with the session over the workspace.
+struct Opened {
+    path: text::String
+    session: check::Session
+} Opened
+
+/// The byte offset in a workspace file of the position a request's params give.
+fn Server.offset(self, opened: Opened, params: Json) -> Option[u32] {
+    let Some(source) = opened.session.workspace.contents().bytes(opened.path.as_str()) else {
+        return None
+    }
+    let Some(position) = params.get("position") else {
+        return None
+    }
+    return offset_of(source, position, encoding: self.encoding)
+} Server.offset
+
+/// The location of bytes of a workspace file.
+fn Server.location(self, session: check::Session, path: Str, span: diagnostic::Span, alloc: mem::Alloc) -> Json {
+    var members = mem::List[Member].empty(alloc)
+    mut members.push(Member.of("uri", value: Json.Text(self.uri(path, alloc)), alloc))
+    let source = match session.workspace.contents().bytes(path) {
+        Some(held) => held
+        None => b""
+    }
+    mut members.push(Member.of("range", value: range_json(source, start: span.start, end: span.end, encoding: self.encoding, alloc), alloc))
+    return Json.Object(take members)
+} Server.location
+
+/// What the server offers the client.
+fn capabilities(encoding: Encoding, alloc: mem::Alloc) -> Json {
+    var sync = mem::List[Member].empty(alloc)
+    mut sync.push(Member.of("openClose", value: Json.Bool(true), alloc))
+    mut sync.push(Member.of("change", value: Json.number(1, alloc), alloc))
+    var save = mem::List[Member].empty(alloc)
+    mut save.push(Member.of("includeText", value: Json.Bool(false), alloc))
+    mut sync.push(Member.of("save", value: Json.Object(take save), alloc))
+    var members = mem::List[Member].empty(alloc)
+    mut members.push(Member.of("positionEncoding", value: Json.text(encoding.name(), alloc), alloc))
+    mut members.push(Member.of("textDocumentSync", value: Json.Object(take sync), alloc))
+    mut members.push(Member.of("codeActionProvider", value: listed_member("codeActionKinds", texts: "quickfix", alloc), alloc))
+    mut members.push(Member.of("documentFormattingProvider", value: Json.Bool(true), alloc))
+    mut members.push(Member.of("definitionProvider", value: Json.Bool(true), alloc))
+    mut members.push(Member.of("referencesProvider", value: Json.Bool(true), alloc))
+    mut members.push(Member.of("hoverProvider", value: Json.Bool(true), alloc))
+    mut members.push(Member.of("documentSymbolProvider", value: Json.Bool(true), alloc))
+    mut members.push(Member.of("workspaceSymbolProvider", value: Json.Bool(true), alloc))
+    mut members.push(Member.of("implementationProvider", value: Json.Bool(true), alloc))
+    mut members.push(Member.of("callHierarchyProvider", value: Json.Bool(true), alloc))
+    mut members.push(Member.of("completionProvider", value: listed_member("triggerCharacters", texts: ". :", alloc), alloc))
+    mut members.push(Member.of("signatureHelpProvider", value: listed_member("triggerCharacters", texts: "( ,", alloc), alloc))
+    mut members.push(Member.of("inlayHintProvider", value: Json.Bool(true), alloc))
+    mut members.push(Member.of("semanticTokensProvider", value: semantic_tokens_options(alloc), alloc))
+    return Json.Object(take members)
+} capabilities
+
+/// An object of one member holding the texts of `texts`, separated by spaces.
+fn listed_member(name: Str, texts: Str, alloc: mem::Alloc) -> Json {
+    var elements = mem::List[Json].empty(alloc)
+    var start: usize = 0
+    let bytes = texts.as_bytes()
+    for at in 0..=bytes.len() {
+        if at < bytes.len() and bytes[at] != b' ' {
+            continue
+        }
+        let Some(word) = texts.slice_bytes(start, end: at) else {
+            continue
+        }
+        mut elements.push(Json.text(word, alloc))
+        start = at + 1
+    }
+    var members = mem::List[Member].empty(alloc)
+    mut members.push(Member.of(name, value: Json.Array(take elements), alloc))
+    return Json.Object(take members)
+} listed_member
+
+/// Applies one change of a `didChange` notification: the whole text, or the text of a range.
+fn apply_change(mut source: mem::Bytes, change: Json, encoding: Encoding, alloc: mem::Alloc) {
+    let Some(new_value) = change.get("text") else {
+        return
+    }
+    let Some(new) = new_value.as_str() else {
+        return
+    }
+    let Some(range) = change.get("range") else {
+        var whole = mem::Bytes.empty(alloc)
+        mut whole.append(new.as_bytes())
+        source = whole
+        return
+    }
+    let Some(start) = position_offset(source.view(), range, name: "start", encoding) else {
+        return
+    }
+    let Some(end) = position_offset(source.view(), range, name: "end", encoding) else {
+        return
+    }
+    if start > end {
+        return
+    }
+    var spliced = mem::Bytes.empty(alloc)
+    for index in 0..<usize.widen(start) {
+        mut spliced.push(source[index])
+    }
+    mut spliced.append(new.as_bytes())
+    for index in usize.widen(end)..<source.len() {
+        mut spliced.push(source[index])
+    }
+    source = spliced
+} apply_change
+
+/// The offset of a range's position of that name.
+fn position_offset(source: Slice[u8], range: Json, name: Str, encoding: Encoding) -> Option[u32] {
+    let Some(position) = range.get(name) else {
+        return None
+    }
+    return offset_of(source, position, encoding)
+} position_offset
+
+fn respond(take id: Json, take answer: Answer, alloc: mem::Alloc) fails platform::IoError {
+    var members = mem::List[Member].empty(alloc)
+    mut members.push(Member.of("jsonrpc", value: Json.text("2.0", alloc), alloc))
+    mut members.push(Member.of("id", value: take id, alloc))
+    match answer {
+        Answer.Done(result) => mut members.push(Member.of("result", value: take result, alloc))
+        Answer.Refused(code: code, message: message) => {
+            var error_members = mem::List[Member].empty(alloc)
+            var written = text::String.empty(alloc)
+            mut written.write(text::fmt("{code}", code), budget: 32)
+            mut error_members.push(Member.of("code", value: Json.Number(take written), alloc))
+            mut error_members.push(Member.of("message", value: Json.Text(take message), alloc))
+            mut members.push(Member.of("error", value: Json.Object(take error_members), alloc))
+        }
+    }
+    try write(Json.Object(take members).written(alloc).as_str(), alloc)
+} respond
+
+fn notify(method: Str, take params: Json, alloc: mem::Alloc) fails platform::IoError {
+    var members = mem::List[Member].empty(alloc)
+    mut members.push(Member.of("jsonrpc", value: Json.text("2.0", alloc), alloc))
+    mut members.push(Member.of("method", value: Json.text(method, alloc), alloc))
+    mut members.push(Member.of("params", value: take params, alloc))
+    try write(Json.Object(take members).written(alloc).as_str(), alloc)
+} notify

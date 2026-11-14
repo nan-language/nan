@@ -652,7 +652,10 @@ impl Checker<'_> {
         let syntax = &holder.file.syntax;
         let body = self.typed(item);
         let mut found = Vec::new();
-        for first in bindings(syntax, holder.tree).of.values() {
+        let mut firsts: Vec<ast::Tok> = bindings(syntax, holder.tree).of.into_values().collect();
+        firsts.sort_unstable();
+        firsts.dedup();
+        for first in &firsts {
             if syntax.tokens[*first as usize].end > at {
                 continue;
             }

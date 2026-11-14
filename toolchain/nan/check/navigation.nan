@@ -1,0 +1,760 @@
+//! What a name written at a byte of a workspace file names, for the language server: its declaration, the names writing it across the workspace, the text describing it, what implements it, and the calls of a function.
+
+/// What a name names: an item or member, or a local of an item by the token first binding it.
+pkg enum NameAt derives Eq {
+    Target(RenameTarget)
+    Local(item: ty::ItemId, binding: u32)
+} NameAt
+
+/// What a name at a byte names, with the span of that name.
+pkg struct NameFound {
+    pkg named: NameAt
+    pkg span: Span
+} NameFound
+
+/// A function as a call hierarchy shows it: its name, whether it is named after a type, and the
+/// bytes of its item and of its name.
+pkg struct ShownFunction {
+    pkg name: text::String
+    pkg member: bool
+    pkg item: Span
+    pkg selection: Span
+} ShownFunction
+
+/// A function with the spans of calls.
+pkg struct CallsOf {
+    pkg function: ShownFunction
+    pkg calls: mem::List[Span]
+} CallsOf
+
+/// The lines describing what a name names, with the span of the name.
+pkg struct Hovered {
+    pkg span: Span
+    pkg lines: mem::List[text::String]
+} Hovered
+
+/// A call of a function item, by its span.
+struct CallSite {
+    callee: ty::ItemId
+    span: Span
+} CallSite
+
+/// The declaration of what the name at a byte of a workspace file names, as the span of its
+/// name; none when it names nothing or is declared outside the workspace's files.
+pkg fn Session.definition(self, path: Str, at: u32) -> Option[Span] {
+    let Some(checker) = self.file_checker(path) else {
+        return None
+    }
+    let Some(found) = checker.named_at(path, at) else {
+        return None
+    }
+    let Some(span) = checker.declared_span(found.named) else {
+        return None
+    }
+    if self.workspace.contents().file(span.path.as_str()).is_none() {
+        return None
+    }
+    return Some(take span)
+} Session.definition
+
+/// The spans writing the name of what the name at a byte of a workspace file names: for an item
+/// or member, those of the workspace; for a local, those of its item; its declaration's only
+/// when `declaration` holds.
+pkg fn Session.references(self, path: Str, at: u32, declaration: bool) -> mem::List[Span] {
+    var spans = mem::Set[Span].empty(self.alloc)
+    for held in self.checkers() {
+        let checker = held.checker
+        let Some(found) = checker.named_at(path, at) else {
+            continue
+        }
+        let declared = checker.declared_span(found.named)
+        var written = mem::Set[Span].empty(self.alloc)
+        match found.named {
+            NameAt.Local(item: item, binding: binding) => {
+                written = checker.local_spans(item, binding)
+            }
+            NameAt.Target(target) => {
+                checker.type_reported_bodies()
+                written = checker.name_spans(target)
+            }
+        }
+        for span in take written {
+            if declaration or not same_span(span, given: declared) {
+                discard mut spans.insert(take span)
+            }
+        }
+    }
+    var listed = mem::List[Span].empty(self.alloc)
+    for span in take spans {
+        mut listed.push(take span)
+    }
+    return listed
+} Session.references
+
+/// Whether a span is the one that may be given.
+fn same_span(span: Span, given: Option[Span]) -> bool {
+    return match given {
+        Some(held) => held == span
+        None => false
+    }
+} same_span
+
+/// A copy of a span.
+fn Span.copy(self, alloc: mem::Alloc) -> Span {
+    return Span(path: text::String.of(self.path.as_str(), alloc), start: self.start, end: self.end)
+} Span.copy
+
+/// What the name at a byte of a workspace file names, described: an item's `api` record lines
+/// with a function's digest line, a member's type's, or a local's binding with its type; with
+/// the span of the name.
+pkg fn Session.hover(self, path: Str, at: u32) -> Option[Hovered] {
+    let Some(checker) = self.file_checker(path) else {
+        return None
+    }
+    let Some(found) = checker.named_at(path, at) else {
+        return None
+    }
+    let lines = checker.described(found.named)
+    if lines.len() == 0 {
+        return None
+    }
+    return Some(Hovered(span: take found.span, lines: take lines))
+} Session.hover
+
+/// What implements what the name at a byte of a workspace file names: the impl lines naming an
+/// interface or a type, or the functions implementing an interface method; those in the
+/// workspace's files, by position.
+pkg fn Session.implementations(self, path: Str, at: u32) -> mem::List[Span] {
+    var spans = mem::Set[Span].empty(self.alloc)
+    for held in self.checkers() {
+        let checker = held.checker
+        let Some(found) = checker.named_at(path, at) else {
+            continue
+        }
+        let NameAt.Target(target) = found.named else {
+            continue
+        }
+        for span in take checker.implementing_spans(target) {
+            discard mut spans.insert(take span)
+        }
+    }
+    var listed = mem::List[Span].empty(self.alloc)
+    for span in take spans {
+        if self.workspace.contents().file(span.path.as_str()).is_some() {
+            mut listed.push(take span)
+        }
+    }
+    return listed
+} Session.implementations
+
+/// The function the name at a byte of a workspace file names.
+pkg fn Session.function_at(self, path: Str, at: u32) -> Option[ShownFunction] {
+    let Some(checker) = self.file_checker(path) else {
+        return None
+    }
+    let Some(function) = checker.function_named(path, at) else {
+        return None
+    }
+    return checker.function(function)
+} Session.function_at
+
+/// The functions of the workspace calling the function the name at a byte of a workspace file
+/// names, by position, each with the spans of its calls.
+pkg fn Session.callers(self, path: Str, at: u32) -> mem::List[CallsOf] {
+    var found = mem::Map[Span, CallsOf].empty(self.alloc)
+    for held in self.checkers() {
+        let checker = held.checker
+        let Some(function) = checker.function_named(path, at) else {
+            continue
+        }
+        checker.type_reported_bodies()
+        let db = checker.db()
+        for index in 0..<db.items.len() {
+            let caller = ty::ItemId(index: u32.fit(index))
+            if not db.is_reported(caller) or db.in_history(caller) {
+                continue
+            }
+            checker.calls_to(caller, function, mut found)
+        }
+    }
+    var listed = mem::List[CallsOf].empty(self.alloc)
+    for pair in take found {
+        var calls = pair.value.calls
+        mut calls.sort_by(fn(left: Span, right: Span) => left.cmp(right))
+        mut listed.push(CallsOf(function: take pair.value.function, calls: take calls))
+    }
+    return listed
+} Session.callers
+
+/// Adds the calls of `function` an item's body makes to the calls found, by caller.
+fn Checker.calls_to(self, caller: ty::ItemId, function: ty::ItemId, mut found: mem::Map[Span, CallsOf]) {
+    var calls = mem::List[Span].empty(self.alloc())
+    for site in take self.calls_in(caller) {
+        if site.callee == function {
+            mut calls.push(take site.span)
+        }
+    }
+    if calls.len() == 0 {
+        return
+    }
+    let Some(shown) = self.function(caller) else {
+        return
+    }
+    let key = shown.item.copy(self.alloc())
+    if not found.contains(key) {
+        discard mut found.insert(shown.item.copy(self.alloc()), value: CallsOf(function: take shown, calls: mem::List[Span].empty(self.alloc())))
+    }
+    var entry = mut found.at_mut(key)
+    for call in take calls {
+        if not holds_span(entry.calls.view(), span: call) {
+            mut entry.calls.push(take call)
+        }
+    }
+} Checker.calls_to
+
+/// Whether spans hold a span.
+fn holds_span(spans: Slice[Span], span: Span) -> bool {
+    for held in spans {
+        if held == span {
+            return true
+        }
+    }
+    return false
+} holds_span
+
+/// The functions declared in the workspace's files that the function the name at a byte of a
+/// workspace file names calls, by position, each with the spans of the calls.
+pkg fn Session.callees(self, path: Str, at: u32) -> mem::List[CallsOf] {
+    var listed = mem::List[CallsOf].empty(self.alloc)
+    let Some(checker) = self.file_checker(path) else {
+        return listed
+    }
+    let Some(function) = checker.function_named(path, at) else {
+        return listed
+    }
+    var found = mem::Map[Span, CallsOf].empty(self.alloc)
+    for site in take checker.calls_in(function) {
+        let Some(shown) = checker.function(site.callee) else {
+            continue
+        }
+        if self.workspace.contents().file(shown.item.path.as_str()).is_none() {
+            continue
+        }
+        let key = shown.item.copy(self.alloc)
+        if not found.contains(key) {
+            discard mut found.insert(shown.item.copy(self.alloc), value: CallsOf(function: take shown, calls: mem::List[Span].empty(self.alloc)))
+        }
+        mut (mut found.at_mut(key)).calls.push(take site.span)
+    }
+    for pair in take found {
+        mut listed.push(take pair.value)
+    }
+    return listed
+} Session.callees
+
+/// The checker of the closure checking the package holding a workspace file, under the first
+/// target that package is checked under, before it checks anything.
+fn Session.file_checker(self, path: Str) -> Option[Checker] {
+    let held = self.workspace.contents()
+    let Some(at) = held.file(path) else {
+        return None
+    }
+    let Some(closure) = held.closure_of(at.package_index) else {
+        return None
+    }
+    let Some(source) = held.package_at(at.package_index) else {
+        expect false
+        return None
+    }
+    let Some(target) = check_targets(source, alloc: self.alloc).get(0) else {
+        return None
+    }
+    return Some(self.unchecked(closure, target))
+} Session.file_checker
+
+/// The token of an item's syntax at a byte that may write a name: an identifier, `self` or a
+/// doc comment holding it, or else one ending at it.
+fn naming_token(source: syntax::SourceFile, item: syntax::ItemSyntax, at: u32) -> Option[u32] {
+    var holding: Option[usize] = None
+    var ending: Option[usize] = None
+    for token in item.head..<item.end {
+        let found = source.tokens[token]
+        if holding.is_none() and found.start <= at and at < found.end {
+            holding = Some(token)
+        }
+        if ending.is_none() and found.end == at {
+            ending = Some(token)
+        }
+    }
+    match holding {
+        Some(token) => {
+            if writes_name(source, token) {
+                return Some(u32.fit(token))
+            }
+        }
+        None => {}
+    }
+    let Some(token) = ending else {
+        return None
+    }
+    if writes_name(source, token) {
+        return Some(u32.fit(token))
+    }
+    return None
+} naming_token
+
+/// Whether a token may write a name: an identifier, `self` or a doc comment.
+fn writes_name(source: syntax::SourceFile, token: usize) -> bool {
+    return match source.tokens[token].kind {
+        syntax::TokenKind.Ident or syntax::TokenKind.Doc or syntax::TokenKind.Keyword(syntax::Keyword.SelfValue) => true
+        else => false
+    }
+} writes_name
+
+/// The item of a workspace file whose lines hold a byte.
+fn Checker.item_holding(self, path: Str, at: u32) -> Option[ty::ItemId] {
+    let db = self.db()
+    for index in 0..<db.items.len() {
+        let item = ty::ItemId(index: u32.fit(index))
+        if db.item_file(item).path.as_str() != path {
+            continue
+        }
+        let syntax = db.syntax(item)
+        let data = db.item(item)
+        let lines = syntax.item_lines(syntax.items[data.index])
+        let start = syntax.lines[usize.widen(lines.low) - 1].start
+        let end = syntax.lines[usize.widen(lines.high) - 1].end
+        if at >= start and at <= end {
+            return Some(item)
+        }
+    }
+    return None
+} Checker.item_holding
+
+/// What the name at a byte of a workspace file names, with the span of that name.
+fn Checker.named_at(self, path: Str, at: u32) -> Option[NameFound] {
+    let Some(item) = self.item_holding(path, at) else {
+        return None
+    }
+    let db = self.db()
+    let syntax = db.syntax(item)
+    let Some(token) = naming_token(syntax, item: syntax.items[db.item(item).index], at) else {
+        return None
+    }
+    if syntax.tokens[usize.widen(token)].kind == syntax::TokenKind.Doc {
+        return self.doc_named(item, path, at)
+    }
+    let Some(named) = self.named(item, token) else {
+        return None
+    }
+    return Some(NameFound(named: take named, span: self.span(item, token)))
+} Checker.named_at
+
+/// What a name an item writes at a token names.
+fn Checker.named(self, item: ty::ItemId, token: u32) -> Option[NameAt] {
+    match self.declared_target(item, token) {
+        Some(target) => return Some(NameAt.Target(take target))
+        None => {}
+    }
+    let holder = self.holder(item)
+    for label in holder.labels(self) {
+        if label.len() > 0 and label[label.len() - 1] == token {
+            return Some(NameAt.Target(RenameTarget.Item(item)))
+        }
+        if label.len() == 3 and label[0] == token {
+            match self.db().owners.get(item) {
+                Some(TypeKey.Item(owner)) => return Some(NameAt.Target(RenameTarget.Item(owner)))
+                else => {}
+            }
+        }
+    }
+    let Some(tree) = self.holder_tree(holder) else {
+        return None
+    }
+    let bound = format::Bindings.collect(self.holder_syntax(holder), tree, alloc: self.alloc())
+    match bound.of.get(token) {
+        Some(introduced) => return Some(NameAt.Local(item: item, binding: introduced))
+        None => {}
+    }
+    discard self.typed(item)
+    match self.member_named_at(item, token) {
+        Some(target) => return Some(NameAt.Target(take target))
+        None => {}
+    }
+    return self.path_named(holder, token)
+} Checker.named
+
+/// The member a name an item's body writes at a token names, as recorded when typing it.
+fn Checker.member_named_at(self, item: ty::ItemId, token: u32) -> Option[RenameTarget] {
+    let alloc = self.alloc()
+    for named in self.state.contents().members_named.cursor() {
+        if named.item != item or named.token != token {
+            continue
+        }
+        return match named.member {
+            Member.Function(function) => Some(RenameTarget.Item(function))
+            Member.Method(owner: owner, name: name) => Some(RenameTarget.Method(owner: owner, name: text::String.of(name.as_str(), alloc)))
+            Member.Field(owner: owner, name: name) => Some(RenameTarget.Field(owner: owner, name: text::String.of(name.as_str(), alloc)))
+            Member.Variant(owner: owner, name: name) => Some(RenameTarget.Variant(owner: owner, name: text::String.of(name.as_str(), alloc)))
+        }
+    }
+    return None
+} Checker.member_named_at
+
+/// What a path an item writes names at a token: the item its segments up to that token name,
+/// or the member a test target names through it.
+fn Checker.path_named(self, holder: HolderItem, token: u32) -> Option[NameAt] {
+    let db = self.db()
+    for written in holder.paths(self) {
+        let writes_member = match written.member {
+            Some(member) => member.token == token
+            None => false
+        }
+        if writes_member {
+            let Ok(Named.Item(owner)) = db.resolve(holder.module, path: written.path) else {
+                continue
+            }
+            let Some(member) = written.member else {
+                continue
+            }
+            return match self.member_target(owner, name: member.text.as_str()) {
+                Some(target) => Some(NameAt.Target(take target))
+                None => None
+            }
+        }
+        match self.segment_named(holder, path: written.path, token) {
+            Some(named) => return Some(take named)
+            None => {}
+        }
+    }
+    return None
+} Checker.path_named
+
+/// What the segments of a path up to the one at a token name: an item or a core variant.
+fn Checker.segment_named(self, holder: HolderItem, path: ast::Path, token: u32) -> Option[NameAt] {
+    let alloc = self.alloc()
+    var segments = mem::List[ast::Name].empty(alloc)
+    var reached = false
+    for segment in path.segments {
+        mut segments.push(segment.copy(alloc))
+        if segment.token == token {
+            reached = true
+            break
+        }
+    }
+    if not reached {
+        return None
+    }
+    let written = ast::Path(segments: take segments)
+    match self.db().resolve(holder.module, path: written) {
+        Ok(Named.Item(found)) => return Some(NameAt.Target(RenameTarget.Item(found)))
+        Ok(Named.Variant(item: owner, index: index)) => {
+            let ast::ItemKind.Enum(enumeration) = self.db().ast(owner).kind else {
+                return None
+            }
+            let Some(variant) = enumeration.variants.get(index) else {
+                return None
+            }
+            return Some(NameAt.Target(RenameTarget.Variant(owner: owner, name: text::String.of(variant.name.text.as_str(), alloc))))
+        }
+        else => return None
+    }
+} Checker.segment_named
+
+/// What a doc reference of an item names at a byte of its doc comments.
+fn Checker.doc_named(self, item: ty::ItemId, path: Str, at: u32) -> Option[NameFound] {
+    let holder = self.holder(item)
+    let alloc = self.alloc()
+    for reference in holder.doc_references(self) {
+        let Ok(Named.Item(found)) = self.db().resolve(holder.module, path: reference.path) else {
+            continue
+        }
+        if at >= reference.last.start and at <= reference.last.end {
+            return Some(NameFound(named: NameAt.Target(RenameTarget.Item(found)), span: Span(path: text::String.of(path, alloc), start: reference.last.start, end: reference.last.end)))
+        }
+        let Some(member) = reference.member else {
+            continue
+        }
+        let end = member.offset + u32.fit(member.name.byte_len())
+        if at < member.offset or at > end {
+            continue
+        }
+        let Some(target) = self.member_target(found, name: member.name.as_str()) else {
+            return None
+        }
+        return Some(NameFound(named: NameAt.Target(take target), span: Span(path: text::String.of(path, alloc), start: member.offset, end: end)))
+    }
+    return None
+} Checker.doc_named
+
+/// The member of an item a name after `.` names: a field, variant or interface method it
+/// declares, or else a function named after it.
+fn Checker.member_target(self, owner: ty::ItemId, name: Str) -> Option[RenameTarget] {
+    let alloc = self.alloc()
+    match self.member_token(owner, name) {
+        Some(_) => {
+            return match self.db().ast(owner).kind {
+                ast::ItemKind.Struct(_) => Some(RenameTarget.Field(owner: owner, name: text::String.of(name, alloc)))
+                ast::ItemKind.Enum(_) => Some(RenameTarget.Variant(owner: owner, name: text::String.of(name, alloc)))
+                else => Some(RenameTarget.Method(owner: owner, name: text::String.of(name, alloc)))
+            }
+        }
+        None => {}
+    }
+    let functions = self.db().members(TypeKey.Item(owner), name)
+    if functions.len() == 0 {
+        return None
+    }
+    return Some(RenameTarget.Item(functions[0]))
+} Checker.member_target
+
+/// The span of the name declaring what a name names.
+fn Checker.declared_span(self, named: NameAt) -> Option[Span] {
+    match named {
+        NameAt.Local(item: item, binding: binding) => return Some(self.span(item, token: binding))
+        NameAt.Target(RenameTarget.Item(item)) => {
+            let Some(name) = declared_name(self.db().ast(item), alloc: self.alloc()) else {
+                return None
+            }
+            return Some(self.span(item, token: name.token))
+        }
+        NameAt.Target(RenameTarget.Field(owner: owner, name: name)) or NameAt.Target(RenameTarget.Variant(owner: owner, name: name)) or NameAt.Target(RenameTarget.Method(owner: owner, name: name)) => {
+            let Some(token) = self.member_token(owner, name: name.as_str()) else {
+                return None
+            }
+            return Some(self.span(owner, token))
+        }
+    }
+} Checker.declared_span
+
+/// The token of the name of a field, variant or interface method an item declares.
+fn Checker.member_token(self, owner: ty::ItemId, name: Str) -> Option[u32] {
+    match self.db().ast(owner).kind {
+        ast::ItemKind.Struct(structure) => {
+            for field in structure.fields() {
+                if field.name.text.as_str() == name {
+                    return Some(field.name.token)
+                }
+            }
+        }
+        ast::ItemKind.Enum(enumeration) => {
+            for variant in enumeration.variants {
+                if variant.name.text.as_str() == name {
+                    return Some(variant.name.token)
+                }
+            }
+        }
+        ast::ItemKind.Interface(declaring) => {
+            for method in declaring.methods {
+                if method.name.text.as_str() == name {
+                    return Some(method.name.token)
+                }
+            }
+        }
+        else => {}
+    }
+    return None
+} Checker.member_token
+
+/// The spans of an item's names of the local first bound at `binding`.
+fn Checker.local_spans(self, item: ty::ItemId, binding: u32) -> mem::Set[Span] {
+    var spans = mem::Set[Span].empty(self.alloc())
+    let holder = self.holder(item)
+    let Some(tree) = self.holder_tree(holder) else {
+        return spans
+    }
+    let bound = format::Bindings.collect(self.holder_syntax(holder), tree, alloc: self.alloc())
+    for entry in bound.of {
+        if entry.value() == binding {
+            discard mut spans.insert(self.span(item, token: entry.key()))
+        }
+    }
+    return spans
+} Checker.local_spans
+
+/// Types every body of the packages the checker reports on, recording the members their names
+/// name.
+fn Checker.type_reported_bodies(self) {
+    let db = self.db()
+    for index in 0..<db.items.len() {
+        let item = ty::ItemId(index: u32.fit(index))
+        if db.is_reported(item) and not db.in_history(item) {
+            discard self.typed(item)
+        }
+    }
+} Checker.type_reported_bodies
+
+/// The lines describing what a name names.
+fn Checker.described(self, named: NameAt) -> mem::List[text::String] {
+    let item = match named {
+        NameAt.Local(item: item, binding: binding) => return self.local_described(item, binding)
+        NameAt.Target(target) => target.item()
+    }
+    var lines = self.api_lines(item, docs: true, viewer: None)
+    let function = match self.db().ast(item).kind {
+        ast::ItemKind.Fn(_) => true
+        else => false
+    }
+    let whole = match named {
+        NameAt.Target(RenameTarget.Item(_)) => true
+        else => false
+    }
+    if function and whole {
+        var line = text::String.of("digest: ", alloc: self.alloc())
+        mut line.append(self.digest_text(item).as_str())
+        mut lines.push(take line)
+    }
+    return lines
+} Checker.described
+
+/// A local's binding as written, with its type: `let`, `var` or its mode, its name and type.
+fn Checker.local_described(self, item: ty::ItemId, binding: u32) -> mem::List[text::String] {
+    let alloc = self.alloc()
+    var lines = mem::List[text::String].empty(alloc)
+    let Some(held) = self.typed(item) else {
+        return lines
+    }
+    let body = held.contents()
+    for local in body.locals {
+        if local.token != binding {
+            continue
+        }
+        var line = text::String.empty(alloc)
+        match local.kind {
+            LocalKind.Let => mut line.append("let ")
+            LocalKind.Var => mut line.append("var ")
+            LocalKind.Param(mode) or LocalKind.Element(mode) or LocalKind.Capture(mode) => append_mode(mut line, mode)
+            LocalKind.Pattern or LocalKind.Quantified => {}
+        }
+        mut line.append(local.name.as_str())
+        mut line.append(": ")
+        mut line.append(self.show(local.ty, from: self.db().item(item).module).as_str())
+        mut lines.push(take line)
+        return lines
+    }
+    return lines
+} Checker.local_described
+
+/// Appends the word a mode is written with before a binding, with its space; none for a read.
+fn append_mode(mut line: text::String, mode: ast::Mode) {
+    match mode {
+        ast::Mode.Mut => mut line.append("mut ")
+        ast::Mode.Take => mut line.append("take ")
+        else => {}
+    }
+} append_mode
+
+/// The impl lines naming an interface or a type, as their items' spans, or the names of the
+/// functions implementing an interface method.
+fn Checker.implementing_spans(self, target: RenameTarget) -> mem::List[Span] {
+    let alloc = self.alloc()
+    var spans = mem::List[Span].empty(alloc)
+    match target {
+        RenameTarget.Method(owner: interface_item, name: name) => {
+            for function in self.implementing(interface_item, name: name.as_str()) {
+                match self.declared_span(NameAt.Target(RenameTarget.Item(function))) {
+                    Some(span) => mut spans.push(take span)
+                    None => {}
+                }
+            }
+        }
+        RenameTarget.Item(named) => {
+            let db = self.db()
+            for index in 0..<db.items.len() {
+                let line = ty::ItemId(index: u32.fit(index))
+                if self.names_in_impl(line, named) {
+                    mut spans.push(self.item_span(line))
+                }
+            }
+        }
+        else => {}
+    }
+    return spans
+} Checker.implementing_spans
+
+/// Whether an item is an impl line naming an interface or a type.
+fn Checker.names_in_impl(self, line: ty::ItemId, named: ty::ItemId) -> bool {
+    let sig = self.sig(line)
+    let SigKind.Impl(target: target, target_ty: _, bound: bound) = sig.contents().kind else {
+        return false
+    }
+    if target == Some(TypeKey.Item(named)) {
+        return true
+    }
+    return match bound {
+        Some(held) => held.item == named
+        None => false
+    }
+} Checker.names_in_impl
+
+/// The bytes of an item's lines, without the last line's end.
+fn Checker.item_span(self, item: ty::ItemId) -> Span {
+    let db = self.db()
+    let syntax = db.syntax(item)
+    let lines = syntax.item_lines(syntax.items[db.item(item).index])
+    let start = syntax.lines[usize.widen(lines.low) - 1].start
+    let end = syntax.lines[usize.widen(lines.high) - 1].end
+    return Span(path: text::String.of(db.item_file(item).path.as_str(), alloc: self.alloc()), start: start, end: end)
+} Checker.item_span
+
+/// The function item the name at a byte of a workspace file names.
+fn Checker.function_named(self, path: Str, at: u32) -> Option[ty::ItemId] {
+    let Some(found) = self.named_at(path, at) else {
+        return None
+    }
+    let NameAt.Target(RenameTarget.Item(item)) = found.named else {
+        return None
+    }
+    return match self.db().ast(item).kind {
+        ast::ItemKind.Fn(_) => Some(item)
+        else => None
+    }
+} Checker.function_named
+
+/// A function item as a call hierarchy shows it.
+fn Checker.function(self, item: ty::ItemId) -> Option[ShownFunction] {
+    let declared = self.db().ast(item)
+    let ast::ItemKind.Fn(function) = declared.kind else {
+        return None
+    }
+    let Some(name) = declared.name(self.alloc()) else {
+        return None
+    }
+    return Some(ShownFunction(name: take name, member: function.label.owner.is_some(), item: self.item_span(item), selection: self.span(item, token: function.label.name.token)))
+} Checker.function
+
+/// The function items an item's body calls, each with the span of the call, by span.
+fn Checker.calls_in(self, item: ty::ItemId) -> mem::List[CallSite] {
+    var found = mem::List[CallSite].empty(self.alloc())
+    let Some(held) = self.typed(item) else {
+        return found
+    }
+    let body = held.contents()
+    match body.root {
+        Some(root) => self.collect_calls(item, expr: root, mut found)
+        None => {}
+    }
+    for clause in body.clauses {
+        self.collect_calls(item, expr: clause.expr, mut found)
+    }
+    mut found.sort_by(fn(left: CallSite, right: CallSite) => left.span.cmp(right.span))
+    return found
+} Checker.calls_in
+
+/// Adds the calls of function items an expression holds, with their spans.
+fn Checker.collect_calls(self, item: ty::ItemId, expr: TExpr, mut found: mem::List[CallSite]) {
+    match expr.kind {
+        TKind.Call(call) => {
+            match call.contents().callee {
+                Callee.Function(item: callee) => {
+                    var span = self.span(item, token: expr.token)
+                    span.end = self.span(item, token: expr.last).end
+                    mut found.push(CallSite(callee: callee, span: take span))
+                }
+                else => {}
+            }
+        }
+        else => {}
+    }
+    expr.each_child(fn[mut found](child: TExpr) => self.collect_calls(item, expr: child, mut found))
+} Checker.collect_calls

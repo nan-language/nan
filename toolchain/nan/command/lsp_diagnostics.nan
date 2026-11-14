@@ -1,0 +1,217 @@
+//! The diagnostics the language server publishes, their exact fixes as quick fixes, and formatting.
+
+/// The diagnostics `nan check` reports on the workspace package at `index`, each with the fixes
+/// it offers.
+fn of_package(session: check::Session, index: usize, alloc: mem::Alloc) -> mem::List[diagnostic::Diagnostic] {
+    var diagnostics = session.reported(scope::Scope.Package(index))
+    let held = session.workspace.contents()
+    let current = platform::join(held.root.as_str(), name: held.packages[index].contents().dir.as_str(), alloc)
+    fix::offer(session, current: current.as_str(), written: None, mut diagnostics)
+    return diagnostics
+} of_package
+
+/// The bytes a diagnostic covers in its file: its reported construct, or else its line without
+/// its line end, or else the file's start.
+fn covered(held: workspace::Workspace, reported: diagnostic::Diagnostic) -> diagnostic::Span {
+    match reported.span {
+        Some(span) => return span
+        None => {}
+    }
+    let Some(line) = reported.line else {
+        return diagnostic::Span(start: 0, end: 0)
+    }
+    let Some(path) = reported.path else {
+        return diagnostic::Span(start: 0, end: 0)
+    }
+    let source = match held.bytes(path.as_str()) {
+        Some(bytes) => bytes
+        None => b""
+    }
+    return line_bytes(source, line)
+} covered
+
+/// A diagnostic of the package at `index` as the protocol writes it: its message the lines of
+/// its record after the header, without quotes, or its code when it has none; each reason with a
+/// line in the workspace as related information.
+fn Server.diagnostic_json(self, session: check::Session, index: usize, reported: diagnostic::Diagnostic, alloc: mem::Alloc) -> Json {
+    let held = session.workspace.contents()
+    let source = match reported.path {
+        Some(path) => match held.bytes(path.as_str()) {
+            Some(bytes) => bytes
+            None => b""
+        }
+        None => b""
+    }
+    let span = covered(held, reported)
+    let lines = diagnostic_lines(held, std: session.std(), scope: scope::Scope.Package(index), reported, quoted: false, alloc)
+    var message = text::String.empty(alloc)
+    for line in lines {
+        if not message.is_empty() {
+            mut message.push('\n')
+        }
+        mut message.append(line.as_str())
+    }
+    if message.is_empty() {
+        mut message.append(reported.code.name())
+    }
+    let severity: u64 = match reported.code.class() {
+        diagnostic::Class.Incompleteness => 2
+        diagnostic::Class.Error or diagnostic::Class.Internal => 1
+    }
+    var members = mem::List[Member].empty(alloc)
+    mut members.push(Member.of("range", value: range_json(source, start: span.start, end: span.end, encoding: self.encoding, alloc), alloc))
+    mut members.push(Member.of("severity", value: Json.number(severity, alloc), alloc))
+    mut members.push(Member.of("code", value: Json.text(reported.code.name(), alloc), alloc))
+    mut members.push(Member.of("source", value: Json.text("nan", alloc), alloc))
+    mut members.push(Member.of("message", value: Json.Text(take message), alloc))
+    let related = self.related(session, reported, alloc)
+    if related.len() > 0 {
+        mut members.push(Member.of("relatedInformation", value: Json.Array(take related), alloc))
+    }
+    return Json.Object(take members)
+} Server.diagnostic_json
+
+/// Each reason of a diagnostic with a line in a workspace file, as related information.
+fn Server.related(self, session: check::Session, reported: diagnostic::Diagnostic, alloc: mem::Alloc) -> mem::List[Json] {
+    let held = session.workspace.contents()
+    var related = mem::List[Json].empty(alloc)
+    for reason in reported.because {
+        let Some(at) = reason.at else {
+            continue
+        }
+        let Some(source) = held.bytes(at.path.as_str()) else {
+            continue
+        }
+        if held.file(at.path.as_str()).is_none() {
+            continue
+        }
+        var said = text::String.of(reason.role.word(), alloc)
+        mut said.push(' ')
+        mut said.append(reason.subject.as_str())
+        var members = mem::List[Member].empty(alloc)
+        mut members.push(Member.of("location", value: self.location(session, path: at.path.as_str(), span: line_bytes(source, line: at.line), alloc), alloc))
+        mut members.push(Member.of("message", value: Json.Text(take said), alloc))
+        mut related.push(Json.Object(take members))
+    }
+    return related
+} Server.related
+
+/// `textDocument/codeAction`: a quick fix per exact fix of each diagnostic of the document
+/// covering bytes of the range, the first fix of each preferred.
+fn Server.code_actions(self, params: Json, alloc: mem::Alloc) -> Option[Json] {
+    let Some(opened) = self.document(params, alloc) else {
+        return None
+    }
+    let held = opened.session.workspace.contents()
+    let path = opened.path.as_str()
+    let Some(source) = held.bytes(path) else {
+        return None
+    }
+    let Some(range) = params.get("range") else {
+        return None
+    }
+    let Some(start) = position_offset(source, range, name: "start", encoding: self.encoding) else {
+        return None
+    }
+    let Some(end) = position_offset(source, range, name: "end", encoding: self.encoding) else {
+        return None
+    }
+    var actions = mem::List[Json].empty(alloc)
+    let Some(at) = held.file(path) else {
+        return Some(Json.Array(take actions))
+    }
+    let index = at.package_index
+    for reported in of_package(opened.session, index, alloc) {
+        let span = covered(held, reported)
+        let named = match reported.path {
+            Some(reported_path) => reported_path.as_str() == path
+            None => false
+        }
+        if not named or span.end < start or span.start > end {
+            continue
+        }
+        let written = self.diagnostic_json(opened.session, index, reported, alloc)
+        for number in 0..<reported.fixes.len() {
+            mut actions.push(self.quick_fix(opened.session, reported, number, diagnostic: written, alloc))
+        }
+    }
+    return Some(Json.Array(take actions))
+} Server.code_actions
+
+/// The quick fix of a diagnostic's fix of that number, from 0.
+fn Server.quick_fix(self, session: check::Session, reported: diagnostic::Diagnostic, number: usize, diagnostic: Json, alloc: mem::Alloc) -> Json {
+    var title = text::String.of("Fix ", alloc)
+    mut title.append(reported.code.name())
+    if reported.fixes.len() != 1 {
+        let shown = number + 1
+        mut title.write(text::fmt(" ({shown})", shown), budget: 32)
+    }
+    var listed = mem::List[Json].empty(alloc)
+    mut listed.push(diagnostic.copy(alloc))
+    var members = mem::List[Member].empty(alloc)
+    mut members.push(Member.of("title", value: Json.Text(take title), alloc))
+    mut members.push(Member.of("kind", value: Json.text("quickfix", alloc), alloc))
+    mut members.push(Member.of("diagnostics", value: Json.Array(take listed), alloc))
+    mut members.push(Member.of("isPreferred", value: Json.Bool(number == 0), alloc))
+    mut members.push(Member.of("edit", value: self.workspace_edit(session, fix: reported.fixes[number], alloc), alloc))
+    return Json.Object(take members)
+} Server.quick_fix
+
+/// A fix as a workspace edit: per file, by path, its replacements by position.
+fn Server.workspace_edit(self, session: check::Session, fix: diagnostic::Fix, alloc: mem::Alloc) -> Json {
+    var files = mem::Map[text::String, mem::List[diagnostic::Replacement]].empty(alloc)
+    for edit in fix.edits {
+        let key = text::String.of(edit.path.as_str(), alloc)
+        if not files.contains(key) {
+            discard mut files.insert(text::String.of(edit.path.as_str(), alloc), value: mem::List[diagnostic::Replacement].empty(alloc))
+        }
+        mut (mut files.at_mut(key)).push(diagnostic::Replacement(start: edit.replacement.start, end: edit.replacement.end, text: text::String.of(edit.replacement.text.as_str(), alloc)))
+    }
+    var changes = mem::List[Member].empty(alloc)
+    for pair in take files {
+        var replacements = pair.value
+        mut replacements.sort_by(fn(left: diagnostic::Replacement, right: diagnostic::Replacement) => left.start.cmp(right.start))
+        let source = match session.workspace.contents().bytes(pair.key.as_str()) {
+            Some(bytes) => bytes
+            None => b""
+        }
+        var edits = mem::List[Json].empty(alloc)
+        for replacement in replacements {
+            mut edits.push(self.text_edit(source, span: diagnostic::Span(start: replacement.start, end: replacement.end), new: replacement.text.as_str(), alloc))
+        }
+        mut changes.push(Member(name: self.uri(pair.key.as_str(), alloc), value: Json.Array(take edits)))
+    }
+    var members = mem::List[Member].empty(alloc)
+    mut members.push(Member.of("changes", value: Json.Object(take changes), alloc))
+    return Json.Object(take members)
+} Server.workspace_edit
+
+/// An edit replacing bytes of a text.
+fn Server.text_edit(self, source: Slice[u8], span: diagnostic::Span, new: Str, alloc: mem::Alloc) -> Json {
+    var members = mem::List[Member].empty(alloc)
+    mut members.push(Member.of("range", value: range_json(source, start: span.start, end: span.end, encoding: self.encoding, alloc), alloc))
+    mut members.push(Member.of("newText", value: Json.text(new, alloc), alloc))
+    return Json.Object(take members)
+} Server.text_edit
+
+/// `textDocument/formatting`: the document in canonical format, as one edit replacing its text,
+/// or none when it is in canonical format.
+fn Server.formatting(self, params: Json, alloc: mem::Alloc) -> Option[Json] {
+    let Some(opened) = self.document(params, alloc) else {
+        return None
+    }
+    let Some(source) = opened.session.workspace.contents().bytes(opened.path.as_str()) else {
+        return None
+    }
+    var copied = mem::Bytes.empty(alloc)
+    mut copied.append(source)
+    let parsed = syntax::parse(take copied, grammar: opened.session.grammar.contents(), alloc)
+    let formatted = format::source_file(parsed, only: None, alloc)
+    var edits = mem::List[Json].empty(alloc)
+    if formatted.view() == source {
+        return Some(Json.Array(take edits))
+    }
+    let new = output::lossy(formatted.view(), alloc)
+    mut edits.push(self.text_edit(source, span: diagnostic::Span(start: 0, end: u32.fit(source.len())), new: new.as_str(), alloc))
+    return Some(Json.Array(take edits))
+} Server.formatting

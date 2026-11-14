@@ -9,7 +9,7 @@ use super::references::{Holder, Span, Target};
 use super::resolve::Named as Resolved;
 use super::sig::SigKind;
 use super::tir::{Callee, LocalKind, TBody, TExpr, TKind};
-use super::{Checker, Member, check_targets, closure_targets, decl, unchecked};
+use super::{Checker, Member, check_targets, checkers, decl, unchecked};
 use crate::format::bindings::bindings;
 use crate::syntax::ast::{self, ItemKind, Tok};
 use crate::syntax::file::{ItemSyntax, SourceFile};
@@ -48,7 +48,7 @@ pub fn definition(workspace: &Workspace, path: &str, offset: u32) -> Option<Span
 /// when `declaration` holds.
 pub fn references(workspace: &Workspace, path: &str, offset: u32, declaration: bool) -> Vec<Span> {
     let mut spans = BTreeSet::new();
-    for checker in closure_checkers(workspace) {
+    for (_, checker) in checkers(workspace, crate::stdlib::packages()) {
         let Some((named, _)) = checker.named_at(path, offset) else {
             continue;
         };
@@ -84,7 +84,7 @@ pub fn hover(workspace: &Workspace, path: &str, offset: u32) -> Option<(Span, Ve
 /// workspace's files, by position.
 pub fn implementations(workspace: &Workspace, path: &str, offset: u32) -> Vec<Span> {
     let mut spans = BTreeSet::new();
-    for checker in closure_checkers(workspace) {
+    for (_, checker) in checkers(workspace, crate::stdlib::packages()) {
         if let Some((Named::Target(target), _)) = checker.named_at(path, offset) {
             spans.extend(checker.implementing_spans(&target));
         }
@@ -106,7 +106,7 @@ pub fn function_at(workspace: &Workspace, path: &str, offset: u32) -> Option<Fun
 /// names, by position, each with the spans of its calls.
 pub fn callers(workspace: &Workspace, path: &str, offset: u32) -> Vec<(Function, Vec<Span>)> {
     let mut found: BTreeMap<Span, (Function, BTreeSet<Span>)> = BTreeMap::new();
-    for checker in closure_checkers(workspace) {
+    for (_, checker) in checkers(workspace, crate::stdlib::packages()) {
         let Some(function) = checker.function_named(path, offset) else {
             continue;
         };
@@ -175,21 +175,6 @@ pub(super) fn file_checker<'a>(workspace: &'a Workspace, path: &str) -> Option<C
         crate::stdlib::packages(),
         target,
     ))
-}
-
-/// A checker of each closure under each target its packages are checked under, before it
-/// checks anything.
-fn closure_checkers(workspace: &Workspace) -> Vec<Checker<'_>> {
-    let std = crate::stdlib::packages();
-    workspace
-        .closures
-        .iter()
-        .flat_map(|closure| {
-            closure_targets(workspace, closure)
-                .into_iter()
-                .map(move |target| unchecked(workspace, closure, std, target))
-        })
-        .collect()
 }
 
 /// The token of an item's syntax at a byte that may write a name: an identifier, `self` or a

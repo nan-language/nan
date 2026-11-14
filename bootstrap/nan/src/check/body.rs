@@ -1747,7 +1747,6 @@ fn substituted(head: &FnSig, subst: &super::ty::Subst) -> FnSig {
     }
 }
 
-/// The local at the root of a place.
 /// Adds each binding a pattern makes to `found`.
 fn bindings_of(pattern: &TPattern, found: &mut Vec<LocalId>) {
     match &pattern.kind {
@@ -1761,6 +1760,7 @@ fn bindings_of(pattern: &TPattern, found: &mut Vec<LocalId>) {
     }
 }
 
+/// The local at the root of a place.
 fn root_local(place: &TExpr) -> Option<LocalId> {
     match &place.kind {
         TKind::Local(local) => Some(*local),

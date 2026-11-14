@@ -85,7 +85,7 @@ const FAILING_DRAWS: [&str; 8] = [
 /// The supplied operations whose owning chapters name traps other than exhausted memory: stale
 /// handles, indexes past an end, duplicate windows, bindings and waits, CPUs past the last, and
 /// exhausted capability tables, cells and runtime records.
-const TRAPPING: [&str; 37] = [
+const TRAPPING: [&str; 38] = [
     "mem::Alloc.split",
     "mem::Watch.wait_outside",
     "mem::Arena.at",
@@ -118,6 +118,7 @@ const TRAPPING: [&str; 37] = [
     "hw::IrqShared.install",
     "hw::IrqShared.install_on",
     "hw::IrqShared.install_msi",
+    "hw::Signal.wait",
     "hw::runtime_record",
     "hw::hold",
     "hw::UserFrame.load",

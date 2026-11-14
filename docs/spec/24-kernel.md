@@ -526,6 +526,23 @@ pub fn next_tick(tick: mem::Shared[hw::Signal[u64]]) -> u64 fails task::Cancelle
 } next_tick
 ```
 
+```nan
+// file: ticker/package.nan
+//! Tick waiting for a bare kernel.
+
+package ticker {
+    language 1
+    targets x86_64-bare
+} ticker
+
+// file: ticker/ticker.nan
+//! Waits for the next tick an interrupt fn posts.
+
+pub fn next_tick(tick: mem::Shared[hw::Signal[u64]]) -> u64 fails task::Cancelled uses wait limits notrap {
+    return try await tick.contents().wait() // error: limit.may-trap
+} next_tick
+```
+
 ## Locks
 
 An **IRQ-safe lock** is an `hw::SpinLock[T]` taken with an `hw::IrqsDisabled` token, including the lock inside an `hw::IrqShared[T]`.

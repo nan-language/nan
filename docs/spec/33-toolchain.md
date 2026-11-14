@@ -1,6 +1,6 @@
 # Toolchain
 
-This chapter defines the commands, the output contract, envelopes, exit classes and internal errors, check time, the query engine, prefix checking, context packs, edits, the merge driver and the last-green record.
+This chapter defines the commands, the output contract, envelopes, exit classes and internal errors, check time, the query engine, prefix checking, context packs, edits, the merge driver, the last-green record and the language server.
 
 ## Commands
 
@@ -39,6 +39,7 @@ The commands are:
 - `nan build [<scope>] [--compare-with <image>]`, `nan build <package> --against <interface> [--as <principal>]`
 - `nan run [<package>] [--keep-resets] [-- <argument>...]`
 - `nan primer [<topic> or tools]`
+- `nan lsp`
 
 ### Checking commands
 
@@ -132,7 +133,7 @@ invalid run hello --keep-reset: files 0, errors 1, incomplete 0
 
 The **output contract** is the rules every command's output follows.
 
-- A command never prompts, opens a pager or editor, reads standard input other than for `--from -`, or writes to standard error. Its output is the same whether or not standard output is a terminal.
+- A command never prompts, opens a pager or editor, reads standard input other than for `--from -` and the [language server](#language-server), or writes to standard error. Its output is the same whether or not standard output is a terminal.
 - Output is UTF-8 lines ending with LF, holding no other control character, no column number, no space aligning text into columns and no absolute path.
 - The first and last lines are the same **verdict line**, `<verdict> <command>: <summary>`, the verdict being the [exit class](#exit-classes) word. The command is the command line without `nan`, arguments separated by single spaces, one that is empty or holds a space, `"` or `\` written as a text literal, an omitted scope written after the command's name words.
 - The summary, `<name> <N>` counts separated by `, `, is `errors N, incomplete N` for `nan check` and `nan fix`, followed by `tests N, failed N` for `nan test` and `nan verify`; `dead N, pending N, holes N` for prefix checking; `entries N, radius N` for `nan context`; `files N, conflicts N, errors N` for `nan merge`; `files N, errors N, incomplete N` for every other command that can write files, files counting `wrote` and `deleted` records; and `records N` otherwise.
@@ -662,6 +663,19 @@ The **last-green record** of an agent holds, per item, its interface hash and `n
 
 - A `nan check` reporting no error replaces the record's entries for every item of its scope.
 - A `nan check` reporting an error prints a record `changed <item> <location>`, merging its old and new `api` lines as `nan diff` does, per item of the closure sets of the lines holding an error whose interface hash differs from its entry. An item without an entry has none.
+
+## Language server
+
+`nan lsp` is the **language server**: it serves the Language Server Protocol 3.17 over standard input and output, each message framed by the base protocol's `Content-Length` header, until an `exit` notification or the end of standard input. The output contract does not apply to it. It exits with status 0 after a `shutdown` request and 1 otherwise. It answers a message that is not JSON with the error -32700, a request before `initialize` with -32002, one after `shutdown` with -32600, a method it does not serve with -32601 and params lacking what its method reads with -32602.
+
+- Its workspace is that of a command run in the client's first workspace folder, else its root URI or root path, else the current directory. Positions count UTF-8 code units when the client offers `utf-8` among its position encodings, and UTF-16 code units otherwise.
+- The client sends documents whole. Every answer reads the workspace with each document the client holds open in it in place of its file, under the shared lock of `.nan/write`; the server writes no source or machine file.
+- After each `didOpen`, `didChange`, `didSave` and `didClose` of a document of a package, it publishes, per file of that package, the diagnostics `nan check` reports on the package. Each ranges over its reported construct, or else its line; has severity 1 for an error and 2 for incompleteness, its code and the source `nan`; holds as message the lines of its record after the header without quotes, or its code without them; and gives each reason with a line in a workspace file as related information. A file whose last published diagnostics were some and that has none gets them empty.
+- `codeAction` gives a quick fix per exact fix of each diagnostic of the document covering part of the range, its first fix preferred. `formatting` gives the document in [canonical format](35-format.md#canonical-format) as one edit, or none when it is in it.
+- `definition` gives the name declaring what the name at the position names, through a path, member name, label or doc reference, or none outside the workspace's files: an item, field, variant, interface method or local. `references` gives the names `nan edit rename` would rewrite for it, a local's within its item; `hover` the lines `nan show --api` prints for its item with a function's digest line, or a local's name and type; `implementation` the impl lines naming an interface or type, or the functions implementing an interface method. `prepareCallHierarchy`, `incomingCalls` and `outgoingCalls` give the function it names and, with the calls of each, the functions of the workspace calling it and those of the workspace's files it calls.
+- `documentSymbol` gives the document's items with their fields, variants and interface methods. `workspace/symbol` gives the items of the workspace's files whose [folded](03-packages-modules.md#naming-conventions) name holds the folded query, at most 256, by name, path and position.
+- `completion` gives the names that may follow the position, each once by name, whose folded name starts with the folded part written of the name ending there: after `.`, a type's variants and functions named after it, or the fields of a value's type its module sees and the functions named after that type taking `self`; after `::`, the items and modules of the module the path names; otherwise the locals bound before the position, the items of its module, the aliases and modules a path starts with, the core vocabulary, the scalar types and the keywords. It reads the text before the position [closed](41-grammar.md#prefix-viability), followed by the items after the one holding the position.
+- `signatureHelp` gives the head of the function the call being written at the position calls, as `nan show --api` prints its first line; its active parameter is the one the argument's label names, or else the argument's position, a method call's receiver counting as `self`. `inlayHint` gives the type of each `let`, `var` and `for` binding written without one, after its name. `semanticTokens/full` classes each keyword, literal, comment and name the document writes.
 
 ## Diagnostics
 

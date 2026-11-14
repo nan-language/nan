@@ -7,10 +7,12 @@ repository=https://github.com/nan-language/nan
 dir=${NAN_INSTALL_DIR:-$HOME/.local/bin}
 
 case "$(uname -s) $(uname -m)" in
-    "Linux x86_64") arch=x86_64 ;;
-    "Linux aarch64") arch=aarch64 ;;
+    "Linux x86_64") target=x86_64-linux ;;
+    "Linux aarch64") target=aarch64-linux ;;
+    "Darwin x86_64") target=x86_64-macos ;;
+    "Darwin arm64") target=aarch64-macos ;;
     *)
-        echo "nan: releases are built for Linux on x86_64 and AArch64 only" >&2
+        echo "nan: releases are built for Linux and macOS on x86_64 and AArch64 only" >&2
         exit 1
         ;;
 esac
@@ -24,12 +26,16 @@ case "$version" in
         ;;
 esac
 
-asset="nan-$version-$arch-linux"
+asset="nan-$version-$target"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 curl -fsSL -o "$work/$asset" "$repository/releases/download/$version/$asset"
 curl -fsSL -o "$work/$asset.sha256" "$repository/releases/download/$version/$asset.sha256"
-(cd "$work" && sha256sum --check --quiet "$asset.sha256")
+if command -v sha256sum > /dev/null; then
+    (cd "$work" && sha256sum --check --quiet "$asset.sha256")
+else
+    (cd "$work" && shasum -a 256 --check --status "$asset.sha256")
+fi
 
 mkdir -p "$dir"
 install -m 755 "$work/$asset" "$dir/nan"

@@ -36,6 +36,17 @@ pub enum Kind {
     Nanos,
 }
 
+impl Kind {
+    /// The system running the toolchain: Windows or Linux.
+    pub fn running() -> Kind {
+        if cfg!(windows) {
+            Kind::Windows
+        } else {
+            Kind::Linux
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Target {
     X64Linux,
@@ -52,13 +63,10 @@ pub enum Target {
 }
 
 impl Target {
-    /// The host target of the machine running the toolchain: the Linux target of its
+    /// The host target of the machine running the toolchain: the target of its system and
     /// architecture.
     pub fn running_host() -> Target {
-        match Arch::running() {
-            Arch::Amd64 => Target::X64Linux,
-            Arch::Aarch64 => Target::Aarch64Linux,
-        }
+        Target::of(Arch::running(), Kind::running())
     }
 
     /// The concrete targets.

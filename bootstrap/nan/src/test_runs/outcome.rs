@@ -1,21 +1,22 @@
 //! A test image as its runs start it, and one run of a test, given the test's number, the run's
 //! index and seed, its replay token and the draws a rerun forces: a process of the image on a
-//! Linux target or under Wine on a Windows target, a boot of the emulator on it on a machine
-//! target, whose standard output or serial port carries frames, and how it ended.
+//! host target, under Wine for a Windows target on Linux, a boot of the emulator on it on a
+//! machine target, whose standard output or serial port carries frames, and how it ended.
 
 use std::fs;
 use std::io;
-use std::os::unix::process::ExitStatusExt as _;
 use std::path::PathBuf;
 use std::process::Command;
 
 use crate::command::Launch;
 use crate::emulator::{self, Boots};
 use crate::lower::test_image::{RUN_FILE, RUN_START, TIMED_OUT, frame, outcome};
+use crate::system;
 use crate::workspace::{Kind, Target};
 
-/// A test image as its runs start it: a Linux target's executable, a Windows target's, which
-/// Wine runs, or a machine image and the emulator invocation booting it.
+/// A test image as its runs start it: an executable of the system running the toolchain, a
+/// Windows target's that Wine runs on Linux, or a machine image and the emulator invocation
+/// booting it.
 pub enum Image {
     Host(PathBuf),
     Windows(PathBuf),
@@ -31,7 +32,7 @@ impl Image {
                 let launch = emulator::launch(target, &path, &[], Boots::Fresh)?;
                 Image::Machine(path, launch)
             }
-            Some(Kind::Windows) => Image::Windows(path),
+            Some(Kind::Windows) if Kind::running() == Kind::Linux => Image::Windows(path),
             _ => Image::Host(path),
         })
     }
@@ -115,7 +116,8 @@ pub fn run(
                 Image::Host(path) | Image::Machine(path, _) => Command::new(path),
             };
             let output = command.args(&texts).output()?;
-            if output.status.code() == Some(TIMED_OUT) || output.status.signal() == Some(24) {
+            if output.status.code() == Some(TIMED_OUT) || system::signal(output.status) == Some(24)
+            {
                 return Ok(timed_out());
             }
             (output, Some(0))
@@ -165,7 +167,7 @@ pub fn run(
         rest = &rest[5 + len..];
     }
     let (ended, contended) = ended.unwrap_or_else(|| {
-        let ending = match output.status.signal() {
+        let ending = match system::signal(output.status) {
             Some(signal) => format!("by signal {signal}"),
             None => format!("with status {}", output.status.code().unwrap_or_default()),
         };

@@ -2,13 +2,13 @@
 //! records, each a file later runs replace whole, both holding their contents followed by their
 //! BLAKE3-256 digest; and the secret keys of its principals.
 
-use std::fs::{self, DirBuilder, Metadata, OpenOptions};
+use std::fs::{self, Metadata};
 use std::io::{self, ErrorKind, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::hash::{Hash, blake3};
+use crate::system;
 
 /// The home directory this process uses in place of the one the user database gives, and the
 /// directory of its local store in place of the user directory's `store`, once a harness gives
@@ -61,10 +61,10 @@ impl Cache {
     /// The running user's build cache, after checking the user directory, `cache` and `store`
     /// and creating each that is missing.
     pub fn open() -> io::Result<Result<Cache, Exposed>> {
-        let uid = running_user()?;
+        let uid = system::running_user()?;
         let (home, store) = match HOME.get() {
             Some((home, store)) => (Some(home.clone()), store.clone()),
-            None => (home(uid)?, None),
+            None => (system::home(uid)?, None),
         };
         let Some(home) = home else {
             return Ok(Ok(Cache {
@@ -89,7 +89,7 @@ impl Cache {
             }
         }
         for dir in missing {
-            match DirBuilder::new().mode(0o700).create(&dir) {
+            match system::private_dir().create(&dir) {
                 Ok(()) => {}
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                     if exposed(&fs::symlink_metadata(&dir)?, uid) {
@@ -175,11 +175,10 @@ impl Cache {
             return Ok(());
         };
         let fresh = dir.join(format!(".{name}.{}", std::process::id()));
-        let mut file = OpenOptions::new()
+        let mut file = system::private_file()
             .write(true)
             .create(true)
             .truncate(true)
-            .mode(0o600)
             .open(&fresh)?;
         file.write_all(contents)?;
         file.write_all(&blake3(contents))?;
@@ -219,7 +218,7 @@ impl Cache {
                 "the user database gives no home directory",
             ));
         };
-        match DirBuilder::new().mode(0o700).create(keys) {
+        match system::private_dir().create(keys) {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
@@ -229,10 +228,9 @@ impl Cache {
         }
         let file = keys.join(format!("{principal}.key"));
         let shown = shown(&self.home, &file);
-        let opened = OpenOptions::new()
+        let opened = system::private_file()
             .write(true)
             .create_new(true)
-            .mode(0o600)
             .open(&file);
         match opened {
             Ok(mut written) => {
@@ -248,42 +246,20 @@ impl Cache {
 /// Whether the directory of secret keys or a key file is a symbolic link, belongs to another
 /// user, or is accessible to its group or to others.
 fn secret_exposed(metadata: &Metadata, uid: u32) -> bool {
-    metadata.file_type().is_symlink() || metadata.uid() != uid || metadata.mode() & 0o077 != 0
+    metadata.file_type().is_symlink() || system::accessible_by_others(metadata, uid)
 }
 
 /// Whether a part of the user directory is a symbolic link, belongs to another user, or is
 /// writable by its group or by others.
 fn exposed(metadata: &Metadata, uid: u32) -> bool {
-    metadata.file_type().is_symlink() || metadata.uid() != uid || metadata.mode() & 0o022 != 0
+    metadata.file_type().is_symlink() || system::writable_by_others(metadata, uid)
 }
 
-/// A path within the home directory, written as `~/` and its path there.
+/// A path within the home directory, written as `~/` and its components there separated by `/`.
 fn shown(home: &Path, path: &Path) -> String {
     let within = path.strip_prefix(home).unwrap_or(path);
-    format!("~/{}", within.display())
-}
-
-/// The real user id of this process, as the kernel gives its status.
-fn running_user() -> io::Result<u32> {
-    fs::read_to_string("/proc/self/status")?
-        .lines()
-        .find_map(|line| line.strip_prefix("Uid:"))
-        .and_then(|ids| ids.split_whitespace().next()?.parse().ok())
-        .ok_or_else(|| io::Error::other("/proc/self/status gives no user id"))
-}
-
-/// The home directory the system's user database gives a user.
-fn home(uid: u32) -> io::Result<Option<PathBuf>> {
-    let users = match fs::read_to_string("/etc/passwd") {
-        Ok(users) => users,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    Ok(users.lines().find_map(|line| {
-        let fields: Vec<&str> = line.split(':').collect();
-        (fields.len() == 7 && fields[2].parse() == Ok(uid) && !fields[5].is_empty())
-            .then(|| PathBuf::from(fields[5]))
-    }))
+    let components: Vec<_> = within.iter().map(|part| part.to_string_lossy()).collect();
+    format!("~/{}", components.join("/"))
 }
 
 #[cfg(test)]

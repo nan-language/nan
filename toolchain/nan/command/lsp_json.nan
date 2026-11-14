@@ -108,7 +108,10 @@ pkg fn Json.to_u32(self) -> Option[u32] {
         let Some(scaled) = value.checked_mul(10) else {
             return None
         }
-        let Some(next) = scaled.checked_add(c.to_bits() - '0'.to_bits()) else {
+        let Some(digit) = c.to_bits().checked_sub('0'.to_bits()) else {
+            return None
+        }
+        let Some(next) = scaled.checked_add(digit) else {
             return None
         }
         value = next
@@ -192,6 +195,7 @@ fn write_text(written: Str, mut out: text::String) {
 } write_text
 
 fn hex_digit(mut out: text::String, value: usize) {
+    expect value < 16
     let Some(digit) = HEX_DIGITS.slice_bytes(value, end: value + 1) else {
         expect false
         return
@@ -228,25 +232,31 @@ fn Reader.peek(self) -> Option[u8] {
 fn Reader.skip_space(mut self) {
     loop {
         match self.peek() {
-            Some(b' ') or Some(b'\t') or Some(b'\n') or Some(b'\r') => {
-                self.at += 1
-            }
+            Some(b' ') or Some(b'\t') or Some(b'\n') or Some(b'\r') => mut self.step()
             else => return
         }
     }
 } Reader.skip_space
 
+/// Moves past the byte at the position.
+fn Reader.step(mut self) {
+    expect self.at < self.bytes.len()
+    self.at += 1
+} Reader.step
+
 /// Takes `word` when the bytes continue with it.
 fn Reader.word(mut self, word: Slice[u8]) -> bool {
-    if self.at + word.len() > self.bytes.len() {
-        return false
-    }
-    for index in 0..<word.len() {
-        if self.bytes[self.at + index] != word[index] {
+    var at = self.at
+    for wanted in word {
+        if at >= self.bytes.len() {
             return false
         }
+        if self.bytes[at] != wanted {
+            return false
+        }
+        at += 1
     }
-    self.at += word.len()
+    self.at = at
     return true
 } Reader.word
 
@@ -294,7 +304,7 @@ fn Reader.value(mut self, depth: u32, alloc: mem::Alloc) -> Option[Json] {
 } Reader.value
 
 fn Reader.array(mut self, depth: u32, alloc: mem::Alloc) -> Option[Json] {
-    self.at += 1
+    mut self.step()
     var elements = mem::List[Json].empty(alloc)
     mut self.skip_space()
     if mut self.word(b"]") {
@@ -316,7 +326,7 @@ fn Reader.array(mut self, depth: u32, alloc: mem::Alloc) -> Option[Json] {
 } Reader.array
 
 fn Reader.members(mut self, depth: u32, alloc: mem::Alloc) -> Option[Json] {
-    self.at += 1
+    mut self.step()
     var members = mem::List[Member].empty(alloc)
     mut self.skip_space()
     if mut self.word(b"}") {
@@ -353,7 +363,7 @@ fn Reader.number(mut self, alloc: mem::Alloc) -> Option[Json] {
     discard mut self.word(b"-")
     match self.peek() {
         Some(b'0') => {
-            self.at += 1
+            mut self.step()
         }
         Some(b'1'..=b'9') => mut self.digits()
         else => return None
@@ -362,9 +372,9 @@ fn Reader.number(mut self, alloc: mem::Alloc) -> Option[Json] {
         return None
     }
     if self.peek() == Some(b'e') or self.peek() == Some(b'E') {
-        self.at += 1
+        mut self.step()
         if self.peek() == Some(b'+') or self.peek() == Some(b'-') {
-            self.at += 1
+            mut self.step()
         }
         if not mut self.required_digits() {
             return None
@@ -380,7 +390,7 @@ fn Reader.digits(mut self) {
     loop {
         match self.peek() {
             Some(b'0'..=b'9') => {
-                self.at += 1
+                mut self.step()
             }
             else => return
         }
@@ -395,7 +405,7 @@ fn Reader.required_digits(mut self) -> bool {
 
 /// A string literal, its escapes decoded; a lone surrogate decodes as U+FFFD.
 fn Reader.text(mut self, alloc: mem::Alloc) -> Option[text::String] {
-    self.at += 1
+    mut self.step()
     var written = text::String.empty(alloc)
     loop {
         let start = self.at
@@ -404,7 +414,7 @@ fn Reader.text(mut self, alloc: mem::Alloc) -> Option[text::String] {
                 None => return None
                 Some(b'"') or Some(b'\\') or Some(0..=0x1F) => break
                 else => {
-                    self.at += 1
+                    mut self.step()
                 }
             }
         }
@@ -414,11 +424,11 @@ fn Reader.text(mut self, alloc: mem::Alloc) -> Option[text::String] {
         mut written.append(piece.as_str())
         match self.peek() {
             Some(b'"') => {
-                self.at += 1
+                mut self.step()
                 return Some(take written)
             }
             Some(b'\\') => {
-                self.at += 1
+                mut self.step()
                 let Some(c) = mut self.escape() else {
                     return None
                 }
@@ -433,7 +443,7 @@ fn Reader.escape(mut self) -> Option[char] {
     let Some(byte) = self.peek() else {
         return None
     }
-    self.at += 1
+    mut self.step()
     return match byte {
         b'"' => Some('"')
         b'\\' => Some('\\')
@@ -451,53 +461,54 @@ fn Reader.escape(mut self) -> Option[char] {
 /// The character a `\u` escape writes, after its `\u`: a pair of surrogates joined, a lone one
 /// U+FFFD.
 fn Reader.unicode(mut self) -> Option[char] {
-    let Some(unit) = self.unit(self.at) else {
+    let Some(unit) = mut self.unit() else {
         return None
     }
-    self.at += 4
     if unit < 0xD800 or unit >= 0xDC00 {
         return match char.checked_from_bits(unit) {
             Some(c) => Some(c)
             None => Some('\u{FFFD}')
         }
     }
-    var low: Option[u32] = None
-    if mut self.continues_with_escape() {
-        low = self.unit(self.at + 2)
-    }
-    let Some(second) = low else {
+    let at = self.at
+    let Some(low) = mut self.low_surrogate() else {
+        self.at = at
         return Some('\u{FFFD}')
     }
-    if second < 0xDC00 or second >= 0xE000 {
-        return Some('\u{FFFD}')
-    }
-    self.at += 6
-    return char.checked_from_bits(0x10000 + ((unit - 0xD800) << 10) + (second - 0xDC00))
+    let pair = ((unit - 0xD800) << 10) | low
+    expect pair < 0x10_0000
+    return char.checked_from_bits(0x10000 + pair)
 } Reader.unicode
 
-/// Whether the bytes continue with `\u`, which this takes nothing of.
-fn Reader.continues_with_escape(mut self) -> bool {
-    let at = self.at
-    let continues = mut self.word(b"\\u")
-    self.at = at
-    return continues
-} Reader.continues_with_escape
-
-/// The four hexadecimal digits at `at`.
-fn Reader.unit(self, at: usize) -> Option[u32] {
-    if at + 4 > self.bytes.len() {
+/// The low ten bits of the low surrogate a `\u` escape writes next.
+fn Reader.low_surrogate(mut self) -> Option[u32] {
+    if not mut self.word(b"\\u") {
         return None
     }
+    let Some(second) = mut self.unit() else {
+        return None
+    }
+    if second < 0xDC00 or second >= 0xE000 {
+        return None
+    }
+    return Some(second - 0xDC00)
+} Reader.low_surrogate
+
+/// The four hexadecimal digits next.
+fn Reader.unit(mut self) -> Option[u32] {
     var unit: u32 = 0
-    for index in 0..<4usize {
-        let byte = self.bytes[at + index]
+    for _ in 0..<4usize {
+        let Some(byte) = self.peek() else {
+            return None
+        }
         let digit = match byte {
             b'0'..=b'9' => byte - b'0'
             b'a'..=b'f' => byte - b'a' + 10
             b'A'..=b'F' => byte - b'A' + 10
             else => return None
         }
-        unit = unit * 16 + u32.widen(digit)
+        mut self.step()
+        unit = (unit << 4) | u32.widen(digit)
     }
     return Some(unit)
 } Reader.unit

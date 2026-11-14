@@ -76,8 +76,100 @@ jobs:
           path: ${{ env.IMAGE }}*
           if-no-files-found: error
 
-  publish:
+  windows:
     needs: build
+    runs-on: ubuntu-26.04
+    env:
+      TAG: ${{ github.ref_name }}
+      LINUX: nan-${{ github.ref_name }}-x86_64-linux
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain
+        working-directory: bootstrap
+        run: rustup toolchain install
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            bootstrap/target
+          key: release-x86_64-${{ hashFiles('bootstrap/rust-toolchain.toml', 'bootstrap/Cargo.lock') }}
+      - name: Build the bootstrap
+        working-directory: bootstrap
+        run: cargo build --release -q -p nan
+      - name: Install Wine
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wine
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.LINUX }}
+          path: ${{ runner.temp }}/linux
+      # Each stage builds a fresh copy of toolchain/ declaring its Windows target, whose lock
+      # approves the escapes of the platform's Windows variant, with empty user directories, so
+      # that no stage reuses another's proofs. The x86_64 Linux toolchain that built itself builds
+      # the first x86_64 Windows toolchain, which builds the second under Wine; the second and
+      # third must be equal byte for byte, the second builds the AArch64 one, and the bootstrap's
+      # stage comparison must accept both.
+      - name: Build the NaN toolchain for Windows
+        env:
+          WINEDEBUG: -all
+          WINEPREFIX: ${{ runner.temp }}/wine
+        run: |
+          linux="$RUNNER_TEMP/linux/$LINUX"
+          chmod +x "$linux"
+          for target in x86_64-windows aarch64-windows; do
+            cp -r toolchain "$RUNNER_TEMP/$target"
+            sed -i "s/^    targets x86_64-linux\$/    targets $target/" "$RUNNER_TEMP/$target/nan/package.nan"
+            grep -q "^    targets $target\$" "$RUNNER_TEMP/$target/nan/package.nan"
+            (cd "$RUNNER_TEMP/$target" && "$linux" dep approve nan)
+          done
+          stage() {
+            target=$1 name=$2
+            shift 2
+            rm -rf ~/.nan "$WINEPREFIX"/drive_c/users/*/.nan "$RUNNER_TEMP/$name"
+            cp -r "$RUNNER_TEMP/$target" "$RUNNER_TEMP/$name"
+            (cd "$RUNNER_TEMP/$name" && "$@" build nan)
+            cp "$RUNNER_TEMP/$name/.nan/images/$target/nan.exe" "$RUNNER_TEMP/$name.exe"
+          }
+          stage x86_64-windows first "$linux"
+          stage x86_64-windows second wine "$RUNNER_TEMP/first.exe"
+          stage x86_64-windows third wine "$RUNNER_TEMP/second.exe"
+          cmp "$RUNNER_TEMP/second.exe" "$RUNNER_TEMP/third.exe"
+          stage aarch64-windows aarch64 wine "$RUNNER_TEMP/second.exe"
+          cp "$RUNNER_TEMP/second.exe" "nan-$TAG-x86_64-windows.exe"
+          cp "$RUNNER_TEMP/aarch64.exe" "nan-$TAG-aarch64-windows.exe"
+          for arch in x86_64 aarch64; do
+            rm -rf ~/.nan "$RUNNER_TEMP/compared"
+            cp -r "$RUNNER_TEMP/$arch-windows" "$RUNNER_TEMP/compared"
+            (cd "$RUNNER_TEMP/compared" && "$GITHUB_WORKSPACE/bootstrap/target/release/nan" build nan --compare-with "$GITHUB_WORKSPACE/nan-$TAG-$arch-windows.exe")
+          done
+      # The tree hash is the contents of the PE section `.nantree`, whose header gives its size
+      # and its offset in the file.
+      - name: Identify the images
+        run: |
+          for arch in x86_64 aarch64; do
+            image="nan-$TAG-$arch-windows.exe"
+            sha256sum "$image" > "$image.sha256"
+            python3 - "$image" > "$image.tree" <<'PYTHON'
+          import sys
+          data = open(sys.argv[1], "rb").read()
+          number = lambda at, width: int.from_bytes(data[at:at + width], "little")
+          signature = number(0x3C, 4)
+          table = signature + 24 + number(signature + 20, 2)
+          for at in range(table, table + 40 * number(signature + 6, 2), 40):
+              if data[at:at + 8] == b".nantree":
+                  print(data[number(at + 20, 4):][:number(at + 8, 4)].hex(), end="")
+          PYTHON
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: nan-${{ github.ref_name }}-windows
+          path: nan-${{ github.ref_name }}-*-windows.exe*
+          if-no-files-found: error
+
+  publish:
+    needs: [build, windows]
     runs-on: ubuntu-26.04
     env:
       TAG: ${{ github.ref_name }}
@@ -92,13 +184,15 @@ jobs:
         run: |
           previous=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)
           {
-            echo "The NaN toolchain built by itself, for Linux on x86_64 and on AArch64 (each image links the system C library)."
-            for image in "nan-$TAG-x86_64-linux" "nan-$TAG-aarch64-linux"; do
+            echo "The NaN toolchain built by itself, for Linux on x86_64 and on AArch64 (each image links the system C library) and for Windows on x86_64; the AArch64 Windows image is built by the x86_64 Windows one."
+            for image in "nan-$TAG-x86_64-linux" "nan-$TAG-aarch64-linux" "nan-$TAG-x86_64-windows.exe" "nan-$TAG-aarch64-windows.exe"; do
+              section=.nan.tree
+              if [[ "$image" == *.exe ]]; then section=.nantree; fi
               echo
               echo "## $image"
               echo
               echo "- SHA-256: \`$(cut -d' ' -f1 "$image.sha256")\`"
-              echo "- Source tree hash (\`.nan.tree\`, hexadecimal): \`$(cat "$image.tree")\`"
+              echo "- Source tree hash (\`$section\`, hexadecimal): \`$(cat "$image.tree")\`"
             done
             echo
             echo "## Changes"
@@ -110,7 +204,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          assets=(nan-"$TAG"-*-linux nan-"$TAG"-*-linux.sha256)
+          assets=(nan-"$TAG"-*-linux nan-"$TAG"-*-linux.sha256 nan-"$TAG"-*-windows.exe nan-"$TAG"-*-windows.exe.sha256)
           if gh release view "$TAG" > /dev/null 2>&1; then
             gh release upload "$TAG" "${assets[@]}" --clobber
             gh release edit "$TAG" --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"

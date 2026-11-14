@@ -87,15 +87,6 @@ const POLL: i32 = 5
 /// The nanoseconds the TPM emulator may take to open its socket.
 const TPM_WAIT: u64 = 10_000_000_000
 
-/// The clock ticks per second of the processor times `/proc` gives, USER_HZ.
-const TICKS_PER_SECOND: u64 = 100
-
-/// The positions of a process's user and system times among the fields of its `/proc` stat that
-/// follow its command name.
-const USER_TIME: usize = 11
-
-const SYSTEM_TIME: usize = 12
-
 /// How a launch boots a machine.
 pkg enum Boots {
     /// The boots of a run: the machine's disks, firmware variables and TPM state persist in the
@@ -163,7 +154,7 @@ fn base_args(arch: workspace::Arch, kvm: bool, kept: Option[bool], alloc: mem::A
 /// Whether the emulator accelerates an architecture's machines with KVM: x86_64 ones when this
 /// machine is x86_64 and this process may read and write `/dev/kvm`.
 fn kvm_usable(arch: workspace::Arch) -> bool {
-    return arch == workspace::Arch.Amd64 and workspace::Arch.running() == arch and platform::may_read_write("/dev/kvm")
+    return arch == workspace::Arch.Amd64 and workspace::Arch.running() == arch and platform::os::may_read_write("/dev/kvm")
 } kvm_usable
 
 /// The words of a text separated by spaces.
@@ -192,9 +183,9 @@ pkg struct Machine {
     fresh: bool
 } Machine
 
-/// What `nan run` starts once it has built an image: the image on a Linux target, Wine running it
-/// on a Windows target, the emulator booting it on a machine target; its arguments and the
-/// environment variables it sets.
+/// What `nan run` starts once it has built an image: the image on a host target, Wine running it
+/// for a Windows target on Linux, the emulator booting it on a machine target; its arguments and
+/// the environment variables it sets.
 pkg struct Launch {
     pkg program: text::String
     pkg args: mem::List[text::String]
@@ -214,25 +205,28 @@ pkg fn Launch.start(self, alloc: mem::Alloc) -> u8 {
         Some(machine) => return run(self, machine, alloc)
         None => {}
     }
-    discard platform::replace_process(self.program.as_str(), args: self.args.view(), env: self.env.view(), alloc)
+    discard platform::os::replace_process(self.program.as_str(), args: self.args.view(), env: self.env.view(), alloc)
     return 101
 } Launch.start
 
 /// Whether a target's images can run on this machine, never a nanos target's: a Linux target's
-/// when the machine has its architecture, a Windows target's when it has and Wine runs, and a
-/// machine target's when its emulator can start, the emulator program running and able to end
-/// with the process that starts it, the TPM emulator running, and the firmware present for a UEFI
-/// target.
+/// when the machine has its architecture and runs the toolchain on Linux, a Windows target's when
+/// it has its architecture and runs the toolchain on Windows or Wine runs, and a machine target's
+/// when its emulator can start, the emulator program running and able to end with the process
+/// that starts it, the TPM emulator running, and the firmware present for a UEFI target.
 pkg fn available(target: workspace::Target, alloc: mem::Alloc) -> bool {
     let Some(arch) = target.arch() else {
         return false
     }
     match target.kind() {
         Some(workspace::Kind.Nanos) => return false
-        Some(workspace::Kind.Linux) => return arch == workspace::Arch.running()
+        Some(workspace::Kind.Linux) => return arch == workspace::Arch.running() and workspace::Kind.running() == workspace::Kind.Linux
         Some(workspace::Kind.Windows) => {
+            if workspace::Kind.running() == workspace::Kind.Windows {
+                return arch == workspace::Arch.running()
+            }
             let wine_version = words_of("--version", alloc)
-            return arch == workspace::Arch.running() and match attempt platform::run_output(WINE, args: wine_version.view(), input: None, capture_errors: false, alloc) {
+            return arch == workspace::Arch.running() and match attempt platform::os::run_output(WINE, args: wine_version.view(), input: None, capture_errors: false, alloc) {
                 Ok(ran) => ran.status.is_success()
                 Err(_) => false
             }
@@ -240,17 +234,17 @@ pkg fn available(target: workspace::Target, alloc: mem::Alloc) -> bool {
         else => {}
     }
     let args = words_of("-run-with help", alloc)
-    let runs = match attempt platform::run_output(program(arch, alloc).as_str(), args: args.view(), input: None, capture_errors: false, alloc) {
+    let runs = match attempt platform::os::run_output(program(arch, alloc).as_str(), args: args.view(), input: None, capture_errors: false, alloc) {
         Ok(ran) => holds(ran.stdout.view(), wanted: b"exit-with-parent")
         Err(_) => false
     }
     let version = words_of("--version", alloc)
-    let tpm = match attempt platform::run_output(TPM_PROGRAM, args: version.view(), input: None, capture_errors: false, alloc) {
+    let tpm = match attempt platform::os::run_output(TPM_PROGRAM, args: version.view(), input: None, capture_errors: false, alloc) {
         Ok(ran) => ran.status.is_success()
         Err(_) => false
     }
     let pair = firmware(arch, alloc)
-    return runs and tpm and (target.kind() != Some(workspace::Kind.Uefi) or (platform::exists(pair.code.as_str()) and platform::exists(pair.vars.as_str())))
+    return runs and tpm and (target.kind() != Some(workspace::Kind.Uefi) or (platform::os::exists(pair.code.as_str()) and platform::os::exists(pair.vars.as_str())))
 } available
 
 /// Whether bytes hold a run of bytes.
@@ -278,7 +272,7 @@ fn run(given: Launch, machine: Machine, alloc: mem::Alloc) -> u8 {
     let Ok(tpm) = attempt start_tpm(machine, alloc) else {
         return OTHER_END
     }
-    let ended = attempt platform::run_attached(given.program.as_str(), args: given.args.view(), dir: machine.dir.as_str(), alloc)
+    let ended = attempt platform::os::run_attached(given.program.as_str(), args: given.args.view(), dir: machine.dir.as_str(), alloc)
     tpm.end()
     return run_status(ended)
 } run
@@ -316,7 +310,7 @@ fn firmware(arch: workspace::Arch, alloc: mem::Alloc) -> Firmware {
         let Some(template) = templates.get(at) else {
             break
         }
-        if platform::exists(codes[at].as_str()) and platform::exists(template.as_str()) {
+        if platform::os::exists(codes[at].as_str()) and platform::os::exists(template.as_str()) {
             chosen = at
             break
         }
@@ -334,27 +328,27 @@ fn firmware(arch: workspace::Arch, alloc: mem::Alloc) -> Firmware {
 
 /// Starts the TPM emulator on the machine's TPM state, made anew for a fresh machine, in the
 /// machine directory, and waits for its socket.
-fn start_tpm(machine: Machine, alloc: mem::Alloc) -> platform::Background fails platform::IoError {
+fn start_tpm(machine: Machine, alloc: mem::Alloc) -> platform::os::Background fails platform::IoError {
     let dir = machine.dir.as_str()
     let state = platform::join(dir, name: TPM_STATE, alloc)
-    if machine.fresh and platform::exists(state.as_str()) {
-        try platform::remove_dir_all(state.as_str(), alloc)
+    if machine.fresh and platform::os::exists(state.as_str()) {
+        try platform::os::remove_dir_all(state.as_str(), alloc)
     }
-    try platform::create_dir_all(state.as_str(), alloc)
+    try platform::os::create_dir_all(state.as_str(), alloc)
     let socket = platform::join(dir, name: TPM_SOCKET, alloc)
-    if platform::exists(socket.as_str()) {
-        try platform::remove_file(socket.as_str())
+    if platform::os::exists(socket.as_str()) {
+        try platform::os::remove_file(socket.as_str())
     }
     let args = words_of(TPM_ARGS, alloc)
-    let tpm = try platform::start_background(TPM_PROGRAM, args: args.view(), dir, alloc)
-    let started = platform::monotonic_nanos()
-    while not platform::exists(socket.as_str()) {
+    let tpm = try platform::os::start_background(TPM_PROGRAM, args: args.view(), dir, alloc)
+    let started = platform::os::monotonic_nanos()
+    while not platform::os::exists(socket.as_str()) {
         let running = attempt tpm.running()
-        if running != Ok(true) or platform::monotonic_nanos().wrapping_sub(started) >= TPM_WAIT {
+        if running != Ok(true) or platform::os::monotonic_nanos().wrapping_sub(started) >= TPM_WAIT {
             tpm.end()
             fail platform::IoError.Other(0)
         }
-        platform::sleep_ms(POLL)
+        platform::os::sleep_ms(POLL)
     }
     return tpm
 } start_tpm
@@ -377,13 +371,13 @@ pkg fn launch(target: workspace::Target, image: Str, files: Slice[text::String],
         }
         Boots.Fresh => {}
     }
-    try platform::create_dir_all(dir.as_str(), alloc)
+    try platform::os::create_dir_all(dir.as_str(), alloc)
     for disk in disks(arch, alloc) {
         var file = text::String.of(disk.id.as_str(), alloc)
         mut file.append(".raw")
         let path = platform::join(dir.as_str(), name: file.as_str(), alloc)
-        if not platform::exists(path.as_str()) {
-            try platform::write_sized(path.as_str(), bytes: disk.bytes)
+        if not platform::os::exists(path.as_str()) {
+            try platform::os::write_sized(path.as_str(), bytes: disk.bytes)
         }
     }
     var args = base_args(arch, kvm: kvm_usable(arch), kept, alloc)
@@ -403,7 +397,7 @@ pkg fn launch(target: workspace::Target, image: Str, files: Slice[text::String],
         match kept {
             Some(_) => {
                 let held = platform::join(dir.as_str(), name: VARS, alloc)
-                if not platform::exists(held.as_str()) {
+                if not platform::os::exists(held.as_str()) {
                     try copy_file(pair.vars.as_str(), to: held.as_str(), alloc)
                 }
                 mut vars_drive.append(VARS)
@@ -434,7 +428,7 @@ pkg fn launch(target: workspace::Target, image: Str, files: Slice[text::String],
 } launch
 
 /// Runs a Windows image under Wine to its end, given its arguments after its name, as
-/// `platform::run_output` runs a program.
+/// `platform::os::run_output` runs a program.
 pkg fn run_wine(image: Str, args: Slice[text::String], capture_errors: bool, alloc: mem::Alloc) -> platform::Output fails platform::IoError {
     var given = mem::List[text::String].empty(alloc)
     mut given.push(text::String.of(image, alloc))
@@ -443,7 +437,7 @@ pkg fn run_wine(image: Str, args: Slice[text::String], capture_errors: bool, all
     }
     var quiet = mem::List[text::String].empty(alloc)
     mut quiet.push(text::String.of(WINE_QUIET, alloc))
-    return try platform::run_output_with(WINE, args: given.view(), env: quiet.view(), input: None, capture_errors, alloc)
+    return try platform::os::run_output_with(WINE, args: given.view(), env: quiet.view(), input: None, capture_errors, alloc)
 } run_wine
 
 /// Appends the format of a firmware flash image: QEMU's copy-on-write format for a `.qcow2`
@@ -460,11 +454,11 @@ fn append_format(mut written: text::String, path: Str) {
 /// boot path the firmware of its architecture loads, and each of `files` at its root.
 fn boot_volume(arch: workspace::Arch, image: Str, files: Slice[text::String], alloc: mem::Alloc) -> text::String fails platform::IoError {
     let directory = volume_of(image, alloc)
-    if platform::exists(directory.as_str()) {
-        try platform::remove_dir_all(directory.as_str(), alloc)
+    if platform::os::exists(directory.as_str()) {
+        try platform::os::remove_dir_all(directory.as_str(), alloc)
     }
     let boot_dir = platform::join(directory.as_str(), name: "EFI/BOOT", alloc)
-    try platform::create_dir_all(boot_dir.as_str(), alloc)
+    try platform::os::create_dir_all(boot_dir.as_str(), alloc)
     let default = match arch {
         workspace::Arch.Amd64 => "BOOTX64.EFI"
         workspace::Arch.Aarch64 => "BOOTAA64.EFI"
@@ -482,8 +476,8 @@ fn boot_volume(arch: workspace::Arch, image: Str, files: Slice[text::String], al
 
 /// Copies a file's contents to a path.
 fn copy_file(from: Str, to: Str, alloc: mem::Alloc) fails platform::IoError {
-    let contents = try platform::read_file(from, alloc)
-    try platform::write_file(to, contents: contents.view())
+    let contents = try platform::os::read_all(from, alloc)
+    try platform::os::write_all(to, contents: contents.view())
 } copy_file
 
 /// The directory a launch makes the boot volume of an image in.
@@ -499,14 +493,14 @@ fn machine_of(image: Str, alloc: mem::Alloc) -> text::String {
 /// Removes a test image with the boot volume and machine directory a launch made for it.
 pkg fn remove_image(image: Str, alloc: mem::Alloc) fails platform::IoError {
     let volume = volume_of(image, alloc)
-    if platform::exists(volume.as_str()) {
-        try platform::remove_dir_all(volume.as_str(), alloc)
+    if platform::os::exists(volume.as_str()) {
+        try platform::os::remove_dir_all(volume.as_str(), alloc)
     }
     let machine = machine_of(image, alloc)
-    if platform::exists(machine.as_str()) {
-        try platform::remove_dir_all(machine.as_str(), alloc)
+    if platform::os::exists(machine.as_str()) {
+        try platform::os::remove_dir_all(machine.as_str(), alloc)
     }
-    try platform::remove_file(image)
+    try platform::os::remove_file(image)
 } remove_image
 
 /// Boots the emulator as `given` gives, with the file at `path` as its configuration file `name`,
@@ -528,10 +522,10 @@ pkg fn boot(given: Launch, name: Str, path: Str, alloc: mem::Alloc) -> Option[pl
     mut configuration.append(path)
     mut args.push(take configuration)
     let tpm = try start_tpm(machine, alloc)
-    let started = platform::monotonic_nanos()
-    let booted = attempt platform::run_bounded(given.program.as_str(), args: args.view(), dir: machine.dir.as_str(), poll_ms: POLL, within: fn(id: u32) -> bool fails platform::IoError {
-        let used = try processor_time_of(id, alloc)
-        return used <= PROCESSOR_TIME and platform::monotonic_nanos().wrapping_sub(started) < WALL_TIME
+    let started = platform::os::monotonic_nanos()
+    let booted = attempt platform::os::run_bounded(given.program.as_str(), args: args.view(), dir: machine.dir.as_str(), poll_ms: POLL, within: fn(id: u32) -> bool fails platform::IoError {
+        let used = try platform::os::processor_time(id, alloc)
+        return used <= PROCESSOR_TIME and platform::os::monotonic_nanos().wrapping_sub(started) < WALL_TIME
     }, alloc)
     tpm.end()
     return match booted {
@@ -539,55 +533,6 @@ pkg fn boot(given: Launch, name: Str, path: Str, alloc: mem::Alloc) -> Option[pl
         Err(error) => fail error
     }
 } boot
-
-/// Whether a byte is ASCII white space.
-fn is_space(byte: u8) -> bool = byte == b' ' or byte == b'\t' or byte == b'\n' or byte == b'\r' or byte == 0x0B or byte == 0x0C
-
-/// The milliseconds of host processor time a process has used, its threads' in user and system
-/// mode.
-fn processor_time_of(pid: u32, alloc: mem::Alloc) -> u64 fails platform::IoError {
-    var path = text::String.empty(alloc)
-    mut path.write(text::fmt("/proc/{pid}/stat", pid), budget: 64)
-    let stat = try platform::read_text(path.as_str(), alloc)
-    let written = stat.as_str()
-    let bytes = written.as_bytes()
-    var after = bytes.len()
-    for at in 0..<bytes.len() {
-        if bytes[at] == b')' {
-            after = at + 1
-        }
-    }
-    var fields = mem::List[text::String].empty(alloc)
-    var start = after
-    expect bytes.len() < ~0usize
-    for at in after..=bytes.len() {
-        if at < bytes.len() and not is_space(bytes[at]) {
-            continue
-        }
-        if at > start {
-            let Some(field) = written.slice_bytes(start, end: at) else {
-                fail platform::IoError.InvalidData
-            }
-            mut fields.push(text::String.of(field, alloc))
-        }
-        start = at + 1
-    }
-    var ticks: u64 = 0
-    for at in 0..<2usize {
-        var position = USER_TIME
-        if at == 1 {
-            position = SYSTEM_TIME
-        }
-        let Some(field) = fields.get(position) else {
-            fail platform::IoError.Other(0)
-        }
-        let Some(value) = platform::parse_decimal(field.as_str()) else {
-            fail platform::IoError.Other(0)
-        }
-        ticks = ticks.wrapping_add(value)
-    }
-    return ticks.wrapping_mul(1_000) / TICKS_PER_SECOND
-} processor_time_of
 
 test a_run_ends_with_the_byte_written_to_the_exit_port_and_otherwise_with_70 for run_status {
     expect run_status(Ok(platform::Status.Exited(1))) == 0

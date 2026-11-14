@@ -68,7 +68,7 @@ fn main(take world: host::World) -> u8 fails task::Cancelled uses wait {
     if given.nir.is_none() and given.lowered.is_none() {
         return try await command::entry(take world, home: given.home)
     }
-    let Ok(directory) = attempt platform::current_dir(alloc) else {
+    let Ok(directory) = attempt platform::os::current_dir(alloc) else {
         return 101
     }
     let Ok(current) = attempt text::String.try_from_utf8(directory.view(), alloc) else {
@@ -83,14 +83,14 @@ fn main(take world: host::World) -> u8 fails task::Cancelled uses wait {
     let session = check::Session.of(mem::Shared.of(take loaded, alloc: alloc), std: workspace::CarriedStd.unloaded(parsing: mem::Shared.of(workspace::Parsing.empty(served: false, alloc), alloc: alloc), alloc), grammar: mem::Shared.of(take grammar, alloc: alloc), home: cache::copied_override(given.home, alloc), alloc)
     match given.nir {
         Some(wanted) => {
-            discard attempt platform::write_stdout(session.nir_streams(wanted.as_str()).view())
+            discard attempt platform::os::write_stdout(session.nir_streams(wanted.as_str()).view())
         }
         None => {}
     }
     let Some(program) = given.lowered else {
         return 0
     }
-    discard attempt platform::write_stdout(final_build::lowered_functions(session, package_name: program.as_str(), alloc).view())
+    discard attempt platform::os::write_stdout(final_build::lowered_functions(session, package_name: program.as_str(), alloc).view())
     return 0
 } main
 

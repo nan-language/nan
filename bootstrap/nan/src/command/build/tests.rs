@@ -9,25 +9,31 @@ const SOURCE: &str = "//! Exits.\n\nfn main(take world: host::World) -> u8 fails
 
 #[test]
 fn stage_comparison_reports_each_package_whose_code_root_differs() {
-    let scratch = Scratch::new(&[("exits/package.nan", MANIFEST), ("exits/exits.nan", SOURCE)]);
-    let dir = &scratch.0;
-    let built = run_in(dir, "build");
-    assert_eq!(built.status, 0, "{}", built.output);
-    fs::copy(
-        dir.join(".nan/images/x86_64-linux/exits"),
-        dir.join("stage1"),
-    )
-    .expect("a copy");
-    let same = run_in(dir, "build --compare-with stage1");
-    assert_eq!(same.status, 0, "{}", same.output);
-    let changed = SOURCE.replace("return 3", "return 4");
-    fs::write(dir.join("exits/exits.nan"), changed).expect("a changed source");
-    let differing = run_in(dir, "build --compare-with stage1").output;
-    assert!(
-        differing.contains("\nerror build.stage-mismatch exits/package.nan:3 exits\n"),
-        "{differing}"
-    );
-    assert!(!differing.contains("\nwrote "), "{differing}");
+    for (target, image) in [("x86_64-linux", "exits"), ("x86_64-windows", "exits.exe")] {
+        let manifest = MANIFEST.replace("x86_64-linux", target);
+        let scratch = Scratch::new(&[
+            ("exits/package.nan", &manifest),
+            ("exits/exits.nan", SOURCE),
+        ]);
+        let dir = &scratch.0;
+        let built = run_in(dir, "build");
+        assert_eq!(built.status, 0, "{}", built.output);
+        fs::copy(
+            dir.join(format!(".nan/images/{target}/{image}")),
+            dir.join("stage1"),
+        )
+        .expect("a copy");
+        let same = run_in(dir, "build --compare-with stage1");
+        assert_eq!(same.status, 0, "{}", same.output);
+        let changed = SOURCE.replace("return 3", "return 4");
+        fs::write(dir.join("exits/exits.nan"), changed).expect("a changed source");
+        let differing = run_in(dir, "build --compare-with stage1").output;
+        assert!(
+            differing.contains("\nerror build.stage-mismatch exits/package.nan:3 exits\n"),
+            "{differing}"
+        );
+        assert!(!differing.contains("\nwrote "), "{differing}");
+    }
 }
 
 const KERNEL: &str = "//! Spins.\n\nfn main(take k: boot::Kernel) -> Never limits stack 16_384 {\n    var spins: u64 = 0\n    loop {\n        spins = spins.wrapping_add(1)\n    }\n} main\n";

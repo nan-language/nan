@@ -21,7 +21,7 @@
 
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -44,6 +44,7 @@ datatest_stable::harness! {
     { test = toolchain, root = "../../toolchain", pattern = r"^nan/package\.nan$" },
     { test = internal_error, root = "../../toolchain", pattern = r"^nan/nan\.nan$" },
     { test = signing, root = "../../docs/spec", pattern = r"^31-trust\.md$" },
+    { test = language_server, root = "../../docs/spec", pattern = r"^33-toolchain\.md$" },
 }
 
 /// The root file the toolchain is built with: the command line with the user directory and local
@@ -349,6 +350,15 @@ struct Given<'a> {
 /// Starts a run of a NaN toolchain in `dir`, on the processors `given` spreads it on, under its
 /// bounds, killed after its time limit.
 fn front(toolchain: &Toolchain, dir: &Path, given: &Given, args: &[&str]) -> Result<Front, String> {
+    Ok(Front {
+        run: Supervised::start(fronted(toolchain, dir, given, args)?, toolchain.limit)?,
+        limit: toolchain.limit,
+        command: args.join(" "),
+    })
+}
+
+/// The command running a NaN toolchain in `dir` as `front` starts it, its standard input empty.
+fn fronted(toolchain: &Toolchain, dir: &Path, given: &Given, args: &[&str]) -> Result<Command, String> {
     fs::create_dir_all(given.home).map_err(|error| error.to_string())?;
     let processors = match given.spread {
         true => affinity()
@@ -377,11 +387,7 @@ fn front(toolchain: &Toolchain, dir: &Path, given: &Given, args: &[&str]) -> Res
     for (variable, value) in given.asked {
         command.env(variable, value);
     }
-    Ok(Front {
-        run: Supervised::start(command, toolchain.limit)?,
-        limit: toolchain.limit,
-        command: args.join(" "),
-    })
+    Ok(command)
 }
 
 /// A started run of a NaN toolchain, with its time limit and command line.
@@ -452,6 +458,12 @@ impl Supervised {
             reported: Some(reported),
             deadline: Instant::now() + limit,
         })
+    }
+
+    /// Writes `input` to the command's standard input, then closes it.
+    fn feed(&mut self, input: &[u8]) -> Result<(), String> {
+        let mut stdin = self.child.stdin.take().expect("the child's input");
+        stdin.write_all(input).map_err(|error| error.to_string())
     }
 
     /// Waits for the command to end, or kills it once its deadline passes.
@@ -1474,7 +1486,6 @@ fn double_compiled(second: SelfBuild, outside: &Path) -> Result<(), String> {
 /// Writes the secret key of a principal from a seed into the user directories of the bootstrap's
 /// runs and of the NaN toolchain's.
 fn secret_key(principal: &str, seed: u8) -> std::io::Result<()> {
-    use std::io::Write as _;
     use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
     let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     for home in [tmp.join("home"), front_home()] {
@@ -1661,5 +1672,143 @@ fn internal_error(_: &Utf8Path, _: String) -> datatest_stable::Result<()> {
         return Err("the reproducer lacks the command line or the files the command read".into());
     }
     fs::remove_dir_all(outside)?;
+    Ok(())
+}
+
+/// The package the language server session runs over.
+const SERVED: [(&str, &str); 2] = [
+    (
+        "app/package.nan",
+        "//! A package.\n\npackage app {\n    language 1\n    targets any\n} app\n",
+    ),
+    (
+        "app/app.nan",
+        "//! Gauges.\n\npub const STEP: u32 = 5\n\n/// A gauge, raised by [STEP].\npub closed struct Gauge {\n    pub level: u32\n    pub limit: u32\n} Gauge\n\n/// Something with a level.\npub interface Leveled {\n    fn level_of(self) -> u32\n} Leveled\n\nimpl Gauge: Leveled\n\npub fn Gauge.level_of(self) -> u32 {\n    return self.level\n} Gauge.level_of\n\npub fn Gauge.raised(self, by: u32) -> u32 {\n    let next = self.level.saturating_add(by)\n    return next\n} Gauge.raised\n\npub fn total(gauge: Gauge) -> u32 {\n    let raised = gauge.raised(STEP)\n    return raised + gauge.level_of()\n} total\n",
+    ),
+];
+
+/// A text as a JSON string.
+fn quoted(text: &str) -> String {
+    let mut written = String::from("\"");
+    for character in text.chars() {
+        match character {
+            '"' => written.push_str("\\\""),
+            '\\' => written.push_str("\\\\"),
+            '\n' => written.push_str("\\n"),
+            other => written.push(other),
+        }
+    }
+    written.push('"');
+    written
+}
+
+/// The messages of a session over the package of `SERVED` in the workspace at `uri`: a request
+/// of each method the server serves, with the document changes its diagnostics, completions and
+/// signature help read, then a method it does not serve, `shutdown` and `exit`.
+fn session(uri: &str) -> Vec<u8> {
+    let text = SERVED[1].1;
+    let file = format!("{uri}/app/app.nan");
+    let document = format!(r#""textDocument":{{"uri":"{file}"}}"#);
+    let at = |line: u32, character: u32| {
+        format!(r#"{document},"position":{{"line":{line},"character":{character}}}"#)
+    };
+    let changed = |text: &str| {
+        format!(r#"{{"method":"textDocument/didChange","params":{{{document},"contentChanges":[{{"text":{}}}]}}}}"#, quoted(text))
+    };
+    let written = |line: &str| text.replace("raised(STEP)\n", &format!("raised(STEP)\n{line}\n"));
+    let broken = text.replace("raised(STEP)", "raised(STEP)?").replace("level_of()\n", "level_of()  \n");
+    let range = r#""range":{"start":{"line":0,"character":0},"end":{"line":40,"character":0}}"#;
+    let item = |name: &str, kind: u32, lines: (u32, u32), selection: (u32, u32)| {
+        format!(r#""item":{{"name":"{name}","kind":{kind},"uri":"{file}","range":{{"start":{{"line":{},"character":0}},"end":{{"line":{},"character":0}}}},"selectionRange":{{"start":{{"line":{},"character":{}}},"end":{{"line":{},"character":{}}}}}}}"#, lines.0, lines.1, selection.0, selection.1, selection.0, selection.1 + 1)
+    };
+    let mut messages = vec![
+        format!(r#"{{"id":0,"method":"initialize","params":{{"rootUri":"{uri}","capabilities":{{}}}}}}"#),
+        r#"{"method":"initialized","params":{}}"#.to_owned(),
+        format!(r#"{{"method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{file}","text":{}}}}}}}"#, quoted(&broken)),
+        format!(r#"{{"id":1,"method":"textDocument/codeAction","params":{{{document},{range}}}}}"#),
+        changed(text),
+        format!(r#"{{"id":2,"method":"textDocument/formatting","params":{{{document}}}}}"#),
+    ];
+    let positioned = [
+        ("textDocument/definition", 27, 24),
+        ("textDocument/definition", 18, 16),
+        ("textDocument/definition", 23, 11),
+        ("textDocument/definition", 4, 25),
+        ("textDocument/references", 2, 10),
+        ("textDocument/references", 22, 8),
+        ("textDocument/hover", 27, 24),
+        ("textDocument/hover", 23, 11),
+        ("textDocument/hover", 26, 21),
+        ("textDocument/implementation", 11, 15),
+        ("textDocument/implementation", 12, 8),
+        ("textDocument/prepareCallHierarchy", 21, 15),
+    ];
+    for (id, (method, line, character)) in (3..).zip(positioned) {
+        messages.push(format!(r#"{{"id":{id},"method":"{method}","params":{{{},"context":{{"includeDeclaration":true}}}}}}"#, at(line, character)));
+    }
+    messages.extend([
+        format!(r#"{{"id":20,"method":"textDocument/documentSymbol","params":{{{document}}}}}"#),
+        r#"{"id":21,"method":"workspace/symbol","params":{"query":"level"}}"#.to_owned(),
+        format!(r#"{{"id":22,"method":"callHierarchy/incomingCalls","params":{{{}}}}}"#, item("Gauge.raised", 6, (21, 24), (21, 13))),
+        format!(r#"{{"id":23,"method":"callHierarchy/outgoingCalls","params":{{{}}}}}"#, item("total", 12, (26, 29), (26, 7))),
+    ]);
+    let partial = [
+        ("textDocument/completion", "    let x = gauge."),
+        ("textDocument/completion", "    let y = ra"),
+        ("textDocument/completion", "    let z = app::"),
+        ("textDocument/signatureHelp", "    let w = gauge.raised("),
+        ("textDocument/signatureHelp", "    let v = gauge.raised(1, by: "),
+    ];
+    for (id, (method, line)) in (24..).zip(partial) {
+        messages.push(changed(&written(line)));
+        messages.push(format!(r#"{{"id":{id},"method":"{method}","params":{{{}}}}}"#, at(28, line.len() as u32)));
+    }
+    messages.extend([
+        changed(text),
+        format!(r#"{{"id":30,"method":"textDocument/inlayHint","params":{{{document},{range}}}}}"#),
+        format!(r#"{{"id":31,"method":"textDocument/semanticTokens/full","params":{{{document}}}}}"#),
+        r#"{"id":32,"method":"textDocument/unknown","params":{}}"#.to_owned(),
+        r#"{"id":33,"method":"shutdown"}"#.to_owned(),
+        r#"{"method":"exit"}"#.to_owned(),
+    ]);
+    let mut input = Vec::new();
+    for message in messages {
+        input.extend(format!("Content-Length: {}\r\n\r\n{message}", message.len()).bytes());
+    }
+    input
+}
+
+/// Compares the bootstrap's and the NaN toolchain's language servers on one session, both run in
+/// the same workspace, which neither writes.
+fn language_server(_: &Utf8Path, _: String) -> datatest_stable::Result<()> {
+    let store = fresh_store("self-check-language-server")?;
+    let toolchain = Toolchain::new(image()?);
+    let dir =
+        std::env::temp_dir().join(format!("nan-self-check-language-server-{}", std::process::id()));
+    drop(fs::remove_dir_all(&dir));
+    for (path, text) in SERVED {
+        fs::create_dir_all(dir.join(path).parent().expect("a package directory"))?;
+        fs::write(dir.join(path), text)?;
+    }
+    let input = session(&format!("file://{}", dir.display()));
+    let mut expected = Vec::new();
+    let status = nan::serve_language(&dir, &mut &input[..], &mut expected);
+    let home = front_home();
+    let given = Given {
+        home: &home,
+        store: &store,
+        asked: &[],
+        spread: false,
+    };
+    let mut command = fronted(&toolchain, &dir, &given, &["lsp"])?;
+    command.stdin(Stdio::piped());
+    let mut run = Supervised::start(command, toolchain.limit)?;
+    run.feed(&input)?;
+    let ran = run.finish()?;
+    if !ran.stderr.is_empty() {
+        return Err(String::from_utf8_lossy(&ran.stderr).into_owned().into());
+    }
+    agree(&["lsp"], (&expected, Some(status)), (&ran.stdout, ran.status.flatten()))?;
+    fs::remove_dir_all(dir)?;
     Ok(())
 }

@@ -41,6 +41,7 @@ pub use check::{Discharge, Measured};
 pub use command::{Launch, Run, run, without_directory};
 pub use diagnostic::Code;
 pub use final_build::TaskStack;
+pub use lsp::serve as serve_language;
 
 /// The facts checking each item of the workspace rooted at `root` reads that its context pack
 /// lacks, for the completeness test.

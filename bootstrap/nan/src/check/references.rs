@@ -138,7 +138,7 @@ impl Checker<'_> {
 
     /// The functions implementing an interface method: those named after each impl line's target
     /// with the method's name, in the impl line's module.
-    fn implementing(&self, interface: ItemId, name: &str) -> Vec<ItemId> {
+    pub(super) fn implementing(&self, interface: ItemId, name: &str) -> Vec<ItemId> {
         let mut found = Vec::new();
         for index in 0..self.db.items.len() {
             let line = ItemId(index as u32);
@@ -161,7 +161,7 @@ impl Checker<'_> {
         found
     }
 
-    fn span(&self, item: ItemId, token: ast::Tok) -> Span {
+    pub(super) fn span(&self, item: ItemId, token: ast::Tok) -> Span {
         let data = self.db.item(item);
         let token = &data.syntax().tokens[token as usize];
         Span {
@@ -259,7 +259,7 @@ impl Checker<'_> {
     }
 
     /// An item with the module its paths are read in.
-    fn holder(&self, item: ItemId) -> Holder<'_> {
+    pub(super) fn holder(&self, item: ItemId) -> Holder<'_> {
         let data = self.db.item(item);
         Holder {
             item: Some(item),
@@ -962,11 +962,11 @@ pub fn removing(
 }
 
 /// A parsed item of a workspace package, with the module its paths are read in.
-struct Holder<'a> {
+pub(super) struct Holder<'a> {
     item: Option<ItemId>,
-    file: &'a File,
-    tree: &'a Tree,
-    module: ModuleId,
+    pub(super) file: &'a File,
+    pub(super) tree: &'a Tree,
+    pub(super) module: ModuleId,
 }
 
 impl Holder<'_> {
@@ -976,7 +976,7 @@ impl Holder<'_> {
 
     /// The identifier tokens of each item label: a function's head and closing labels, or a
     /// type's closing label.
-    fn labels(&self) -> Vec<Vec<ast::Tok>> {
+    pub(super) fn labels(&self) -> Vec<Vec<ast::Tok>> {
         let tree = self.tree;
         tree.descendants(tree.root())
             .into_iter()
@@ -994,7 +994,7 @@ impl Holder<'_> {
     }
 
     /// The doc references of the item's doc comments.
-    fn doc_references(&self) -> Vec<DocReference> {
+    pub(super) fn doc_references(&self) -> Vec<DocReference> {
         let syntax = self.syntax();
         let Some((first, last)) = self.tree.span(self.tree.root()) else {
             return Vec::new();
@@ -1052,7 +1052,7 @@ impl Holder<'_> {
 
     /// The paths of the item that may name an item, each with the member a test target names
     /// through it: not a label, a binding or a tombstone's old form.
-    fn paths(&self) -> Vec<(ast::Path, Option<ast::Name>)> {
+    pub(super) fn paths(&self) -> Vec<(ast::Path, Option<ast::Name>)> {
         let written = self.written();
         let mut found: Vec<(ast::Path, Option<ast::Name>)> =
             written.paths.into_iter().map(|path| (path, None)).collect();
@@ -1143,9 +1143,9 @@ struct Written {
 
 /// A doc reference: its path, the bytes of the whole path and of its last segment, and the
 /// member it names through that path with the offset of its name.
-struct DocReference {
-    path: ast::Path,
+pub(super) struct DocReference {
+    pub(super) path: ast::Path,
     whole: (u32, u32),
-    last: (u32, u32),
-    member: Option<(u32, String)>,
+    pub(super) last: (u32, u32),
+    pub(super) member: Option<(u32, String)>,
 }

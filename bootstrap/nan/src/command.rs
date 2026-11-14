@@ -82,6 +82,7 @@ enum Name {
     KeyNew,
     KeyShow,
     KeyTrust,
+    Lsp,
 }
 
 impl Name {
@@ -137,6 +138,7 @@ impl Name {
             "upgrade" => Name::Upgrade,
             "diff" => Name::Diff,
             "seal" => Name::Seal,
+            "lsp" => Name::Lsp,
             _ => return None,
         };
         Some((name, 1))
@@ -175,6 +177,7 @@ impl Name {
             Name::KeyNew => "key new",
             Name::KeyShow => "key show",
             Name::KeyTrust => "key trust",
+            Name::Lsp => "lsp",
         }
     }
 
@@ -219,6 +222,7 @@ impl Name {
             }
             Name::Run => "nan run [<package>] [--keep-resets] [-- <argument>...]",
             Name::Primer => "nan primer [<topic> or tools]",
+            Name::Lsp => "nan lsp",
         }
     }
 
@@ -237,7 +241,8 @@ impl Name {
             | Name::Primer
             | Name::KeyNew
             | Name::KeyShow
-            | Name::KeyTrust => (&[], &[]),
+            | Name::KeyTrust
+            | Name::Lsp => (&[], &[]),
             Name::Run => (&["--keep-resets"], &[]),
             Name::Build => (&[], &["--compare-with", "--against", "--as"]),
             Name::EditReplace => (&[], &["--expect", "--from"]),
@@ -271,7 +276,7 @@ impl Name {
             Name::Find | Name::EditRename | Name::EditMove | Name::DepAdd | Name::KeyTrust => 2,
             Name::Merge => 3,
             Name::Diff => 2,
-            Name::Publish => 0,
+            Name::Publish | Name::Lsp => 0,
             _ => 1,
         }
     }
@@ -307,6 +312,7 @@ impl Name {
                 | Name::KeyNew
                 | Name::KeyShow
                 | Name::KeyTrust
+                | Name::Lsp
         )
     }
 
@@ -363,7 +369,8 @@ impl Name {
             | Name::Expand
             | Name::Primer
             | Name::Diff
-            | Name::KeyShow => &["records"],
+            | Name::KeyShow
+            | Name::Lsp => &["records"],
             Name::Context => &["entries", "radius"],
             Name::Merge => &["files", "conflicts", "errors"],
         }
@@ -527,7 +534,7 @@ thread_local! {
 
 /// Runs a command's body, or describes the panic ending it: `panic at` and the location of the
 /// panic, then its message.
-fn caught<T>(body: impl FnOnce() -> T) -> Result<T, String> {
+pub(crate) fn caught<T>(body: impl FnOnce() -> T) -> Result<T, String> {
     static HOOK: Once = Once::new();
     HOOK.call_once(|| {
         let previous = panic::take_hook();
@@ -738,7 +745,7 @@ fn usage(args: &[String], found: Option<&str>) -> Run {
 }
 
 /// The first words of the commands, in the order of the commands' list.
-const COMMANDS: &str = "check, verify, test, fix, fmt, holes, show, read, find, context, explain, expand, edit, merge, diff, seal, key, api, dep, publish, upgrade, build, run, primer";
+const COMMANDS: &str = "check, verify, test, fix, fmt, holes, show, read, find, context, explain, expand, edit, merge, diff, seal, key, api, dep, publish, upgrade, build, run, primer, lsp";
 
 /// The lines of a `tool.usage` record of a command line outside every synopsis: the synopses
 /// of its command, or of the commands its first word starts, or else the commands' first words;
@@ -766,6 +773,15 @@ fn execute(invocation: &Invocation, current: &Path, trace: &mut Trace) -> io::Re
     }
     if invocation.name == Name::KeyShow {
         return key::show(invocation).map(Outcome::Output);
+    }
+    if invocation.name == Name::Lsp {
+        let mut input = io::stdin().lock();
+        let mut output = io::stdout().lock();
+        return Ok(Outcome::Ended(crate::lsp::serve(
+            current,
+            &mut input,
+            &mut output,
+        )));
     }
     if invocation.name == Name::Diff
         && invocation.value("--path").is_none()
@@ -810,8 +826,8 @@ fn execute(invocation: &Invocation, current: &Path, trace: &mut Trace) -> io::Re
         Name::Diff => diff::run(invocation, &workspace, current, trace),
         Name::Seal => seal::run(invocation, &workspace, current, trace),
         Name::KeyTrust => key::trust(invocation, &workspace, current, trace),
-        Name::KeyNew | Name::KeyShow => {
-            unreachable!("key new and key show run outside a workspace")
+        Name::KeyNew | Name::KeyShow | Name::Lsp => {
+            unreachable!("key new, key show and lsp run outside a workspace")
         }
     };
     output.map(Outcome::Output)
@@ -914,8 +930,24 @@ fn record(workspace: &Workspace, scope: &Scope, diagnostic: &Diagnostic) -> Reco
         }
         _ => "-".to_owned(),
     };
+    Record {
+        word: diagnostic.code.class().word().to_owned(),
+        fields: vec![diagnostic.code.name().to_owned(), location, item],
+        lines: diagnostic_lines(workspace, scope, diagnostic, true),
+    }
+}
+
+/// The lines a diagnostic's record holds after its header, the quotes of its line and of its
+/// reasons' lines only when `quoted`.
+pub(crate) fn diagnostic_lines(
+    workspace: &Workspace,
+    scope: &Scope,
+    diagnostic: &Diagnostic,
+    quoted: bool,
+) -> Vec<String> {
+    let writer = scope.package(workspace).and_then(|package| package.name());
     let mut lines = Vec::new();
-    if let (Some(path), Some(line)) = (&diagnostic.path, diagnostic.line) {
+    if let (true, Some(path), Some(line)) = (quoted, &diagnostic.path, diagnostic.line) {
         let text = workspace
             .line_text(path, line)
             .expect("diagnostics lie in workspace files");
@@ -960,15 +992,13 @@ fn record(workspace: &Workspace, scope: &Scope, diagnostic: &Diagnostic) -> Reco
             reason.role.word(),
             reason.subject
         ));
-        lines.push(output::printable(file.syntax.line_text(*line)));
+        if quoted {
+            lines.push(output::printable(file.syntax.line_text(*line)));
+        }
     }
     lines.extend(fix::shown(workspace, &diagnostic.fixes));
-    Record {
-        word: diagnostic.code.class().word().to_owned(),
-        fields: vec![diagnostic.code.name().to_owned(), location, item],
-        lines,
-    }
+    lines
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

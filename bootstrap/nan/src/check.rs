@@ -34,6 +34,7 @@ pub(crate) mod ledger;
 pub(crate) mod lowlevel;
 mod measure;
 pub(crate) mod migrate;
+mod navigation;
 mod newer;
 mod package;
 mod preserved;
@@ -81,14 +82,18 @@ pub use changes::{Change, changes, semantic_conflicts};
 pub use compatible::{compatible, encode_class, schema_records};
 pub use context::{Context, Green, context_gaps, contexts, greens, greens_after};
 use db::{Db, ItemId, ModuleId, PackageId};
+pub use decl::{declared_name, fold};
 pub use edits::{identity, moved, renamed};
 pub use elaborate::EnsuresClause;
 pub use gate::gate;
 pub use measure::{Discharge, Measured, measure};
+pub use navigation::{
+    Function, callees, callers, definition, function_at, hover, implementations, references,
+};
 pub use preserved::not_preserved;
 pub use published::summaries as publish_summaries;
 pub use reading::{api, contributed, declared, expanded, explained, holes, ledgered, shown};
-pub use references::Relocated;
+pub use references::{Relocated, Span};
 pub use releases::{holds_releases, release_check, release_errors};
 pub use root::{nir_streams, package_files as package_sources};
 use sig::{GenericDef, Sig};

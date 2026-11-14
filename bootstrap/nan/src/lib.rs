@@ -16,6 +16,7 @@ mod image;
 mod interp;
 mod journal;
 mod lower;
+mod lsp;
 mod machine;
 mod merge;
 mod nir;

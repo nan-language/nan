@@ -1772,11 +1772,20 @@ impl Body<'_, '_> {
             }
             seen.push(&capture.name.text);
         }
-        let listed: Vec<(String, Mode, Tok)> = closure
-            .captures
-            .iter()
-            .map(|capture| (capture.name.text.clone(), capture.mode, capture.token))
-            .collect();
+        let mut listed: Vec<(String, Mode, Tok)> = Vec::new();
+        let mut list_unknown = false;
+        for capture in &closure.captures {
+            match self.lookup_local(&capture.name.text) {
+                Some(local) => {
+                    self.note_use(local);
+                    listed.push((capture.name.text.clone(), capture.mode, capture.token));
+                }
+                None => {
+                    self.unknown_capture(capture);
+                    list_unknown = true;
+                }
+            }
+        }
         let params: Vec<FnParam> = closure
             .params
             .iter()
@@ -1795,12 +1804,6 @@ impl Body<'_, '_> {
             (ast::ClosureBody::Short(_), None) => short_result.clone().unwrap_or(Ty::Error),
             (ast::ClosureBody::Block(_), None) => Ty::Unit,
         };
-        for capture in &closure.captures {
-            match self.lookup_local(&capture.name.text) {
-                Some(local) => self.note_use(local),
-                None => self.report(capture.name.token, Code::NameUnknown),
-            }
-        }
         let loops = self.loops.len();
         let scopes = self.scopes.len();
         self.push_frame(Frame {
@@ -1944,6 +1947,7 @@ impl Body<'_, '_> {
                     _ => None,
                 },
                 demanded: wanted.map(|wanted| wanted.limits).unwrap_or_default(),
+                list_unknown,
             })),
         }
     }

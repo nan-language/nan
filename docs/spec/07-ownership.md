@@ -979,7 +979,7 @@ capture = mode when_place ;
 
 ### Captures
 
-- A capture names a binding, or, inside the body of an [`await when`](16-concurrency.md#await-when), the place path of one of its accesses, which names the cown's value there; a listed place path that names no such access names nothing ([unknown names](03-packages-modules.md#unknown-names)).
+- A capture names a binding, or, inside the body of an [`await when`](16-concurrency.md#await-when), the place path of one of its accesses, which names the cown's value there; a listed place path that names no such access names nothing ([unknown names](03-packages-modules.md#unknown-names)). A capture naming nothing is failed ([root-cause reporting](34-diagnostics.md#root-cause-reporting)), and no rule judges the mode of a capture absent from its list.
 - A capture absent from the list is a read. A Copy read capture is copied when the closure is created. Any other read capture is a read access to each place path the body reads through it, while the closure is live.
 - `mut a` is a `mut` access to `a` while the closure is live; the body uses `a` as a `mut` parameter's place.
 - `take b` moves `b` into the closure when it is created. In a closure that is not a task closure, the body uses `b` as a `mut` parameter's place. A task closure's captures follow [task closures](16-concurrency.md#task-closures) and [lending](16-concurrency.md#lending).
@@ -1087,6 +1087,24 @@ pub fn count_nonzero(values: Slice[u32]) -> u32 {
     var count: u32 = 0
     var seen: u32 = 0
     each_value(values, visit: fn[mut count, mut seen](value: u32) { // error: closure.capture-unused
+        if value > 0 {
+            count += 1
+        }
+    })
+    return count
+} count_nonzero
+```
+
+```nan
+pub fn each_value(values: Slice[u32], visit: fn(value: u32)) {
+    for value in values {
+        visit(value)
+    }
+} each_value
+
+pub fn count_nonzero(values: Slice[u32]) -> u32 {
+    var count: u32 = 0
+    each_value(values, visit: fn[mut cont](value: u32) { // error: name.unknown
         if value > 0 {
             count += 1
         }

@@ -368,6 +368,20 @@ impl<'c, 'a> Body<'c, 'a> {
         }
     }
 
+    /// Reports a capture naming nothing, its candidates the bindings and `await when` place paths
+    /// in scope.
+    pub fn unknown_capture(&self, capture: &ast::Capture) {
+        let candidates = self
+            .scopes
+            .iter()
+            .flatten()
+            .map(|local| self.locals[local.0 as usize].name.clone())
+            .collect();
+        let span = (capture.token + 1, capture.name.token);
+        self.ck
+            .report_unknown(self.item, span, Vec::new(), candidates, None);
+    }
+
     /// Reports an unknown member of a type, its candidates the type's members the body's module
     /// may name, or `stub` when none is near.
     pub fn unknown_member(&self, name: &ast::Name, ty: &Ty, stub: Option<String>) {

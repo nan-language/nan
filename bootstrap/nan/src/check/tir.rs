@@ -498,6 +498,8 @@ pub struct TClosure {
     pub lent: Option<u32>,
     /// The limits the function type it is written for demands.
     pub demanded: LimitSet,
+    /// Whether an entry of its capture list names nothing.
+    pub list_unknown: bool,
 }
 
 /// A capture: the closure's local, the enclosing local it names, and the mode and token of its

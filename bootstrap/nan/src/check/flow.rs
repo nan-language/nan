@@ -250,6 +250,9 @@ struct Flow<'c, 'a> {
     failed: bool,
     /// For a closure's body, the `fn` token opening the closure.
     opener: Option<Tok>,
+    /// For a closure's body, whether its capture list names nothing at an entry, whose fix
+    /// decides the modes of the captures it leaves unlisted.
+    list_unknown: bool,
     /// The first token of the statement being walked.
     statement: Option<Tok>,
     /// Whether the expression about to be walked gives the value a projection returns, which
@@ -295,6 +298,7 @@ impl<'c, 'a> Flow<'c, 'a> {
             first_use: HashMap::new(),
             failed: false,
             opener: None,
+            list_unknown: false,
             statement: None,
             returning: false,
         }
@@ -525,8 +529,10 @@ impl<'c, 'a> Flow<'c, 'a> {
         let root = path.root;
         let local = self.body.local(root);
         if local.kind == LocalKind::Capture(Mode::Read) {
-            let fixes = self.listed(root, Mode::Mut);
-            self.report_fixed((token, token), Code::ClosureCaptureMode, fixes);
+            if !self.list_unknown {
+                let fixes = self.listed(root, Mode::Mut);
+                self.report_fixed((token, token), Code::ClosureCaptureMode, fixes);
+            }
         } else if !local.assignable() {
             let syntax = &self.ck.db.item(self.item).file.syntax;
             let keyword = syntax
@@ -611,8 +617,10 @@ impl<'c, 'a> Flow<'c, 'a> {
             if self.task == Some(true)
                 && self.body.local(root).kind == LocalKind::Capture(Mode::Read)
             {
-                let fixes = self.listed(root, Mode::Take);
-                self.report_fixed((token, token), Code::ClosureCaptureMode, fixes);
+                if !self.list_unknown {
+                    let fixes = self.listed(root, Mode::Take);
+                    self.report_fixed((token, token), Code::ClosureCaptureMode, fixes);
+                }
             } else {
                 self.report_not_owned(value, token);
             }
@@ -1827,6 +1835,7 @@ impl<'c, 'a> Flow<'c, 'a> {
             let mut inner = Flow::new(self.ck, self.item, self.body);
             inner.task = Some(closure.task);
             inner.opener = Some(token);
+            inner.list_unknown = closure.list_unknown;
             inner.loop_base = self.loop_base + self.loops.len();
             inner.reported = std::mem::take(&mut self.reported);
             inner.walked = std::mem::take(&mut self.walked);

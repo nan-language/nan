@@ -485,7 +485,7 @@ impl Checker<'_> {
 
     /// The requires clauses of a function item, by index, with whether each is disputed.
     pub fn requires_clauses(&self, function: ItemId) -> Vec<(u32, bool)> {
-        self.typed(function)
+        self.untraced(|| self.typed(function))
             .map(|body| clause_indexes(&body, ClauseRole::Requires, 0))
             .unwrap_or_default()
     }
@@ -577,7 +577,7 @@ impl Checker<'_> {
     /// unit's functions compute them.
     pub fn ensures_clauses(&self, item: ItemId, method: Option<usize>) -> Vec<EnsuresClause> {
         let bodies: Vec<Rc<TBody>> = match method {
-            None => self.typed(item).into_iter().collect(),
+            None => self.untraced(|| self.typed(item)).into_iter().collect(),
             Some(method) => (0..=method)
                 .filter_map(|index| self.method_bodies.borrow().get(&(item, index)).cloned())
                 .collect(),

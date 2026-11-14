@@ -846,11 +846,11 @@ impl<'a> Checker<'a> {
         };
         match &self.db.ast(item).kind {
             ItemKind::Fn(function) => match &function.body {
-                FnBody::Block(block) => block.visit(&mut collect),
+                FnBody::Block(block) => self.lowered_body(item, *block).visit(&mut collect),
                 FnBody::Expr(expr) => expr.visit(&mut collect),
                 FnBody::None => {}
             },
-            ItemKind::Test(test) => test.body.visit(&mut collect),
+            ItemKind::Test(test) => self.lowered_body(item, test.body).visit(&mut collect),
             ItemKind::Const(constant) => constant.value.visit(&mut collect),
             ItemKind::ConstAssert(condition) => condition.visit(&mut collect),
             ItemKind::Contribute(contribution) => contribution.value.visit(&mut collect),

@@ -31,8 +31,10 @@ pub struct Kept {
     /// The items whose outcomes a snapshot gives: their own work reports nothing.
     restored: RefCell<HashSet<ItemId>>,
     /// The reads of another item's body, typed, lowered, elaborated or with its obligations
-    /// decided, or of the items it names, by an item's own work: reader, then read.
+    /// decided, by an item's own work: reader, then read.
     reads: RefCell<BTreeSet<(ItemId, ItemId)>>,
+    /// The reads of the items another item names by an item's own work: reader, then read.
+    names_reads: RefCell<BTreeSet<(ItemId, ItemId)>>,
     /// The fields of structs each item's own work reads: reader, struct, field.
     fields: RefCell<BTreeSet<(ItemId, ItemId, String)>>,
     /// The `label: value` naming each field of a struct, in order: struct, field, label.
@@ -105,7 +107,8 @@ struct Plan {
 struct Restoring {
     key: Hash,
     outcomes: HashMap<ItemId, Outcome>,
-    reads: Vec<(ItemId, ItemId)>,
+    reads: ReadsBy,
+    names_reads: ReadsBy,
     greens: HashMap<ItemId, Greened>,
     files: Vec<SnapshotFile>,
 }
@@ -159,9 +162,75 @@ struct Snapshot {
     items: usize,
     files: Vec<SnapshotFile>,
     seeds: Vec<Seed>,
-    reads: Vec<(ItemId, ItemId)>,
+    reads: ReadsBy,
+    names_reads: ReadsBy,
     greens: HashMap<ItemId, Greened>,
     outcomes: HashMap<ItemId, Outcome>,
+}
+
+/// Reads of other items by items' own work, by reader: each reader with the items it reads, in
+/// order, as a snapshot encodes them, each the distance from the one before.
+#[derive(Default)]
+struct ReadsBy(Vec<(ItemId, Vec<u8>)>);
+
+impl ReadsBy {
+    /// The reads of a set of them, reader then read.
+    fn of(reads: &BTreeSet<(ItemId, ItemId)>) -> ReadsBy {
+        let mut by: Vec<(ItemId, Vec<u8>)> = Vec::new();
+        let mut last = 0;
+        for (reader, read) in reads {
+            if by.last().is_none_or(|(held, _)| held != reader) {
+                by.push((*reader, Vec::new()));
+                last = 0;
+            }
+            let (_, encoded) = by.last_mut().expect("a reader");
+            put_number(encoded, read.0 - last);
+            last = read.0;
+        }
+        ReadsBy(by)
+    }
+
+    /// Each read, reader then read; none when one does not decode.
+    fn pairs(&self) -> Option<Vec<(ItemId, ItemId)>> {
+        let mut pairs = Vec::new();
+        for (reader, encoded) in &self.0 {
+            let mut cursor = Cursor {
+                bytes: encoded,
+                at: 0,
+            };
+            let mut read = 0u32;
+            while cursor.at < encoded.len() {
+                read = read.checked_add(cursor.small()?)?;
+                pairs.push((*reader, ItemId(read)));
+            }
+        }
+        Some(pairs)
+    }
+
+    /// The reads of the readers not marked.
+    fn unmarked(&self, marked: &[bool]) -> ReadsBy {
+        ReadsBy(
+            (self.0.iter())
+                .filter(|(reader, _)| !marked[reader.0 as usize])
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// The reads of both, whose readers differ.
+    fn joined(&self, other: ReadsBy) -> ReadsBy {
+        let mut by: Vec<(ItemId, Vec<u8>)> = self.0.iter().cloned().chain(other.0).collect();
+        by.sort_by_key(|(reader, _)| *reader);
+        ReadsBy(by)
+    }
+
+    fn put(&self, out: &mut Vec<u8>) {
+        put_number(out, self.0.len() as u64);
+        for (reader, encoded) in &self.0 {
+            put_item(out, *reader);
+            bytes(out, encoded);
+        }
+    }
 }
 
 /// What a snapshot keeps of an item's own work: whether judging it alone, and the check, rejected
@@ -414,7 +483,7 @@ fn file_moves(path: &str, old: &FileShape, new: &FileShape) -> Option<FileMoves>
     Some(moves)
 }
 
-const SNAPSHOT_HEADER: &str = "nan kept 1";
+const SNAPSHOT_HEADER: &str = "nan kept 2";
 
 fn put_flag(out: &mut Vec<u8>, value: bool) {
     uvar(out, u128::from(value));
@@ -817,6 +886,11 @@ impl<'b> Cursor<'b> {
         Some(FileShape { skeleton, bodies })
     }
 
+    fn reads_by(&mut self) -> Option<ReadsBy> {
+        let by = self.list(|cursor| Some((cursor.item()?, cursor.chunk()?.to_vec())))?;
+        Some(ReadsBy(by))
+    }
+
     fn green(&mut self) -> Option<Greened> {
         Some(Greened {
             api: self.list(Self::text)?,
@@ -881,7 +955,8 @@ impl<'b> Cursor<'b> {
                 traps: cursor.optional(Self::flag)?,
             })
         })?;
-        let reads = self.list(|cursor| Some((cursor.item()?, cursor.item()?)))?;
+        let reads = self.reads_by()?;
+        let names_reads = self.reads_by()?;
         let greens = self.list(|cursor| Some((cursor.item()?, cursor.green()?)))?;
         let outcomes = self.list(|cursor| {
             let item = cursor.item()?;
@@ -898,6 +973,7 @@ impl<'b> Cursor<'b> {
             files,
             seeds,
             reads,
+            names_reads,
             greens: greens.into_iter().collect(),
             outcomes: outcomes.into_iter().collect(),
         })
@@ -1009,12 +1085,12 @@ fn snapshot_edges(snapshot: &Snapshot) -> Vec<Vec<u32>> {
     edges
 }
 
-/// The items a check of a snapshot's state checks again beside those whose bodies changed:
-/// those whose own work read one of them, closed under that relation and under the cycles of the
-/// snapshot's dependencies; by item index.
-fn rechecked(snapshot: &Snapshot, changed: &[ItemId], old: &Components) -> Vec<bool> {
+/// The items a check of a snapshot's state checks again from those it checks first: those
+/// whose own work read the body of one checked again, closed under that relation and under the
+/// cycles of the snapshot's dependencies; by item index. None when its reads do not decode.
+fn rechecked(snapshot: &Snapshot, first: &[ItemId], old: &Components) -> Option<Vec<bool>> {
     let mut readers: HashMap<u32, Vec<u32>> = HashMap::new();
-    for (reader, read) in &snapshot.reads {
+    for (reader, read) in snapshot.reads.pairs()? {
         readers.entry(read.0).or_default().push(reader.0);
     }
     let mut cycles: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -1028,7 +1104,7 @@ fn rechecked(snapshot: &Snapshot, changed: &[ItemId], old: &Components) -> Vec<b
     }
     let mut marked = vec![false; snapshot.items];
     let mut pending: Vec<u32> = Vec::new();
-    for item in changed {
+    for item in first {
         if !marked[item.0 as usize] {
             marked[item.0 as usize] = true;
             pending.push(item.0);
@@ -1048,7 +1124,7 @@ fn rechecked(snapshot: &Snapshot, changed: &[ItemId], old: &Components) -> Vec<b
             }
         }
     }
-    marked
+    Some(marked)
 }
 
 /// Whether diagnostics that the reported ones order alike come from the own work of one item,
@@ -1123,11 +1199,33 @@ impl Checker<'_> {
         item.is_some_and(|item| self.kept.restored.borrow().contains(&item))
     }
 
-    /// Records that the item whose own work is computed reads another item's body or names.
+    /// The item whose own work is computed, when it reads another item's body or names as its
+    /// own read.
+    fn reader(&self, item: ItemId) -> Option<ItemId> {
+        (self.traced.get()).filter(|reader| *reader != item && !self.untraced.get())
+    }
+
+    /// Records that the item whose own work is computed reads another item's body.
     pub(crate) fn trace_read(&self, item: ItemId) {
-        if let Some(reader) = self.traced.get().filter(|reader| *reader != item) {
+        if let Some(reader) = self.reader(item) {
             self.kept.reads.borrow_mut().insert((reader, item));
         }
+    }
+
+    /// Records that the item whose own work is computed reads the items another item names.
+    pub(super) fn trace_names_read(&self, item: ItemId) {
+        if let Some(reader) = self.reader(item) {
+            self.kept.names_reads.borrow_mut().insert((reader, item));
+        }
+    }
+
+    /// Computes what a restored check takes from the items' heads or compares: what it reads of
+    /// another item's body or names is not the traced item's read.
+    pub(crate) fn untraced<T>(&self, compute: impl FnOnce() -> T) -> T {
+        let outer = self.untraced.replace(true);
+        let computed = compute();
+        self.untraced.set(outer);
+        computed
     }
 
     /// Records that the item whose own work is computed reads a struct's field.
@@ -1201,7 +1299,7 @@ impl Checker<'_> {
                         put_file(&mut context, path, content);
                     }
                     for file in &package.files {
-                        files.push((file.path.clone(), Hash::of(&file.syntax.source)));
+                        files.push((file.path.clone(), file.content));
                     }
                 }
             }
@@ -1363,45 +1461,54 @@ impl Checker<'_> {
             });
             put_optional(&mut out, seed.traps, put_flag);
         }
-        let mut reads: BTreeSet<(ItemId, ItemId)> = plan
-            .restored
-            .iter()
-            .flat_map(|restoring| restoring.reads.iter().copied())
-            .collect();
-        reads.extend(self.kept.reads.borrow().iter().filter(|(reader, read)| {
-            !self.is_restored(Some(*reader))
-                && self.db.is_reported(*reader)
-                && self.db.is_reported(*read)
-        }));
-        put_number(&mut out, reads.len() as u64);
-        for (reader, read) in reads {
-            put_item(&mut out, reader);
-            put_item(&mut out, read);
+        let restored = plan.restored.as_ref();
+        let fresh = |reads: &BTreeSet<(ItemId, ItemId)>| {
+            ReadsBy::of(
+                &(reads.iter().copied())
+                    .filter(|(reader, read)| {
+                        !self.is_restored(Some(*reader))
+                            && self.db.is_reported(*reader)
+                            && self.db.is_reported(*read)
+                    })
+                    .collect(),
+            )
+        };
+        let reads = fresh(&self.kept.reads.borrow());
+        match restored {
+            Some(restoring) => restoring.reads.joined(reads).put(&mut out),
+            None => reads.put(&mut out),
         }
-        let mut greens: Vec<(ItemId, Greened)> = plan
-            .restored
-            .iter()
-            .flat_map(|restoring| restoring.greens.clone())
-            .chain(self.kept.greens.borrow().clone())
+        let names_reads = fresh(&self.kept.names_reads.borrow());
+        match restored {
+            Some(restoring) => restoring.names_reads.joined(names_reads).put(&mut out),
+            None => names_reads.put(&mut out),
+        }
+        let computed = self.kept.greens.borrow();
+        let mut greens: Vec<(&ItemId, &Greened)> = restored
+            .into_iter()
+            .flat_map(|restoring| &restoring.greens)
+            .chain(computed.iter())
             .collect();
-        greens.sort_by_key(|(item, _)| *item);
-        greens.dedup_by_key(|(item, _)| *item);
+        greens.sort_by_key(|(item, _)| **item);
+        greens.dedup_by_key(|(item, _)| **item);
         put_number(&mut out, greens.len() as u64);
-        for (item, green) in &greens {
+        for (item, green) in greens {
             put_item(&mut out, *item);
             put_green(&mut out, green);
         }
         let items = self.outcome_items();
-        let mut fresh = self.outcomes(&items);
+        let held = |item: &ItemId| restored.and_then(|restoring| restoring.outcomes.get(item));
+        let unheld: Vec<ItemId> = items
+            .iter()
+            .copied()
+            .filter(|item| held(item).is_none())
+            .collect();
+        let mut fresh = self.outcomes(&unheld);
         put_number(&mut out, items.len() as u64);
         for item in items {
             put_item(&mut out, item);
-            let restored = plan
-                .restored
-                .as_ref()
-                .and_then(|restoring| restoring.outcomes.get(&item));
             let mut encoded = Vec::new();
-            match restored {
+            match held(&item) {
                 Some(outcome) => put_outcome(&mut encoded, outcome),
                 None => put_outcome(&mut encoded, &fresh.remove(&item).expect("an outcome")),
             }
@@ -1572,8 +1679,31 @@ impl Checker<'_> {
                 .iter()
                 .filter(|item| !snapshot.outcomes.contains_key(item)),
         );
+        let renamed: HashSet<ItemId> = changed
+            .iter()
+            .copied()
+            .filter(|item| {
+                let held = snapshot
+                    .outcomes
+                    .get(item)
+                    .and_then(|outcome| outcome.names.as_ref());
+                held.is_none_or(|names| !names.iter().eq(self.names(*item).iter()))
+            })
+            .collect();
+        if !renamed.is_empty() {
+            let Some(names_reads) = snapshot.names_reads.pairs() else {
+                return false;
+            };
+            changed.extend(
+                (names_reads.into_iter())
+                    .filter(|(_, read)| renamed.contains(read))
+                    .map(|(reader, _)| reader),
+            );
+        }
         let old = components(&snapshot_edges(&snapshot));
-        let marked = rechecked(&snapshot, &changed, &old);
+        let Some(marked) = rechecked(&snapshot, &changed, &old) else {
+            return false;
+        };
         let Some((outcomes, greens)) = self.restore(&snapshot, &marked, &moves) else {
             return false;
         };
@@ -1590,16 +1720,13 @@ impl Checker<'_> {
                 Some((*item, facts))
             })
             .collect();
-        let reads = (snapshot.reads.iter())
-            .filter(|(reader, _)| !marked[reader.0 as usize])
-            .copied()
-            .collect();
         *self.kept.plan.borrow_mut() = Some(Plan {
             state,
             restored: Some(Restoring {
                 key,
                 outcomes,
-                reads,
+                reads: snapshot.reads.unmarked(&marked),
+                names_reads: snapshot.names_reads.unmarked(&marked),
                 greens,
                 files: snapshot.files.clone(),
             }),
@@ -1709,9 +1836,9 @@ impl Checker<'_> {
         components(&edges) == *old
     }
 
-    /// Writes the snapshot of the state the checker checked to the build cache, unless it holds
-    /// it, makes it the latest of its closure under its target in its workspace, and deletes the
-    /// one it restored from.
+    /// Writes the snapshot of the state the checker checked to the build cache, unless it
+    /// restored from it, makes it the latest of its closure under its target in its workspace,
+    /// and deletes the one it restored from.
     pub fn keep(&self) {
         let plan = self.kept.plan.borrow();
         let Some(plan) = plan.as_ref() else {
@@ -1726,8 +1853,11 @@ impl Checker<'_> {
         else {
             return;
         };
-        if !matches!(cache.entry(&plan.state.key), Ok(Ok(Some(_))))
-            && cache.put(&plan.state.key, &self.snapshot(plan)).is_err()
+        let restored = plan.restored.as_ref().map(|restoring| restoring.key);
+        if restored != Some(plan.state.key)
+            && cache
+                .replace_entry(&plan.state.key, &self.snapshot(plan))
+                .is_err()
         {
             return;
         }
@@ -1736,10 +1866,10 @@ impl Checker<'_> {
         if cache.replace(&plan.state.latest, &named).is_err() {
             return;
         }
-        if let Some(restoring) = &plan.restored
-            && restoring.key != plan.state.key
+        if let Some(key) = restored
+            && key != plan.state.key
         {
-            let _ = cache.remove(&restoring.key);
+            let _ = cache.remove(&key);
         }
     }
 }

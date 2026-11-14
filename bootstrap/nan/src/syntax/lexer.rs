@@ -528,9 +528,19 @@ impl Scanner<'_> {
     }
 
     fn punct(&mut self, start: usize, c: char) -> Scanned {
-        let ahead: String = (start..start + 3)
-            .map_while(|index| self.char_at(index))
-            .collect();
+        let mut ahead = [0u8; 3];
+        let mut length = 0;
+        while let Some(next) = self
+            .char_at(start + length)
+            .filter(|_| length < ahead.len())
+        {
+            if !next.is_ascii() {
+                break;
+            }
+            ahead[length] = next as u8;
+            length += 1;
+        }
+        let ahead = std::str::from_utf8(&ahead[..length]).expect("ASCII characters");
         let punct = Punct::ALL
             .iter()
             .map(|punct| (punct.spelling(), TokenKind::Punct(*punct)))

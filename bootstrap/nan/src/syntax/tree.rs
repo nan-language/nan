@@ -14,15 +14,15 @@ pub enum Child {
 #[derive(Clone, Copy, Debug)]
 pub struct Node {
     pub rule: Rule,
-    children: (u32, u32),
+    pub(super) children: (u32, u32),
 }
 
 /// The tree of one item. Nodes refer to the tokens of their file by index.
 #[derive(Clone, Debug, Default)]
 pub struct Tree {
-    nodes: Vec<Node>,
-    children: Vec<Child>,
-    root: NodeId,
+    pub(super) nodes: Vec<Node>,
+    pub(super) children: Vec<Child>,
+    pub(super) root: NodeId,
 }
 
 impl Tree {
@@ -119,34 +119,34 @@ impl Tree {
 #[derive(Clone, Debug, Default)]
 pub struct Builder {
     tree: Tree,
-    open: Vec<(Rule, Vec<Child>)>,
+    /// The open nodes, innermost last, each with where its children start in `children`.
+    open: Vec<(Rule, usize)>,
+    /// The children of the open nodes, in order.
+    children: Vec<Child>,
 }
 
 impl Builder {
     pub fn open(&mut self, rule: Rule) {
-        self.open.push((rule, Vec::new()));
+        self.open.push((rule, self.children.len()));
     }
 
     pub fn token(&mut self, token: TokenId) {
-        self.open
-            .last_mut()
-            .expect("a token inside a node")
-            .1
-            .push(Child::Token(token));
+        assert!(!self.open.is_empty(), "a token inside a node");
+        self.children.push(Child::Token(token));
     }
 
     pub fn close(&mut self) {
-        let (rule, children) = self.open.pop().expect("a node to close");
+        let (rule, first) = self.open.pop().expect("a node to close");
         let start = self.tree.children.len() as u32;
-        self.tree.children.extend(children);
+        self.tree.children.extend(self.children.drain(first..));
         let id = self.tree.nodes.len() as NodeId;
         self.tree.nodes.push(Node {
             rule,
             children: (start, self.tree.children.len() as u32),
         });
-        match self.open.last_mut() {
-            Some((_, siblings)) => siblings.push(Child::Node(id)),
-            None => self.tree.root = id,
+        match self.open.is_empty() {
+            false => self.children.push(Child::Node(id)),
+            true => self.tree.root = id,
         }
     }
 

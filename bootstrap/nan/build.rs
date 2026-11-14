@@ -534,6 +534,11 @@ impl<'a> Generator<'a> {
             writeln!(out, "    {},", camel(name)).unwrap();
         }
         out.push_str("}\n\nimpl Rule {\n");
+        writeln!(out, "    pub const ALL: [Rule; {}] = [", self.order.len()).unwrap();
+        for name in &self.order {
+            writeln!(out, "        Rule::{},", camel(name)).unwrap();
+        }
+        out.push_str("    ];\n\n");
         out.push_str("    pub fn name(self) -> &'static str {\n        match self {\n");
         for name in &self.order {
             writeln!(out, "            Rule::{} => {:?},", camel(name), name).unwrap();

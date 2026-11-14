@@ -1148,14 +1148,24 @@ impl Checker<'_> {
         }
     }
 
+    /// The abstract syntax of a function's or a test's block body.
+    pub(crate) fn lowered_body(&self, item: ItemId, body: ast::BodySyntax) -> ast::Block {
+        self.trace_read(item);
+        let data = self.db.item(item);
+        let syntax = data.syntax();
+        let tree = (syntax.items[data.index].tree.as_ref()).expect("a lowered item's tree");
+        ast::lower_body(syntax, tree, body)
+    }
+
     fn function_body(&self, item: ItemId, function: &ast::FnItem, sig: &FnSig) -> TBody {
         let mut body = Body::new(self, item, sig.generics.clone());
         body.push_frame(Body::function_frame(sig.result.clone(), sig.fails.clone()));
         body.declare_params(&function.head.params, sig);
         body.clauses(&function.clauses, sig);
         let root = match &function.body {
-            ast::FnBody::Block(block) => {
-                let typed = body.result_block(block, &sig.result);
+            ast::FnBody::Block(syntax) => {
+                let block = self.lowered_body(item, *syntax);
+                let typed = body.result_block(&block, &sig.result);
                 Some(TExpr {
                     token: block.token,
                     last: block.end,
@@ -1248,10 +1258,11 @@ impl Checker<'_> {
                 body.params.push(id);
             }
         }
-        let (typed, _) = body.block(&test.body);
+        let block = self.lowered_body(item, test.body);
+        let (typed, _) = body.block(&block);
         body.finish(Some(TExpr {
-            token: test.body.token,
-            last: test.body.end,
+            token: block.token,
+            last: block.end,
             ty: Ty::Unit,
             kind: TKind::Block(typed),
         }))

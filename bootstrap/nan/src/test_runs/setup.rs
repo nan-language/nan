@@ -521,7 +521,7 @@ pub fn regression(ck: &Checker, test: ItemId, given: &[i128]) -> (Vec<String>, F
     };
     let syntax = data.syntax();
     let lines = syntax.item_lines(&syntax.items[data.index]);
-    let opener = data.line(item.body.token);
+    let opener = data.line(item.body.opener);
     let mut text = format!("\ntest {label} for {target} {{\n");
     for statement in &writer.statements {
         text.push_str(&format!("    {statement}\n"));

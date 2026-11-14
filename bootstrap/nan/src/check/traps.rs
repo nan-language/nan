@@ -112,7 +112,7 @@ impl Checker<'_> {
         let mut listed = HashSet::from([item]);
         let mut index = 0;
         while index < reachable.len() {
-            for dependency in self.dependencies(reachable[index]) {
+            for dependency in self.untraced(|| self.dependencies(reachable[index])) {
                 if listed.insert(dependency) {
                     reachable.push(dependency);
                 }

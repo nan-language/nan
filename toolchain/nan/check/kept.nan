@@ -1,7 +1,7 @@
 //! The snapshots of checks the build cache keeps: for a closure under a target, what checking a state gave each workspace item and the facts it derived of every item. A check of a state differing from a snapshot's in function bodies alone checks the items whose bodies changed and those whose own work read them, takes every other item's outcome from the snapshot, and keeps that result only when the items it checked give the facts the snapshot holds; otherwise it checks the state whole.
 
-/// A read of another item's body, typed, lowered, elaborated or with its obligations decided, or
-/// of the items it names, by an item's own work.
+/// A read of another item by an item's own work: of its body, typed, lowered, elaborated or with
+/// its obligations decided, or of the items it names.
 struct TracedRead derives Copy, Eq, Hash {
     reader: ty::ItemId
     read: ty::ItemId
@@ -31,8 +31,12 @@ struct PerformedBy derives Eq, Hash {
 struct Kept {
     /// The items whose outcomes a snapshot gives, by index: their own work reports nothing.
     restored: mem::OnceMap[u32, Unit]
+    /// The reads of another item's body.
     reads: mem::Arena[TracedRead]
     read_once: cell::Claims[TracedRead]
+    /// The reads of the items another item names.
+    names_reads: mem::Arena[TracedRead]
+    names_read_once: cell::Claims[TracedRead]
     fields: mem::Arena[FieldRead]
     field_once: cell::Claims[FieldRead]
     labels: mem::Arena[LabelOf]
@@ -54,6 +58,8 @@ fn Kept.empty(alloc: mem::Alloc) -> Kept {
         restored: mem::OnceMap[u32, Unit].empty(seed: 0, alloc),
         reads: mem::Arena[TracedRead].empty(alloc),
         read_once: cell::Claims[TracedRead].empty(alloc),
+        names_reads: mem::Arena[TracedRead].empty(alloc),
+        names_read_once: cell::Claims[TracedRead].empty(alloc),
         fields: mem::Arena[FieldRead].empty(alloc),
         field_once: cell::Claims[FieldRead].empty(alloc),
         labels: mem::Arena[LabelOf].empty(alloc),
@@ -72,12 +78,21 @@ fn Checker.is_restored(self, bits: u32) -> bool {
     return bits != NO_ID and self.state.contents().kept.restored.get(bits).is_some()
 } Checker.is_restored
 
-/// Records that the item whose own work is computed reads another item's body or names.
-fn Checker.trace_read(self, item: ty::ItemId) {
+/// The item whose own work is computed, when it reads another item's body or names as its own
+/// read.
+fn Checker.reader(self, item: ty::ItemId) -> Option[ty::ItemId] {
     let Some(reader) = self.traced() else {
-        return
+        return None
     }
-    if reader == item {
+    if reader == item or self.underway.contents().untraced.load() {
+        return None
+    }
+    return Some(reader)
+} Checker.reader
+
+/// Records that the item whose own work is computed reads another item's body.
+fn Checker.trace_read(self, item: ty::ItemId) {
+    let Some(reader) = self.reader(item) else {
         return
     }
     let kept = self.state.contents().kept
@@ -86,6 +101,28 @@ fn Checker.trace_read(self, item: ty::ItemId) {
         discard kept.reads.push(read)
     }
 } Checker.trace_read
+
+/// Records that the item whose own work is computed reads the items another item names.
+fn Checker.trace_names_read(self, item: ty::ItemId) {
+    let Some(reader) = self.reader(item) else {
+        return
+    }
+    let kept = self.state.contents().kept
+    let read = TracedRead(reader: reader, read: item)
+    if kept.names_read_once.claim(read) {
+        discard kept.names_reads.push(read)
+    }
+} Checker.trace_names_read
+
+/// Computes what a restored check takes from the items' heads or compares: what it reads of
+/// another item's body or names is not the traced item's read.
+fn Checker.untraced[T](self, compute: fn() -> T) -> T {
+    let untraced = self.underway.contents().untraced
+    let outer = untraced.swap(true)
+    let computed = compute()
+    untraced.store(outer)
+    return computed
+} Checker.untraced
 
 /// Records that the item whose own work is computed reads a struct's field.
 fn Checker.kept_field_read(self, owner: ty::ItemId, field: Str) {
@@ -238,6 +275,7 @@ struct Restoring {
     bytes: mem::Bytes
     outcomes: mem::HashMap[u32, ByteSpan]
     reads: mem::List[TracedRead]
+    names_reads: mem::List[TracedRead]
     files: mem::List[SnapshotFile]
     source: mem::Bytes
     greens: mem::HashMap[u32, ByteSpan]
@@ -1003,7 +1041,7 @@ fn Checker.outcome_items(self) -> mem::List[ty::ItemId] {
     return items
 } Checker.outcome_items
 
-const SNAPSHOT_HEADER: Str = "nan kept 1"
+const SNAPSHOT_HEADER: Str = "nan kept 2"
 
 /// The snapshot of the state the checker checked.
 fn Checker.snapshot(self, plan: Plan) -> mem::Bytes {
@@ -1061,6 +1099,7 @@ struct Snapshot {
     files: mem::List[SnapshotFile]
     seeds: mem::List[Seed]
     reads: mem::List[TracedRead]
+    names_reads: mem::List[TracedRead]
     greens: mem::HashMap[u32, ByteSpan]
     outcomes: mem::HashMap[u32, ByteSpan]
 } Snapshot
@@ -1109,19 +1148,14 @@ fn read_snapshot(bytes: Slice[u8], alloc: mem::Alloc) -> Option[Snapshot] {
         }
         mut seeds.push(take seed)
     }
-    var reads = mem::List[TracedRead].empty(alloc)
-    let read_count = mut cursor.count()
-    for _ in 0..<read_count {
-        let reader = mut cursor.item()
-        let read = mut cursor.item()
-        mut reads.push(TracedRead(reader: reader, read: read))
-    }
+    let reads = mut cursor.reads(alloc)
+    let names_reads = mut cursor.reads(alloc)
     let greens = mut cursor.green_spans(alloc)
     let outcomes = mut cursor.outcome_spans(alloc)
     if cursor.failed or cursor.at != bytes.len() {
         return None
     }
-    return Some(Snapshot(context: context, items: items, files: take files, seeds: take seeds, reads: take reads, greens: take greens, outcomes: take outcomes))
+    return Some(Snapshot(context: context, items: items, files: take files, seeds: take seeds, reads: take reads, names_reads: take names_reads, greens: take greens, outcomes: take outcomes))
 } read_snapshot
 
 /// A file of a package and an item's index among its items.
@@ -1454,6 +1488,20 @@ fn Checker.check_restored(self, state: mem::Shared[CheckState], key: hashing::Ha
             mut changed.push(item)
         }
     }
+    var renamed = ItemMarks.empty(alloc)
+    for item in changed {
+        let Some(held) = self.held_names(snapshot, bytes: bytes.view(), item) else {
+            return false
+        }
+        if not self.names_agree(item, held) {
+            discard mut renamed.insert(item)
+        }
+    }
+    for read in snapshot.names_reads {
+        if renamed.contains(read.read) {
+            mut changed.push(read.reader)
+        }
+    }
     let old = components(snapshot_edges(snapshot, alloc).view(), alloc)
     let marked = rechecked(snapshot, changed: changed.view(), old, alloc)
     let Some(restored) = self.restore(snapshot, bytes: bytes.view(), marked: marked.view(), moves: differences.moves) else {
@@ -1477,17 +1525,57 @@ fn Checker.check_restored(self, state: mem::Shared[CheckState], key: hashing::Ha
             None => {}
         }
     }
-    var reads = mem::List[TracedRead].empty(alloc)
-    for read in snapshot.reads {
-        if not marked[usize.widen(read.reader.index)] {
-            mut reads.push(read)
-        }
-    }
+    let reads = unmarked_reads(snapshot.reads.view(), marked: marked.view(), alloc)
+    let names_reads = unmarked_reads(snapshot.names_reads.view(), marked: marked.view(), alloc)
     let Restored(bytes: kept_bytes, outcomes: outcomes, greens: greens) = restored
-    discard self.state.contents().kept.plan.insert(0, value: mem::Shared.of(Plan(state: state.share(), restored: Some(Restoring(key: key, bytes: take kept_bytes, outcomes: take outcomes, reads: take reads, files: copied_files(snapshot.files.view(), alloc), source: take bytes, greens: take greens))), alloc))
+    discard self.state.contents().kept.plan.insert(0, value: mem::Shared.of(Plan(state: state.share(), restored: Some(Restoring(key: key, bytes: take kept_bytes, outcomes: take outcomes, reads: take reads, names_reads: take names_reads, files: copied_files(snapshot.files.view(), alloc), source: take bytes, greens: take greens))), alloc))
     self.check_all()
     return self.accepts(snapshot, facts, marked: marked.view(), old)
 } Checker.check_restored
+
+/// The items a snapshot's outcome of an item names, none within when it holds no outcome of the
+/// item or no names in it; none when its bytes hold no outcome where it says.
+fn Checker.held_names(self, snapshot: Snapshot, bytes: Slice[u8], item: ty::ItemId) -> Option[Option[mem::List[ty::ItemId]]] {
+    let alloc = self.alloc()
+    let Some(span) = snapshot.outcomes.get(item.index) else {
+        return Some(None)
+    }
+    let Some(held) = copied_span(bytes, span, alloc) else {
+        return None
+    }
+    let Some(outcome) = read_outcome(held.view(), item, alloc) else {
+        return None
+    }
+    return Some(take outcome.names)
+} Checker.held_names
+
+/// Whether the items an item names are those a snapshot's outcome of it names.
+fn Checker.names_agree(self, item: ty::ItemId, held: Option[mem::List[ty::ItemId]]) -> bool {
+    let Some(listed) = held else {
+        return false
+    }
+    let named = self.names(item)
+    if named.contents().len() != listed.len() {
+        return false
+    }
+    for name in listed {
+        if not named.contents().contains(name) {
+            return false
+        }
+    }
+    return true
+} Checker.names_agree
+
+/// The reads whose readers are not marked.
+fn unmarked_reads(reads: Slice[TracedRead], marked: Slice[bool], alloc: mem::Alloc) -> mem::List[TracedRead] {
+    var kept = mem::List[TracedRead].empty(alloc)
+    for read in reads {
+        if not marked[usize.widen(read.reader.index)] {
+            mut kept.push(read)
+        }
+    }
+    return kept
+} unmarked_reads
 
 /// A diagnostic's file, line and code, by which reported diagnostics are ordered.
 struct DiagnosticKey derives Eq, Hash {
@@ -1660,9 +1748,9 @@ fn Checker.wholly_checked(take self, take state: mem::Shared[CheckState]) -> Che
     return self
 } Checker.wholly_checked
 
-/// Writes the snapshot of the state the checker checked to the build cache, unless it holds it,
-/// makes it the latest of its closure under its target in its workspace, and deletes the one it
-/// restored from.
+/// Writes the snapshot of the state the checker checked to the build cache, unless it restored
+/// from it, makes it the latest of its closure under its target in its workspace, and deletes the
+/// one it restored from.
 fn Checker.keep(self) {
     let state = self.state.contents()
     let alloc = self.alloc()
@@ -1679,8 +1767,12 @@ fn Checker.keep(self) {
         return
     }
     let checked = plan.state.contents()
-    if cached_entry(user_cache, key: checked.key).is_none() {
-        let Ok(_) = attempt user_cache.put(checked.key, contents: self.snapshot(plan).view()) else {
+    let restored_here = match plan.restored {
+        Some(restoring) => restoring.key == checked.key
+        None => false
+    }
+    if not restored_here {
+        let Ok(_) = attempt user_cache.replace_entry(checked.key, contents: self.snapshot(plan).view()) else {
             return
         }
     }
@@ -1846,17 +1938,31 @@ fn put_shape(mut out: mem::Bytes, shape: FileShape) {
 
 /// The reads of other items the work of the items whose outcomes a snapshot keeps made.
 fn Checker.put_reads(self, mut out: mem::Bytes, plan: Plan) {
-    let db = self.db()
-    var reads = mem::List[TracedRead].empty(self.alloc())
+    let kept = self.state.contents().kept
+    let none = mem::List[TracedRead].empty(self.alloc())
     match plan.restored {
         Some(restoring) => {
-            for read in restoring.reads {
-                mut reads.push(read)
-            }
+            self.put_read_list(mut out, restored: restoring.reads.view(), recorded: kept.reads)
+            self.put_read_list(mut out, restored: restoring.names_reads.view(), recorded: kept.names_reads)
         }
-        None => {}
+        None => {
+            self.put_read_list(mut out, restored: none.view(), recorded: kept.reads)
+            self.put_read_list(mut out, restored: none.view(), recorded: kept.names_reads)
+        }
     }
-    for read in self.state.contents().kept.reads.cursor() {
+} Checker.put_reads
+
+/// Reads a snapshot keeps: those restored, and those recorded of items reported by readers not
+/// restored, by reader, each with the items it reads in order, each as the distance from the one
+/// before.
+fn Checker.put_read_list(self, mut out: mem::Bytes, restored: Slice[TracedRead], recorded: mem::Arena[TracedRead]) {
+    let db = self.db()
+    let alloc = self.alloc()
+    var reads = mem::List[TracedRead].empty(alloc)
+    for read in restored {
+        mut reads.push(read)
+    }
+    for read in recorded.cursor() {
         if not self.is_restored(read.reader.index) and db.is_reported(read.reader) and db.is_reported(read.read) {
             mut reads.push(read)
         }
@@ -1868,12 +1974,27 @@ fn Checker.put_reads(self, mut out: mem::Bytes, plan: Plan) {
         }
         return left.read.cmp(right.read)
     })
-    encoding::uvar(mut out, value: u64.widen(reads.len()))
-    for read in reads {
-        put_item(mut out, item: read.reader)
-        put_item(mut out, item: read.read)
+    var readers: usize = 0
+    for position in 0..<reads.len() {
+        if position == 0 or reads[position].reader != reads[position - 1].reader {
+            readers += 1
+        }
     }
-} Checker.put_reads
+    encoding::uvar(mut out, value: u64.widen(readers))
+    var position: usize = 0
+    while position < reads.len() {
+        let reader = reads[position].reader
+        var encoded = mem::Bytes.empty(alloc)
+        var last: u32 = 0
+        while position < reads.len() and reads[position].reader == reader {
+            encoding::uvar(mut encoded, value: u64.widen(reads[position].read.index - last))
+            last = reads[position].read.index
+            position += 1
+        }
+        put_item(mut out, item: reader)
+        encoding::bytes(mut out, value: encoded.view())
+    }
+} Checker.put_read_list
 
 /// The green entries the check gave or restored.
 fn Checker.put_greens(self, mut out: mem::Bytes) {
@@ -1956,6 +2077,35 @@ fn Checker.put_outcomes(self, mut out: mem::Bytes, plan: Plan) {
         encoding::bytes(mut out, value: fresh.view())
     }
 } Checker.put_outcomes
+
+/// Reads as `Checker.put_read_list` writes them.
+fn Cursor.reads(mut self, alloc: mem::Alloc) -> mem::List[TracedRead] {
+    var reads = mem::List[TracedRead].empty(alloc)
+    let reader_count = mut self.count()
+    for _ in 0..<reader_count {
+        let reader = mut self.item()
+        let length = mut self.count()
+        if self.failed or length > self.bytes.len() - self.at {
+            self.failed = true
+            return reads
+        }
+        let end = self.at + length
+        var read: u32 = 0
+        while self.at < end and not self.failed {
+            let step = mut self.small()
+            if step > ~0u32 - read {
+                self.failed = true
+                return reads
+            }
+            read += step
+            mut reads.push(TracedRead(reader: reader, read: ty::ItemId(index: read)))
+        }
+        if self.at != end {
+            self.failed = true
+        }
+    }
+    return reads
+} Cursor.reads
 
 fn Cursor.extent(mut self) -> Stretch {
     let start = mut self.small()

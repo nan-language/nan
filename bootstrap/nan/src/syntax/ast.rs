@@ -5,7 +5,7 @@ mod expr;
 mod item;
 mod visit;
 
-pub use item::lower;
+pub use item::{lower, lower_body};
 
 /// The index of a token of the item's file.
 pub type Tok = u32;
@@ -266,7 +266,8 @@ pub struct Clause {
 
 #[derive(Clone, Debug)]
 pub enum FnBody {
-    Block(Block),
+    /// A block, lowered when read.
+    Block(BodySyntax),
     Expr(Expr),
     /// A foreign fn's convention, or a std declaration's missing body.
     None,
@@ -483,7 +484,15 @@ pub struct TestItem {
     pub target: Path,
     pub member: Option<Name>,
     pub params: Option<Vec<Param>>,
-    pub body: Block,
+    pub body: BodySyntax,
+}
+
+/// Where a function's or a test's block body lies in its item's tree: its `{` and its `fn_body`
+/// node.
+#[derive(Clone, Copy, Debug)]
+pub struct BodySyntax {
+    pub opener: Tok,
+    pub node: crate::syntax::tree::NodeId,
 }
 
 #[derive(Clone, Debug)]

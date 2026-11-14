@@ -131,6 +131,11 @@ impl Cache {
         }
     }
 
+    /// Writes a cache entry under its key, replacing any there.
+    pub fn replace_entry(&self, key: &Hash, contents: &[u8]) -> io::Result<()> {
+        self.replace(&format!("entry-{}", key.full()), contents)
+    }
+
     /// Deletes a cache entry, if there.
     pub fn remove(&self, key: &Hash) -> io::Result<()> {
         let Some(dir) = &self.dir else {

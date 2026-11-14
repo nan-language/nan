@@ -713,7 +713,12 @@ impl Resolver<'_> {
             entries: &self.entries,
             current: appended,
         };
-        let alone = Workspace::from_files(self.workspace.root.clone(), &files, &mut store)?;
+        let alone = Workspace::from_files(
+            self.workspace.root.clone(),
+            &files,
+            &mut store,
+            &crate::workspace::Syntaxes::parsing(),
+        )?;
         Ok(check::authority_summaries(
             &alone,
             &alone.packages[0],

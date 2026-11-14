@@ -111,6 +111,9 @@ pub struct Checker<'a> {
     found: RefCell<Vec<Found>>,
     /// The item whose own work is being computed, if any.
     traced: Cell<Option<ItemId>>,
+    /// Whether what that work reads of another item's body or names is not its own read: one
+    /// a restored check takes from heads or compares.
+    untraced: Cell<bool>,
     /// The package being checked.
     package: Cell<Option<PackageId>>,
     /// The impl lines, by the type they target, once indexed.
@@ -250,6 +253,7 @@ impl<'a> Checker<'a> {
             sigs: RefCell::new(HashMap::new()),
             found: RefCell::new(Vec::new()),
             traced: Cell::new(None),
+            untraced: Cell::new(false),
             package: Cell::new(None),
             impls: RefCell::new(None),
             muted: Cell::new(0),
@@ -310,9 +314,13 @@ impl<'a> Checker<'a> {
 
     /// Computes part of an item's own work, as the item whose own work is traced.
     fn traced_as<T>(&self, item: ItemId, compute: impl FnOnce() -> T) -> T {
-        let outer = self.traced.replace(Some(item));
+        let outer = (
+            self.traced.replace(Some(item)),
+            self.untraced.replace(false),
+        );
         let computed = compute();
-        self.traced.set(outer);
+        self.traced.set(outer.0);
+        self.untraced.set(outer.1);
         computed
     }
 

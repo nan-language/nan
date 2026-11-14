@@ -1,23 +1,18 @@
 use super::*;
 use crate::syntax::file::parse;
 
-fn items(source: &str) -> Vec<Item> {
-    let file = parse(source.as_bytes().to_vec());
-    assert!(file.diagnostics.is_empty(), "{:?}", file.diagnostics);
-    file.items
-        .iter()
-        .filter_map(|item| lower(&file, item.tree.as_ref()?))
-        .collect()
-}
-
 fn returned(source: &str) -> Expr {
-    let items = items(&format!("//! Test.\n\n{source}"));
-    let ItemKind::Fn(item) = &items[0].kind else {
+    let file = parse(format!("//! Test.\n\n{source}").into_bytes());
+    assert!(file.diagnostics.is_empty(), "{:?}", file.diagnostics);
+    let tree = file.items[0].tree.as_ref().expect("a tree");
+    let item = lower(&file, tree).expect("an item");
+    let ItemKind::Fn(item) = &item.kind else {
         panic!("a function");
     };
-    let FnBody::Block(block) = &item.body else {
+    let FnBody::Block(body) = &item.body else {
         panic!("a block body");
     };
+    let block = lower_body(&file, tree, *body);
     let StmtKind::Expr(Expr {
         kind: ExprKind::Return(Some(value)),
         ..

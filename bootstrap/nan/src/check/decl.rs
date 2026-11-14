@@ -340,10 +340,10 @@ impl Checker<'_> {
                         self.check_stack_bound(item, &fn_sig.limits, !fixed);
                     }
                     let block = match &function.body {
-                        ast::FnBody::Block(block) => Some(block),
+                        ast::FnBody::Block(block) => Some(self.lowered_body(item, *block)),
                         _ => None,
                     };
-                    self.check_thresholds(item, &function.clauses, block);
+                    self.check_thresholds(item, &function.clauses, block.as_ref());
                     match function.modifier.map(|(modifier, _)| modifier) {
                         Some(FnModifier::Validator) => self.check_validator(item, fn_sig),
                         Some(FnModifier::Migrate) => {

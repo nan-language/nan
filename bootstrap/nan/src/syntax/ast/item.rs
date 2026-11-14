@@ -12,6 +12,11 @@ pub fn lower(file: &SourceFile, tree: &Tree) -> Option<Item> {
     Lower { file, tree }.item()
 }
 
+/// The abstract syntax of a function's or a test's block body, from its item's tree.
+pub fn lower_body(file: &SourceFile, tree: &Tree, body: BodySyntax) -> Block {
+    Lower { file, tree }.fn_body(body.opener, body.node)
+}
+
 /// A view of one item's tree over its file, with the lowering of each rule.
 #[derive(Clone, Copy)]
 pub(super) struct Lower<'a> {
@@ -452,7 +457,7 @@ impl<'a> Lower<'a> {
                 .rev()
                 .find(|token| self.kind(*token) == TokenKind::Punct(Punct::LBrace))
                 .expect("a body opens");
-            FnBody::Block(self.fn_body(opener, body))
+            FnBody::Block(BodySyntax { opener, node: body })
         } else if let Some(expr) = self.find(end, Rule::Expr) {
             FnBody::Expr(self.expr(expr))
         } else {
@@ -932,7 +937,10 @@ impl<'a> Lower<'a> {
             params: self
                 .find(node, Rule::TestParams)
                 .map(|params| self.params(self.find(params, Rule::ParamList))),
-            body: self.fn_body(opener, self.find(node, Rule::FnBody).expect("a test body")),
+            body: BodySyntax {
+                opener,
+                node: self.find(node, Rule::FnBody).expect("a test body"),
+            },
         }
     }
 

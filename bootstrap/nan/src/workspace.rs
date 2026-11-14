@@ -22,7 +22,9 @@ pub use manifest::{
 };
 pub use modules::Module;
 
+use crate::cache::Cache;
 use crate::diagnostic::{Code, Diagnostic, Reason};
+use crate::hash::Hash;
 use crate::syntax::ast;
 use crate::syntax::file::{SourceFile, parse, parse_std};
 use crate::syntax::grammar::Rule;
@@ -73,6 +75,8 @@ pub struct File {
     /// The index of the file's module, none for `package.nan`.
     pub module: Option<usize>,
     pub syntax: SourceFile,
+    /// The hash of its contents.
+    pub content: Hash,
     /// Whether it holds a module's history tombstones: the history with every other line blank,
     /// so that each tombstone keeps its line.
     pub history: bool,
@@ -81,11 +85,12 @@ pub struct File {
 }
 
 impl File {
-    fn new(path: String, module: Option<usize>, syntax: SourceFile) -> File {
+    fn new(path: String, module: Option<usize>, (syntax, content): (SourceFile, Hash)) -> File {
         File {
             path,
             module,
             syntax,
+            content,
             history: false,
             lowered: OnceLock::new(),
         }
@@ -116,6 +121,52 @@ pub fn root(current: &Path) -> PathBuf {
     {
         Some(outermost) => outermost.parent().unwrap_or(outermost).to_path_buf(),
         None => current.to_path_buf(),
+    }
+}
+
+/// Where the syntax of source files comes from: the build cache of the user directory, when it
+/// holds the syntax of a file's bytes under the toolchain hash, and otherwise parsing them, after
+/// which the cache receives it.
+pub struct Syntaxes(Option<(Cache, Hash)>);
+
+impl Syntaxes {
+    /// Syntax from the build cache of the user directory, when it has a usable one.
+    pub fn cached() -> Syntaxes {
+        let cache = Cache::open().ok().and_then(Result::ok);
+        Syntaxes(cache.map(|cache| (cache, crate::toolchain::hash(1))))
+    }
+
+    /// Syntax from parsing alone.
+    pub fn parsing() -> Syntaxes {
+        Syntaxes(None)
+    }
+
+    /// The syntax of a source file's bytes, parsed as a std package's file when `std` holds,
+    /// with the hash of the bytes.
+    fn parsed(&self, source: Vec<u8>, std: bool) -> (SourceFile, Hash) {
+        let content = Hash::of(&source);
+        let parse = |source| match std {
+            true => parse_std(source),
+            false => parse(source),
+        };
+        let Some((cache, toolchain)) = &self.0 else {
+            return (parse(source), content);
+        };
+        let mut keyed = b"syntax\n".to_vec();
+        keyed.extend_from_slice(&toolchain.0);
+        keyed.push(u8::from(std));
+        keyed.extend_from_slice(&content.0);
+        let key = Hash::of(&keyed);
+        let source = match cache.entry(&key) {
+            Ok(Ok(Some(held))) => match crate::syntax::stored::decoded(&held, source) {
+                Ok(file) => return (file, content),
+                Err(source) => source,
+            },
+            _ => source,
+        };
+        let file = parse(source);
+        let _ = cache.put(&key, &file.stored());
+        (file, content)
     }
 }
 
@@ -169,10 +220,11 @@ pub fn holds_package(root: &Path) -> io::Result<bool> {
 fn loaded(
     layout: &[Found],
     source: &mut dyn FnMut(&str) -> io::Result<Vec<u8>>,
+    syntaxes: &Syntaxes,
 ) -> io::Result<Vec<Arc<Package>>> {
     layout
         .iter()
-        .map(|found| Package::load(found.clone(), source).map(Arc::new))
+        .map(|found| Package::load(found.clone(), source, syntaxes).map(Arc::new))
         .collect()
 }
 
@@ -207,7 +259,7 @@ impl Workspace {
             read.push(path.to_owned());
             fs::read(root.join(path))
         };
-        let packages = loaded(&layout, &mut source)?;
+        let packages = loaded(&layout, &mut source, &Syntaxes::cached())?;
         Workspace::build(
             root.clone(),
             layout,
@@ -270,7 +322,9 @@ impl Workspace {
             .iter()
             .enumerate()
             .map(|(index, found)| match touched.contains(&index) {
-                true => Package::load(found.clone(), &mut source).map(Arc::new),
+                true => {
+                    Package::load(found.clone(), &mut source, &Syntaxes::parsing()).map(Arc::new)
+                }
                 false => Ok(Arc::clone(&self.packages[index])),
             })
             .collect::<io::Result<_>>()?;
@@ -287,22 +341,28 @@ impl Workspace {
     /// The workspace of in-memory files, each given by its path relative to `root`: each file
     /// belongs to the package of the nearest directory at or above it holding a `package.nan`.
     pub fn of_files(root: PathBuf, files: &[(&str, &[u8])]) -> Workspace {
-        Workspace::from_files(root, files, &mut HeldReleases(&[], &[]))
-            .expect("in-memory files read without failing")
+        Workspace::from_files(
+            root,
+            files,
+            &mut HeldReleases(&[], &[]),
+            &Syntaxes::cached(),
+        )
+        .expect("in-memory files read without failing")
     }
 
     /// The workspace of in-memory files as `of_files` places them, its locks reading releases
     /// from the local store.
     pub fn of_stored_files(root: PathBuf, files: &[(&str, &[u8])]) -> io::Result<Workspace> {
-        Workspace::from_files(root, files, &mut UserStore::default())
+        Workspace::from_files(root, files, &mut UserStore::default(), &Syntaxes::cached())
     }
 
     /// The workspace of in-memory files as `of_files` places them, its locks reading releases
-    /// through `store`.
+    /// through `store`, their syntax from `syntaxes`.
     pub fn from_files(
         root: PathBuf,
         files: &[(&str, &[u8])],
         store: &mut dyn closure::Store,
+        syntaxes: &Syntaxes,
     ) -> io::Result<Workspace> {
         let mut layout: Vec<Found> = files
             .iter()
@@ -338,7 +398,7 @@ impl Workspace {
                 .expect("a file of the workspace");
             Ok(bytes.to_vec())
         };
-        let packages = loaded(&layout, &mut source)?;
+        let packages = loaded(&layout, &mut source, syntaxes)?;
         Workspace::build(root, layout, packages, stray, &mut source, store)
     }
 
@@ -685,7 +745,11 @@ fn history_files(machine: &Machine, modules: &[Module]) -> Vec<File> {
             text.push('\n');
             File {
                 history: true,
-                ..File::new(loaded.path.clone(), Some(index), parse(text.into_bytes()))
+                ..File::new(
+                    loaded.path.clone(),
+                    Some(index),
+                    Syntaxes::parsing().parsed(text.into_bytes(), false),
+                )
             }
         })
         .collect()
@@ -842,12 +906,13 @@ impl Package {
     fn load(
         mut found: Found,
         source: &mut dyn FnMut(&str) -> io::Result<Vec<u8>>,
+        syntaxes: &Syntaxes,
     ) -> io::Result<Package> {
         found.sources.sort();
         let manifest_path = format!("{}/package.nan", found.dir);
-        let syntax = parse(source(&manifest_path)?);
+        let syntax = syntaxes.parsed(source(&manifest_path)?, false);
         let mut diagnostics = Vec::new();
-        let manifest = Manifest::read(&syntax, &manifest_path, &mut diagnostics);
+        let manifest = Manifest::read(&syntax.0, &manifest_path, &mut diagnostics);
         let mut files = vec![File::new(manifest_path.clone(), None, syntax)];
         if let Some(manifest) = &manifest {
             for link in &found.links {
@@ -869,10 +934,7 @@ impl Package {
                 .collect::<io::Result<_>>()?;
             let parsed = on_processors(sources.len(), |index| {
                 let source = std::mem::take(&mut *sources[index].lock().expect("a source"));
-                match std {
-                    true => parse_std(source),
-                    false => parse(source),
-                }
+                syntaxes.parsed(source, std)
             });
             for ((path, module), syntax) in found.sources.iter().zip(assigned).zip(parsed) {
                 files.push(File::new(path.clone(), Some(module), syntax));
@@ -938,7 +1000,7 @@ impl Package {
                 .map(|(_, content)| content.to_vec())
                 .ok_or_else(|| io::Error::other("a release's file"))
         };
-        Package::load(found, &mut source)
+        Package::load(found, &mut source, &Syntaxes::parsing())
     }
 
     /// Reports every `package` item outside `package.nan`, and every item of `package.nan` but

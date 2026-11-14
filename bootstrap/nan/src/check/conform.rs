@@ -84,7 +84,7 @@ pub type ImplIndex = Rc<HashMap<TypeKey, Vec<ItemId>>>;
 
 impl Checker<'_> {
     /// The impl lines of the database, by the type they target.
-    fn impl_index(&self) -> ImplIndex {
+    pub(super) fn impl_index(&self) -> ImplIndex {
         if let Some(index) = self.impls.borrow().as_ref() {
             return index.clone();
         }
@@ -1149,7 +1149,7 @@ impl Checker<'_> {
 
     /// Whether an instantiation of `target` that `holder` writes meets its `where` conditions.
     fn where_met(&self, holder: ItemId, target: ItemId, args: &Args) -> bool {
-        let Some(unit) = self.unit(target) else {
+        let Some(unit) = self.untraced(|| self.unit(target)) else {
             return true;
         };
         let conditions: Vec<u32> = unit

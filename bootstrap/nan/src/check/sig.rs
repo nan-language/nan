@@ -803,11 +803,15 @@ impl Checker<'_> {
         let module = self.db.module_of(function);
         let name = &head.label.name.text;
         self.about(Some(function), || {
-            self.db
-                .module(module)
-                .items
-                .iter()
-                .copied()
+            let candidates: Vec<ItemId> = match self.db.recording() {
+                true => self.db.module(module).items.clone(),
+                false => (self.impl_index().get(&key).into_iter().flatten())
+                    .copied()
+                    .filter(|line| self.db.module_of(*line) == module)
+                    .collect(),
+            };
+            candidates
+                .into_iter()
                 .filter(|&line| {
                     let ItemKind::Impl(implementation) = &self.db.ast(line).kind else {
                         return false;

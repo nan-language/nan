@@ -10,5 +10,6 @@ pub mod items;
 pub mod lexer;
 pub mod literal;
 pub mod parser;
+pub mod stored;
 pub mod token;
 pub mod tree;

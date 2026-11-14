@@ -350,7 +350,7 @@ impl Checker<'_> {
         }
         let mut facts = Vec::new();
         for holder in holders {
-            let Some(unit) = self.unit(holder) else {
+            let Some(unit) = self.untraced(|| self.unit(holder)) else {
                 continue;
             };
             let generics = self.sig(holder).generics.clone();

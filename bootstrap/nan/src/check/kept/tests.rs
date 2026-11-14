@@ -19,10 +19,11 @@ fn a_check_after_a_body_edit_checks_again_only_the_items_reaching_it() {
     let [(_, checker)] = checkers.as_slice() else {
         panic!("one checker");
     };
-    let restored: Vec<String> = (checker.kept.restored.borrow().iter())
+    let mut restored: Vec<String> = (checker.kept.restored.borrow().iter())
         .filter_map(|item| checker.canonical_path(*item))
         .collect();
-    assert_eq!(restored, ["app::pages"]);
+    restored.sort();
+    assert_eq!(restored, ["app::frames", "app::pages"]);
     let whole = scope_checkers(&workspace, crate::stdlib::packages(), &Scope::Workspace);
     for (_, checker) in &whole {
         checker.check_all();

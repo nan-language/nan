@@ -330,7 +330,7 @@ impl Checker<'_> {
     /// with its Env's abandon method for one naming `sys::Component`. It reads no other item's
     /// facts as a subject's.
     pub fn names(&self, item: ItemId) -> Rc<BTreeSet<ItemId>> {
-        self.trace_read(item);
+        self.trace_names_read(item);
         if let Some(named) = self.named.borrow().get(&item) {
             return named.clone();
         }

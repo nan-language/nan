@@ -523,7 +523,11 @@ fn authoring_completes_signs_hints_and_classes() {
             .collect()
     };
     assert_eq!(labels(1), ["level", "level_of", "limit", "raised"]);
-    assert_eq!(labels(2), ["Range", "raised"], "a local and the core vocabulary");
+    assert_eq!(
+        labels(2),
+        ["Range", "raised"],
+        "a local and the core vocabulary"
+    );
     assert_eq!(labels(3), ["Gauge", "Leveled", "STEP", "total"]);
     let signed = result(&written, 4);
     assert_eq!(

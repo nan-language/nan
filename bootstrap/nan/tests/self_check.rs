@@ -358,7 +358,12 @@ fn front(toolchain: &Toolchain, dir: &Path, given: &Given, args: &[&str]) -> Res
 }
 
 /// The command running a NaN toolchain in `dir` as `front` starts it, its standard input empty.
-fn fronted(toolchain: &Toolchain, dir: &Path, given: &Given, args: &[&str]) -> Result<Command, String> {
+fn fronted(
+    toolchain: &Toolchain,
+    dir: &Path,
+    given: &Given,
+    args: &[&str],
+) -> Result<Command, String> {
     fs::create_dir_all(given.home).map_err(|error| error.to_string())?;
     let processors = match given.spread {
         true => affinity()
@@ -1713,18 +1718,36 @@ fn session(uri: &str) -> Vec<u8> {
         format!(r#"{document},"position":{{"line":{line},"character":{character}}}"#)
     };
     let changed = |text: &str| {
-        format!(r#"{{"method":"textDocument/didChange","params":{{{document},"contentChanges":[{{"text":{}}}]}}}}"#, quoted(text))
+        format!(
+            r#"{{"method":"textDocument/didChange","params":{{{document},"contentChanges":[{{"text":{}}}]}}}}"#,
+            quoted(text)
+        )
     };
     let written = |line: &str| text.replace("raised(STEP)\n", &format!("raised(STEP)\n{line}\n"));
-    let broken = text.replace("raised(STEP)", "raised(STEP)?").replace("level_of()\n", "level_of()  \n");
+    let broken = text
+        .replace("raised(STEP)", "raised(STEP)?")
+        .replace("level_of()\n", "level_of()  \n");
     let range = r#""range":{"start":{"line":0,"character":0},"end":{"line":40,"character":0}}"#;
     let item = |name: &str, kind: u32, lines: (u32, u32), selection: (u32, u32)| {
-        format!(r#""item":{{"name":"{name}","kind":{kind},"uri":"{file}","range":{{"start":{{"line":{},"character":0}},"end":{{"line":{},"character":0}}}},"selectionRange":{{"start":{{"line":{},"character":{}}},"end":{{"line":{},"character":{}}}}}}}"#, lines.0, lines.1, selection.0, selection.1, selection.0, selection.1 + 1)
+        format!(
+            r#""item":{{"name":"{name}","kind":{kind},"uri":"{file}","range":{{"start":{{"line":{},"character":0}},"end":{{"line":{},"character":0}}}},"selectionRange":{{"start":{{"line":{},"character":{}}},"end":{{"line":{},"character":{}}}}}}}"#,
+            lines.0,
+            lines.1,
+            selection.0,
+            selection.1,
+            selection.0,
+            selection.1 + 1
+        )
     };
     let mut messages = vec![
-        format!(r#"{{"id":0,"method":"initialize","params":{{"rootUri":"{uri}","capabilities":{{}}}}}}"#),
+        format!(
+            r#"{{"id":0,"method":"initialize","params":{{"rootUri":"{uri}","capabilities":{{}}}}}}"#
+        ),
         r#"{"method":"initialized","params":{}}"#.to_owned(),
-        format!(r#"{{"method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{file}","text":{}}}}}}}"#, quoted(&broken)),
+        format!(
+            r#"{{"method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{file}","text":{}}}}}}}"#,
+            quoted(&broken)
+        ),
         format!(r#"{{"id":1,"method":"textDocument/codeAction","params":{{{document},{range}}}}}"#),
         changed(text),
         format!(r#"{{"id":2,"method":"textDocument/formatting","params":{{{document}}}}}"#),
@@ -1749,24 +1772,38 @@ fn session(uri: &str) -> Vec<u8> {
     messages.extend([
         format!(r#"{{"id":20,"method":"textDocument/documentSymbol","params":{{{document}}}}}"#),
         r#"{"id":21,"method":"workspace/symbol","params":{"query":"level"}}"#.to_owned(),
-        format!(r#"{{"id":22,"method":"callHierarchy/incomingCalls","params":{{{}}}}}"#, item("Gauge.raised", 6, (21, 24), (21, 13))),
-        format!(r#"{{"id":23,"method":"callHierarchy/outgoingCalls","params":{{{}}}}}"#, item("total", 12, (26, 29), (26, 7))),
+        format!(
+            r#"{{"id":22,"method":"callHierarchy/incomingCalls","params":{{{}}}}}"#,
+            item("Gauge.raised", 6, (21, 24), (21, 13))
+        ),
+        format!(
+            r#"{{"id":23,"method":"callHierarchy/outgoingCalls","params":{{{}}}}}"#,
+            item("total", 12, (26, 29), (26, 7))
+        ),
     ]);
     let partial = [
         ("textDocument/completion", "    let x = gauge."),
         ("textDocument/completion", "    let y = ra"),
         ("textDocument/completion", "    let z = app::"),
         ("textDocument/signatureHelp", "    let w = gauge.raised("),
-        ("textDocument/signatureHelp", "    let v = gauge.raised(1, by: "),
+        (
+            "textDocument/signatureHelp",
+            "    let v = gauge.raised(1, by: ",
+        ),
     ];
     for (id, (method, line)) in (24..).zip(partial) {
         messages.push(changed(&written(line)));
-        messages.push(format!(r#"{{"id":{id},"method":"{method}","params":{{{}}}}}"#, at(28, line.len() as u32)));
+        messages.push(format!(
+            r#"{{"id":{id},"method":"{method}","params":{{{}}}}}"#,
+            at(28, line.len() as u32)
+        ));
     }
     messages.extend([
         changed(text),
         format!(r#"{{"id":30,"method":"textDocument/inlayHint","params":{{{document},{range}}}}}"#),
-        format!(r#"{{"id":31,"method":"textDocument/semanticTokens/full","params":{{{document}}}}}"#),
+        format!(
+            r#"{{"id":31,"method":"textDocument/semanticTokens/full","params":{{{document}}}}}"#
+        ),
         r#"{"id":32,"method":"textDocument/unknown","params":{}}"#.to_owned(),
         r#"{"id":33,"method":"shutdown"}"#.to_owned(),
         r#"{"method":"exit"}"#.to_owned(),
@@ -1783,8 +1820,10 @@ fn session(uri: &str) -> Vec<u8> {
 fn language_server(_: &Utf8Path, _: String) -> datatest_stable::Result<()> {
     let store = fresh_store("self-check-language-server")?;
     let toolchain = Toolchain::new(image()?);
-    let dir =
-        std::env::temp_dir().join(format!("nan-self-check-language-server-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "nan-self-check-language-server-{}",
+        std::process::id()
+    ));
     drop(fs::remove_dir_all(&dir));
     for (path, text) in SERVED {
         fs::create_dir_all(dir.join(path).parent().expect("a package directory"))?;
@@ -1808,7 +1847,11 @@ fn language_server(_: &Utf8Path, _: String) -> datatest_stable::Result<()> {
     if !ran.stderr.is_empty() {
         return Err(String::from_utf8_lossy(&ran.stderr).into_owned().into());
     }
-    agree(&["lsp"], (&expected, Some(status)), (&ran.stdout, ran.status.flatten()))?;
+    agree(
+        &["lsp"],
+        (&expected, Some(status)),
+        (&ran.stdout, ran.status.flatten()),
+    )?;
     fs::remove_dir_all(dir)?;
     Ok(())
 }

@@ -1,0 +1,102 @@
+name: Windows toolchain
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: The release tag naming the images to upload; none uploads nothing
+        type: string
+        default: ''
+
+jobs:
+  toolchain:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-2025
+            rust: x86_64-pc-windows-msvc
+          - arch: aarch64
+            runner: windows-11-arm
+            rust: aarch64-pc-windows-msvc
+    name: toolchain-${{ matrix.arch }}-windows
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.arch }}-windows
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain
+        working-directory: bootstrap
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          if (-not (Get-Command rustup -ErrorAction Ignore)) {
+            $installer = "$env:RUNNER_TEMP\rustup-init.exe"
+            Invoke-WebRequest "https://static.rust-lang.org/rustup/dist/${{ matrix.rust }}/rustup-init.exe" -OutFile $installer
+            & $installer -y --default-toolchain none --profile minimal
+            "$HOME\.cargo\bin" >> $env:GITHUB_PATH
+            $env:PATH = "$HOME\.cargo\bin;$env:PATH"
+          }
+          rustup toolchain install
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            bootstrap/target
+          key: windows-${{ matrix.arch }}-${{ hashFiles('bootstrap/rust-toolchain.toml', 'bootstrap/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: windows-${{ matrix.arch }}-${{ hashFiles('bootstrap/rust-toolchain.toml', 'bootstrap/Cargo.lock') }}-
+      - name: Build the bootstrap
+        working-directory: bootstrap
+        run: cargo build --release -q -p nan
+      # The copies of the workspace declare the Windows target of the runner's architecture, and
+      # their lock approves the escapes of the platform library's Windows variant.
+      - name: Declare the Windows target of the runner's architecture
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $manifest = "$env:GITHUB_WORKSPACE\toolchain\nan\package.nan"
+          $declared = [IO.File]::ReadAllText($manifest)
+          $retargeted = $declared.Replace("`n    targets x86_64-linux`n", "`n    targets $env:TARGET`n")
+          if ($retargeted -eq $declared) { throw "the toolchain's manifest lacks targets x86_64-linux" }
+          [IO.File]::WriteAllText($manifest, $retargeted)
+          Push-Location toolchain
+          & "$env:GITHUB_WORKSPACE\bootstrap\target\release\nan.exe" dep approve nan
+          Pop-Location
+      # Each stage builds a fresh copy of toolchain/ with an empty user directory, so that no
+      # stage reuses another's proofs; the second and third stages must be equal byte for byte,
+      # and the bootstrap's stage comparison must accept the second.
+      - name: Build the NaN toolchain three times
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          function Stage($builder, $name) {
+            Remove-Item -Recurse -Force -ErrorAction Ignore "$HOME\.nan", "$env:RUNNER_TEMP\$name"
+            Copy-Item -Recurse toolchain "$env:RUNNER_TEMP\$name"
+            Push-Location "$env:RUNNER_TEMP\$name"
+            & $builder build nan
+            Pop-Location
+            Copy-Item "$env:RUNNER_TEMP\$name\.nan\images\$env:TARGET\nan.exe" "$env:RUNNER_TEMP\$name.exe"
+          }
+          $bootstrap = "$env:GITHUB_WORKSPACE\bootstrap\target\release\nan.exe"
+          Stage $bootstrap first
+          Stage "$env:RUNNER_TEMP\first.exe" second
+          Stage "$env:RUNNER_TEMP\second.exe" third
+          if ((Get-FileHash "$env:RUNNER_TEMP\second.exe").Hash -ne (Get-FileHash "$env:RUNNER_TEMP\third.exe").Hash) {
+            throw 'the second and third stages differ'
+          }
+          Remove-Item -Recurse -Force -ErrorAction Ignore "$HOME\.nan", "$env:RUNNER_TEMP\compared"
+          Copy-Item -Recurse toolchain "$env:RUNNER_TEMP\compared"
+          Push-Location "$env:RUNNER_TEMP\compared"
+          & $bootstrap build nan --compare-with "$env:RUNNER_TEMP\second.exe"
+          Pop-Location
+          if ('${{ inputs.tag }}') {
+            Copy-Item "$env:RUNNER_TEMP\second.exe" "nan-${{ inputs.tag }}-$env:TARGET.exe"
+          }
+      - if: inputs.tag != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: nan-${{ inputs.tag }}-${{ env.TARGET }}
+          path: nan-${{ inputs.tag }}-${{ env.TARGET }}.exe
+          if-no-files-found: error

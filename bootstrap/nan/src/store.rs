@@ -3,14 +3,14 @@
 //! exclusive lock on `store/write`, and never removed or rewritten. An entry holds its release's
 //! artefact with the source tree its attestation hashes.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, ErrorKind, Write as _};
-use std::os::unix::fs::OpenOptionsExt as _;
 
 use crate::artefact::{self, read_bytes, read_uvar};
 use crate::cache::{Exposed, StoreDir};
 use crate::encoding::{Record, bytes, list, uvar};
 use crate::hash::{Hash, blake3};
+use crate::system;
 
 /// A release class, in the order identical, additive, breaking.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -414,11 +414,10 @@ impl Store {
                 "the user database gives no home directory",
             ));
         };
-        let lock = OpenOptions::new()
+        let lock = system::private_file()
             .create(true)
             .truncate(false)
             .write(true)
-            .mode(0o600)
             .open(dir.join("write"))?;
         let locked: File = lock;
         locked.lock()?;
@@ -451,11 +450,10 @@ impl Store {
         };
         let contents = entry.encoded();
         let fresh = dir.join(format!(".{}.{}", entry.index, std::process::id()));
-        let mut file = OpenOptions::new()
+        let mut file = system::private_file()
             .write(true)
             .create(true)
             .truncate(true)
-            .mode(0o600)
             .open(&fresh)?;
         file.write_all(&contents)?;
         file.write_all(&blake3(&contents))?;

@@ -6,6 +6,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
+use crate::system;
+
 /// The advisory lock a command holds while it reads or writes workspace files.
 pub struct Lock {
     _file: File,
@@ -66,7 +68,7 @@ pub fn apply(root: &Path, changes: &[(String, Option<Vec<u8>>)]) -> io::Result<(
     journal.extend(COMPLETE);
     let path = journal_path(root);
     write_synced(&path, &journal)?;
-    sync_directory(&root.join(".nan"))?;
+    system::sync_dir(&root.join(".nan"))?;
     replace(root, &journal)?;
     fs::remove_file(path)
 }
@@ -85,17 +87,13 @@ pub fn replace_alone(root: &Path, path: &str, content: &[u8]) -> io::Result<()> 
     let new = directory.join(format!(".{name}.{}.new", std::process::id()));
     write_synced(&new, content)?;
     fs::rename(&new, &target)?;
-    sync_directory(directory)
+    system::sync_dir(directory)
 }
 
 fn write_synced(path: &Path, content: &[u8]) -> io::Result<()> {
     let mut file = File::create(path)?;
     file.write_all(content)?;
     file.sync_all()
-}
-
-fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
 }
 
 /// Performs the replacements of a complete journal left by an interrupted command.
@@ -165,7 +163,7 @@ fn replace(root: &Path, journal: &[u8]) -> io::Result<()> {
     }
     directories
         .iter()
-        .try_for_each(|directory| sync_directory(directory))
+        .try_for_each(|directory| system::sync_dir(directory))
 }
 
 #[cfg(test)]

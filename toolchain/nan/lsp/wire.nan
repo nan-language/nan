@@ -1,0 +1,163 @@
+//! The base protocol's framing over standard input and output: each message a header block, ended by an empty line, whose `Content-Length` gives the byte length of its JSON content.
+
+/// The largest content a message may hold.
+const LARGEST: usize = 67_108_864
+
+/// The most bytes one read of standard input takes.
+const CHUNK: usize = 65_536
+
+/// Standard input as read so far: the bytes not yet taken, from `at`, and whether its end was
+/// reached.
+pkg struct Input {
+    held: mem::Bytes
+    at: usize
+    ended: bool
+} Input
+
+pkg fn Input.empty(alloc: mem::Alloc) -> Input {
+    return Input(held: mem::Bytes.empty(alloc), at: 0, ended: false)
+} Input.empty
+
+/// Reads more of standard input, keeping only the bytes not yet taken; false at its end.
+fn Input.fill(mut self, alloc: mem::Alloc) -> bool fails platform::IoError {
+    if self.ended {
+        return false
+    }
+    let more = try platform::os::read_stdin_some(CHUNK, alloc)
+    if more.len() == 0 {
+        self.ended = true
+        return false
+    }
+    var kept = mem::Bytes.empty(alloc)
+    for index in self.at..<self.held.len() {
+        mut kept.push(self.held[index])
+    }
+    mut kept.append(more.view())
+    self.held = kept
+    self.at = 0
+    return true
+} Input.fill
+
+/// The next line, without its line end; what is left before the end of the input as the last;
+/// none at the end.
+fn Input.line(mut self, alloc: mem::Alloc) -> Option[mem::Bytes] fails platform::IoError {
+    var scanned = self.at
+    loop {
+        while scanned < self.held.len() {
+            if self.held[scanned] == b'\n' {
+                return Some(mut self.taken(scanned, skip: 1, alloc))
+            }
+            scanned += 1
+        }
+        let unread = scanned - self.at
+        if not try mut self.fill(alloc) {
+            if self.at == self.held.len() {
+                return None
+            }
+            return Some(mut self.taken(self.held.len(), skip: 0, alloc))
+        }
+        scanned = self.at + unread
+    }
+} Input.line
+
+/// The bytes from `at` up to `end`, which are taken with the `skip` bytes after them.
+fn Input.taken(mut self, end: usize, skip: usize, alloc: mem::Alloc) -> mem::Bytes {
+    var taken = mem::Bytes.empty(alloc)
+    for index in self.at..<end {
+        mut taken.push(self.held[index])
+    }
+    self.at = end + skip
+    return taken
+} Input.taken
+
+/// The content of the next message, none at the end of the input or after a header block giving
+/// no valid `Content-Length`.
+pkg fn Input.message(mut self, alloc: mem::Alloc) -> Option[mem::Bytes] fails platform::IoError {
+    var length: Option[usize] = None
+    loop {
+        let Some(line) = try mut self.line(alloc) else {
+            return None
+        }
+        var header = line.view()
+        if header.len() > 0 and header[header.len() - 1] == b'\r' {
+            let Some(kept) = header.prefix(header.len() - 1) else {
+                return None
+            }
+            header = kept
+        }
+        if header.len() == 0 {
+            break
+        }
+        if is_content_length(header) {
+            length = header_value(header)
+        }
+    }
+    let Some(size) = length else {
+        return None
+    }
+    if size > LARGEST {
+        return None
+    }
+    while self.held.len() - self.at < size {
+        if not try mut self.fill(alloc) {
+            return None
+        }
+    }
+    return Some(mut self.taken(self.at + size, skip: 0, alloc))
+} Input.message
+
+/// Whether a header line starts with `Content-Length:`, in any case.
+fn is_content_length(header: Slice[u8]) -> bool {
+    let name = b"content-length:"
+    if header.len() < name.len() {
+        return false
+    }
+    for index in 0..<name.len() {
+        var byte = header[index]
+        if byte >= b'A' and byte <= b'Z' {
+            byte += 32
+        }
+        if byte != name[index] {
+            return false
+        }
+    }
+    return true
+} is_content_length
+
+/// The number a `Content-Length` header gives after its name, spaces around it.
+fn header_value(header: Slice[u8]) -> Option[usize] {
+    var value: usize = 0
+    var digits: usize = 0
+    var ended = false
+    for index in 15..<header.len() {
+        let byte = header[index]
+        if byte == b' ' or byte == b'\t' {
+            ended = digits > 0
+            continue
+        }
+        if byte < b'0' or byte > b'9' or ended {
+            return None
+        }
+        let Some(scaled) = value.checked_mul(10) else {
+            return None
+        }
+        let Some(next) = scaled.checked_add(usize.widen(byte - b'0')) else {
+            return None
+        }
+        value = next
+        digits += 1
+    }
+    if digits == 0 {
+        return None
+    }
+    return Some(value)
+} header_value
+
+/// Writes a message holding `content` to standard output.
+pkg fn write(content: Str, alloc: mem::Alloc) fails platform::IoError {
+    var framed = text::String.empty(alloc)
+    let length = content.byte_len()
+    mut framed.write(text::fmt("Content-Length: {length}\r\n\r\n", length), budget: 64)
+    mut framed.append(content)
+    try platform::os::write_stdout(framed.as_bytes())
+} write

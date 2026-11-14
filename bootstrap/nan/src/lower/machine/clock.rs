@@ -607,7 +607,7 @@ impl Lowering<'_, '_> {
             )[0];
             fx.when(due, |fx| {
                 timers::disarm(self, fx, first);
-                claim(fx, first);
+                timers::claim(fx, first);
             });
             self.call_routine(fx, Routine::Unlock, &[lock]);
             fx.when(due, |fx| {
@@ -649,32 +649,8 @@ impl Lowering<'_, '_> {
     /// Cancels a timer of the clock that is armed and has not expired: it leaves the timers and
     /// completes cancelled.
     pub fn kernel_cancel(&mut self, fx: &mut Fx, op: Value) {
-        let claimed = self.kernel_claim(fx, op);
-        fx.when(claimed, |fx| self.kernel_cancelled(fx, op));
-    }
-
-    /// Takes a timer of the clock that is armed and has not expired out of the timers, giving
-    /// whether it did so; its cancelled completion is then the caller's to deliver.
-    pub fn kernel_claim(&mut self, fx: &mut Fx, op: Value) -> Value {
-        let state_address = self.state(fx);
-        let lock = fx.offset(state_address, state::TIMER_LOCK);
-        self.call_routine(fx, Routine::Lock, &[lock]);
-        let done = fx.load(PTR, op, operation::DONE);
-        let pending = fx.b.ins().icmp_imm_s(IntCC::Equal, done, 0);
-        let order = fx.load(PTR, op, operation::ORDER);
-        let armed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, order, 0);
-        let in_flight = fx.b.ins().band(pending, armed);
-        fx.when(in_flight, |fx| {
-            timers::disarm(self, fx, op);
-            claim(fx, op);
-        });
-        self.call_routine(fx, Routine::Unlock, &[lock]);
-        in_flight
-    }
-
-    /// Delivers the cancelled completion of a timer the caller claimed.
-    pub fn kernel_cancelled(&mut self, fx: &mut Fx, op: Value) {
-        tasks::deliver_cancelled(self, fx, op);
+        let claimed = timers::claim_armed(self, fx, op);
+        fx.when(claimed, |fx| tasks::deliver_cancelled(self, fx, op));
     }
 
     /// Reads the target's wall clock source: whether it gave a time, and that time in
@@ -763,12 +739,6 @@ impl Lowering<'_, '_> {
         let data = fx.ptr(CMOS_DATA);
         self.port_in(fx, 1, data)
     }
-}
-
-/// Marks a timer taken out of the timers as completed, so no other CPU delivers it.
-fn claim(fx: &mut Fx, op: Value) {
-    let completed = fx.ptr(operation::COMPLETED as u64);
-    fx.store(completed, op, operation::DONE);
 }
 
 /// The seconds since the Unix epoch of a time from 2000 on: its year, month, day, hour, minute

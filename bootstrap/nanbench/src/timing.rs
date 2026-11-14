@@ -68,7 +68,7 @@ pub fn take(repository: &Path, dir: &Path) -> Result<Times, String> {
         return Err(format!("nan build hostbench reports\n{built}"));
     }
     let host = times(&pinned(
-        &host.join(".nan/images/x86_64-host/hostbench"),
+        &host.join(".nan/images/x86_64-linux/hostbench"),
         &host,
     )?);
     let kernel = kernel(&bench.join("kernel"), &work.join("kernel"))?;

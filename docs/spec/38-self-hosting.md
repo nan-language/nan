@@ -8,13 +8,13 @@ The **bootstrap** is the [implementation](00-charter.md#conformance) written in 
 
 - The bootstrap implements all of language 1: every rule on every [target](27-program-model.md#targets), every [command](33-toolchain.md#commands), the [prover](20-prover.md#procedure) and the [interpreter](21-interpreter.md#interpreter). It passes every conformance test.
 - The bootstrap implements language 1 only; no later language version applies to it. Until the [freeze](#milestones), each change to language 1 lands in the bootstrap and the NaN toolchain together; after it, the bootstrap does not change. It is the independent compiler against which the first toolchain built by itself is checked by [stage comparison](36-builds.md#stage-comparison).
-- Cranelift emits the objects of lowering, freestanding for the machine targets, each function in its [calling convention](23-low-level.md#calling-conventions). The [linker](27-program-model.md#images) of each host target links its images from them, and the bootstrap's own image writer links the others.
+- Cranelift emits the objects of lowering, freestanding for the machine targets, each function in its [calling convention](23-low-level.md#calling-conventions). The [linker](27-program-model.md#images) of each Linux target links its images from them, and the bootstrap's own image writer links the others.
 - The bootstrap's `stack_switch` [support routine](27-program-model.md#runtime-support) switches task stacks with Cranelift's stack switching on x86_64 and with a compiler stub of its own on AArch64.
 - Cranelift is the backend whose reported frame sizes the [stack limits](10-effects-digests.md#stack-limits) check reads.
 
 ### NaN toolchain
 
-The **NaN toolchain** is a program written in NaN that implements every [command](33-toolchain.md#commands) on every target. Its workspace declares `x86_64-host`, and a copy of it declaring `aarch64-host` instead builds it for that target; its lowering emits machine code through a code generator of its own, whose reported frame sizes its [stack limits](10-effects-digests.md#stack-limits) check reads.
+The **NaN toolchain** is a program written in NaN that implements every [command](33-toolchain.md#commands) on every target. Its workspace declares `x86_64-linux`, and a copy of it declaring `aarch64-linux` instead builds it for that target; its lowering emits machine code through a code generator of its own, whose reported frame sizes its [stack limits](10-effects-digests.md#stack-limits) check reads.
 
 - For every workspace and command line, the NaN toolchain prints what the bootstrap prints, exits with the same status and writes the same source and machine files; each image it writes behaves as the bootstrap's image of that build does.
 

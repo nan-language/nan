@@ -15,13 +15,13 @@
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
-use super::super::Lowering;
 use super::super::body::{Body, Held};
 use super::super::call::Called;
 use super::super::fx::{Fx, PTR};
 use super::super::runtime::tables::{self, RESOLUTION, entry, kind, live_entry};
 use super::super::runtime::{Routine, holdings, seeded, tasks, timers};
 use super::super::transfer;
+use super::super::{Lowering, host};
 use super::Supply;
 use super::render;
 use super::served;
@@ -91,7 +91,8 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "sys::Runner" => runner(lo, fx, supply),
         "sys::fs::File" | "sys::net::Listener" | "sys::net::Conn" => resource(lo, fx, supply),
         "sys::revocable" | "sys::Revoker" => revocation(lo, fx, supply),
-        "host_platform::submit" => submit(lo, fx, supply),
+        "linux_platform::submit" => submit(lo, fx, supply),
+        path if path.starts_with("windows_platform::") => windows_platform(lo, fx, supply),
         _ => return false,
     }
     true
@@ -480,10 +481,15 @@ fn clock(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
                 supply.done(lo, fx);
             });
             let delay = clock_delay(lo, fx, minted, resolution, ns);
-            if lo.seeded() || lo.kernel() {
-                let cancelled = sims::wait(lo, fx, None, |lo, fx, op| match lo.seeded() {
-                    true => seeded::arm(lo, fx, op, delay),
-                    false => lo.kernel_arm(fx, op, delay),
+            if lo.seeded() || lo.kernel() || lo.windows() {
+                let cancelled = sims::wait(lo, fx, None, |lo, fx, op| {
+                    if lo.seeded() {
+                        seeded::arm(lo, fx, op, delay);
+                    } else if lo.windows() {
+                        host::windows::arm(lo, fx, op, delay);
+                    } else {
+                        lo.kernel_arm(fx, op, delay);
+                    }
                 });
                 fx.when(cancelled, |fx| sims::fail_cancelled(lo, fx, supply));
                 supply.done(lo, fx);
@@ -994,7 +1000,65 @@ fn revocation(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     }
 }
 
-/// `host_platform::submit(entry)`: the operation's result once its completion arrives.
+/// The operations `windows_platform` declares without a body: `call`, a call of the function
+/// at an address with nine arguments under the system's calling convention; `generate`, the
+/// system's random bytes; `associate`, the association of a handle with the completion port;
+/// and `transfer`, `accept` and `connect`, the requests a task waits for, whose result they
+/// give.
+fn windows_platform(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let scalar = |index: usize| supply.param(index).scalar();
+    let name = supply.path.trim_start_matches("windows_platform::");
+    match name {
+        "call" => {
+            let args: Vec<Value> = (1..10).map(scalar).collect();
+            let result = lo.call_address(fx, scalar(0), &args, types::I64);
+            supply.ret(lo, fx, Held::Scalar(result));
+            return;
+        }
+        "generate" => {
+            let args = [scalar(0), scalar(1)];
+            lo.call_system(fx, "bcryptprimitives.dll!ProcessPrng", &args, &[types::I32]);
+            supply.done(lo, fx);
+            return;
+        }
+        "associate" => {
+            let associated = host::windows::associate(lo, fx, scalar(0));
+            supply.ret(lo, fx, Held::Scalar(associated));
+            return;
+        }
+        _ => {}
+    }
+    let request = |fx: &mut Fx, kind: i64| fx.int(types::I64, kind);
+    let args = match name {
+        "transfer" => {
+            let writes = fx.b.ins().uextend(types::I64, scalar(3));
+            let blocking = fx.b.ins().uextend(types::I64, scalar(4));
+            let blocking = fx.b.ins().ishl_imm_s(blocking, 1);
+            let kind = fx.b.ins().bor(writes, blocking);
+            let len = fx.b.ins().uextend(types::I64, scalar(2));
+            let none = fx.ptr(0);
+            [kind, scalar(0), scalar(1), len, none]
+        }
+        "accept" => {
+            let kind = request(fx, host::windows::request::ACCEPT);
+            [kind, scalar(1), scalar(0), scalar(2), scalar(3)]
+        }
+        "connect" => {
+            let kind = request(fx, host::windows::request::CONNECT);
+            let len = fx.b.ins().uextend(types::I64, scalar(3));
+            [kind, scalar(1), scalar(0), scalar(2), len]
+        }
+        name => panic!("no lowering of windows_platform::{name}"),
+    };
+    let results = lo.call_routine(fx, Routine::Request, &args);
+    fx.when(results[0], |fx| {
+        let origin = super::tasks::origin(lo, fx);
+        super::tasks::fail_cancelled(lo, fx, supply, origin);
+    });
+    supply.ret(lo, fx, Held::Scalar(results[1]));
+}
+
+/// `linux_platform::submit(entry)`: the operation's result once its completion arrives.
 fn submit(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let entry = supply.param(0).address();
     let results = lo.call_routine(fx, Routine::IoSubmit, &[entry]);

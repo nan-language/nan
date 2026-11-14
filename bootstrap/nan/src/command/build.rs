@@ -1,7 +1,6 @@
 //! The commands that perform final builds, and build bundles: `nan build` and `nan run`.
 
 use std::io;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -11,27 +10,32 @@ use crate::emulator::{self, Boots, Machine};
 use crate::final_build;
 use crate::output::{Output, Record, Verdict};
 use crate::scope::Scope;
+use crate::system;
 use crate::workspace::{Kind, Target, Workspace};
 
-/// What `nan run` starts once it has built an image: the image on a host target, the emulator
-/// booting it on a machine target, and its arguments.
+/// What `nan run` starts once it has built an image: the image on a host target, Wine running it
+/// for a Windows target on Linux, the emulator booting it on a machine target; its arguments and
+/// the environment variables it sets.
 pub struct Launch {
     pub program: PathBuf,
     pub args: Vec<String>,
+    pub env: Vec<(&'static str, &'static str)>,
     /// The machine directory of the emulator, whose end gives the run's status; none for an
     /// image.
     pub machine: Option<Machine>,
 }
 
 impl Launch {
-    /// Starts the program: the image replaces this process, so that termination requests reach
+    /// Starts the program: the image takes this process over, so that termination requests reach
     /// it and its status is the run's; the emulator runs as a child, and the status the run ends
     /// with is given once it ends.
     pub fn start(&self) -> i32 {
         if let Some(machine) = &self.machine {
             return emulator::run(self, machine);
         }
-        let error = Command::new(&self.program).args(&self.args).exec();
+        let mut command = Command::new(&self.program);
+        command.args(&self.args).envs(self.env.iter().copied());
+        let error = system::hand_over(command);
         panic!("starting {}: {error}", self.program.display());
     }
 }
@@ -100,9 +104,19 @@ pub fn run(
                 emulator::launch(target, &path, &files, boots())?
             }
             Some(Kind::Bare) => emulator::launch(target, &path, &[], boots())?,
+            Some(Kind::Windows) if Kind::running() == Kind::Linux => Launch {
+                program: PathBuf::from(emulator::WINE),
+                args: [path.to_string_lossy().into_owned()]
+                    .into_iter()
+                    .chain(invocation.passed.iter().cloned())
+                    .collect(),
+                env: vec![emulator::WINE_QUIET],
+                machine: None,
+            },
             _ => Launch {
                 program: path,
                 args: invocation.passed.to_vec(),
+                env: Vec::new(),
                 machine: None,
             },
         };

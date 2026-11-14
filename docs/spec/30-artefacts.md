@@ -1,6 +1,6 @@
 # Artefacts
 
-This chapter defines artefacts with their attestation files, code roots, the sections signing them, the host ELF section `.nan`, releases with their release checks, lowering with type layout, niche packing and the ABI, the interface files of kernels and the bundles built against them, and host symbol names.
+This chapter defines artefacts with their attestation files, code roots, the sections signing them, the host sections, releases with their release checks, lowering with type layout, niche packing and the ABI, the interface files of kernels and the bundles built against them, and host symbol names.
 
 ## Artefacts
 
@@ -96,9 +96,9 @@ An artefact **verifies** when every signature it holds [verifies](31-trust.md#si
 
 - An artefact of a locked release that the locking package does not accept is an error (`artefact.bad-signature`), and its release is not read: a signature by a principal the package does not trust, by another key under a trusted principal's name, or sections stripped from or added to the release its lock records.
 
-## Host ELF section
+## Host sections
 
-Every image of a host target's [final build](27-program-model.md#final-builds) holds exactly one ELF section named `.nan`, of type `SHT_PROGBITS`, with no flags and alignment 1. Its content is a list of bytes, one per package of the final closure, std included, in byte order of package name, each holding that package's artefact. A package checked from source contributes the artefact of its current state, and a release the artefact its local store entry holds, whose attestation file hashes the source tree it was checked from. It also holds exactly one ELF section named `.nan.tree`, of the same type, flags and alignment, holding the hash of the encoding of the list of the code roots of the artefacts of its `.nan` section, in that section's order.
+Every image of a host target's [final build](27-program-model.md#final-builds) holds exactly one **host section** named `.nan`: on a Linux target an ELF section of type `SHT_PROGBITS`, with no flags and alignment 1, and on a Windows target a PE section of initialised, discardable, readable data, after the sections of its segments and its base relocations. Its content is a list of bytes, one per package of the final closure, std included, in byte order of package name, each holding that package's artefact. A package checked from source contributes the artefact of its current state, and a release the artefact its local store entry holds, whose attestation file hashes the source tree it was checked from. It also holds exactly one host section holding the hash of the encoding of the list of the code roots of the artefacts of its `.nan` section, in that section's order, named `.nan.tree` on a Linux target and `.nantree` on a Windows target, whose section names hold at most 8 bytes.
 
 The runtime never reads these sections; a toolchain written in NaN reads its own image's for its [toolchain hash](36-builds.md#toolchain-hash). Images of the machine targets hold no artefact.
 

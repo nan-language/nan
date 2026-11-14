@@ -1,4 +1,4 @@
-//! The image writer: links the relocatable object of a machine target's lowering into its image, a PE32+ EFI application on a UEFI target, a static ELF64 executable on a bare target, or a bundle. It lays the object's sections out in segments, one per access kind, resolves its symbols and applies its relocations.
+//! The image writer: links the relocatable object of a Windows or machine target's lowering into its image, a PE32+ console program on a Windows target, a PE32+ EFI application on a UEFI target, a static ELF64 executable on a bare target, or a bundle. It lays the object's sections out in segments, one per access kind, resolves its symbols and applies its relocations.
 
 /// The size of a page, to which every segment is aligned.
 const PAGE: u64 = 4_096
@@ -26,19 +26,24 @@ pkg const RELOCATION_HEADER: Str = "_NSrelocs"
 
 pkg const RELOCATION_HEADER_BYTES: usize = 40
 
-/// The image of a machine target linking an object lowering wrote, entered at the symbol `entry`.
+/// The image of a Windows or machine target linking an object lowering wrote, entered at the
+/// symbol `entry`.
 pkg fn write(target: workspace::Target, object: Slice[u8], entry: Str, alloc: mem::Alloc) -> mem::Bytes {
     let Some(arch) = target.arch() else {
         expect false
         return mem::Bytes.empty(alloc)
     }
     match target.kind() {
+        Some(workspace::Kind.Windows) => {
+            let linked = link(object, base: pe_base(Program.Console), imports: Imports.Table, alloc)
+            return pe_write(linked, entry: linked.symbol(entry), arch, program: Program.Console, alloc)
+        }
         Some(workspace::Kind.Uefi) => {
-            let linked = link(object, base: PE_BASE, importing: false, alloc)
-            return pe_write(linked, entry: linked.symbol(entry), arch, alloc)
+            let linked = link(object, base: pe_base(Program.Efi), imports: Imports.None, alloc)
+            return pe_write(linked, entry: linked.symbol(entry), arch, program: Program.Efi, alloc)
         }
         Some(workspace::Kind.Bare) => {
-            let linked = link(object, base: elf_base(arch), importing: false, alloc)
+            let linked = link(object, base: elf_base(arch), imports: Imports.None, alloc)
             return elf_write(linked, entry: linked.symbol(entry), arch, alloc)
         }
         else => {
@@ -47,6 +52,32 @@ pkg fn write(target: workspace::Target, object: Slice[u8], entry: Str, alloc: me
         }
     }
 } write
+
+/// How a link treats the symbols an object leaves undefined: none is left undefined; a bundle's
+/// absolute addresses of one are imports, and its calls of one go through an import stub after
+/// the object's code; a Windows image's are each an `IMPORT_PREFIX` symbol naming a word of the
+/// import address table, which the system's loader fills with the address of the function it
+/// names.
+enum Imports derives Copy, Eq {
+    None
+    Bundle
+    Table
+} Imports
+
+/// The prefix of the symbol naming the import address table's word of a function a Windows image
+/// imports, followed by the function's name for a function of `KERNEL32`, and otherwise by its
+/// library's name, `!` and its name.
+pkg const IMPORT_PREFIX: Str = "__imp_"
+
+/// The library a Windows image imports a function from when its symbol names none.
+const KERNEL32: Str = "kernel32.dll"
+
+/// A function a Windows image imports: its library, its name and the symbol naming its word.
+struct Named {
+    library: text::String
+    function: text::String
+    symbol: text::String
+} Named
 
 /// What a segment's memory permits beside reading.
 enum Access derives Copy, Eq {
@@ -67,12 +98,15 @@ fn Segment.contains(self, address: u64) -> bool = address >= self.address and ad
 
 /// An object linked at an address: its segments, the address of each of its symbols, the
 /// address of each 8-byte absolute address its relocations wrote, and each word holding the
-/// address of a symbol it imports.
+/// address of a symbol it imports; a Windows image's words are its import address table, the
+/// last segment, where each library's functions follow each other in order and end with a zero
+/// word, and each name is the library's, `!` and the function's.
 struct Linked {
     segments: mem::List[Segment]
     symbols: mem::Map[text::String, u64]
     absolute: mem::List[u64]
     imports: mem::List[Import]
+    unallocated: mem::List[Unallocated]
 } Linked
 
 /// The address of a word holding the address of a symbol an object imports, and its name.
@@ -234,13 +268,12 @@ fn next_multiple_of(value: u64, multiple: u64) -> u64 {
     return value + (multiple - rest)
 } next_multiple_of
 
-/// Links an object with its first segment at `base`. Only a bundle, when `importing`, leaves
-/// symbols undefined: each absolute address of one is an import, and each call of one goes
-/// through an import stub after the object's code.
-fn link(object: Slice[u8], base: u64, importing: bool, alloc: mem::Alloc) -> Linked {
-    let read_object = read(object, alloc)
+/// Links an object with its first segment at `base`, treating its undefined symbols as `imports`
+/// says.
+fn link(object: Slice[u8], base: u64, imports: Imports, alloc: mem::Alloc) -> Linked {
+    var read_object = read(object, alloc)
     let called = called_imports(read_object, alloc)
-    expect importing or called.len() == 0
+    expect imports == Imports.Bundle or called.len() == 0
     var placed = mem::List[Option[u64]].empty(alloc)
     for _ in read_object.sections {
         mut placed.push(None)
@@ -253,10 +286,14 @@ fn link(object: Slice[u8], base: u64, importing: bool, alloc: mem::Alloc) -> Lin
         stubs = segments[0].address + segments[0].size - u64.widen(called.len()) * IMPORT_STUB_BYTES
     }
     next = add_segment(mut segments, mut placed, sections, address: next, access: Access.Read, stubs: 0, alloc)
-    discard add_segment(mut segments, mut placed, sections, address: next, access: Access.Write, stubs: 0, alloc)
-    var imports = mem::List[Import].empty(alloc)
+    next = add_segment(mut segments, mut placed, sections, address: next, access: Access.Write, stubs: 0, alloc)
+    var imported = mem::List[Import].empty(alloc)
     for index in 0..<called.len() {
-        mut imports.push(Import(address: stubs + u64.widen(index) * IMPORT_STUB_BYTES + 8, name: text::String.of(called[index].as_str(), alloc)))
+        mut imported.push(Import(address: stubs + u64.widen(index) * IMPORT_STUB_BYTES + 8, name: text::String.of(called[index].as_str(), alloc)))
+    }
+    var table = mem::Map[text::String, u64].empty(alloc)
+    if imports == Imports.Table {
+        mut segments.push(import_table(read_object, at: next, mut imported, mut table, alloc))
     }
     var symbols = mem::Map[text::String, u64].empty(alloc)
     for symbol in read_object.symbols {
@@ -291,24 +328,20 @@ fn link(object: Slice[u8], base: u64, importing: bool, alloc: mem::Alloc) -> Lin
             let place = start + relocation.offset
             var target: i64 = 0
             if undefined(symbol) {
-                match called.position(fn(name: text::String) => name == symbol.name) {
-                    Some(stub) => {
-                        target = i64.from_bits(stubs + u64.widen(stub) * IMPORT_STUB_BYTES) + relocation.addend
-                    }
-                    None => {
-                        expect importing and (relocation.kind == ABS64 or relocation.kind == A64_ABS64)
-                        mut imports.push(Import(address: place, name: text::String.of(symbol.name.as_str(), alloc)))
-                        continue
-                    }
+                let Some(imported_at) = import_target(called, table, name: symbol.name.as_str(), stubs) else {
+                    expect imports == Imports.Bundle and (relocation.kind == ABS64 or relocation.kind == A64_ABS64)
+                    mut imported.push(Import(address: place, name: text::String.of(symbol.name.as_str(), alloc)))
+                    continue
                 }
+                target = i64.from_bits(imported_at) + relocation.addend
             } else {
                 target = i64.from_bits(address_of(symbol, placed: placed.view())) + relocation.addend
             }
             mut segment.relocate(at: place, kind: relocation.kind, target, mut absolute)
         }
     }
-    mut imports.sort_by(import_order)
-    var linked = Linked(segments: take segments, symbols: take symbols, absolute: take absolute, imports: take imports)
+    mut imported.sort_by(import_order)
+    var linked = Linked(segments: take segments, symbols: take symbols, absolute: take absolute, imports: take imported, unallocated: take read_object.unallocated)
     mut linked.record_relocations(base, alloc)
     mut linked.record_extent(base)
     mut linked.record_segments(alloc)
@@ -318,6 +351,40 @@ fn link(object: Slice[u8], base: u64, importing: bool, alloc: mem::Alloc) -> Lin
 
 /// Whether a symbol is one the object leaves undefined.
 fn undefined(symbol: Symbol) -> bool = symbol.section.is_none() and not symbol.name.is_empty()
+
+/// The address an undefined symbol's relocation reaches: the import stub of a function the
+/// object calls, which `stubs` begin, or the import address table's word of a Windows image's
+/// import; none for a bundle's import, which its loader resolves.
+fn import_target(called: mem::List[text::String], table: mem::Map[text::String, u64], name: Str, stubs: u64) -> Option[u64] {
+    match called.position(fn(known: text::String) => known.as_str() == name) {
+        Some(stub) => return Some(stubs + u64.widen(stub) * IMPORT_STUB_BYTES)
+        None => {}
+    }
+    return table.get_by(fn(key: text::String) => key.as_str().cmp(name))
+} import_target
+
+/// Lays out a Windows image's import address table at `at`, after its other segments: the words
+/// of each library's functions, which a zero word ends, each recorded in `imported` with its
+/// library and in `table` by the symbol naming it; gives the table's segment.
+fn import_table(read_object: Object, at: u64, mut imported: mem::List[Import], mut table: mem::Map[text::String, u64], alloc: mem::Alloc) -> Segment {
+    let named = table_imports(read_object, alloc)
+    var word = at
+    for index in 0..<named.len() {
+        if index > 0 and named[index - 1].library != named[index].library {
+            word += 8
+        }
+        var name = text::String.of(named[index].library.as_str(), alloc)
+        mut name.append("!")
+        mut name.append(named[index].function.as_str())
+        mut imported.push(Import(address: word, name: take name))
+        discard mut table.insert(text::String.of(named[index].symbol.as_str(), alloc), value: word)
+        word += 8
+    }
+    let words = word + 8 - at
+    var zeros = mem::Bytes.empty(alloc)
+    object::resize(mut zeros, length: usize.widen(words))
+    return Segment(address: at, access: Access.Write, bytes: take zeros, size: words)
+} import_table
 
 /// The names of the undefined symbols an object calls, in the order of their first calls.
 fn called_imports(read_object: Object, alloc: mem::Alloc) -> mem::List[text::String] {
@@ -334,6 +401,59 @@ fn called_imports(read_object: Object, alloc: mem::Alloc) -> mem::List[text::Str
     }
     return called
 } called_imports
+
+/// The functions a Windows image imports through the relocations of its object, each once, in
+/// the order of their libraries, names and symbols.
+fn table_imports(read_object: Object, alloc: mem::Alloc) -> mem::List[Named] {
+    var named = mem::List[Named].empty(alloc)
+    for section in read_object.sections {
+        for relocation in section.relocations {
+            expect relocation.symbol < read_object.symbols.len()
+            let symbol = read_object.symbols[relocation.symbol]
+            if not undefined(symbol) or named.position(fn(known: Named) => known.symbol == symbol.name).is_some() {
+                continue
+            }
+            let whole = symbol.name.as_str()
+            expect whole.starts_with(IMPORT_PREFIX)
+            let Some(import) = whole.slice_bytes(IMPORT_PREFIX.byte_len(), end: whole.byte_len()) else {
+                expect false
+                continue
+            }
+            var library = text::String.of(KERNEL32, alloc)
+            var function = text::String.of(import, alloc)
+            match import.find("!") {
+                Some(split) => {
+                    let Some(head) = import.slice_bytes(0, end: split) else {
+                        expect false
+                        continue
+                    }
+                    let Some(tail) = import.slice_bytes(split + 1, end: import.byte_len()) else {
+                        expect false
+                        continue
+                    }
+                    library = text::String.of(head, alloc)
+                    function = text::String.of(tail, alloc)
+                }
+                None => {}
+            }
+            mut named.push(Named(library: take library, function: take function, symbol: text::String.of(whole, alloc)))
+        }
+    }
+    mut named.sort_by(named_order)
+    return named
+} table_imports
+
+fn named_order(left: Named, right: Named) -> core::Ordering {
+    let library = left.library.as_str().cmp(right.library.as_str())
+    if library != core::Ordering.Equal {
+        return library
+    }
+    let function = left.function.as_str().cmp(right.function.as_str())
+    if function != core::Ordering.Equal {
+        return function
+    }
+    return left.symbol.as_str().cmp(right.symbol.as_str())
+} named_order
 
 fn import_order(left: Import, right: Import) -> core::Ordering {
     if left.address != right.address {

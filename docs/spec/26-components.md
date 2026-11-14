@@ -416,7 +416,7 @@ pub fn Gate.on(mut self, take message: Message, mut env: Env, mut cx: sys::Cx[Me
 
 package pulse {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } pulse
 
@@ -513,7 +513,7 @@ A call `host::Runner[S].run(env, exec, alloc, body: b)` runs these steps:
 
 package meter {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } meter
 
@@ -567,7 +567,7 @@ test measure_totals_every_frame for measure {
 
 package gauge {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } gauge
 
@@ -726,7 +726,7 @@ pub fn Stepper.abandon(take self)
 
 package tally {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
 } tally
 
 // file: tally/tally.nan
@@ -909,7 +909,7 @@ A reader that its holder restores from a checkpoint re-arms its poll, which the 
 
 package reader {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
 } reader
 
 // file: reader/reader.nan
@@ -1291,7 +1291,7 @@ pub closed enum CallError[E: Send] derives Render {
 
 package cell {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
 } cell
 
 // file: cell/cell.nan
@@ -1523,7 +1523,7 @@ pub closed enum Refused derives Render, Encode {
 
 package counter {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     dep refusals "../refusals"
     allow validate in counter
 } counter
@@ -1583,7 +1583,7 @@ pub fn serve(
 
 package probe {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     dep refusals "../refusals"
 } probe
 
@@ -1615,7 +1615,7 @@ pub protocol Adder {
 
 package link {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     dep counter "../counter"
     dep probe "../probe"
     dep refusals "../refusals"
@@ -1730,7 +1730,7 @@ A handle record carries values and handles together, here a reading with the clo
 
 package stamps {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     allow validate in stamps
 } stamps
 

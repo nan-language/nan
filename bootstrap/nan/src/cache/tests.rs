@@ -11,7 +11,7 @@ fn a_record_reads_back_until_damaged_or_exposed() {
         store: None,
         keys: None,
         home: scratch.0.clone(),
-        uid: running_user().expect("a user id"),
+        uid: system::running_user().expect("a user id"),
     };
     let read = |name: &str| match cache.record(name).expect("a readable record") {
         Ok(contents) => Ok(contents),
@@ -38,7 +38,7 @@ fn a_secret_key_is_written_once_for_its_user_alone() {
         store: None,
         keys: Some(scratch.0.join("keys")),
         home: scratch.0.clone(),
-        uid: running_user().expect("a user id"),
+        uid: system::running_user().expect("a user id"),
     };
     let written = |seed: &[u8; 32]| match cache.new_key("ana", seed).expect("a key written") {
         Ok(made) => made,

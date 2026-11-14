@@ -1,7 +1,9 @@
 //! The program harness: builds each program of `tests/programs` and compares what its image
 //! writes with the program's `expected` file, whose first line states the exit status. A host
-//! program runs as a process, writing standard output then standard error; one for another
-//! architecture than this machine's is only built. A machine program boots under its emulator,
+//! program runs as a process, writing standard output then standard error: a Windows program as
+//! `nan run` launches it under Wine, in a Wine prefix of its own made first. One for another
+//! architecture than this machine's, or a Windows program where Wine does not run, is only
+//! built. A machine program boots under its emulator,
 //! writing the serial port until it ends the emulator through the exit port; on a UEFI target the
 //! firmware writes first, so its output only ends with the expected text. A machine program with an
 //! `emulator` file boots once per line of it, the line's words added to the emulator's arguments.
@@ -78,6 +80,41 @@ fn run_host(root: &Path, target: &str, name: &str) -> std::io::Result<(i32, Stri
     let mut written = String::from_utf8_lossy(&run.stdout).into_owned();
     written.push_str(&String::from_utf8_lossy(&run.stderr));
     Ok((run.status.code().unwrap_or(-1), written))
+}
+
+/// Runs a Windows program's image as `nan run` launches it, under Wine in a prefix of its own
+/// that Wine sets up first, giving its exit status and what it writes; none when `nan run`
+/// launches nothing, the program being for another architecture or Wine not running.
+fn run_windows(
+    tmp: &Path,
+    root: &Path,
+    name: &str,
+) -> datatest_stable::Result<Option<(i32, String)>> {
+    let run = nan::run(&["run".to_owned(), name.to_owned()], root);
+    let Some(launch) = run.launch else {
+        if !run.output.is_empty() {
+            return Err(format!("nan run {name} reports\n{}", run.output).into());
+        }
+        return Ok(None);
+    };
+    fs::create_dir_all(tmp.join("wine"))?;
+    let prefix = tmp.join("wine").join(name);
+    let wine = |args: &[String]| {
+        let mut command = Command::new(&launch.program);
+        command
+            .args(args)
+            .envs(launch.env.iter().copied())
+            .env("WINEPREFIX", &prefix)
+            .current_dir(root);
+        command
+    };
+    if !prefix.exists() {
+        wine(&["wineboot".to_owned(), "--init".to_owned()]).output()?;
+    }
+    let run = wine(&launch.args).output()?;
+    let mut written = String::from_utf8_lossy(&run.stdout).into_owned();
+    written.push_str(&String::from_utf8_lossy(&run.stderr));
+    Ok(Some((run.status.code().unwrap_or(-1), written)))
 }
 
 /// Whether this machine has the extensions of a codegen level.
@@ -199,9 +236,21 @@ fn program(path: &Utf8Path, expected: String) -> datatest_stable::Result<()> {
     let target = target(&root.join(name))?;
     let bundles = bundles(&root, name, &target)?;
     let mut runs = Vec::new();
-    match target.strip_suffix("-host") {
-        Some(arch) if arch != std::env::consts::ARCH => {}
-        Some(_) => {
+    let (arch, kind) = target.rsplit_once('-').expect("a concrete target");
+    match kind {
+        "linux" if arch != std::env::consts::ARCH => {}
+        "windows" => {
+            if let Some((status, written)) = run_windows(&tmp, &root, name)? {
+                runs.push((
+                    String::new(),
+                    status,
+                    written,
+                    wanted_status,
+                    wanted.to_owned(),
+                ));
+            }
+        }
+        "linux" => {
             let (status, written) = run_host(&root, &target, name)?;
             runs.push((
                 String::new(),
@@ -225,7 +274,7 @@ fn program(path: &Utf8Path, expected: String) -> datatest_stable::Result<()> {
                 runs.push((format!(" at {level}"), status, written, status_line, text));
             }
         }
-        None => {
+        _ => {
             let boots = match fs::read_to_string(source.join("emulator")) {
                 Ok(lines) => lines.lines().map(str::to_owned).collect(),
                 Err(_) => vec![String::new()],

@@ -68,7 +68,7 @@ fn main(take world: host::World) -> u8 fails task::Cancelled uses wait {
     if given.nir.is_none() and given.lowered.is_none() {
         return try await command::entry(take world, home: given.home)
     }
-    let Ok(directory) = attempt platform::current_dir(alloc) else {
+    let Ok(directory) = attempt platform::os::current_dir(alloc) else {
         return 101
     }
     let Ok(current) = attempt text::String.try_from_utf8(directory.view(), alloc) else {
@@ -83,14 +83,14 @@ fn main(take world: host::World) -> u8 fails task::Cancelled uses wait {
     let session = check::Session.of(mem::Shared.of(take loaded, alloc: alloc), std: workspace::CarriedStd.unloaded(parsing: mem::Shared.of(workspace::Parsing.empty(served: false, alloc), alloc: alloc), alloc), grammar: mem::Shared.of(take grammar, alloc: alloc), home: cache::copied_override(given.home, alloc), alloc)
     match given.nir {
         Some(wanted) => {
-            discard attempt platform::write_stdout(session.nir_streams(wanted.as_str()).view())
+            discard attempt platform::os::write_stdout(session.nir_streams(wanted.as_str()).view())
         }
         None => {}
     }
     let Some(program) = given.lowered else {
         return 0
     }
-    discard attempt platform::write_stdout(final_build::lowered_functions(session, package_name: program.as_str(), alloc).view())
+    discard attempt platform::os::write_stdout(final_build::lowered_functions(session, package_name: program.as_str(), alloc).view())
     return 0
 } main
 
@@ -129,7 +129,7 @@ const GRANT: &str = "allow validate in platform, command\n";
 
 /// The targets directive of the toolchain's manifest, which its copies replace with the host
 /// target of this machine's architecture.
-const DECLARED_TARGET: &str = "targets x86_64-host\n";
+const DECLARED_TARGET: &str = "targets x86_64-linux\n";
 
 /// How long one run of a program or of the NaN toolchain may take, and one of the NaN toolchain
 /// over its own workspace, which checks, tests or builds the whole toolchain.
@@ -213,7 +213,7 @@ fn hash_tree(dir: &Path, prefix: &str, hasher: &mut DefaultHasher) -> std::io::R
 
 /// The host target of this machine's architecture.
 fn host_target() -> String {
-    format!("{}-host", std::env::consts::ARCH)
+    format!("{}-linux", std::env::consts::ARCH)
 }
 
 /// The image of the toolchain that `nan build nan` writes in the workspace `dir`.
@@ -693,8 +693,8 @@ fn lowered(dump: &[u8]) -> Result<Vec<(String, String)>, String> {
     Ok(functions)
 }
 
-/// The support routines the NaN toolchain lowers its own way on `x86_64-host`, whose programs
-/// the harness compares by what they write instead.
+/// The support routines the NaN toolchain lowers its own way on a host target, whose programs the
+/// harness compares by what they write instead.
 const OWN_ROUTINES: [&str; 17] = [
     "_NScap_table_alloc",
     "_NScap_table_alloc_in",
@@ -716,7 +716,7 @@ const OWN_ROUTINES: [&str; 17] = [
 ];
 
 /// Compares the text of each function the final build of `program` lowers with the bootstrap's,
-/// for an `x86_64-host` program those `comparable` keeps, as it gives them.
+/// for a host program those `comparable` keeps, as it gives them.
 fn compare_lowered(
     toolchain: &Toolchain,
     bootstrap: &Path,
@@ -770,7 +770,7 @@ fn compare_lowered(
 }
 
 /// The prefix of the symbols of std's `hw` package, whose synchronisation operations read the
-/// line tables the NaN toolchain lays out its own way on `x86_64-host`, so that the harness
+/// line tables the NaN toolchain lays out its own way on `x86_64-linux`, so that the harness
 /// compares the programs calling them by what they write instead.
 const HW_FUNCTIONS: &str = "_N2hw_";
 
@@ -830,7 +830,8 @@ fn renumbered(text: &str, numbers: &mut std::collections::HashMap<String, usize>
 
 /// Runs the images of `program` for `target` that each toolchain built in its workspace and
 /// compares what both write and the statuses they end with: a host program's standard streams
-/// when this machine has its architecture, a machine program's serial port under its emulator.
+/// when this machine has its architecture, a Windows one's under Wine, a machine program's serial
+/// port under its emulator.
 fn compare_program(
     toolchain: &Toolchain,
     bootstrap: &Path,
@@ -838,11 +839,77 @@ fn compare_program(
     program: &str,
     target: &str,
 ) -> Result<(), String> {
-    match target.strip_suffix("-host") {
-        Some(arch) if arch != std::env::consts::ARCH => Ok(()),
-        Some(_) => compare_processes(bootstrap, store, program, target),
-        None => compare_boots(toolchain, bootstrap, store, program),
+    match target.split_once('-') {
+        Some((arch, "linux" | "windows")) if arch != std::env::consts::ARCH => Ok(()),
+        Some((_, "linux")) => compare_processes(bootstrap, store, program, target),
+        Some((_, "windows")) => compare_wine(toolchain, bootstrap, store, program),
+        _ => compare_boots(toolchain, bootstrap, store, program),
     }
+}
+
+/// Runs the Windows image of `program` that each toolchain builds in its workspace with
+/// `nan run`, under Wine in a prefix of its own that Wine sets up first, and compares what both
+/// write and the statuses they end with; nothing where Wine does not run.
+fn compare_wine(
+    toolchain: &Toolchain,
+    bootstrap: &Path,
+    store: &Path,
+    program: &str,
+) -> Result<(), String> {
+    let run = nan::run(&["run".to_owned(), program.to_owned()], bootstrap);
+    let Some(launch) = run.launch else {
+        if run.output.is_empty() {
+            return Ok(());
+        }
+        return Err(format!("nan run {program} reports\n{}", run.output));
+    };
+    let prefix = bootstrap.join(".wine");
+    let wine = |args: &[String]| {
+        let mut command = Command::new(&launch.program);
+        command
+            .args(args)
+            .envs(launch.env.iter().copied())
+            .env("WINEPREFIX", &prefix)
+            .current_dir(bootstrap)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    };
+    Supervised::start(
+        wine(&["wineboot".to_owned(), "--init".to_owned()]),
+        RUN_LIMIT,
+    )?
+    .finish()?;
+    let expected = Supervised::start(wine(&launch.args), RUN_LIMIT)?.finish()?;
+    let (front_dir, front_store) = fronts(bootstrap, store);
+    let mut command = Command::new(&toolchain.image);
+    command
+        .args(["run", program])
+        .current_dir(&front_dir)
+        .env("NAN_SELF_CHECK_HOME", front_home())
+        .env("NAN_SELF_CHECK_STORE", &front_store)
+        .env("WINEPREFIX", &prefix)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let ran = Supervised::start(command, RUN_LIMIT)?.finish()?;
+    if ran != expected {
+        let written = |ran: &Ran| {
+            format!(
+                "{}{}exiting with {:?}",
+                String::from_utf8_lossy(&ran.stdout),
+                String::from_utf8_lossy(&ran.stderr),
+                ran.status
+            )
+        };
+        return Err(format!(
+            "{program} built by the bootstrap writes\n{}\nbuilt by the NaN toolchain\n{}",
+            written(&expected),
+            written(&ran)
+        ));
+    }
+    Ok(())
 }
 
 /// Runs the host image of `program` for `target` that each toolchain built in its workspace and
@@ -941,8 +1008,9 @@ fn compare_example(
         for program in programs(example) {
             let (_, status) = compare(toolchain, dir, store, &["build", &program.0])?;
             if status == Some(0) {
-                let host = program.1.strip_suffix("-host");
-                compare_lowered(toolchain, dir, store, &program.0, host.is_some())?;
+                let host = program.1.strip_suffix("-linux");
+                let windows = program.1.ends_with("-windows");
+                compare_lowered(toolchain, dir, store, &program.0, host.is_some() || windows)?;
                 if host == Some(std::env::consts::ARCH) {
                     compare_processes(dir, store, &program.0, &program.1)?;
                 }
@@ -964,11 +1032,13 @@ fn compare_example(
 }
 
 /// The concrete targets.
-const TARGETS: [&str; 6] = [
-    "x86_64-host",
+const TARGETS: [&str; 8] = [
+    "x86_64-linux",
+    "x86_64-windows",
     "x86_64-uefi",
     "x86_64-bare",
-    "aarch64-host",
+    "aarch64-linux",
+    "aarch64-windows",
     "aarch64-uefi",
     "aarch64-bare",
 ];
@@ -1071,7 +1141,8 @@ fn program(path: &Utf8Path, _: String) -> datatest_stable::Result<()> {
     if !bundles.is_empty() {
         compare_bundled(&toolchain, &dir, &store, name, &target, &bundles)?;
     }
-    compare_lowered(&toolchain, &dir, &store, name, target.ends_with("-host"))?;
+    let host = target.ends_with("-linux") || target.ends_with("-windows");
+    compare_lowered(&toolchain, &dir, &store, name, host)?;
     if bundles.is_empty() {
         compare_program(&toolchain, &dir, &store, name, &target)?;
     }
@@ -1476,7 +1547,7 @@ fn compare_published(
 const SIGNED_FILES: [(&str, &str); 4] = [
     (
         "procinfo/package.nan",
-        "//! Process facts.\n\npackage procinfo {\n    language 1\n    targets x86_64-host\n    allow trusted in procinfo\n} procinfo\n",
+        "//! Process facts.\n\npackage procinfo {\n    language 1\n    targets x86_64-linux\n    allow trusted in procinfo\n} procinfo\n",
     ),
     (
         "procinfo/procinfo.nan",
@@ -1484,7 +1555,7 @@ const SIGNED_FILES: [(&str, &str); 4] = [
     ),
     (
         "app/package.nan",
-        "//! Apps.\n\npackage app {\n    language 1\n    targets x86_64-host\n    dep procinfo \"self-check-signing\"\n    allow trusted in procinfo\n} app\n",
+        "//! Apps.\n\npackage app {\n    language 1\n    targets x86_64-linux\n    dep procinfo \"self-check-signing\"\n    allow trusted in procinfo\n} app\n",
     ),
     (
         "app/app.nan",

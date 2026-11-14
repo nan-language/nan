@@ -63,6 +63,11 @@ const AT_HWCAP: u64 = 16;
 const HWCAP_ATOMICS: i64 = 1 << 8;
 const HWCAP_ASIMDDP: i64 = 1 << 20;
 
+/// The processor features `IsProcessorFeaturePresent` names for LSE atomics and the dot
+/// product instructions.
+const PF_ARM_ATOMICS: i64 = 34;
+const PF_ARM_DOT_PRODUCT: i64 = 43;
+
 /// The encoding of `ID_AA64ISAR0_EL1` for the `ReadSysReg` stub, and its fields: atomics at bit
 /// 20, at least 2 with LSE, and dot product at bit 44, at least 1 with it.
 const ID_AA64ISAR0_EL1: u16 = 0x4030;
@@ -85,6 +90,21 @@ impl Lowering<'_, '_> {
                 let no_dot = fx.b.ins().icmp_imm_s(IntCC::Equal, dot, 0);
                 fx.b.ins().bor(no_atomic, no_dot)
             }
+            Level::Aarch64Dotprod if self.windows() => {
+                let mut missing = fx.int(types::I8, 0);
+                for feature in [PF_ARM_ATOMICS, PF_ARM_DOT_PRODUCT] {
+                    let feature = fx.int(types::I32, feature);
+                    let present = self.call_system(
+                        fx,
+                        "IsProcessorFeaturePresent",
+                        &[feature],
+                        &[types::I32],
+                    )[0];
+                    let absent = fx.b.ins().icmp_imm_s(IntCC::Equal, present, 0);
+                    missing = fx.b.ins().bor(missing, absent);
+                }
+                missing
+            }
             Level::Aarch64Dotprod => {
                 let kind = fx.ptr(AT_HWCAP);
                 let hwcap = self.call_libc(fx, "getauxval", &[kind], &[PTR])[0];
@@ -98,8 +118,8 @@ impl Lowering<'_, '_> {
         });
     }
 
-    /// Whether the processor lacks an extension of an x86_64 level, or on a host target Linux
-    /// leaves the register state of its AVX or AVX-512 extensions disabled.
+    /// Whether the processor lacks an extension of an x86_64 level, or on a host target the
+    /// operating system leaves the register state of its AVX or AVX-512 extensions disabled.
     fn x64_missing(&mut self, fx: &mut Fx, level: Level) -> Value {
         let mut bits = V2.to_vec();
         if level != Level::X64V2 {

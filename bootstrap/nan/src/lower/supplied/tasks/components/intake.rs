@@ -16,7 +16,8 @@ use super::{entry, numbering, reference, runner, status, unreference, wake_waite
 use crate::check::ty::Ty;
 
 /// The fields of a delayed message's timer after its operation record: its links in its
-/// runner's timers, its relative time, and on a kernel the next timer a cancellation claimed.
+/// runner's timers, its relative time, and on a kernel and a Windows target the next timer a
+/// cancellation claimed.
 mod timer {
     use super::operation;
     pub const NEXT: u64 = operation::SIZE;
@@ -61,12 +62,13 @@ pub fn stop(lo: &mut Lowering, fx: &mut Fx, record: Value, message: &Ty) {
     });
 }
 
-/// Cancels the timers of a runner's delayed messages. On a kernel, where a cancelled timer
-/// completes at once, it only claims them, giving the chain of those it claimed, whose
-/// completions the caller delivers once it has released the lock. The caller holds the lock.
+/// Cancels the timers of a runner's delayed messages. On a kernel and a Windows target, where a
+/// cancelled timer completes at once, it only claims them, giving the chain of those it claimed,
+/// whose completions the caller delivers once it has released the lock. The caller holds the
+/// lock.
 pub fn cancel_timers(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Option<Value> {
     let first = fx.load(PTR, record, runner::TIMERS);
-    if lo.seeded() || !lo.kernel() {
+    if lo.seeded() || !(lo.kernel() || lo.windows()) {
         fx.repeat(&[first], |fx, state| {
             let op = state[0];
             let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, op, 0);
@@ -93,7 +95,7 @@ pub fn cancel_timers(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Option<Va
             present,
             &[PTR, PTR],
             |lo, fx| {
-                let taken = lo.kernel_claim(fx, op);
+                let taken = timers::claim_armed(lo, fx, op);
                 fx.store(claimed, op, timer::CLAIMED);
                 let claimed = fx.b.ins().select(taken, op, claimed);
                 vec![fx.load(PTR, op, timer::NEXT), claimed]
@@ -119,7 +121,7 @@ pub fn complete_claimed(lo: &mut Lowering, fx: &mut Fx, claimed: Option<Value>) 
             &[PTR],
             |lo, fx| {
                 let next = fx.load(PTR, op, timer::CLAIMED);
-                lo.kernel_cancelled(fx, op);
+                tasks::deliver_cancelled(lo, fx, op);
                 vec![next]
             },
             |_, fx| vec![fx.ptr(0)],

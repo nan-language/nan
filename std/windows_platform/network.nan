@@ -1,0 +1,327 @@
+//! The network operations of `sys::Net`, `sys::net::Listener` and `sys::net::Conn` over Winsock.
+
+/// An IPv6 socket address. With `flow` and `address` zero, its first 16 bytes are the IPv4 socket
+/// address of every local address when `family` is `AF_INET`.
+layout Inet6Address: bytes 28 le {
+    family: u16 at 0
+    port: u16 at 2
+    flow: u32 at 4
+    address: Array[u8, 16] at 8
+    scope: u32 at 24
+} Inet6Address
+
+/// An `ADDRINFOW`: a resolved address and the next one.
+layout AddressInfo: bytes 48 le {
+    flags: i32 at 0
+    family: i32 at 4
+    kind: i32 at 8
+    protocol: i32 at 12
+    address_len: u64 at 16
+    canonical_name: u64 at 24
+    address: u64 at 32
+    next: u64 at 40
+} AddressInfo
+
+foreign fn MultiByteToWideChar(page: u32, flags: u32, text: hw::Ptr[u8], len: i32, wide: hw::Ptr[u16], room: i32) -> i32 convention "win64"
+
+/// The system library of the socket functions.
+pkg const WINSOCK: Str = "ws2_32.dll"
+
+/// The address families of IPv4 and IPv6, the stream socket type and TCP.
+const AF_INET: u64 = 2
+
+const AF_INET6: u64 = 23
+
+const STREAM_SOCKET: u64 = 1
+
+const TCP: u64 = 6
+
+/// The flags of `WSASocketW` opening a socket for overlapped I/O that child processes do not
+/// inherit, and the socket it gives on failure.
+const SOCKET_FLAGS: u64 = 0x81
+
+const INVALID_SOCKET: u64 = 0xFFFF_FFFF_FFFF_FFFF
+
+/// The levels and names of the socket options this platform sets: `IPV6_V6ONLY`, `SO_LINGER`
+/// and the contexts `AcceptEx` and `ConnectEx` leave to update.
+const LEVEL_SOCKET: u64 = 0xFFFF
+
+const LEVEL_IPV6: u64 = 41
+
+const V6_ONLY: u64 = 27
+
+const LINGER_OPTION: u64 = 0x80
+
+const UPDATE_ACCEPT_CONTEXT: u64 = 0x700B
+
+const UPDATE_CONNECT_CONTEXT: u64 = 0x7010
+
+/// The control code giving an extension function's address, and the GUIDs of `AcceptEx` and
+/// `ConnectEx`, each as two little-endian words.
+const EXTENSION_FUNCTION: u64 = 0xC800_0006
+
+const ACCEPT_EX_LOW: u64 = 0x11CF_CBAC_B536_7DF1
+
+const ACCEPT_EX_HIGH: u64 = 0x92A1_485F_8000_CA95
+
+const CONNECT_EX_LOW: u64 = 0x4660_DDF3_25A2_07B9
+
+const CONNECT_EX_HIGH: u64 = 0x3E06_748C_E576_E98E
+
+/// The code page of UTF-8, the shutdown of a socket's sending side, and the error code of a
+/// socket that is not connected.
+const UTF8: u32 = 65_001
+
+const SEND_SIDE: u64 = 1
+
+const NOT_CONNECTED: i64 = 10_057
+
+/// The failure of a negated error code of a network operation.
+fn net_failure(error: i64) -> sys::net::NetError {
+    return match -error {
+        1_225 or 10_061 => sys::net::NetError.Refused
+        59 or 64 or 109 or 1_236 or 10_053 or 10_054 or 10_057 or 10_058 => sys::net::NetError.Reset
+        121 or 1_231 or 1_232 or 10_050 or 10_051 or 10_060 or 10_065 => sys::net::NetError.Unreachable
+        52 or 10_048 => sys::net::NetError.AddressInUse
+        else => sys::net::NetError.Denied
+    }
+} net_failure
+
+/// A port with its bytes in network order.
+fn network_order(port: u16) -> u16 {
+    return (port << 8) | (port >> 8)
+} network_order
+
+/// Calls a Winsock function with its first arguments, zero standing for the others.
+fn winsock_call(name: Str, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> u64 {
+    return call(library_function(WINSOCK, name), a, b, c, d, e, f, g: 0, h: 0, i: 0)
+} winsock_call
+
+/// Whether a Winsock function giving an `int` succeeded, giving 0.
+fn succeeded(result: u64) -> bool = i32.truncate(result) == 0
+
+/// Starts Winsock for one more user, which it stays started for: whether it started.
+fn started() -> bool {
+    var data = Array[u8, 512].filled(0)
+    let address = u64.widen(hw::Ptr.of_view_mut(mut data.view_mut()).addr())
+    return library_function(WINSOCK, name: "WSAStartup") != 0 and succeeded(winsock_call("WSAStartup", a: 0x202, b: address, c: 0, d: 0, e: 0, f: 0))
+} started
+
+/// A new TCP socket of an address family, opened for overlapped I/O; `INVALID_SOCKET` when the
+/// system refuses.
+fn open_socket(family: u64) -> u64 {
+    return winsock_call("WSASocketW", a: family, b: STREAM_SOCKET, c: TCP, d: 0, e: 0, f: SOCKET_FLAGS)
+} open_socket
+
+/// Closes a socket: whether it was one.
+pkg fn close_socket(socket: u64) -> bool {
+    return succeeded(winsock_call("closesocket", a: socket, b: 0, c: 0, d: 0, e: 0, f: 0))
+} close_socket
+
+/// Sets a socket option of `len` bytes at `value`.
+fn set_option(socket: u64, level: u64, name: u64, value: u64, len: u64) {
+    discard winsock_call("setsockopt", a: socket, b: level, c: name, d: value, e: len, f: 0)
+} set_option
+
+/// Sets an integer option of a socket.
+fn set_number(socket: u64, level: u64, name: u64, value: i32) {
+    var held = Array[i32, 1].filled(value)
+    let address = u64.widen(hw::Ptr.of_view_mut(mut held.view_mut()).addr())
+    set_option(socket, level, name, value: address, len: 4)
+} set_number
+
+/// The address of the extension function the GUID of words `low` and `high` names, zero when
+/// the system gives none.
+fn extension(socket: u64, low: u64, high: u64) -> u64 {
+    var id = Array[u64, 2].filled(low)
+    id[1] = high
+    var found = Array[u64, 2].filled(0)
+    let id_address = u64.widen(hw::Ptr.of_view_mut(mut id.view_mut()).addr())
+    let found_address = u64.widen(hw::Ptr.of_view_mut(mut found.view_mut()).addr())
+    let ioctl = library_function(WINSOCK, name: "WSAIoctl")
+    if ioctl == 0 or not succeeded(call(ioctl, a: socket, b: EXTENSION_FUNCTION, c: id_address, d: 16, e: found_address, f: 8, g: found_address + 8, h: 0, i: 0)) {
+        return 0
+    }
+    return found[0]
+} extension
+
+/// Frees the results `GetAddrInfoW` gave.
+fn free_addresses(head: u64) {
+    discard winsock_call("FreeAddrInfoW", a: head, b: 0, c: 0, d: 0, e: 0, f: 0)
+} free_addresses
+
+/// Associates a new socket with the completion port, closing it when the system refuses.
+fn prepared(socket: u64) -> bool {
+    if associate(socket) {
+        return true
+    }
+    discard close_socket(socket)
+    return false
+} prepared
+
+pkg fn net_listen(port: u16) -> i32 fails sys::net::NetError {
+    if port == 0 or not started() {
+        fail sys::net::NetError.Denied
+    }
+    var family = AF_INET6
+    var socket = open_socket(family)
+    if socket == INVALID_SOCKET {
+        family = AF_INET
+        socket = open_socket(family)
+    }
+    if socket == INVALID_SOCKET {
+        fail sys::net::NetError.Denied
+    }
+    if family == AF_INET6 {
+        set_number(socket, level: LEVEL_IPV6, name: V6_ONLY, value: 0)
+    }
+    var address = Inet6Address(family: u16.fit(family), port: network_order(port), flow: 0, address: Array[u8, 16].filled(0), scope: 0)
+    var len: u64 = 28
+    if family == AF_INET {
+        len = 16
+    }
+    let address_at = u64.widen(hw::Ptr.of_mut(mut address).addr())
+    if not succeeded(winsock_call("bind", a: socket, b: address_at, c: len, d: 0, e: 0, f: 0)) {
+        discard close_socket(socket)
+        fail sys::net::NetError.AddressInUse
+    }
+    if not succeeded(winsock_call("listen", a: socket, b: 128, c: 0, d: 0, e: 0, f: 0)) or not prepared(socket) {
+        discard close_socket(socket)
+        fail sys::net::NetError.Denied
+    }
+    return descriptor(socket)
+} net_listen
+
+pkg fn net_connect(host: Str, port: u16) -> i32 fails sys::net::NetError uses wait {
+    if port == 0 or not started() {
+        fail sys::net::NetError.Denied
+    }
+    var name = Array[u16, 256].filled(0)
+    let bytes = host.as_bytes()
+    if bytes.len() == 0 or bytes.len() >= 256 {
+        fail sys::net::NetError.Unreachable
+    }
+    if MultiByteToWideChar(UTF8, flags: 0, text: hw::Ptr.of_view(bytes), len: i32.fit(bytes.len()), wide: hw::Ptr.of_view_mut(mut name.view_mut()), room: 255) == 0 {
+        fail sys::net::NetError.Unreachable
+    }
+    var hints = AddressInfo(flags: 0, family: 0, kind: 1, protocol: 0, address_len: 0, canonical_name: 0, address: 0, next: 0)
+    var found = Array[u64, 1].filled(0)
+    let name_at = u64.widen(hw::Ptr.of_view(name.view()).addr())
+    let hints_at = u64.widen(hw::Ptr.of_mut(mut hints).addr())
+    let found_at = u64.widen(hw::Ptr.of_view_mut(mut found.view_mut()).addr())
+    if not succeeded(winsock_call("GetAddrInfoW", a: name_at, b: 0, c: hints_at, d: found_at, e: 0, f: 0)) {
+        fail sys::net::NetError.Unreachable
+    }
+    let head_address = found[0]
+    defer free_addresses(head_address)
+    let head: hw::Ptr[AddressInfo] = hw::Ptr.of_addr(usize.widen(head_address))
+    let info = trusted "GetAddrInfoW succeeded, so its first result is a live ADDRINFOW" { head.read() }
+    let socket_address = hw::Ptr[u16].of_addr(usize.widen(info.address))
+    trusted "the result's address is a socket address whose port lies at byte 2" {
+        socket_address.offset(1).write(network_order(port))
+    }
+    let family = u64.widen(u32.fit(info.family))
+    let socket = open_socket(family)
+    if socket == INVALID_SOCKET {
+        fail sys::net::NetError.Denied
+    }
+    var local = Inet6Address(family: u16.fit(family), port: 0, flow: 0, address: Array[u8, 16].filled(0), scope: 0)
+    let local_at = u64.widen(hw::Ptr.of_mut(mut local).addr())
+    let function = extension(socket, low: CONNECT_EX_LOW, high: CONNECT_EX_HIGH)
+    if function == 0 or not succeeded(winsock_call("bind", a: socket, b: local_at, c: info.address_len, d: 0, e: 0, f: 0)) or not prepared(socket) {
+        discard close_socket(socket)
+        fail sys::net::NetError.Denied
+    }
+    let result = match attempt await connect(function, socket, address: info.address, len: u32.fit(info.address_len)) {
+        Ok(result) => result
+        Err(cancelled) => {
+            discard close_socket(socket)
+            fail cancelled
+        }
+    }
+    if result < 0 {
+        discard close_socket(socket)
+        fail net_failure(result)
+    }
+    set_option(socket, level: LEVEL_SOCKET, name: UPDATE_CONNECT_CONTEXT, value: 0, len: 0)
+    return descriptor(socket)
+} net_connect
+
+/// Accepts the next connection, passing over one its peer reset before it was accepted, which
+/// Windows drops from the listener's queue.
+pkg fn listener_accept(fd: i32) -> i32 fails sys::net::NetError uses wait {
+    let listener = handle_of(fd)
+    var local = Inet6Address(family: 0, port: 0, flow: 0, address: Array[u8, 16].filled(0), scope: 0)
+    var len = Array[i32, 1].filled(28)
+    let local_at = u64.widen(hw::Ptr.of_mut(mut local).addr())
+    let len_at = u64.widen(hw::Ptr.of_view_mut(mut len.view_mut()).addr())
+    if not succeeded(winsock_call("getsockname", a: listener, b: local_at, c: len_at, d: 0, e: 0, f: 0)) {
+        fail sys::net::NetError.Denied
+    }
+    loop {
+        let socket = open_socket(u64.widen(local.family))
+        if socket == INVALID_SOCKET {
+            fail sys::net::NetError.Denied
+        }
+        let function = extension(socket, low: ACCEPT_EX_LOW, high: ACCEPT_EX_HIGH)
+        if function == 0 or not prepared(socket) {
+            discard close_socket(socket)
+            fail sys::net::NetError.Denied
+        }
+        var addresses = Array[u8, 88].filled(0)
+        let addresses_at = u64.widen(hw::Ptr.of_view_mut(mut addresses.view_mut()).addr())
+        let result = match attempt await accept(function, listener, socket, buffer: addresses_at) {
+            Ok(result) => result
+            Err(cancelled) => {
+                discard close_socket(socket)
+                fail cancelled
+            }
+        }
+        if result >= 0 {
+            var held = Array[u64, 1].filled(listener)
+            let held_at = u64.widen(hw::Ptr.of_view_mut(mut held.view_mut()).addr())
+            set_option(socket, level: LEVEL_SOCKET, name: UPDATE_ACCEPT_CONTEXT, value: held_at, len: 8)
+            return descriptor(socket)
+        }
+        discard close_socket(socket)
+        let refused = net_failure(result)
+        match refused {
+            sys::net::NetError.Reset => {}
+            else => fail refused
+        }
+    }
+} listener_accept
+
+pkg fn conn_read(fd: i32, address: u64, len: usize) -> usize fails sys::net::NetError uses wait {
+    let count = try await transfer(handle_of(fd), buffer: address, len: u32.saturate(len), writes: false, blocking: false)
+    if count < 0 {
+        fail net_failure(count)
+    }
+    return usize.fit(count)
+} conn_read
+
+pkg fn conn_write(fd: i32, data: Slice[u8]) -> usize fails sys::net::NetError uses wait {
+    let count = try await transfer(handle_of(fd), buffer: address_of(data), len: u32.saturate(data.len()), writes: true, blocking: false)
+    if count < 0 {
+        fail net_failure(count)
+    }
+    return usize.fit(count)
+} conn_write
+
+pkg fn conn_close(fd: i32) fails sys::net::NetError {
+    defer release(fd)
+    if not succeeded(winsock_call("shutdown", a: handle_of(fd), b: SEND_SIDE, c: 0, d: 0, e: 0, f: 0)) {
+        let error = last_error()
+        if error != -NOT_CONNECTED {
+            fail net_failure(error)
+        }
+    }
+} conn_close
+
+pkg fn conn_abandon(fd: i32) {
+    var linger = Array[u16, 2].filled(0)
+    linger[0] = 1
+    let linger_at = u64.widen(hw::Ptr.of_view_mut(mut linger.view_mut()).addr())
+    set_option(handle_of(fd), level: LEVEL_SOCKET, name: LINGER_OPTION, value: linger_at, len: 4)
+    release(fd)
+} conn_abandon

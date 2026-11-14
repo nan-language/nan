@@ -1,0 +1,198 @@
+//! What the system running the toolchain does: files, directories, locks, processes and the machine's facts, through glibc on Linux and kernel32 on Windows.
+
+const ENOENT: i32 = 2
+
+const EINTR: i32 = 4
+
+const EEXIST: i32 = 17
+
+const ENOTDIR: i32 = 20
+
+const EINVAL: i32 = 22
+
+const EPIPE: i32 = 32
+
+const ERANGE: i32 = 34
+
+const ENAMETOOLONG: i32 = 36
+
+const ELOOP: i32 = 40
+
+/// The most bytes of a path the system reads, its NUL included.
+const PATH_MAX: usize = 4_096
+
+foreign fn __errno_location() -> hw::Ptr[i32] limits notrap, terminates, noalloc convention "sysv"
+
+foreign fn getpid() -> i32 limits notrap, terminates, noalloc convention "sysv"
+
+foreign fn getuid() -> u32 limits notrap, terminates, noalloc convention "sysv"
+
+foreign fn uname(name: hw::Ptr[Utsname]) -> i32 limits notrap, terminates, noalloc convention "sysv"
+
+foreign fn strlen(start: hw::Ptr[u8]) -> usize convention "sysv"
+
+/// The error number the last failing call of the C library on this thread set.
+fn last_code() -> i32 {
+    return trusted "the C library gives the calling thread's error number, an int that lives as long as the thread" { __errno_location().read() }
+} last_code
+
+/// Clears the calling thread's error number, for a call that reports failure only through it.
+fn clear_code() {
+    trusted "the C library gives the calling thread's error number, an int that lives as long as the thread" {
+        __errno_location().write(0)
+    }
+} clear_code
+
+fn error_of(code: i32) -> platform::IoError {
+    return match code {
+        ENOENT => platform::IoError.NotFound
+        EEXIST => platform::IoError.AlreadyExists
+        EPIPE => platform::IoError.BrokenPipe
+        else => platform::IoError.Other(code)
+    }
+} error_of
+
+/// The error the last failing call of the C library on this thread gave.
+fn last_error() -> platform::IoError {
+    return error_of(last_code())
+} last_error
+
+/// Bytes as the C library reads a path or name: the bytes, then a NUL.
+struct CText {
+    bytes: Array[u8, 4_096]
+} CText
+
+/// The bytes of a `CText` before any is written.
+const NO_C_TEXT: Array[u8, 4_096] = Array[u8, 4_096].filled(0)
+
+/// The C form of bytes holding no NUL and fewer than `PATH_MAX`.
+fn c_text(bytes: Slice[u8]) -> CText fails platform::IoError {
+    if bytes.len() >= PATH_MAX {
+        fail platform::IoError.Other(ENAMETOOLONG)
+    }
+    var held = NO_C_TEXT
+    for at in 0..<bytes.len() {
+        if bytes[at] == 0 {
+            fail platform::IoError.Other(EINVAL)
+        }
+        held[at] = bytes[at]
+    }
+    return CText(bytes: held)
+} c_text
+
+/// The id of this process.
+pub fn process_id() -> u32 {
+    return getpid().to_bits()
+} process_id
+
+/// glibc's `struct utsname`, each name NUL-terminated in 65 bytes.
+layout Utsname: bytes 390 le {
+    sysname: Array[u8, 65] at 0
+    nodename: Array[u8, 65] at 65
+    release: Array[u8, 65] at 130
+    version: Array[u8, 65] at 195
+    machine: Array[u8, 65] at 260
+    domainname: Array[u8, 65] at 325
+} Utsname
+
+/// Whether the machine running the toolchain is an AArch64 one, as the system names its
+/// architecture.
+pub fn on_aarch64() -> bool {
+    var raw = Utsname.from_bits(Array[u8, 390].filled(0))
+    let buffer = hw::Ptr.of_mut(mut raw)
+    discard trusted "buffer addresses a struct utsname" { uname(buffer) }
+    let named = trusted "uname wrote a struct utsname at buffer, or left it zeroed" { buffer.read() }
+    let Some(prefix) = named.machine.view().prefix(7) else {
+        return false
+    }
+    return prefix == b"aarch64" and named.machine[7] == 0
+} on_aarch64
+
+/// Whether the system running the toolchain is Windows.
+pub fn on_windows() -> bool {
+    return false
+} on_windows
+
+/// The path of the running image, empty when the system gives none.
+pub fn own_image(alloc: mem::Alloc) -> text::String {
+    return text::String.of("/proc/self/exe", alloc)
+} own_image
+
+/// The bytes of a NUL-terminated text at `start`.
+fn copied_text(start: hw::Ptr[u8], alloc: mem::Alloc) -> mem::Bytes {
+    let length = trusted "start addresses a NUL-terminated text" { strlen(start) }
+    var copy = mem::Bytes.zeroed(length, alloc)
+    let target = hw::Ptr.of_view_mut(mut copy.view_mut())
+    trusted "start addresses length bytes before its NUL and target the length bytes of copy" {
+        start.copy(target, count: length)
+    }
+    return copy
+} copied_text
+
+/// The id of the user running this process on Linux, and 0 on Windows, where the toolchain compares
+/// no owners.
+pub fn running_user() -> u32 {
+    return trusted "getuid reads no memory" { getuid() }
+} running_user
+
+/// The home directory of the user `uid`: on Linux the one the system's user database gives, on
+/// Windows the running user's profile directory, which `USERPROFILE` names, with `/` separators;
+/// none when there is none.
+pub fn home(uid: u32, alloc: mem::Alloc) -> Option[text::String] fails platform::IoError {
+    let users = match first attempt read_text("/etc/passwd", alloc) {
+        Ok(users) => users
+        Err(platform::IoError.NotFound) => return None
+        Err(error) => fail error
+    }
+    let written = users.as_str()
+    var at: usize = 0
+    while at < written.byte_len() {
+        let line = platform::next_line(written, at)
+        at = line.next
+        let Some(content) = written.slice_bytes(line.start, end: line.end) else {
+            break
+        }
+        let Some(dir) = user_home(content, uid, alloc) else {
+            continue
+        }
+        return Some(take dir)
+    }
+    return None
+} home
+
+/// The home directory a user database line gives when it holds 7 fields, the third `uid` and the
+/// sixth not empty.
+fn user_home(line: Str, uid: u32, alloc: mem::Alloc) -> Option[text::String] {
+    let bytes = line.as_bytes()
+    var field: usize = 0
+    var start: usize = 0
+    var id = platform::Run(start: 0, end: 0)
+    var dir = platform::Run(start: 0, end: 0)
+    for at in 0..<bytes.len() {
+        invariant field <= at
+        if bytes[at] != b':' {
+            continue
+        }
+        if field == 2 {
+            id = platform::Run(start: start, end: at)
+        }
+        if field == 5 {
+            dir = platform::Run(start: start, end: at)
+        }
+        field += 1
+        start = at + 1
+    }
+    if field != 6 or dir.start == dir.end {
+        return None
+    }
+    let Some(written) = line.slice_bytes(id.start, end: id.end) else {
+        return None
+    }
+    if platform::parse_decimal(written) != Some(u64.widen(uid)) {
+        return None
+    }
+    let Some(path) = line.slice_bytes(dir.start, end: dir.end) else {
+        return None
+    }
+    return Some(text::String.of(path, alloc))
+} user_home

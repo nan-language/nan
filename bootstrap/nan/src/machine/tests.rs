@@ -171,7 +171,7 @@ fn snapshot() -> Snapshot {
                 text: vec!["pub fn Meter.bump(mut self)".to_owned()],
                 interface: Some(hash),
                 digests: vec![(
-                    "x86_64-host".to_owned(),
+                    "x86_64-linux".to_owned(),
                     "effects none | authority none | may-trap no | terminates".to_owned(),
                 )],
                 docs: vec![Doc {

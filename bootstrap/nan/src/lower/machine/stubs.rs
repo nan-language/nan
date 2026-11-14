@@ -86,6 +86,9 @@ use crate::workspace::Arch;
 /// and the number of a system call, makes it and gives its result: on x86_64 by `syscall` with
 /// the number in `rax` and the arguments in `rdi`, `rsi`, `rdx`, `r10`, `r8` and `r9`, on AArch64
 /// by `svc` with the number in `x8` and the arguments in `x0` to `x5`.
+///
+/// `Teb`, which code of a Windows image calls, gives the address of the running thread's
+/// environment block: on x86_64 the word at offset `0x30` of the GS segment, on AArch64 `x18`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Stub {
     Out1,
@@ -178,6 +181,7 @@ pub enum Stub {
     FiqOn,
     FiqOff,
     Syscall,
+    Teb,
 }
 
 // The x86_64 stubs read the running CPU's features and its executor thread's index at these
@@ -248,6 +252,11 @@ impl Stub {
                 &[
                     0x49, 0x89, 0xca, 0x48, 0x8b, 0x44, 0x24, 0x08, 0x0f, 0x05, 0xc3,
                 ],
+            ),
+            Stub::Teb => (
+                0,
+                1,
+                &[0x65, 0x48, 0x8b, 0x04, 0x25, 0x30, 0x00, 0x00, 0x00, 0xc3],
             ),
             Stub::FlushLine => (1, 0, &[0x0f, 0xae, 0x3f, 0xc3]),
             Stub::IdleWait => (0, 0, &[0xfb, 0xf4, 0xfa, 0xc3]),
@@ -701,6 +710,7 @@ impl Stub {
                     0xe8, 0x03, 0x06, 0xaa, 0x01, 0x00, 0x00, 0xd4, 0xc0, 0x03, 0x5f, 0xd6,
                 ],
             ),
+            Stub::Teb => (0, 1, &[0xe0, 0x03, 0x12, 0xaa, 0xc0, 0x03, 0x5f, 0xd6]),
             Stub::FlushLine => (1, 0, &[0x20, 0x7a, 0x0b, 0xd5, 0xc0, 0x03, 0x5f, 0xd6]),
             Stub::IdleWait => (
                 0,

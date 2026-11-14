@@ -124,7 +124,7 @@ fn units_decode_only_in_order_with_the_keys_and_values_this_version_defines() {
         defect(&stream(1, &[&second, &first])),
         Some(Code::NirMalformed)
     );
-    let unsorted = parts("example::A", &["x86_64-host", "any"]);
+    let unsorted = parts("example::A", &["x86_64-linux", "any"]);
     assert_eq!(defect(&stream(1, &[&unsorted])), Some(Code::NirMalformed));
     let mut undefined = first.clone();
     undefined.push((13, number(0)));

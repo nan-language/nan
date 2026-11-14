@@ -178,7 +178,7 @@ fn short_len(header: u16) -> u16 limits notrap {
 
 package monitor {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
     dep codecs "../codecs"
     dep framing "../framing"
@@ -238,7 +238,7 @@ fn short_len(header: u16) -> u16 limits notrap {
 
 package monitor {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
     dep codecs "../codecs"
     dep framing "../framing" // error: registry.ungranted
@@ -542,7 +542,7 @@ contribute hw::vectors timer = hw::Vector(vector: 14, ist: 0, handler: hw::Vecto
 
 package kernel {
     language 1
-    targets x86_64-bare, x86_64-host
+    targets x86_64-bare, x86_64-linux
 } kernel
 
 // file: kernel/kernel.nan

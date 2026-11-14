@@ -32,7 +32,7 @@ fn distinct_instances_with_one_symbol_name_collide() {
     let scratch = example("//! Scales.\n\npub fn scale(value: u64) -> u64 = value\n");
     let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
     let std = crate::stdlib::packages();
-    let checker = checked(&workspace, &workspace.closures[0], std, Target::X64Host);
+    let checker = checked(&workspace, &workspace.closures[0], std, Target::X64Linux);
     let item = item_named(&checker, "example::scale");
     let mut lowering = Lowering::new(
         &checker,
@@ -81,7 +81,7 @@ fn secret_code_lowers_without_branches_or_divisions() {
     );
     let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
     let std = crate::stdlib::packages();
-    for target in [Target::X64Host, Target::Aarch64Host] {
+    for target in [Target::X64Linux, Target::Aarch64Linux] {
         let checker = checked(&workspace, &workspace.closures[0], std, target);
         let item = item_named(&checker, "example::step");
         let mut lowering = Lowering::new(
@@ -129,7 +129,7 @@ fn secret_lanes_lower_without_branches_or_divisions() {
     );
     let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
     let std = crate::stdlib::packages();
-    for target in [Target::X64Host, Target::X64Bare] {
+    for target in [Target::X64Linux, Target::X64Bare] {
         let checker = checked(&workspace, &workspace.closures[0], std, target);
         let item = item_named(&checker, "example::step");
         let mut lowering = Lowering::new(
@@ -183,7 +183,7 @@ fn lanes_lower_to_vectors_off_machine_targets() {
     );
     let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
     let std = crate::stdlib::packages();
-    for target in [Target::X64Host, Target::X64Bare, Target::X64Nanos] {
+    for target in [Target::X64Linux, Target::X64Bare, Target::X64Nanos] {
         let checker = checked(&workspace, &workspace.closures[0], std, target);
         let item = item_named(&checker, "example::mixed");
         let mut lowering = Lowering::new(
@@ -315,7 +315,7 @@ fn slots_of_values_never_needed_at_once_are_shared() {
     let scratch = Scratch::new(&[
         (
             "frames/package.nan",
-            "//! Frames.\n\npackage frames {\n    language 1\n    targets x86_64-host\n    entry main\n} frames\n",
+            "//! Frames.\n\npackage frames {\n    language 1\n    targets x86_64-linux\n    entry main\n} frames\n",
         ),
         ("frames/frames.nan", &source),
     ]);
@@ -338,7 +338,7 @@ fn the_decoders_erased_gives_are_judged_at_its_call() {
     let scratch = Scratch::new(&[
         (
             "trees/package.nan",
-            "//! Trees.\n\npackage trees {\n    language 1\n    targets x86_64-host\n    entry main\n    allow validate in trees\n} trees\n",
+            "//! Trees.\n\npackage trees {\n    language 1\n    targets x86_64-linux\n    entry main\n    allow validate in trees\n} trees\n",
         ),
         (
             "trees/trees.nan",
@@ -375,7 +375,7 @@ fn proven_divisions_lower_without_a_zero_test() {
     );
     let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
     let std = crate::stdlib::packages();
-    let checker = checked(&workspace, &workspace.closures[0], std, Target::X64Host);
+    let checker = checked(&workspace, &workspace.closures[0], std, Target::X64Linux);
     let lowered = |path: &str| {
         let item = item_named(&checker, path);
         let mut lowering = Lowering::new(

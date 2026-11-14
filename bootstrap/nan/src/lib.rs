@@ -29,6 +29,7 @@ mod stage;
 mod stdlib;
 mod store;
 mod syntax;
+mod system;
 mod test_runs;
 mod toolchain;
 mod vcs;

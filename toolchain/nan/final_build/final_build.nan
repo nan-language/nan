@@ -107,7 +107,7 @@ pkg fn build(session: check::Session, program: usize, compared: Option[Compared]
 /// the program's `entry` directive, quoting the linker's output.
 fn link_failed(source: workspace::Package, target: workspace::Target, output: Str, alloc: mem::Alloc) -> diagnostic::Diagnostic {
     var reported = at_entry(source, code: diagnostic::Code.TargetLinkFailed, alloc)
-    reported.envelope = Some(diagnostic::Envelope(origin: lower::host_linker(target, alloc), lines: lines_of(output, alloc)))
+    reported.envelope = Some(diagnostic::Envelope(origin: lower::linux_linker(target, alloc), lines: lines_of(output, alloc)))
     return reported
 } link_failed
 
@@ -312,33 +312,36 @@ fn dumped_into(mut written: mem::Bytes, functions: Slice[lower::LoweredFunction]
 } dumped_into
 
 /// Writes the image of a lowered object at `image` through a staged file beside it, replacing
-/// any earlier image at once: on a host target an executable the target's linker links, giving
-/// the linker's output when it fails; on a machine target the image writer's, entered by the
-/// program entry seam.
+/// any earlier image at once: on a Linux target an executable the target's linker links, giving
+/// the linker's output when it fails; on a Windows or machine target the image writer's, entered
+/// by the program entry seam.
 pkg fn write_image(target: workspace::Target, object: Slice[u8], image: Str, alloc: mem::Alloc) -> Result[Unit, text::String] fails platform::IoError {
     let Some(directory) = platform::parent(image, alloc) else {
         expect false
         fail platform::IoError.NotFound
     }
-    try platform::create_dir_all(directory.as_str(), alloc)
+    try platform::os::create_dir_all(directory.as_str(), alloc)
     let Some(name) = platform::file_name(image, alloc) else {
         expect false
         fail platform::IoError.NotFound
     }
     let staged_new = staged(directory.as_str(), name: name.as_str(), extension: "new", alloc)
-    if target.is_machine() {
+    if target.kind() == Some(workspace::Kind.Windows) {
+        let bytes = image::write(target, object, entry: lower::WINDOWS_ENTRY, alloc)
+        try platform::os::write_all(staged_new.as_str(), contents: bytes.view())
+    } else if target.is_machine() {
         let bytes = image::write(target, object, entry: lower::MACHINE_ENTRY, alloc)
-        try platform::write_file(staged_new.as_str(), contents: bytes.view())
+        try platform::os::write_all(staged_new.as_str(), contents: bytes.view())
     } else {
         let staged_object = staged(directory.as_str(), name: name.as_str(), extension: "o", alloc)
-        try platform::write_file(staged_object.as_str(), contents: object)
-        let linked = lower::host_link(target, object: staged_object.as_str(), image: staged_new.as_str(), alloc)
-        try platform::remove_file(staged_object.as_str())
+        try platform::os::write_all(staged_object.as_str(), contents: object)
+        let linked = lower::linux_link(target, object: staged_object.as_str(), image: staged_new.as_str(), alloc)
+        try platform::os::remove_file(staged_object.as_str())
         let Ok(_) = linked else {
             return linked
         }
     }
-    try platform::rename_path(staged_new.as_str(), to: image)
+    try platform::os::rename_path(staged_new.as_str(), to: image)
     return Ok(Unit)
 } write_image
 
@@ -346,7 +349,7 @@ pkg fn write_image(target: workspace::Target, object: Slice[u8], image: Str, all
 fn staged(directory: Str, name: Str, extension: Str, alloc: mem::Alloc) -> text::String {
     var file = text::String.of(".", alloc)
     mut file.append(name)
-    mut file.write(text::fmt(".{id}.", id: platform::process_id()), budget: 32)
+    mut file.write(text::fmt(".{id}.", id: platform::os::process_id()), budget: 32)
     mut file.append(extension)
     return platform::join(directory, name: file.as_str(), alloc)
 } staged

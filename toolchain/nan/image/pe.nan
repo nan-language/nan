@@ -1,10 +1,23 @@
-//! Writes UEFI-target images: PE32+ EFI applications with one section per segment and the base relocations of every 64-bit absolute address, so the firmware may load them anywhere.
+//! Writes PE32+ images: the console programs of the Windows targets, which import functions of the system's libraries, and the EFI applications of the UEFI targets, each with one section per segment and the base relocations of every 64-bit absolute address, so the system or the firmware may load it anywhere, then the object's unallocated sections.
 
-/// The address an image is linked for; its headers occupy its first page.
-const IMAGE_BASE: u64 = 0x0040_0000
+/// What a PE image runs as: a Windows console program or an EFI application.
+enum Program derives Copy, Eq {
+    Console
+    Efi
+} Program
+
+/// The address the image is linked for; its headers occupy its first page.
+fn Program.image_base(self) -> u64 {
+    return match self {
+        Program.Console => 0x0001_4000_0000
+        Program.Efi => 0x0040_0000
+    }
+} Program.image_base
 
 /// The address of an image's first section, after its headers.
-const PE_BASE: u64 = IMAGE_BASE + PAGE
+fn pe_base(program: Program) -> u64 {
+    return program.image_base() + PAGE
+} pe_base
 
 const FILE_ALIGNMENT: u64 = 0x200
 
@@ -23,9 +36,24 @@ const MACHINE_X86_64: u16 = 0x8664
 const MACHINE_AARCH64: u16 = 0xAA64
 const EXECUTABLE_LARGE_ADDRESS_AWARE: u16 = 0x0022
 const PE32_PLUS: u16 = 0x020B
+const SUBSYSTEM_CONSOLE: u16 = 3
 const SUBSYSTEM_EFI_APPLICATION: u16 = 10
+
+/// The system version a console program needs, Windows Vista's, and its DLL characteristics: a
+/// high-entropy and dynamic base, no execution of data and awareness of terminal servers.
+const CONSOLE_VERSION: u16 = 6
+const CONSOLE_CHARACTERISTICS: u16 = 0x8160
+
+/// The stack and heap a console program's process reserves and commits at start.
+const CONSOLE_RESERVE: u64 = 0x10_0000
+const CONSOLE_COMMIT: u64 = 0x1000
 const DIRECTORIES: u32 = 16
+const IMPORT_DIRECTORY: u32 = 1
 const BASE_RELOCATION_DIRECTORY: u32 = 5
+const IMPORT_ADDRESS_DIRECTORY: u32 = 12
+
+/// The size of an import directory entry.
+const IMPORT_ENTRY: u64 = 20
 const DIR64: u16 = 10
 
 const CODE: u32 = 0x0000_0020
@@ -34,6 +62,19 @@ const MEM_DISCARDABLE: u32 = 0x0200_0000
 const MEM_EXECUTE: u32 = 0x2000_0000
 const MEM_READ: u32 = 0x4000_0000
 const MEM_WRITE: u32 = 0x8000_0000
+
+/// The name of the image section holding an unallocated section of the object: its name without
+/// the dots after its first character, which fits the 8 bytes of a section name.
+fn section_name(name: Str, alloc: mem::Alloc) -> text::String {
+    var spelt = text::String.empty(alloc)
+    for c in name {
+        if spelt.is_empty() or c != '.' {
+            mut spelt.push(c)
+        }
+    }
+    expect spelt.byte_len() <= 8
+    return spelt
+} section_name
 
 /// A section of the image: its name, its RVA, its bytes, its size in memory and its flags.
 struct PeSection {
@@ -68,8 +109,116 @@ fn base_relocations(rvas: Slice[u64], alloc: mem::Alloc) -> mem::Bytes {
     return out
 } base_relocations
 
+/// A word of a console program's import address table: the library and the name of the function
+/// whose address it holds.
+struct TableWord {
+    library: text::String
+    function: text::String
+} TableWord
+
+/// A library a console program imports functions from, and how many words of its import address
+/// table follow each other for them.
+struct ImportedLibrary {
+    name: text::String
+    count: usize
+} ImportedLibrary
+
+/// The data directory entries of a console program's import address table and import directory:
+/// each one's RVA and size.
+struct ImportDirectories derives Copy {
+    table_rva: u32
+    table_size: u32
+    entries_rva: u32
+    entries_size: u32
+} ImportDirectories
+
+/// The import directory of a console program, laid after its import address table, its last
+/// section, whose words `imports` gives in order with each function's library and name: an entry
+/// per library and the terminating entry, the lookup tables, laid out as the address table is,
+/// each function's hint and name, then each library's name. Each word of the address table is set
+/// as the lookup table's is, to the address of the function's hint and name, which the loader
+/// replaces with the function's.
+fn import_tables(mut section: PeSection, imports: Slice[TableWord], alloc: mem::Alloc) -> ImportDirectories {
+    var libraries = mem::List[ImportedLibrary].empty(alloc)
+    for word in imports {
+        let last = libraries.len()
+        if last > 0 and libraries[last - 1].name == word.library {
+            var library = mut libraries.at_mut(last - 1)
+            library.count += 1
+        } else {
+            mut libraries.push(ImportedLibrary(name: text::String.of(word.library.as_str(), alloc), count: 1))
+        }
+    }
+    let table = section.rva
+    let size = 8 * u64.widen(imports.len() + libraries.len())
+    let directory = table + size
+    let lookup = directory + IMPORT_ENTRY * (u64.widen(libraries.len()) + 1)
+    let strings = lookup + size
+    var names = mem::Bytes.empty(alloc)
+    var words = mem::Bytes.empty(alloc)
+    var at: usize = 0
+    for library in libraries {
+        for _ in 0..<library.count {
+            expect at < imports.len()
+            object::append_u64(mut words, value: strings + u64.widen(names.len()))
+            mut names.push(0)
+            mut names.push(0)
+            mut names.append(imports[at].function.as_bytes())
+            mut names.push(0)
+            if names.len() % 2 == 1 {
+                mut names.push(0)
+            }
+            at += 1
+        }
+        object::append_u64(mut words, value: 0)
+    }
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(words.view())
+    var library_words: u64 = 0
+    for library in libraries {
+        let name = strings + u64.widen(names.len())
+        mut names.append(library.name.as_bytes())
+        mut names.push(0)
+        object::append_u32(mut bytes, value: u32.truncate(lookup + library_words))
+        object::append_u32(mut bytes, value: 0)
+        object::append_u32(mut bytes, value: 0)
+        object::append_u32(mut bytes, value: u32.truncate(name))
+        object::append_u32(mut bytes, value: u32.truncate(table + library_words))
+        library_words += 8 * (u64.widen(library.count) + 1)
+    }
+    object::resize(mut bytes, length: bytes.len() + usize.widen(IMPORT_ENTRY))
+    mut bytes.append(words.view())
+    mut bytes.append(names.view())
+    section.size = u64.widen(bytes.len())
+    section.bytes = bytes
+    return ImportDirectories(table_rva: u32.truncate(table), table_size: u32.truncate(size), entries_rva: u32.truncate(directory), entries_size: u32.truncate(lookup - directory))
+} import_tables
+
+/// The words of a console program's import address table, from the linked object's imports, each
+/// named by its library, `!` and its function.
+fn table_words(linked: Linked, alloc: mem::Alloc) -> mem::List[TableWord] {
+    var words = mem::List[TableWord].empty(alloc)
+    for import in linked.imports {
+        let named = import.name.as_str()
+        let Some(split) = named.find("!") else {
+            expect false
+            continue
+        }
+        let Some(library) = named.slice_bytes(0, end: split) else {
+            expect false
+            continue
+        }
+        let Some(function) = named.slice_bytes(split + 1, end: named.byte_len()) else {
+            expect false
+            continue
+        }
+        mut words.push(TableWord(library: text::String.of(library, alloc), function: text::String.of(function, alloc)))
+    }
+    return words
+} table_words
+
 /// The sections of the linked object's segments.
-fn pe_sections(linked: Linked, alloc: mem::Alloc) -> mem::List[PeSection] {
+fn pe_sections(linked: Linked, image_base: u64, alloc: mem::Alloc) -> mem::List[PeSection] {
     var sections = mem::List[PeSection].empty(alloc)
     for segment in linked.segments {
         let name = match segment.access {
@@ -84,8 +233,8 @@ fn pe_sections(linked: Linked, alloc: mem::Alloc) -> mem::List[PeSection] {
         }
         var bytes = mem::Bytes.empty(alloc)
         mut bytes.append(segment.bytes.view())
-        expect segment.address >= IMAGE_BASE
-        mut sections.push(PeSection(name: text::String.of(name, alloc), rva: segment.address - IMAGE_BASE, bytes: take bytes, size: segment.size, flags: flags))
+        expect segment.address >= image_base
+        mut sections.push(PeSection(name: text::String.of(name, alloc), rva: segment.address - image_base, bytes: take bytes, size: segment.size, flags: flags))
     }
     return sections
 } pe_sections
@@ -101,28 +250,47 @@ fn sum(sections: Slice[PeSection], flag: u32) -> u32 {
     return total
 } sum
 
-/// What the optional header gives beside the sections: the entry's address, the sizes of the
-/// image and of its headers, and the RVA and size of the base relocations.
+/// What the optional header gives beside the sections: what the image runs as, its image base,
+/// the entry's address, the sizes of the image and of its headers, the RVA and size of the base
+/// relocations, and a console program's import directories.
 struct Sizes derives Copy {
+    program: Program
+    image_base: u64
     entry: u64
     image: u64
     headers: u64
     relocation_rva: u64
     relocation_size: u64
+    imports: Option[ImportDirectories]
 } Sizes
 
-/// The bytes of a PE32+ EFI application holding the linked object's segments, linked at
-/// `IMAGE_BASE` and entered at the address `entry`.
-fn pe_write(linked: Linked, entry: u64, arch: workspace::Arch, alloc: mem::Alloc) -> mem::Bytes {
-    var sections = pe_sections(linked, alloc)
+/// The bytes of a PE32+ image of `program` holding the linked object's segments, linked at the
+/// program's image base and entered at the address `entry`; a console program's last segment is
+/// its import address table.
+fn pe_write(linked: Linked, entry: u64, arch: workspace::Arch, program: Program, alloc: mem::Alloc) -> mem::Bytes {
+    let image_base = program.image_base()
+    var sections = pe_sections(linked, image_base, alloc)
+    var imports: Option[ImportDirectories] = None
+    if program == Program.Console {
+        let words = table_words(linked, alloc)
+        let last = sections.len()
+        expect last > 0
+        var section = mut sections.at_mut(last - 1)
+        section.name = text::String.of(".idata", alloc)
+        imports = Some(import_tables(mut section, imports: words.view(), alloc))
+    }
     var relocations = mem::List[u64].empty(alloc)
     for address in linked.absolute {
-        expect address >= IMAGE_BASE
-        mut relocations.push(address - IMAGE_BASE)
+        expect address >= image_base
+        mut relocations.push(address - image_base)
     }
-    let end = linked.end()
-    expect end >= IMAGE_BASE
-    let relocation_rva = next_multiple_of(end - IMAGE_BASE, multiple: PAGE)
+    var end: u64 = 0
+    for section in sections {
+        if section.rva + section.size > end {
+            end = section.rva + section.size
+        }
+    }
+    let relocation_rva = next_multiple_of(end, multiple: PAGE)
     let relocation_bytes = base_relocations(relocations.view(), alloc)
     let relocation_size = u64.widen(relocation_bytes.len())
     var relocation_memory = relocation_size
@@ -130,10 +298,18 @@ fn pe_write(linked: Linked, entry: u64, arch: workspace::Arch, alloc: mem::Alloc
         relocation_memory = 1
     }
     mut sections.push(PeSection(name: text::String.of(".reloc", alloc), rva: relocation_rva, bytes: take relocation_bytes, size: relocation_memory, flags: INITIALIZED | MEM_DISCARDABLE | MEM_READ))
-    let image_size = next_multiple_of(relocation_rva + relocation_memory, multiple: PAGE)
+    var end_rva = relocation_rva + relocation_memory
+    for held in linked.unallocated {
+        let rva = next_multiple_of(end_rva, multiple: PAGE)
+        var data = mem::Bytes.empty(alloc)
+        mut data.append(held.data.view())
+        end_rva = rva + u64.widen(held.data.len())
+        mut sections.push(PeSection(name: section_name(held.name.as_str(), alloc), rva: rva, bytes: take data, size: u64.widen(held.data.len()), flags: INITIALIZED | MEM_DISCARDABLE | MEM_READ))
+    }
+    let image_size = next_multiple_of(end_rva, multiple: PAGE)
     let headers_size = next_multiple_of(PE_HEADERS + PE_SECTION_HEADER * u64.widen(sections.len()), multiple: FILE_ALIGNMENT)
     var out = mem::Bytes.empty(alloc)
-    write_headers(mut out, sections: sections.view(), sizes: Sizes(entry: entry, image: image_size, headers: headers_size, relocation_rva: relocation_rva, relocation_size: relocation_size), arch)
+    write_headers(mut out, sections: sections.view(), sizes: Sizes(program: program, image_base: image_base, entry: entry, image: image_size, headers: headers_size, relocation_rva: relocation_rva, relocation_size: relocation_size, imports: imports), arch)
     var raw = headers_size
     var placed = mem::List[u64].empty(alloc)
     for section in sections {
@@ -169,7 +345,7 @@ fn pe_write(linked: Linked, entry: u64, arch: workspace::Arch, alloc: mem::Alloc
 
 /// Writes the DOS header, the signature, the file header and the optional header.
 fn write_headers(mut out: mem::Bytes, sections: Slice[PeSection], sizes: Sizes, arch: workspace::Arch)
-    requires sections.len() > 0 and sizes.entry >= IMAGE_BASE
+    requires sections.len() > 0 and sizes.entry >= sizes.image_base
 {
     mut out.append(b"MZ")
     object::resize(mut out, length: E_LFANEW)
@@ -189,18 +365,40 @@ fn write_headers(mut out: mem::Bytes, sections: Slice[PeSection], sizes: Sizes, 
     object::append_u32(mut out, value: sum(sections, flag: CODE))
     object::append_u32(mut out, value: sum(sections, flag: INITIALIZED))
     object::append_u32(mut out, value: 0)
-    object::append_u32(mut out, value: u32.truncate(sizes.entry - IMAGE_BASE))
+    object::append_u32(mut out, value: u32.truncate(sizes.entry - sizes.image_base))
     object::append_u32(mut out, value: u32.truncate(sections[0].rva))
-    object::append_u64(mut out, value: IMAGE_BASE)
+    object::append_u64(mut out, value: sizes.image_base)
     object::append_u32(mut out, value: u32.fit(PAGE))
     object::append_u32(mut out, value: u32.fit(FILE_ALIGNMENT))
-    object::resize(mut out, length: out.len() + 16)
+    let console = sizes.program == Program.Console
+    let version = if console {
+        CONSOLE_VERSION
+    } else {
+        0
+    }
+    for half in 0..<6usize {
+        if half == 0 or half == 4 {
+            object::append_u16(mut out, value: version)
+        } else {
+            object::append_u16(mut out, value: 0)
+        }
+    }
+    object::append_u32(mut out, value: 0)
     object::append_u32(mut out, value: u32.truncate(sizes.image))
     object::append_u32(mut out, value: u32.truncate(sizes.headers))
     object::append_u32(mut out, value: 0)
-    object::append_u16(mut out, value: SUBSYSTEM_EFI_APPLICATION)
-    object::append_u16(mut out, value: 0)
-    object::resize(mut out, length: out.len() + 32)
+    if console {
+        object::append_u16(mut out, value: SUBSYSTEM_CONSOLE)
+        object::append_u16(mut out, value: CONSOLE_CHARACTERISTICS)
+        for _ in 0..<2usize {
+            object::append_u64(mut out, value: CONSOLE_RESERVE)
+            object::append_u64(mut out, value: CONSOLE_COMMIT)
+        }
+    } else {
+        object::append_u16(mut out, value: SUBSYSTEM_EFI_APPLICATION)
+        object::append_u16(mut out, value: 0)
+        object::resize(mut out, length: out.len() + 32)
+    }
     object::append_u32(mut out, value: 0)
     object::append_u32(mut out, value: DIRECTORIES)
     for directory in 0..<DIRECTORIES {
@@ -209,6 +407,18 @@ fn write_headers(mut out: mem::Bytes, sections: Slice[PeSection], sizes: Sizes, 
         if directory == BASE_RELOCATION_DIRECTORY {
             rva = u32.truncate(sizes.relocation_rva)
             size = u32.truncate(sizes.relocation_size)
+        }
+        match sizes.imports {
+            Some(imports) => {
+                if directory == IMPORT_ADDRESS_DIRECTORY {
+                    rva = imports.table_rva
+                    size = imports.table_size
+                } else if directory == IMPORT_DIRECTORY {
+                    rva = imports.entries_rva
+                    size = imports.entries_size
+                }
+            }
+            None => {}
         }
         object::append_u32(mut out, value: rva)
         object::append_u32(mut out, value: size)

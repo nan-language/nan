@@ -291,9 +291,8 @@ pub fn wait(
             let cancelled = fx.b.ins().icmp_imm_s(IntCC::NotEqual, cancelled, 0);
             fx.when(cancelled, |fx| lo.cancel_operation(fx, op));
             tasks::wait_delivered(lo, fx, op);
-            let current = tasks::current_task(lo, fx);
-            let zero = fx.ptr(0);
-            fx.store(zero, current, task::IO);
+            let word = fx.offset(record, task::IO);
+            tasks::release_io(lo, fx, word, op);
             let result = fx.load(types::I32, op, operation::RESULT);
             vec![fx.b.ins().icmp_imm_s(IntCC::Equal, result, CANCELED)]
         },

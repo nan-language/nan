@@ -4,10 +4,10 @@ This chapter defines targets and the dependencies they allow, target descriptors
 
 ## Targets
 
-A **target** is a platform a package is checked and built for: `x86_64-host`, `x86_64-uefi`, `x86_64-bare`, `x86_64-nanos`, `aarch64-host`, `aarch64-uefi`, `aarch64-bare`, `aarch64-nanos` or `any`. The `targets` [directive](03-packages-modules.md#manifest) lists a package's declared targets.
+A **target** is a platform a package is checked and built for: `x86_64-linux`, `x86_64-windows`, `x86_64-uefi`, `x86_64-bare`, `x86_64-nanos`, `aarch64-linux`, `aarch64-windows`, `aarch64-uefi`, `aarch64-bare`, `aarch64-nanos` or `any`. The `targets` [directive](03-packages-modules.md#manifest) lists a package's declared targets.
 
 - The targets other than `any` are the **concrete targets**, each fixed by its [descriptor](#descriptors). A package declaring `any` is valid on every concrete target and is checked once, under the `any` descriptor.
-- A concrete target's **architecture** is x86_64 or AArch64, as its name starts with `x86_64` or `aarch64`. `x86_64-host` and `aarch64-host` are the **host targets**, `x86_64-uefi` and `aarch64-uefi` the **UEFI targets**, and `x86_64-bare` and `aarch64-bare` the **bare targets**, and `x86_64-nanos` and `aarch64-nanos` the **nanos targets**, whose programs and libraries run on a NaN OS kernel; the UEFI and bare targets are the **machine targets**.
+- A concrete target's **architecture** is x86_64 or AArch64, as its name starts with `x86_64` or `aarch64`. `x86_64-linux` and `aarch64-linux` are the **Linux targets**, `x86_64-windows` and `aarch64-windows` the **Windows targets**, `x86_64-uefi` and `aarch64-uefi` the **UEFI targets**, `x86_64-bare` and `aarch64-bare` the **bare targets**, and `x86_64-nanos` and `aarch64-nanos` the **nanos targets**, whose programs and libraries run on a NaN OS kernel; the Linux and Windows targets are the **host targets**, whose programs run as processes of an operating system, and the UEFI and bare targets are the **machine targets**.
 - A package **covers** a target when it declares that target or `any`. A `dep` directive naming a package that does not cover every target the declaring package declares, `any` included, is an error (`target.dependency-uncovered`).
 
 ```nan
@@ -56,7 +56,7 @@ pub fn drop_twice() -> ring::Drops {
 
 package hostinfo {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
 } hostinfo
 
 // file: hostinfo/hostinfo.nan
@@ -85,39 +85,39 @@ pub fn pages(bytes: usize) -> usize {
 
 A **descriptor** is the fixed definition of a target. The language version fixes every descriptor; no option, file or variable changes one. A concrete target's descriptor fixes its [environment](#environments), [root grant](14-authority.md#root-grants), [platform package](28-stdlib.md#platform-packages) (whose entry [landing fn](23-low-level.md#landing-functions) mints the root grant), [calling conventions](23-low-level.md#calling-conventions), [privileged intrinsics](23-low-level.md#privileged-intrinsics), [compiler stubs](23-low-level.md#compiler-stubs), codegen, [image](#images) format, [support routine](#runtime-support) names and these values:
 
-| Field | `x86_64-host` | `x86_64-uefi` | `x86_64-bare` |
-| --- | --- | --- | --- |
-| Platform | Linux 6.1 or later on x86_64, with glibc 2.35 or later | UEFI firmware with boot services, on x86_64 | an x86_64 machine started by the PVH boot protocol |
-| Default task stack ([task stacks](17-suspension-io.md#task-stacks)) | 64 KiB | none | none |
-| Entry task stack ([task stacks](17-suspension-io.md#task-stacks)) | 64 MiB | none | none |
-| Stub call bound | 256 bytes | 256 bytes | 256 bytes |
-| Seam frame | none | 4 KiB | 4 KiB |
-| Boot heap ([anchor](24-kernel.md#anchor)) | none | 16 MiB | 16 MiB |
-| Serial port | none | the 16550 UART at I/O port `0x3F8` | the 16550 UART at I/O port `0x3F8` |
-| Console port | none | the 16550 UART at I/O port `0x2F8` | the 16550 UART at I/O port `0x2F8` |
-| Exit port | none | I/O port `0xF4` | I/O port `0xF4` |
-| Interrupt controller | none | each CPU's local APIC, in x2APIC mode when the boot CPU has it and at `0xFEE0_0000` otherwise, and the I/O APIC at `0xFEC0_0000` | each CPU's local APIC, in x2APIC mode when the boot CPU has it and at `0xFEE0_0000` otherwise, and the I/O APIC at `0xFEC0_0000` |
-| Timer | none | each CPU's local APIC timer, firing vector `0x20` in TSC-deadline mode where CPUID leaf 1 reports the mode and the clock is the time-stamp counter, and one-shot otherwise ([kernel time](24-kernel.md#kernel-time)) | each CPU's local APIC timer, firing vector `0x20` in TSC-deadline mode where CPUID leaf 1 reports the mode and the clock is the time-stamp counter, and one-shot otherwise ([kernel time](24-kernel.md#kernel-time)) |
-| Clock | none | the time-stamp counter where CPUID leaf `0x8000_0007` reports it invariant, otherwise the HPET the ACPI `HPET` table names, else the ACPI PM timer the FADT names, else the time-stamp counter; the time-stamp counter's rate is the one CPUID leaf `0x15` gives where it gives both the ratio and the crystal's frequency, and is otherwise measured against 10 ms of that HPET or else PM timer, or else 11,932 periods of the 1,193,182 Hz legacy PIT's channel 2 | the time-stamp counter where CPUID leaf `0x8000_0007` reports it invariant, otherwise the HPET the ACPI `HPET` table names, else the ACPI PM timer the FADT names, else the time-stamp counter; the time-stamp counter's rate is the one CPUID leaf `0x15` gives where it gives both the ratio and the crystal's frequency, and is otherwise measured against 10 ms of that HPET or else PM timer, or else 11,932 periods of the 1,193,182 Hz legacy PIT's channel 2 |
-| Wall clock | none | the firmware's `GetTime` | the CMOS clock, its year read in the century from 2000 |
-| Emulator | none | QEMU with OVMF firmware | QEMU |
+| Field | `x86_64-linux` | `x86_64-windows` | `x86_64-uefi` | `x86_64-bare` |
+| --- | --- | --- | --- | --- |
+| Platform | Linux 6.1 or later on x86_64, with glibc 2.35 or later | Windows 10 version 1809 or later on x86_64 | UEFI firmware with boot services, on x86_64 | an x86_64 machine started by the PVH boot protocol |
+| Default task stack ([task stacks](17-suspension-io.md#task-stacks)) | 64 KiB | 64 KiB | none | none |
+| Entry task stack ([task stacks](17-suspension-io.md#task-stacks)) | 64 MiB | 64 MiB | none | none |
+| Stub call bound | 256 bytes | 256 bytes | 256 bytes | 256 bytes |
+| Seam frame | none | none | 4 KiB | 4 KiB |
+| Boot heap ([anchor](24-kernel.md#anchor)) | none | none | 16 MiB | 16 MiB |
+| Serial port | none | none | the 16550 UART at I/O port `0x3F8` | the 16550 UART at I/O port `0x3F8` |
+| Console port | none | none | the 16550 UART at I/O port `0x2F8` | the 16550 UART at I/O port `0x2F8` |
+| Exit port | none | none | I/O port `0xF4` | I/O port `0xF4` |
+| Interrupt controller | none | none | each CPU's local APIC, in x2APIC mode when the boot CPU has it and at `0xFEE0_0000` otherwise, and the I/O APIC at `0xFEC0_0000` | each CPU's local APIC, in x2APIC mode when the boot CPU has it and at `0xFEE0_0000` otherwise, and the I/O APIC at `0xFEC0_0000` |
+| Timer | none | none | each CPU's local APIC timer, firing vector `0x20` in TSC-deadline mode where CPUID leaf 1 reports the mode and the clock is the time-stamp counter, and one-shot otherwise ([kernel time](24-kernel.md#kernel-time)) | each CPU's local APIC timer, firing vector `0x20` in TSC-deadline mode where CPUID leaf 1 reports the mode and the clock is the time-stamp counter, and one-shot otherwise ([kernel time](24-kernel.md#kernel-time)) |
+| Clock | none | none | the time-stamp counter where CPUID leaf `0x8000_0007` reports it invariant, otherwise the HPET the ACPI `HPET` table names, else the ACPI PM timer the FADT names, else the time-stamp counter; the time-stamp counter's rate is the one CPUID leaf `0x15` gives where it gives both the ratio and the crystal's frequency, and is otherwise measured against 10 ms of that HPET or else PM timer, or else 11,932 periods of the 1,193,182 Hz legacy PIT's channel 2 | the time-stamp counter where CPUID leaf `0x8000_0007` reports it invariant, otherwise the HPET the ACPI `HPET` table names, else the ACPI PM timer the FADT names, else the time-stamp counter; the time-stamp counter's rate is the one CPUID leaf `0x15` gives where it gives both the ratio and the crystal's frequency, and is otherwise measured against 10 ms of that HPET or else PM timer, or else 11,932 periods of the 1,193,182 Hz legacy PIT's channel 2 |
+| Wall clock | none | none | the firmware's `GetTime` | the CMOS clock, its year read in the century from 2000 |
+| Emulator | none | Wine | QEMU with OVMF firmware | QEMU |
 
-| Field | `aarch64-host` | `aarch64-uefi` | `aarch64-bare` |
-| --- | --- | --- | --- |
-| Platform | Linux 6.1 or later on AArch64, with glibc 2.35 or later | UEFI firmware with boot services, on AArch64 at EL1, on a machine its device tree or ACPI tables describe ([machine discovery](#descriptors)) | an AArch64 machine with a GICv3, entering the image at EL1 or EL2 with the MMU off, the address of a flattened device tree in `x0` and that of a [start information](24-kernel.md#start-information) in `x1`, either zero for none, the device tree or else the ACPI tables the start information names describing the machine ([machine discovery](#descriptors)); with both zero, the device tree lies at `0x4000_0000` |
-| Default task stack ([task stacks](17-suspension-io.md#task-stacks)) | 64 KiB | none | none |
-| Entry task stack ([task stacks](17-suspension-io.md#task-stacks)) | 64 MiB | none | none |
-| Stub call bound | 256 bytes | 256 bytes | 256 bytes |
-| Seam frame | none | 4 KiB | 4 KiB |
-| Boot heap ([anchor](24-kernel.md#anchor)) | none | 16 MiB | 16 MiB |
-| Serial port | none | the UART machine discovery finds, none without one | the UART machine discovery finds, none without one |
-| Console port | none | on the emulator, the PL011 UART at `0x0904_0000` | on the emulator, the PL011 UART at `0x0904_0000` |
-| Exit port | none | the semihosting exit call | the semihosting exit call |
-| Interrupt controller | none | the GICv3 machine discovery finds, with its ITS when it has one and its distributor reports LPIs | the GICv3 machine discovery finds, with its ITS when it has one and its distributor reports LPIs |
-| Timer | none | each CPU's virtual timer, firing vector 27 one-shot ([kernel time](24-kernel.md#kernel-time)) | each CPU's virtual timer, firing vector 27 one-shot ([kernel time](24-kernel.md#kernel-time)) |
-| Clock | none | the virtual counter, at the rate `CNTFRQ_EL0` gives | the virtual counter, at the rate `CNTFRQ_EL0` gives |
-| Wall clock | none | the firmware's `GetTime` | the PL031 machine discovery finds, none without one |
-| Emulator | none | QEMU with AAVMF firmware | QEMU |
+| Field | `aarch64-linux` | `aarch64-windows` | `aarch64-uefi` | `aarch64-bare` |
+| --- | --- | --- | --- | --- |
+| Platform | Linux 6.1 or later on AArch64, with glibc 2.35 or later | Windows 10 version 1809 or later on AArch64 | UEFI firmware with boot services, on AArch64 at EL1, on a machine its device tree or ACPI tables describe ([machine discovery](#descriptors)) | an AArch64 machine with a GICv3, entering the image at EL1 or EL2 with the MMU off, the address of a flattened device tree in `x0` and that of a [start information](24-kernel.md#start-information) in `x1`, either zero for none, the device tree or else the ACPI tables the start information names describing the machine ([machine discovery](#descriptors)); with both zero, the device tree lies at `0x4000_0000` |
+| Default task stack ([task stacks](17-suspension-io.md#task-stacks)) | 64 KiB | 64 KiB | none | none |
+| Entry task stack ([task stacks](17-suspension-io.md#task-stacks)) | 64 MiB | 64 MiB | none | none |
+| Stub call bound | 256 bytes | 256 bytes | 256 bytes | 256 bytes |
+| Seam frame | none | none | 4 KiB | 4 KiB |
+| Boot heap ([anchor](24-kernel.md#anchor)) | none | none | 16 MiB | 16 MiB |
+| Serial port | none | none | the UART machine discovery finds, none without one | the UART machine discovery finds, none without one |
+| Console port | none | none | on the emulator, the PL011 UART at `0x0904_0000` | on the emulator, the PL011 UART at `0x0904_0000` |
+| Exit port | none | none | the semihosting exit call | the semihosting exit call |
+| Interrupt controller | none | none | the GICv3 machine discovery finds, with its ITS when it has one and its distributor reports LPIs | the GICv3 machine discovery finds, with its ITS when it has one and its distributor reports LPIs |
+| Timer | none | none | each CPU's virtual timer, firing vector 27 one-shot ([kernel time](24-kernel.md#kernel-time)) | each CPU's virtual timer, firing vector 27 one-shot ([kernel time](24-kernel.md#kernel-time)) |
+| Clock | none | none | the virtual counter, at the rate `CNTFRQ_EL0` gives | the virtual counter, at the rate `CNTFRQ_EL0` gives |
+| Wall clock | none | none | the firmware's `GetTime` | the PL031 machine discovery finds, none without one |
+| Emulator | none | Wine | QEMU with AAVMF firmware | QEMU |
 
 - Codegen uses, on x86_64, the x86-64 base instruction set with SSE2 and, on AArch64, the A64 instruction set of Armv8.0-A with floating point and Advanced SIMD, and no later extension unless a [codegen level](#codegen-levels) adds it. On the machine targets, lowered code never stores below the stack pointer and uses no floating-point, SSE or SIMD register ([floating point](24-kernel.md#floating-point)).
 - A call of a compiler stub or a support routine uses at most the stub call bound of its caller's stack, switching to a stack the image reserves when it needs more. A **seam frame** is the most stack a vector seam uses for the state it saves.
@@ -129,7 +129,8 @@ A **descriptor** is the fixed definition of a target. The language version fixes
 - On the emulator, writing a byte v to the **exit port** ends the emulator with exit status (2v + 1) mod 256; on AArch64 the write is a semihosting `SYS_EXIT` call with reason `ADP_Stopped_ApplicationExit` and subcode 2v + 1. On other machines of the platform, writing to it has no effect on x86_64 and stops the CPU with maskable interrupts disabled on AArch64.
 - On `x86_64-uefi` and `x86_64-bare`, the vectors of [`hw::vectors`](25-registries.md#platform-registries) have these classes: `Trap` for 0 to 7, 16, 18 to 20 and 28; `TrapWithCode` for 8, 10 to 13, 17, 21, 29 and 30; `PageFault` for 14; `Irq` for 32 to 255; none for 9, 15, 22 to 27 and 31. Vectors 0 to 31 are the exception vectors and 32 to 255 the interrupt vectors. Vectors 2, 8 and 18 need a nonzero `ist`. Vector `0xFE` is the CPU signal ([cross-CPU operations](24-kernel.md#cross-cpu-operations)), a fixed interrupt of the local APICs.
 - On `aarch64-uefi` and `aarch64-bare`, vector n from 16 to 255 is interrupt n of the interrupt controller, of class `Irq`, except vector `0xFE`, the CPU signal ([cross-CPU operations](24-kernel.md#cross-cpu-operations)), which software-generated interrupt 1 delivers; vectors 0 to 15 are the exception vectors: vector 0, a synchronous exception other than an instruction or data abort, and vector 2, an SError interrupt, have class `TrapWithCode`; vector 1, an instruction or data abort, has class `PageFault`; vectors 3 to 15 have none. Vectors 0 to 15 are the exception vectors and 16 to 255 the interrupt vectors. Every vector's seam runs on its CPU's interrupt stack of `ist` 0, the only `ist` a vector takes.
-- The descriptor of each nanos target fixes its environment and its root grant, `nanos::World` ([root grants](14-authority.md#root-grants)), and names no platform package. Its codegen is that of the host target of its architecture: code holds floats and lane types in the floating-point and vector registers. A task whose entry states no `limits stack N`, the entry task among them, starts with a stack of 64 KiB that [grows](17-suspension-io.md#grown-stacks), and its stub call bound is 256 bytes. Its images are [bundles](30-artefacts.md#bundles) that a bare kernel of its architecture loads and runs on its runtime ([final builds](#final-builds)).
+- The descriptor of each nanos target fixes its environment and its root grant, `nanos::World` ([root grants](14-authority.md#root-grants)), and names no platform package. Its codegen is that of the Linux target of its architecture: code holds floats and lane types in the floating-point and vector registers. A task whose entry states no `limits stack N`, the entry task among them, starts with a stack of 64 KiB that [grows](17-suspension-io.md#grown-stacks), and its stub call bound is 256 bytes. Its images are [bundles](30-artefacts.md#bundles) that a bare kernel of its architecture loads and runs on its runtime ([final builds](#final-builds)).
+- The emulator of the Windows targets is Wine, `wine` from the `PATH`, running an image on a machine of the target's architecture with its own diagnostics off, `WINEDEBUG` set to `-all`, when the toolchain runs on Linux; a toolchain running on Windows runs the image as a process of its system.
 - The `any` descriptor fixes only its environment, which restricts nothing.
 
 ```nan
@@ -240,7 +241,7 @@ The `entry main` directive names the **entry function**: the function item `main
 
 | Target | Head |
 | --- | --- |
-| `x86_64-host`, `aarch64-host` | `fn main(take P: host::World) fails E uses wait` or `fn main(take P: host::World) -> u8 fails E uses wait` |
+| `x86_64-linux`, `x86_64-windows`, `aarch64-linux`, `aarch64-windows` | `fn main(take P: host::World) fails E uses wait` or `fn main(take P: host::World) -> u8 fails E uses wait` |
 | `x86_64-uefi`, `aarch64-uefi` | `fn main(take P: boot::Machine) -> Never` |
 | `x86_64-bare`, `aarch64-bare` | `fn main(take P: boot::Kernel) -> Never` |
 | `x86_64-nanos`, `aarch64-nanos` | `fn main(take P: nanos::World, take I: In) -> Out fails E uses wait`, In and Out implementing `Encode`, or a form of the host targets |
@@ -255,7 +256,7 @@ The entry function of a bare target starts kernel tasks only by ending in `take 
 
 package status {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } status
 
@@ -402,7 +403,7 @@ fn main(take world: nanos::World, input: u32) fails task::Cancelled uses wait li
 
 package status {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } status
 
@@ -420,7 +421,7 @@ fn main(take world: host::World) fails task::Cancelled { // error: target.entry-
 
 package status {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry start // error: target.entry-missing
 } status
 
@@ -434,24 +435,24 @@ fn start(take world: host::World) fails task::Cancelled uses wait {
 
 ### Host runs
 
-A program run on a host target is one Linux process:
+A program run on a host target is one process of its operating system:
 
-1. glibc's start-up code calls the program entry seam, whose symbol is `main`. The seam calls the host entry landing fn, which mints `host::World`.
+1. On a Linux target, glibc's start-up code calls the program entry seam, whose symbol is `main`; on a Windows target, the system enters the image at the seam. The seam calls the host entry landing fn, which mints `host::World`.
 2. The executor runs tasks on one thread per processor in the process's affinity set at start. The seam starts the entry function, given the `host::World`, as the **entry task**: the first task of the process [domain](11-errors-domains.md#domains).
 3. The process exits when the entry task ends, with the status of the first row of this table matching the outcome.
 
 | Outcome | Exit status |
 | --- | --- |
 | the processor lacks an extension of the image's [codegen level](#codegen-levels) | 71, after writing `nan: codegen `, the level's name, ` unsupported` and a line feed to standard error |
-| the executor threads, the thread reading termination requests, their io_uring instances or the entry task's stack cannot be created | 71, after writing `nan: runtime unavailable` and a line feed to standard error |
+| the executor threads, the thread reading termination requests or the console control handler, their io_uring instances or completion port, or the entry task's stack cannot be created | 71, after writing `nan: runtime unavailable` and a line feed to standard error |
 | the entry task traps | 70, after writing the [trap report](11-errors-domains.md#trap-reports) to standard error |
-| the entry task returns or fails after a termination request with signal number n | 128 + n |
+| the entry task returns or fails after a termination request | on a Linux target 128 + n for a request with signal number n, and on a Windows target `0xC000013A` |
 | it fails with `e` | 1, after writing `error: `, the rendering of `e` within a render budget of 4,096 bytes, and a line feed to standard error; a trap while rendering `e` is a trap of the entry task, with status 70 |
 | it returns, `Unit` form | 0 |
 | it returns `s`, `u8` form | `s` |
 
-- A **termination request** is the delivery of `SIGINT`, `SIGTERM` or `SIGHUP` to the process. The first one is a cancelling construct ([origin and absorption](11-errors-domains.md#origin-and-absorption)) whose region is the entry task: it cancels that task with [acknowledged cancellation](17-suspension-io.md#acknowledged-cancellation) and absorbs the cancellation. A later one ends the process at once with status 128 + n.
-- The runtime ignores `SIGPIPE`.
+- A **termination request** is, on a Linux target, the delivery of `SIGINT`, `SIGTERM` or `SIGHUP` to the process, and on a Windows target a console control event, such as Ctrl+C, which the system passes to the console's control handler. The first one is a cancelling construct ([origin and absorption](11-errors-domains.md#origin-and-absorption)) whose region is the entry task: it cancels that task with [acknowledged cancellation](17-suspension-io.md#acknowledged-cancellation) and absorbs the cancellation. A later one ends the process at once with the status the table gives after one.
+- On a Linux target the runtime ignores `SIGPIPE`.
 
 ### Machine runs
 
@@ -470,7 +471,7 @@ A **program** is a package with an `entry` directive; a **library** is a package
 
 package hello {
     language 1
-    targets x86_64-bare, x86_64-host
+    targets x86_64-bare, x86_64-linux
     entry main // error: target.program-targets
 } hello
 
@@ -506,7 +507,7 @@ fn main(take world: host::World) fails task::Cancelled uses wait {
 
 package hello {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
 } hello
 
@@ -524,7 +525,7 @@ fn main(take world: host::World) fails task::Cancelled uses wait {
 
 package echo {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     dep hello "../hello" // error: target.dep-program
 } echo
 
@@ -606,7 +607,7 @@ A **codegen level** names extensions beyond the base instruction set of a [descr
 | `aarch64-dotprod` | AArch64 | the large system extensions and the dot product instructions (FEAT_LSE and FEAT_DotProd) |
 
 - A level changes no result: lowering gives the same intermediate form at every level, and only the selection of instructions depends on it. On a machine target, code still uses no floating-point, SSE or SIMD register, so a level adds only instructions on general registers.
-- An image of a level checks, before anything else, that its processor has each extension of the level, and on a host target that Linux enables the register state of its AVX and AVX-512 extensions; an image whose check fails ends as [host runs](#host-runs) and [machine runs](#machine-runs) state.
+- An image of a level checks, before anything else, that its processor has each extension of the level, and on a host target that the operating system enables the register state of its AVX and AVX-512 extensions; an image whose check fails ends as [host runs](#host-runs) and [machine runs](#machine-runs) state.
 
 ```nan
 // file: mixer/package.nan
@@ -614,7 +615,7 @@ A **codegen level** names extensions beyond the base instruction set of a [descr
 
 package mixer {
     language 1
-    targets x86_64-host
+    targets x86_64-linux
     entry main
     codegen x86_64-v3
 } mixer
@@ -630,14 +631,14 @@ fn main(take world: host::World) fails task::Cancelled uses wait {
 
 ## Runtime support
 
-No mandatory runtime exists. Before the entry landing fn, only the program entry seam runs, preceded on the host targets by glibc's start-up code. Lowered code has no writable static data: consts, literals and registry tables are read-only data of the image, never initialised at run time. An image holds exactly the support routines that its lowered code, compiler stubs and seams call.
+No mandatory runtime exists. Before the entry landing fn, only the program entry seam runs, preceded on the Linux targets by glibc's start-up code. Lowered code has no writable static data: consts, literals and registry tables are read-only data of the image, never initialised at run time. An image holds exactly the support routines that its lowered code, compiler stubs and seams call.
 
 A **support routine** is one of these fixed routines of the implementation, each with the name its descriptor gives it:
 
 | Name | Does | Targets |
 | --- | --- | --- |
 | `stack_switch` | creates, switches and frees task stacks, and runs each executor's choice of ready tasks | every concrete target |
-| `trap` | stops a trapping domain's tasks, writes the trap report and ends the domain as its kind gives; on the host targets it receives a fault in a stack's guard region as `SIGSEGV` on an alternate signal stack and reports `trap.stack-overflow` | every concrete target |
+| `trap` | stops a trapping domain's tasks, writes the trap report and ends the domain as its kind gives; on the Linux targets it receives a fault in a stack's guard region as `SIGSEGV` on an alternate signal stack, and on the Windows targets as a stack overflow exception in a vectored exception handler, and reports `trap.stack-overflow` | every concrete target |
 | `settle` | performs [settlement](11-errors-domains.md#settlement) | the host targets |
 | `cap_table` | mints capabilities, revokes, keeps cells, chunk draws and the outbox table, and dispatches each target-dependent operation to the platform function its table entry records ([platform packages](28-stdlib.md#platform-packages)) | every concrete target |
 | `mem_op` | copies, fills and compares byte ranges for lowering | every concrete target |
@@ -646,11 +647,11 @@ A **support routine** is one of these fixed routines of the implementation, each
 
 Each function of a routine is named by the routine's name, `_` and a suffix that belongs to the ABI inside the final closure.
 
-The runtime turns on the data-independent timing mode that [Secret values](15-untrusted.md#constant-time-lowering) rely on where a program can: on the machine targets, on each CPU as it starts, DOITM on x86_64 when `IA32_ARCH_CAPABILITIES` enumerates it and `PSTATE.DIT` on AArch64 when `ID_AA64PFR0_EL1` does; on `aarch64-host`, `PSTATE.DIT` for every thread of the process before the entry landing fn, when the kernel reports `HWCAP_DIT`. On `x86_64-host` the mode is the kernel's, which a user process cannot set.
+The runtime turns on the data-independent timing mode that [Secret values](15-untrusted.md#constant-time-lowering) rely on where a program can: on the machine targets, on each CPU as it starts, DOITM on x86_64 when `IA32_ARCH_CAPABILITIES` enumerates it and `PSTATE.DIT` on AArch64 when `ID_AA64PFR0_EL1` does; on `aarch64-linux`, `PSTATE.DIT` for every thread of the process before the entry landing fn, when the kernel reports `HWCAP_DIT`. On `x86_64-linux` the mode is the kernel's, which a user process cannot set, and on the Windows targets it is the system's.
 
 ### Host I/O backend
 
-On the host targets every waiting primitive of the platform package performs its operation through io_uring:
+On the Linux targets every waiting primitive of the platform package performs its operation through io_uring:
 
 - Each executor thread owns one io_uring instance. A primitive submits its operation as submission queue entries on the ring of the thread running its task, and suspends the task until the matching completion queue entries arrive on that ring.
 - Cancelling an in-flight operation submits `IORING_OP_ASYNC_CANCEL` for it on the ring holding it; the operation's own completion entry, whatever its result, is the acknowledgement.
@@ -658,17 +659,25 @@ On the host targets every waiting primitive of the platform package performs its
 - Every thread blocks the termination request signals. A thread of the runtime that runs no task reads them from a `signalfd` and passes the first to an executor thread's ring with `IORING_OP_MSG_RING`, so a later one ends the process whatever the executor threads run.
 - An executor thread with no ready task waits in `io_uring_enter` for a completion; making a task ready wakes such a thread with `IORING_OP_MSG_RING`.
 
+On the Windows targets the executor threads share one I/O completion port:
+
+- A waiting primitive of the platform package runs a request: a socket's reads, writes, accepts and connects are overlapped operations completing through the port, and a standard stream's reads and writes run synchronously on a thread of their own, which posts their completion to the port. Cancelling a request in flight cancels it with `CancelIoEx`, or `CancelSynchronousIo` for one on a thread of its own; its completion, whatever its result, is the acknowledgement. File operations run synchronously on the executor thread.
+- Sleeps and deadlines are timers of the monotonic clock, the performance counter, which the runtime keeps; an executor thread waiting idle waits no longer than the first one is due.
+- The console's control handler runs on a thread of the system's and passes the first termination request to the port, so a later one ends the process whatever the executor threads run.
+- An executor thread with no ready task waits on the port in `GetQueuedCompletionStatusEx`; making a task ready posts a packet to the port when another thread waits there.
+
 ## Images
 
 An **image** is the output of a final build:
 
-- On a host target, a position-independent ELF64 executable for Linux on the target's architecture, dynamically linked against `libc.so.6` alone and named after the package. The target's **linker** links it from the objects lowering produced: `cc` from the `PATH` when the machine running the toolchain has the target's architecture, and otherwise `x86_64-linux-gnu-gcc` for `x86_64-host` and `aarch64-linux-gnu-gcc` for `aarch64-host`, from the `PATH`. It carries the [host ELF section](30-artefacts.md#host-elf-section). A failing linker run is an error (`target.link-failed`), reported on the root's `entry` directive and quoting the linker's output in an [envelope](33-toolchain.md#envelopes).
+- On a Linux target, a position-independent ELF64 executable for Linux on the target's architecture, dynamically linked against `libc.so.6` alone and named after the package. The target's **linker** links it from the objects lowering produced: `cc` from the `PATH` when the machine running the toolchain has the target's architecture, and otherwise `x86_64-linux-gnu-gcc` for `x86_64-linux` and `aarch64-linux-gnu-gcc` for `aarch64-linux`, from the `PATH`. It carries the [host sections](30-artefacts.md#host-sections). A failing linker run is an error (`target.link-failed`), reported on the root's `entry` directive and quoting the linker's output in an [envelope](33-toolchain.md#envelopes).
+- On a Windows target, a PE32+ console image for machine type `0x8664` on x86_64 and `0xAA64` on AArch64, with base relocations, named after the package with `.exe`. It imports the functions its support routines call from `kernel32.dll` and `bcryptprimitives.dll`, and each foreign fn it reaches from `kernel32.dll`, by name; the system enters it at the program entry seam under `"win64"`. It carries the [host sections](30-artefacts.md#host-sections).
 - On `x86_64-uefi`, a PE32+ image for machine type `0x8664`, subsystem EFI application, with base relocations, named after the package with `.efi`. The firmware calls its entry point, the program entry seam, with the image handle and system table under `"win64"`, and the seam passes both to the entry landing fn.
 - On `aarch64-uefi`, the same with machine type `0xAA64`, its entry point called under `"aapcs64"`.
 - On `x86_64-bare`, a statically linked ELF64 executable with no interpreter or dynamic segment, its segments loaded at their physical addresses from `0x0010_0000`, or all moved by one multiple of 2 MiB below 4 GiB, named after the package with `.elf`. A `XEN_ELFNOTE_PHYS32_ENTRY` note names the program entry seam, which a PVH loader enters, moved with the segments, in 32-bit protected mode with paging disabled and `ebx` holding the physical address of the start information. The seam adjusts each absolute address the image holds by the distance it was moved, maps all physical memory the start information lists at its physical addresses, in page tables the image reserves, enables long mode and passes the `ebx` value to the entry landing fn.
 - On `aarch64-bare`, a statically linked ELF64 executable for AArch64 with no interpreter or dynamic segment, its segments loaded at their physical addresses from `0x4020_0000`, or all moved by one multiple of 2 MiB below 512 GiB, named after the package with `.elf`. Its entry point is the program entry seam, which the platform enters at EL1 or EL2 with the MMU off. The seam continues at EL1, enables floating point, installs a root mapping the gigabytes the image spans as normal memory and the rest of the first 512 GiB as device memory, turns the MMU and caches on, adjusts each absolute address the image holds by the distance it was moved, and passes `x0`, `0x4000_0000` when `x0` and `x1` are both zero, and `x1` to the entry landing fn.
 
-The implementation's own image writer builds the images of the machine targets. A kernel exporting its load ABI ([loading](24-kernel.md#loading)) also has its [interface file](30-artefacts.md#interface-files) beside its image.
+The implementation's own image writer builds the images of the Windows and machine targets. A kernel exporting its load ABI ([loading](24-kernel.md#loading)) also has its [interface file](30-artefacts.md#interface-files) beside its image.
 
 Every image keeps frame pointers in every function, stubs and support routines included, and holds line tables mapping each instruction of lowered code to its source path, line and item. The trap routine reads both to write [trap reports](11-errors-domains.md#trap-reports); their encoding belongs to the ABI inside the final closure, which is unspecified.
 

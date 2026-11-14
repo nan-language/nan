@@ -14,7 +14,12 @@ pub const PACKAGES: [&str; 10] = [
 ];
 
 /// The platform packages, which no alias names.
-pub const PLATFORMS: [&str; 3] = ["host_platform", "uefi_platform", "bare_platform"];
+pub const PLATFORMS: [&str; 4] = [
+    "linux_platform",
+    "windows_platform",
+    "uefi_platform",
+    "bare_platform",
+];
 
 /// Whether a package name is a std package's.
 pub fn is_std(name: &str) -> bool {

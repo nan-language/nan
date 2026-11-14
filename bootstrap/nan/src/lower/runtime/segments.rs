@@ -17,11 +17,15 @@ use crate::workspace::Arch;
 const HEADER: u64 = 24;
 
 /// The offsets in the record `Grow` keeps in its frame while a segment runs: `Grow`'s context,
-/// the thunk and its record, and the segment's context once it switches back.
+/// the thunk and its record, the segment's context once it switches back, and on a Windows
+/// target the segment's bounds.
 const SWITCH_THUNK: u64 = 24;
 const SWITCH_RECORD: u64 = 32;
 const SWITCH_BACK: u64 = 40;
 const SWITCH: u64 = 64;
+const SWITCH_LOW: u64 = 64;
+const SWITCH_HIGH: u64 = 72;
+const SWITCH_WINDOWS: u64 = 80;
 
 /// The alignment of a stack drawn through a cell: a chunk's on a host target, whose guard regions
 /// it protects page by page, and on a machine target the least a carved allocation has.
@@ -245,17 +249,31 @@ fn run_on_segment(
     fx.store(grown_limit, task, task::LIMIT);
     fx.store(grown_top, task, task::TOP);
     fx.store(segment, task, task::SEGMENT);
-    switch_onto(lo, fx, grown_top, thunk, record);
+    switch_onto(lo, fx, (segment, grown_top), thunk, record);
     fx.store(limit, task, task::LIMIT);
     fx.store(top, task, task::TOP);
     fx.store(older, task, task::SEGMENT);
     return_segment(lo, fx, segment, length, mapped);
 }
 
-/// Runs a thunk with its record on the stack whose top is `top`, through `GrownStart`, and
+/// Runs a thunk with its record on the stack from `low` to `top`, through `GrownStart`, and
 /// comes back once it returns.
-fn switch_onto(lo: &mut Lowering, fx: &mut Fx, top: Value, thunk: Value, record: Value) {
-    let switch = fx.slot(SWITCH, 16);
+fn switch_onto(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    (low, top): (Value, Value),
+    thunk: Value,
+    record: Value,
+) {
+    let switch = match lo.windows() {
+        true => {
+            let switch = fx.slot(SWITCH_WINDOWS, 16);
+            fx.store(low, switch, SWITCH_LOW);
+            fx.store(top, switch, SWITCH_HIGH);
+            switch
+        }
+        false => fx.slot(SWITCH, 16),
+    };
     fx.store(thunk, switch, SWITCH_THUNK);
     fx.store(record, switch, SWITCH_RECORD);
     // The stack's first context: on x86_64 eight below its top over a zeroed return slot, so
@@ -344,7 +362,7 @@ pub fn nested(lo: &mut Lowering, fx: &mut Fx) {
             let drawn = fx.b.ins().icmp_imm_s(IntCC::NotEqual, segment, 0);
             fx.when(drawn, |fx| {
                 let top = fx.b.ins().iadd(segment, length);
-                switch_onto(lo, fx, top, thunk, held);
+                switch_onto(lo, fx, (segment, top), thunk, held);
                 lo.call_routine(fx, Routine::Free, &[segment]);
             });
             Vec::new()
@@ -398,6 +416,11 @@ pub fn off_task_stack(lo: &mut Lowering, fx: &mut Fx, here: Value) -> Value {
 /// `Grow`.
 pub fn grown_start(lo: &mut Lowering, fx: &mut Fx) {
     let switch = fx.entry()[0];
+    if lo.windows() {
+        let low = fx.load(PTR, switch, SWITCH_LOW);
+        let high = fx.load(PTR, switch, SWITCH_HIGH);
+        super::super::host::windows::enter_segment(lo, fx, low, high);
+    }
     let frame = fx.b.ins().get_frame_pointer(PTR);
     let grow = lo.routine(Routine::Grow);
     let grow = lo.func_ref(fx, grow);

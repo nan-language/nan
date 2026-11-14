@@ -120,12 +120,13 @@ pub mod task {
 }
 
 /// The offsets of an executor thread record's fields: the scheduler's saved context, the task
-/// it runs, its index and the locks it holds; on a host target also its ring, whether it waits
-/// idle in its ring, the operations in flight on it, whether another thread asked to cancel one,
-/// its POSIX thread and the top of the stack its stack overflow reports run on; on a kernel the
-/// flags from before its outermost held lock disabled interrupts and the time its CPU's timer was
-/// last programmed to need; and on a machine target whether its CPU's extended state is enabled,
-/// holding the state of the last task owning one that it ran.
+/// it runs, its index and the locks it holds; on a host target also whether it waits idle, the
+/// system's handle to it, which is its POSIX thread on Linux, and the top of the stack its stack
+/// overflow reports run on, and on a Linux target its ring, the operations in flight on it and
+/// whether another thread asked to cancel one; on a kernel the flags from before its outermost
+/// held lock disabled interrupts and the time its CPU's timer was last programmed to need; and on
+/// a machine target whether its CPU's extended state is enabled, holding the state of the last
+/// task owning one that it ran.
 pub mod thread {
     pub const CONTEXT: u64 = 0;
     pub const CURRENT: u64 = 24;
@@ -137,7 +138,7 @@ pub mod thread {
     /// The number of locks the thread holds, then up to `HELD_LOCKS` of them in the order it
     /// took them.
     pub const LOCKS: u64 = 72;
-    pub const PTHREAD: u64 = 80;
+    pub const SYSTEM: u64 = 80;
     pub const TRAP_STACK: u64 = 88;
     pub const HELD: u64 = 96;
     pub const SAVED_IF: u64 = HELD + 8 * super::super::locks::HELD_LOCKS;
@@ -210,17 +211,19 @@ pub mod operation {
     /// Zero, `REQUESTED` once its cancellation is asked, `SUBMITTED` once submitted.
     pub const CANCEL: u64 = 32;
     pub const KIND: u64 = 40;
-    /// Its links among its thread's operations in flight; on the seeded scheduler and on a
-    /// kernel, among the timers of its clock or in the queue of the sim it waits in.
+    /// Its links among its thread's operations in flight; on the seeded scheduler, on a
+    /// kernel and on a Windows target, among the timers of its clock or in the queue of the sim
+    /// it waits in.
     pub const NEXT: u64 = 48;
     pub const PREVIOUS: u64 = 56;
     /// For a deadline, the task to wake once it completes, and the next deadline its task
-    /// armed; for a wait in a sim, the sim's record.
+    /// armed; for a wait in a sim, the sim's record; for a Windows request, its handle and the
+    /// thread running it, zero for one through the completion port.
     pub const WAITER: u64 = 64;
     pub const LINK: u64 = 72;
-    /// When a deadline is due, and on the seeded scheduler and on a kernel when a timer is due
-    /// and the order in which it was armed; for a wait in a sim, the glue withdrawing it from
-    /// the sim, given the record.
+    /// When a deadline is due, and on the seeded scheduler, on a kernel and on a Windows target
+    /// when a timer is due and the order in which it was armed; for a wait in a sim, the glue
+    /// withdrawing it from the sim, given the record.
     pub const DUE: u64 = 80;
     pub const ORDER: u64 = 88;
     pub const WITHDRAW: u64 = 96;
@@ -260,7 +263,7 @@ pub mod trap_record {
 }
 
 /// The default size of a task's stack, of the entry task's stack on a host target, and of a
-/// host target's guard region.
+/// Linux target's guard region.
 pub const STACK: u64 = 65_536;
 pub const ENTRY_STACK: u64 = 67_108_864;
 pub const GUARD: u64 = 4_096;
@@ -279,9 +282,10 @@ const RESERVE: &str = "_NSroutine_reserve";
 
 /// The guard region a task's stack holds below the rest, on a host target alone.
 fn guard(lo: &Lowering) -> u64 {
-    match lo.machine() {
-        true => 0,
-        false => GUARD,
+    match (lo.machine(), lo.windows()) {
+        (true, _) => 0,
+        (false, true) => host::windows::GUARD,
+        (false, false) => GUARD,
     }
 }
 
@@ -361,9 +365,14 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         Routine::Schedule => schedule(lo, fx),
         Routine::ThreadMain => {
             let params = fx.entry();
-            let slot = lo.thread_slot(fx);
-            fx.store(params[0], slot, 0);
-            let refused = host::thread_signals(lo, fx, params[0]);
+            let refused = match lo.windows() {
+                true => host::windows::thread_start(lo, fx, params[0]),
+                false => {
+                    let slot = lo.thread_slot(fx);
+                    fx.store(params[0], slot, 0);
+                    host::linux::thread_signals(lo, fx, params[0])
+                }
+            };
             fx.when(refused, |fx| {
                 let status = fx.ptr(70);
                 lo.call_routine(fx, Routine::Exit, &[status]);
@@ -378,9 +387,10 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         Routine::IoSubmit => io_submit(lo, fx),
         Routine::Thread => {
             fx.entry();
-            let record = match lo.machine() {
-                true => lo.thread(fx),
-                false => {
+            let record = match (lo.machine(), lo.windows()) {
+                (true, _) => lo.thread(fx),
+                (false, true) => host::windows::current_thread(lo, fx),
+                (false, false) => {
                     let slot = lo.thread_slot(fx);
                     fx.load(PTR, slot, 0)
                 }
@@ -763,6 +773,9 @@ fn spawn(lo: &mut Lowering, fx: &mut Fx) {
 fn task_start(lo: &mut Lowering, fx: &mut Fx) {
     let params = fx.entry();
     let record = params[0];
+    if lo.windows() {
+        host::windows::enter_task_stack(lo, fx, record);
+    }
     let mut signature = Signature::new(CALL_CONV);
     signature.params.push(AbiParam::new(PTR));
     let signature = fx.b.import_signature(signature);
@@ -1328,11 +1341,24 @@ fn io_submit(lo: &mut Lowering, fx: &mut Fx) {
     fx.store(record, op, operation::TASK);
     let word = fx.offset(record, task::IO);
     fx.atomic_store(op, word);
-    host::submit(lo, fx, entry, Some(op));
+    host::linux::submit(lo, fx, entry, Some(op));
     let cancelled = origin(fx, region);
     let cancelled = fx.b.ins().icmp_imm_s(IntCC::NotEqual, cancelled, 0);
-    fx.when(cancelled, |fx| host::cancel_operation(lo, fx, op));
+    fx.when(cancelled, |fx| host::linux::cancel_operation(lo, fx, op));
     wait_delivered(lo, fx, op);
+    release_io(lo, fx, word, op);
+    let result = fx.load(types::I32, op, operation::RESULT);
+    let refused = fx.b.ins().icmp_imm_s(IntCC::Equal, result, CANCELED);
+    let cancelled = origin(fx, region);
+    let cancelled = fx.b.ins().icmp_imm_s(IntCC::NotEqual, cancelled, 0);
+    let failed = fx.b.ins().band(refused, cancelled);
+    fx.b.ins().return_(&[failed, result]);
+}
+
+/// Clears the operation the running task waits on from the `IO` word of its record, once no
+/// cancellation holds it claimed.
+pub fn release_io(lo: &mut Lowering, fx: &mut Fx, word: Value, op: Value) {
+    let zero = fx.ptr(0);
     fx.repeat(&[], |fx, _| {
         let seen =
             fx.b.ins()
@@ -1343,12 +1369,6 @@ fn io_submit(lo: &mut Lowering, fx: &mut Fx) {
         });
         (claimed, Vec::new())
     });
-    let result = fx.load(types::I32, op, operation::RESULT);
-    let refused = fx.b.ins().icmp_imm_s(IntCC::Equal, result, CANCELED);
-    let cancelled = origin(fx, region);
-    let cancelled = fx.b.ins().icmp_imm_s(IntCC::NotEqual, cancelled, 0);
-    let failed = fx.b.ins().band(refused, cancelled);
-    fx.b.ins().return_(&[failed, result]);
 }
 
 /// Delivers an operation's completion with its result, by its kind: a waiting task wakes, a
@@ -1441,12 +1461,16 @@ impl Lowering<'_, '_> {
             self.kernel_arm(fx, op, ns);
             return;
         }
+        if self.windows() {
+            host::windows::arm(self, fx, op, ns);
+            return;
+        }
         let billion = fx.ptr(1_000_000_000);
         let seconds = fx.b.ins().udiv(ns, billion);
         let nanoseconds = fx.b.ins().urem(ns, billion);
         fx.store(seconds, spec, 0);
         fx.store(nanoseconds, spec, 8);
-        host::submit_timeout(self, fx, op, spec);
+        host::linux::submit_timeout(self, fx, op, spec);
     }
 
     /// Asks once for the cancellation of an operation whose record stays valid during the
@@ -1457,31 +1481,36 @@ impl Lowering<'_, '_> {
             super::seeded::cancel(self, fx, op);
         } else if self.kernel() {
             self.kernel_cancel(fx, op);
+        } else if self.windows() {
+            host::windows::cancel_operation(self, fx, op);
         } else {
-            host::cancel_operation(self, fx, op);
+            host::linux::cancel_operation(self, fx, op);
         }
     }
 
-    /// Delivers the completions that have arrived: those on the running thread's ring, those
-    /// the seeded scheduler queued, or the expiries of an isolated space's timers that are due;
-    /// a kernel's waits end by wakes alone.
+    /// Delivers the completions that have arrived: those on the running thread's ring or on the
+    /// completion port, those the seeded scheduler queued, or the expiries of an isolated space's
+    /// timers that are due; a kernel's waits end by wakes alone.
     pub fn reap(&mut self, fx: &mut Fx) {
         if self.seeded() {
             super::seeded::reap(self, fx);
         } else if self.user() {
             super::space::reap(self, fx);
+        } else if self.windows() {
+            host::windows::take_packets(self, fx, None);
         } else if !self.kernel() {
-            host::reap(self, fx, None);
+            host::linux::reap(self, fx, None);
         }
     }
 
     /// The nanoseconds of the clock that delays count: the monotonic clock, the virtual clock
-    /// on the seeded scheduler, or the kernel's clock.
+    /// on the seeded scheduler, or the kernel's clock; a kernel's and a Windows target's through
+    /// `ClockNow`.
     pub fn now_ns(&mut self, fx: &mut Fx) -> Value {
         if self.seeded() {
             return super::seeded::now(self, fx);
         }
-        match self.kernel() {
+        match self.kernel() || self.windows() {
             true => self.call_routine(fx, Routine::ClockNow, &[])[0],
             false => self.platform_call(fx, "now_ns", &[]).result.scalar(),
         }

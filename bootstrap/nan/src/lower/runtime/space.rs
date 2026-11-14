@@ -121,7 +121,7 @@ pub fn idle(lo: &mut Lowering, fx: &mut Fx) {
         fx.when(waiting, |fx| {
             let zero = fx.ptr(0);
             fx.store(zero, slot, 0);
-            let claimed = lo.kernel_claim(fx, op);
+            let claimed = super::timers::claim_armed(lo, fx, op);
             fx.when(claimed, |fx| {
                 let expired = fx.int(types::I32, EXPIRED);
                 tasks::deliver(lo, fx, op, expired);

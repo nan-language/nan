@@ -18,7 +18,7 @@ fn a_second_termination_request_ends_a_program_that_never_waits() {
     let scratch = Scratch::new(&[
         (
             "spin/package.nan",
-            "//! Counts forever.\n\npackage spin {\n    language 1\n    targets x86_64-host\n    entry main\n} spin\n",
+            "//! Counts forever.\n\npackage spin {\n    language 1\n    targets x86_64-linux\n    entry main\n} spin\n",
         ),
         (
             "spin/spin.nan",
@@ -27,7 +27,7 @@ fn a_second_termination_request_ends_a_program_that_never_waits() {
     ]);
     let built = crate::run(&["build".to_owned()], &scratch.0);
     assert_eq!(built.status, 0, "{}", built.output);
-    let mut child = Command::new(scratch.0.join(".nan/images/x86_64-host/spin"))
+    let mut child = Command::new(scratch.0.join(".nan/images/x86_64-linux/spin"))
         .spawn()
         .expect("start the program");
     sleep(Duration::from_millis(300));

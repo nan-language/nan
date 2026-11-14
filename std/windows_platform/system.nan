@@ -1,0 +1,88 @@
+//! The wall clock, random bytes and log records of Windows.
+
+/// A 64-bit count the system writes.
+layout Count: bytes 8 le {
+    value: i64 at 0
+} Count
+
+foreign fn GetSystemTimePreciseAsFileTime(time: hw::Ptr[Count]) limits stack 256 convention "win64"
+
+foreign fn GetStdHandle(which: u32) -> u64 limits stack 256 convention "win64"
+
+foreign fn WriteFile(handle: u64, buffer: hw::Ptr[u8], count: u32, written: hw::Ptr[u32], overlapped: u64) -> i32 convention "win64"
+
+/// The handle number `GetStdHandle` takes for standard error.
+const STD_ERROR: u32 = 0xFFFF_FFF4
+
+/// The 100-nanosecond intervals from 1601-01-01, where Windows counts file times from, to the
+/// Unix epoch.
+const EPOCH_INTERVALS: u64 = 116_444_736_000_000_000
+
+/// The nanoseconds of the real-time clock since the Unix epoch.
+pkg fn wall_ns() -> u64 {
+    var time = Count(value: 0)
+    GetSystemTimePreciseAsFileTime(hw::Ptr.of_mut(mut time))
+    return (u64.fit(time.value).saturating_sub(EPOCH_INTERVALS)).saturating_mul(100)
+} wall_ns
+
+/// Writes every byte of a buffer's prefix to standard error.
+fn write_err(bytes: Slice[u8]) {
+    let handle = GetStdHandle(STD_ERROR)
+    var done: usize = 0
+    while done < bytes.len() {
+        let Some(parts) = bytes.split_at(done) else {
+            return
+        }
+        var written = Array[u32, 1].filled(0)
+        let wrote = WriteFile(handle, buffer: hw::Ptr.of_view(parts.tail), count: u32.saturate(parts.tail.len()), written: hw::Ptr.of_view_mut(mut written.view_mut()), overlapped: 0)
+        if wrote == 0 or written[0] == 0 {
+            return
+        }
+        done += usize.widen(written[0])
+    }
+} write_err
+
+/// Writes one log record to standard error: the level, `: `, the message, a space and the
+/// rendering, each line feed written as `\n`, then a line feed.
+pkg fn log_line(level: Str, message: Str, rendering: Str) {
+    var line = Array[u8, 4_096].filled(0)
+    var len: usize = 0
+    len = append_escaped(mut line, at: len, text: level.as_bytes())
+    len = append_escaped(mut line, at: len, text: b": ")
+    len = append_escaped(mut line, at: len, text: message.as_bytes())
+    len = append_escaped(mut line, at: len, text: b" ")
+    len = append_escaped(mut line, at: len, text: rendering.as_bytes())
+    let Some(written) = line.view().prefix(len) else {
+        return
+    }
+    write_err(written)
+    write_err(b"\n")
+} log_line
+
+/// Appends a text to a line from `at`, each line feed as `\n`, flushing a full line; returns
+/// the line's new length.
+fn append_escaped(mut line: Array[u8, 4_096], at: usize, text: Slice[u8]) -> usize {
+    var len = at
+    for byte in text {
+        if len + 2 > 4_096 {
+            let Some(full) = line.view().prefix(len) else {
+                return len
+            }
+            write_err(full)
+            len = 0
+        }
+        if byte == b'\n' {
+            line[len] = b'\\'
+            line[len + 1] = b'n'
+            len += 2
+        } else {
+            line[len] = byte
+            len += 1
+        }
+    }
+    return len
+} append_escaped
+
+pkg fn random_fill(mut buf: SliceMut[u8]) {
+    generate(buffer: u64.widen(hw::Ptr.of_view_mut(mut buf).addr()), len: buf.len())
+} random_fill

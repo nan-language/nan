@@ -61,7 +61,7 @@ fn unused_code_is_reported_where_no_target_uses_it_with_its_fixes() {
     let scratch = Scratch::new(&[
         (
             "probe/package.nan",
-            "//! Probes.\n\npackage probe {\n    language 1\n    targets x86_64-bare, x86_64-host\n    dep ring \"../ring\"\n} probe\n",
+            "//! Probes.\n\npackage probe {\n    language 1\n    targets x86_64-bare, x86_64-linux\n    dep ring \"../ring\"\n} probe\n",
         ),
         (
             "probe/probe.nan",
@@ -72,7 +72,7 @@ fn unused_code_is_reported_where_no_target_uses_it_with_its_fixes() {
             "//! Stacks.\n\npkg fn stack() -> u32 {\n    return bare_stack()\n} stack\n\nfn bare_stack() -> u32 {\n    return 16\n} bare_stack\n",
         ),
         (
-            "probe/platform@host/platform.nan",
+            "probe/platform@linux/platform.nan",
             "//! Stacks.\n\npkg fn stack() -> u32 {\n    return 64\n} stack\n",
         ),
         (
@@ -545,7 +545,7 @@ fn a_syntax_error_in_a_target_variant_is_reported_as_such() {
     let scratch = Scratch::new(&[
         (
             "app/package.nan",
-            "//! A package.\n\npackage app {\n    language 1\n    targets x86_64-bare, x86_64-host\n} app\n",
+            "//! A package.\n\npackage app {\n    language 1\n    targets x86_64-bare, x86_64-linux\n} app\n",
         ),
         ("app/app.nan", "//! Root.\n"),
         (
@@ -553,14 +553,14 @@ fn a_syntax_error_in_a_target_variant_is_reported_as_such() {
             "//! Platform.\n\nfn broken() {\n} broken\n",
         ),
         (
-            "app/platform@host/platform.nan",
+            "app/platform@linux/platform.nan",
             "//! Platform.\n\nfn broken() {\n    let k: fn() uses other = t\n} broken\n",
         ),
     ]);
     let run = run_in(&scratch.0, "check");
     assert!(
         run.output
-            .contains("\nerror effect.uses-unknown app/platform@host/platform.nan:4 "),
+            .contains("\nerror effect.uses-unknown app/platform@linux/platform.nan:4 "),
         "{}",
         run.output
     );

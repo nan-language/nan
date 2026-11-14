@@ -1,12 +1,14 @@
-//! A test image as its runs start it, and one run of a test, given the test's number, the run's index and seed, its replay token and the draws a rerun forces: a process of the image on a host target, a boot of the emulator on it on a machine target, whose standard output or serial port carries frames, and how it ended.
+//! A test image as its runs start it, and one run of a test, given the test's number, the run's index and seed, its replay token and the draws a rerun forces: a process of the image on a host target, under Wine for a Windows target on Linux, a boot of the emulator on it on a machine target, whose standard output or serial port carries frames, and how it ended.
 
 /// The signal ending a process that passed its processor time limit, `SIGXCPU`.
 const SIGXCPU: i32 = 24
 
-/// A test image as its runs start it: a host target's executable, or a machine image and the
-/// emulator invocation booting it.
+/// A test image as its runs start it: an executable of the system running the toolchain, a
+/// Windows target's that Wine runs on Linux, or a machine image and the emulator invocation
+/// booting it.
 enum Image {
     Host(text::String)
+    Windows(text::String)
     Machine(path: text::String, launch: emulator::Launch)
 } Image
 
@@ -18,13 +20,16 @@ fn Image.new(target: workspace::Target, take path: text::String, alloc: mem::All
         let launch = try emulator::launch(target, image: path.as_str(), files: none.view(), boots: emulator::Boots.Fresh, alloc)
         return Image.Machine(path: take path, launch: take launch)
     }
+    if target.kind() == Some(workspace::Kind.Windows) and workspace::Kind.running() != workspace::Kind.Windows {
+        return Image.Windows(take path)
+    }
     return Image.Host(take path)
 } Image.new
 
 /// Removes the image with its boot volume and machine.
 fn Image.remove(self, alloc: mem::Alloc) fails platform::IoError {
     match self {
-        Image.Host(path) => try platform::remove_file(path.as_str())
+        Image.Host(path) or Image.Windows(path) => try platform::os::remove_file(path.as_str())
         Image.Machine(path: path, launch: _) => try emulator::remove_image(path.as_str(), alloc)
     }
 } Image.remove
@@ -68,6 +73,15 @@ fn timed_out(alloc: mem::Alloc) -> Run {
     return Run(ended: Ended.TimedOut, contended: false, trace: mem::Bytes.empty(alloc), draws: mem::List[Draw].empty(alloc))
 } timed_out
 
+/// The run of a test that a process of its image gave, which writes its frames from the start of
+/// its standard output.
+fn process_ran(ran_output: platform::Output, alloc: mem::Alloc) -> Run fails platform::IoError {
+    if ran_output.status == platform::Status.Exited(lower::TIMED_OUT) or ran_output.status == platform::Status.Signalled(SIGXCPU) {
+        return timed_out(alloc)
+    }
+    return try ran_from(ran_output, start: Some(0), alloc)
+} process_ran
+
 /// Performs one run of the numbered test of an image, its draws forced for a rerun when
 /// `forced` holds some.
 fn run_test(image: Image, number: usize, index: u64, seed: u64, token: Str, forced: Slice[wide::Wide], alloc: mem::Alloc) -> Run fails platform::IoError {
@@ -83,11 +97,12 @@ fn run_test(image: Image, number: usize, index: u64, seed: u64, token: Str, forc
     }
     match image {
         Image.Host(path) => {
-            let ran_output = try platform::run_output(path.as_str(), args: texts.view(), input: None, capture_errors: true, alloc)
-            if ran_output.status == platform::Status.Exited(lower::TIMED_OUT) or ran_output.status == platform::Status.Signalled(SIGXCPU) {
-                return timed_out(alloc)
-            }
-            return try ran_from(ran_output, start: Some(0), alloc)
+            let ran_output = try platform::os::run_output(path.as_str(), args: texts.view(), input: None, capture_errors: true, alloc)
+            return try process_ran(ran_output, alloc)
+        }
+        Image.Windows(path) => {
+            let ran_output = try emulator::run_wine(path.as_str(), args: texts.view(), capture_errors: true, alloc)
+            return try process_ran(ran_output, alloc)
         }
         Image.Machine(path: path, launch: launch) => {
             let file = platform::replaced_extension(path.as_str(), extension: "run", alloc)
@@ -96,9 +111,9 @@ fn run_test(image: Image, number: usize, index: u64, seed: u64, token: Str, forc
                 mut contents.append(written.as_bytes())
                 mut contents.push(0)
             }
-            try platform::write_file(file.as_str(), contents: contents.view())
+            try platform::os::write_all(file.as_str(), contents: contents.view())
             let booted = attempt emulator::boot(launch, name: lower::RUN_FILE, path: file.as_str(), alloc)
-            try platform::remove_file(file.as_str())
+            try platform::os::remove_file(file.as_str())
             match booted {
                 Err(error) => fail error
                 Ok(_) => {}

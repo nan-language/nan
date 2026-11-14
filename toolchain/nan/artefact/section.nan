@@ -1,7 +1,7 @@
-//! The sections of an ELF64 file, and the artefacts an image's `.nan` section holds.
+//! The sections of an ELF64 or PE32+ file, and the artefacts an image's `.nan` section holds.
 
-/// The artefacts the one section named `.nan` of an ELF64 file holds; none when the file is no
-/// little-endian ELF64 file or holds no such section, or several.
+/// The artefacts the one section named `.nan` of an ELF64 or PE32+ file holds; none when the file
+/// is neither or holds no such section, or several.
 pkg fn image_section(image: Slice[u8], alloc: mem::Alloc) -> Option[mem::List[mem::Bytes]] {
     let Ok(located) = attempt named_section(read: fn(at: usize, length: usize) -> mem::Bytes {
         return held_bytes(image, at, length, alloc)
@@ -36,9 +36,9 @@ fn held_bytes(image: Slice[u8], at: usize, length: usize, alloc: mem::Alloc) -> 
     return out
 } held_bytes
 
-/// The contents of the one section named `name` of the ELF64 file whose bytes at an offset
-/// `read` gives, fewer when the file ends before them; none when the file is no little-endian
-/// ELF64 file or holds no such section, or several.
+/// The contents of the one section named `name` of the ELF64 or PE32+ file whose bytes at an
+/// offset `read` gives, fewer when the file ends before them; none when the file is neither or
+/// holds no such section, or several.
 pkg fn section_contents(read: fn(at: usize, length: usize) -> mem::Bytes fails platform::IoError, name: Slice[u8]) -> Option[mem::Bytes] fails platform::IoError {
     let Some(found) = try named_section(read, name) else {
         return None
@@ -50,25 +50,29 @@ pkg fn section_contents(read: fn(at: usize, length: usize) -> mem::Bytes fails p
     return Some(take held)
 } section_contents
 
-/// Where the one section named `name` of the ELF64 file `read` reads lies.
-fn named_section(read: fn(at: usize, length: usize) -> mem::Bytes fails platform::IoError, name: Slice[u8]) -> Option[ElfSpan] fails platform::IoError {
+/// Where the one section named `name` of the ELF64 or PE32+ file `read` reads lies, a PE32+
+/// file naming it without the dots after its first byte.
+fn named_section(read: fn(at: usize, length: usize) -> mem::Bytes fails platform::IoError, name: Slice[u8]) -> Option[Span] fails platform::IoError {
     let head = try read(0, length: ELF_HEADER)
+    if head.view().prefix(2) == Some(b"MZ") {
+        return try pe_section(read, head: head.view(), name)
+    }
     let Some(leading) = head.view().prefix(6) else {
         return None
     }
     if leading != b"\x7FELF\x02\x01" {
         return None
     }
-    let Some(headers) = elf_number(head.view(), at: 0x28, width: 8) else {
+    let Some(headers) = number_at(head.view(), at: 0x28, width: 8) else {
         return None
     }
-    let Some(size) = elf_number(head.view(), at: 0x3A, width: 2) else {
+    let Some(size) = number_at(head.view(), at: 0x3A, width: 2) else {
         return None
     }
-    let Some(count) = elf_number(head.view(), at: 0x3C, width: 2) else {
+    let Some(count) = number_at(head.view(), at: 0x3C, width: 2) else {
         return None
     }
-    let Some(names) = elf_number(head.view(), at: 0x3E, width: 2) else {
+    let Some(names) = number_at(head.view(), at: 0x3E, width: 2) else {
         return None
     }
     let Some(extent) = count.checked_mul(size) else {
@@ -83,12 +87,12 @@ fn named_section(read: fn(at: usize, length: usize) -> mem::Bytes fails platform
     if name_table.len() != names_at.length {
         return None
     }
-    var found: Option[ElfSpan] = None
+    var found: Option[Span] = None
     for index in 0..<count {
         let Some(at) = table_at.header(index) else {
             return None
         }
-        let Some(offset) = elf_number(table.view(), at, width: 4) else {
+        let Some(offset) = number_at(table.view(), at, width: 4) else {
             return None
         }
         let Some(named) = name_matches(name_table.view(), offset, name) else {
@@ -107,8 +111,89 @@ fn named_section(read: fn(at: usize, length: usize) -> mem::Bytes fails platform
     return found
 } named_section
 
-/// The bytes of an ELF64 file header.
+/// The bytes of an ELF64 file header, which hold a PE32+ file's offset of its PE signature.
 const ELF_HEADER: usize = 0x40
+
+/// The bytes of a PE32+ file's signature and file header, and of each of its section headers.
+const PE_HEADER: usize = 24
+
+const PE_SECTION_HEADER: usize = 40
+
+/// Where the one section named `name` without the dots after its first byte lies in the PE32+
+/// file `read` reads, whose first bytes are `head`.
+fn pe_section(read: fn(at: usize, length: usize) -> mem::Bytes fails platform::IoError, head: Slice[u8], name: Slice[u8]) -> Option[Span] fails platform::IoError {
+    let Some(spelt) = pe_name(name) else {
+        return None
+    }
+    let Some(signature_at) = number_at(head, at: 0x3C, width: 4) else {
+        return None
+    }
+    let file_header = try read(signature_at, length: PE_HEADER)
+    if file_header.view().prefix(4) != Some(b"PE\x00\x00") {
+        return None
+    }
+    let Some(count) = number_at(file_header.view(), at: 6, width: 2) else {
+        return None
+    }
+    let Some(optional) = number_at(file_header.view(), at: 20, width: 2) else {
+        return None
+    }
+    let Some(table_at) = signature_at.checked_add(PE_HEADER) else {
+        return None
+    }
+    let Some(first_at) = table_at.checked_add(optional) else {
+        return None
+    }
+    let Some(extent) = count.checked_mul(PE_SECTION_HEADER) else {
+        return None
+    }
+    let table = try read(first_at, length: extent)
+    var found: Option[Span] = None
+    var at: usize = 0
+    while at < table.len() {
+        let Some(parts) = table.view().split_at(at) else {
+            return None
+        }
+        let Some(field) = parts.tail.prefix(8) else {
+            return None
+        }
+        let Some(size) = number_at(parts.tail, at: 8, width: 4) else {
+            return None
+        }
+        let Some(offset) = number_at(parts.tail, at: 20, width: 4) else {
+            return None
+        }
+        if field == spelt.view() {
+            if found.is_some() {
+                return None
+            }
+            found = Some(Span(start: offset, length: size))
+        }
+        let Some(next) = at.checked_add(PE_SECTION_HEADER) else {
+            return None
+        }
+        at = next
+    }
+    return found
+} pe_section
+
+/// The name field of a PE32+ section header naming a section `name` without the dots after its
+/// first byte; none when that holds more than 8 bytes.
+fn pe_name(name: Slice[u8]) -> Option[Array[u8, 8]] {
+    var field = Array[u8, 8].filled(0)
+    var length: usize = 0
+    for at in 0..<name.len() {
+        if at > 0 and name[at] == b'.' {
+            continue
+        }
+        if length >= 8 {
+            return None
+        }
+        field[length] = name[at]
+        length += 1
+    }
+    return Some(field)
+} pe_name
 
 /// Where the section headers of an ELF64 file lie: their offset and the size of each.
 struct ElfHeaders derives Copy {
@@ -125,13 +210,13 @@ fn ElfHeaders.header(self, index: usize) -> Option[usize] {
 } ElfHeaders.header
 
 /// Where bytes lie in a file: their offset and their length.
-struct ElfSpan derives Copy {
+struct Span derives Copy {
     start: usize
     length: usize
-} ElfSpan
+} Span
 
 /// The little-endian unsigned number of `width` bytes at an offset of bytes.
-fn elf_number(image: Slice[u8], at: usize, width: usize) -> Option[usize] {
+fn number_at(image: Slice[u8], at: usize, width: usize) -> Option[usize] {
     let Some(end) = at.checked_add(width) else {
         return None
     }
@@ -148,10 +233,10 @@ fn elf_number(image: Slice[u8], at: usize, width: usize) -> Option[usize] {
         shift += 8
     }
     return Some(usize.widen(value))
-} elf_number
+} number_at
 
 /// Where the contents of the section at an index of a section header table lie.
-fn section_span(table: Slice[u8], headers: ElfHeaders, index: usize) -> Option[ElfSpan] {
+fn section_span(table: Slice[u8], headers: ElfHeaders, index: usize) -> Option[Span] {
     let Some(at) = headers.header(index) else {
         return None
     }
@@ -161,16 +246,16 @@ fn section_span(table: Slice[u8], headers: ElfHeaders, index: usize) -> Option[E
     let Some(size_at) = at.checked_add(32) else {
         return None
     }
-    let Some(offset) = elf_number(table, at: offset_at, width: 8) else {
+    let Some(offset) = number_at(table, at: offset_at, width: 8) else {
         return None
     }
-    let Some(size) = elf_number(table, at: size_at, width: 8) else {
+    let Some(size) = number_at(table, at: size_at, width: 8) else {
         return None
     }
     if offset.checked_add(size).is_none() {
         return None
     }
-    return Some(ElfSpan(start: offset, length: size))
+    return Some(Span(start: offset, length: size))
 } section_span
 
 /// Whether the name at an offset of a section name table, up to its NUL or the table's end, is

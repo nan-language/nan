@@ -43,8 +43,11 @@ const PRIVILEGED_PRIMITIVES: [&str; 10] = [
 
 /// The calling conventions and the targets each serves.
 const CONVENTIONS: [(&str, &[Target]); 3] = [
-    ("sysv", &[Target::X64Host, Target::Aarch64Host]),
-    ("win64", &[Target::X64Uefi]),
+    ("sysv", &[Target::X64Linux, Target::Aarch64Linux]),
+    (
+        "win64",
+        &[Target::X64Windows, Target::X64Uefi, Target::Aarch64Windows],
+    ),
     ("aapcs64", &[Target::Aarch64Uefi]),
 ];
 
@@ -636,22 +639,13 @@ impl Checker<'_> {
         }
     }
 
-    /// A convention clause: a known convention serving every target its package declares.
+    /// A convention clause: a known convention serving the target its item is checked under.
     pub fn check_convention(&self, item: ItemId, token: Tok, convention: &str) {
         let Some((_, targets)) = CONVENTIONS.iter().find(|(name, _)| *name == convention) else {
             self.report(item, token, Code::TrustedConventionUnknown);
             return;
         };
-        let package = self.db.package(self.db.package_of(item));
-        let declared = package
-            .source
-            .manifest
-            .iter()
-            .flat_map(|manifest| &manifest.targets);
-        if declared
-            .into_iter()
-            .any(|declared| !targets.contains(declared))
-        {
+        if !targets.contains(&self.db.target) {
             self.report(item, token, Code::TrustedConventionTarget);
         }
     }

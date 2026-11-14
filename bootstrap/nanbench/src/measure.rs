@@ -310,7 +310,7 @@ pub fn sections(scenarios: &[Scenario], times: &Times, radii: &mut String) -> (S
         }
     }
     text.push_str(&format!(
-        "\n## Time of an allocation through `mem::Alloc`, its cell charge included\n\nA box drawn through a heap over an allocator, every box kept so that the heap draws chunks and charges its cell, by an `x86_64-host` image.\n\n| Milestone | Time |\n| --- | ---: |\n| M5 | {} |\n",
+        "\n## Time of an allocation through `mem::Alloc`, its cell charge included\n\nA box drawn through a heap over an allocator, every box kept so that the heap draws chunks and charges its cell, by an `x86_64-linux` image.\n\n| Milestone | Time |\n| --- | ---: |\n| M5 | {} |\n",
         nanoseconds(times.host.get("alloc"))
     ));
     text.push_str("\n## Waivers, per threshold, and the closure radius of each item\n\nEach item's radius is in `radii.tsv`.\n\n| Milestone | Waivers | Items | Median radius | 90th percentile | Largest |\n| --- | --- | ---: | ---: | ---: | --- |\n");
@@ -378,7 +378,7 @@ pub fn sections(scenarios: &[Scenario], times: &Times, radii: &mut String) -> (S
         nanoseconds(times.kernel.get("owner-switch"))
     ));
     text.push_str(&format!(
-        "\n## Time of a generation check in a capability table\n\nAn operation failing at a stale capability's generation check: on `x86_64-host` for M2, on `x86_64-bare` under the emulator for M4.\n\n| Milestone | Time |\n| --- | ---: |\n| M2 | {} |\n| M4 | {} |\n",
+        "\n## Time of a generation check in a capability table\n\nAn operation failing at a stale capability's generation check: on `x86_64-linux` for M2, on `x86_64-bare` under the emulator for M4.\n\n| Milestone | Time |\n| --- | ---: |\n| M2 | {} |\n| M4 | {} |\n",
         nanoseconds(times.host.get("generation")),
         nanoseconds(times.kernel.get("generation"))
     ));

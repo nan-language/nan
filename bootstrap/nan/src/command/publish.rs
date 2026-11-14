@@ -12,7 +12,7 @@ use super::{Invocation, Trace, key, record};
 use crate::artefact::{self, Publication};
 use crate::cache::Cache;
 use crate::check;
-use crate::diagnostic::{Class as DiagnosticClass, Code, Diagnostic};
+use crate::diagnostic::{Class as DiagnosticClass, Code, Diagnostic, sort_diagnostics};
 use crate::format;
 use crate::journal;
 use crate::machine::history::{History, Module};
@@ -447,7 +447,7 @@ fn refusal(
     index: usize,
     mut diagnostics: Vec<Diagnostic>,
 ) -> Output {
-    check::sort_diagnostics(&mut diagnostics);
+    sort_diagnostics(&mut diagnostics);
     let records = diagnostics
         .iter()
         .map(|diagnostic| record(workspace, &Scope::Package(index), diagnostic))

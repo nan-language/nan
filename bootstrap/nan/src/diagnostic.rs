@@ -10,6 +10,19 @@ pub enum Class {
     Internal,
 }
 
+/// Sorts diagnostics by path, line and code, keeping each once whatever bytes it is located on.
+pub fn sort_diagnostics(found: &mut Vec<Diagnostic>) {
+    found.sort_by(|left, right| {
+        (&left.path, left.line, left.code.name()).cmp(&(&right.path, right.line, right.code.name()))
+    });
+    found.dedup_by(|later, earlier| {
+        Diagnostic {
+            span: earlier.span,
+            ..later.clone()
+        } == *earlier
+    });
+}
+
 impl Class {
     /// The word starting a diagnostic record of this class.
     pub fn word(self) -> &'static str {

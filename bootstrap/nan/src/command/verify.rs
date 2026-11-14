@@ -9,7 +9,7 @@ use super::test::fail_records;
 use super::{Invocation, Trace, record};
 use crate::cache::Cache;
 use crate::check;
-use crate::diagnostic::{Class, Code, Diagnostic};
+use crate::diagnostic::{Class, Code, Diagnostic, sort_diagnostics};
 use crate::output::{Output, Verdict};
 use crate::scope::Scope;
 use crate::test_runs::{self, Report, Runs};
@@ -121,10 +121,7 @@ pub fn judged(
         }
     }
     diagnostics.extend(gate_found);
-    diagnostics.sort_by(|left, right| {
-        (&left.path, left.line, left.code.name()).cmp(&(&right.path, right.line, right.code.name()))
-    });
-    diagnostics.dedup();
+    sort_diagnostics(&mut diagnostics);
     Ok((diagnostics, report))
 }
 

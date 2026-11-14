@@ -7,7 +7,7 @@ use std::path::Path;
 
 use super::{Invocation, Trace, apply, record};
 use crate::check::{self, Snapshots};
-use crate::diagnostic::{Class, Code, Diagnostic, Reason};
+use crate::diagnostic::{Class, Code, Diagnostic, Reason, sort_diagnostics};
 use crate::output::{Output, Record, Verdict};
 use crate::scope::Scope;
 use crate::workspace::Workspace;
@@ -95,7 +95,7 @@ pub fn update(
     }
     changes.sort();
     diagnostics.extend(apply(workspace, &mut changes)?);
-    check::sort_diagnostics(&mut diagnostics);
+    sort_diagnostics(&mut diagnostics);
     let count = |class: Class| {
         diagnostics
             .iter()

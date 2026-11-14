@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::{Invocation, Name, Outcome, Trace, record};
-use crate::diagnostic::{Class, Code};
+use crate::diagnostic::{Class, Code, sort_diagnostics};
 use crate::emulator::{self, Boots, Machine};
 use crate::final_build;
 use crate::output::{Output, Record, Verdict};
@@ -196,10 +196,7 @@ fn report(
     mut diagnostics: Vec<crate::diagnostic::Diagnostic>,
     mut images: Vec<String>,
 ) -> Output {
-    diagnostics.sort_by(|left, right| {
-        (&left.path, left.line, left.code.name()).cmp(&(&right.path, right.line, right.code.name()))
-    });
-    diagnostics.dedup();
+    sort_diagnostics(&mut diagnostics);
     let count = |class: Class| {
         diagnostics
             .iter()

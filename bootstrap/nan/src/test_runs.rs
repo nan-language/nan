@@ -14,7 +14,7 @@ use std::io;
 use crate::cache::{Cache, Exposed};
 use crate::check::db::{ItemId, PackageId};
 use crate::check::{self, Checker, testing};
-use crate::diagnostic::{Class, Diagnostic};
+use crate::diagnostic::{Class, Diagnostic, sort_diagnostics};
 use crate::emulator;
 use crate::encoding::{bytes, uvar};
 use crate::hash::{Hash, blake3, checksummed_base32, read_checksummed_base32};
@@ -160,7 +160,7 @@ pub fn run(
             right.target.name(),
         ))
     });
-    check::sort_diagnostics(&mut report.diagnostics);
+    sort_diagnostics(&mut report.diagnostics);
     Ok(Ok(report))
 }
 

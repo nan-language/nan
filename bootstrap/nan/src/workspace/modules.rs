@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{Manifest, Package, Target};
-use crate::diagnostic::{Code, Diagnostic};
+use crate::diagnostic::{Code, Diagnostic, sort_diagnostics};
 
 /// A module: the root module, or a plain directory, or the variants of one name.
 pub struct Module {
@@ -154,9 +154,6 @@ pub fn check(package: &Package, manifest: &Manifest) -> Vec<Diagnostic> {
             }
         }
     }
-    found.sort_by(|left, right| {
-        (&left.path, left.line, left.code).cmp(&(&right.path, right.line, right.code))
-    });
-    found.dedup();
+    sort_diagnostics(&mut found);
     found
 }

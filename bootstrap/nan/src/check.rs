@@ -97,7 +97,7 @@ pub use supplied::stated;
 pub use traps::closure_demands_notrap;
 
 use crate::cache::Cache;
-use crate::diagnostic::{Code, Diagnostic, Fix, Offer, Reason, Role};
+use crate::diagnostic::{Code, Diagnostic, Fix, Offer, Reason, Role, sort_diagnostics};
 use crate::hash::Hash;
 use crate::machine::api::Entry as ApiEntry;
 use crate::scope::Scope;
@@ -674,19 +674,6 @@ pub fn reported_by(
     }
     sort_diagnostics(&mut found);
     found
-}
-
-/// Sorts diagnostics by path, line and code, keeping each once whatever bytes it is located on.
-pub fn sort_diagnostics(found: &mut Vec<Diagnostic>) {
-    found.sort_by(|left, right| {
-        (&left.path, left.line, left.code.name()).cmp(&(&right.path, right.line, right.code.name()))
-    });
-    found.dedup_by(|later, earlier| {
-        Diagnostic {
-            span: earlier.span,
-            ..later.clone()
-        } == *earlier
-    });
 }
 
 impl Checker<'_> {

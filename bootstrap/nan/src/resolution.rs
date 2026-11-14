@@ -9,7 +9,7 @@ use std::io;
 use crate::artefact;
 use crate::cache::{Cache, Exposed};
 use crate::check;
-use crate::diagnostic::{Class as DiagnosticClass, Code, Diagnostic, Fix};
+use crate::diagnostic::{Class as DiagnosticClass, Code, Diagnostic, Fix, sort_diagnostics};
 use crate::fix;
 use crate::hash::Hash;
 use crate::machine::lock::{Entry as Authority, Lock, Locked};
@@ -163,7 +163,7 @@ pub fn resolve(
             manifest.line,
         )];
         diagnostics.extend(resolver.newest.take().unwrap_or_default());
-        check::sort_diagnostics(&mut diagnostics);
+        sort_diagnostics(&mut diagnostics);
         return Ok(Ok(Outcome::Unresolved(diagnostics)));
     };
     resolver.lock(store, &assignment)
@@ -583,7 +583,7 @@ impl Resolver<'_> {
             false => Vec::new(),
         };
         errors.extend(unapproved);
-        check::sort_diagnostics(&mut errors);
+        sort_diagnostics(&mut errors);
         Ok(Ok(Outcome::Resolved {
             lock,
             changes,

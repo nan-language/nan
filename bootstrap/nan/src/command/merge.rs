@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use super::{Invocation, Trace, record};
 use crate::check;
-use crate::diagnostic::{Class, Code, Diagnostic};
+use crate::diagnostic::{Class, Code, Diagnostic, sort_diagnostics};
 use crate::merge::merge;
 use crate::output::{Output, Record, Verdict};
 use crate::scope::Scope;
@@ -105,7 +105,7 @@ pub fn run(invocation: &Invocation, current: &Path, trace: &mut Trace) -> io::Re
             checked = Some(merged);
         }
     }
-    check::sort_diagnostics(&mut diagnostics);
+    sort_diagnostics(&mut diagnostics);
     let conflicts = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.code == Code::MergeConflict)

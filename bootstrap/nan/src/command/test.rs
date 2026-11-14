@@ -8,7 +8,7 @@ use std::path::Path;
 use super::{Invocation, Trace, record, written_for};
 use crate::cache::Cache;
 use crate::check;
-use crate::diagnostic::{Class, Code, Diagnostic};
+use crate::diagnostic::{Class, Code, Diagnostic, sort_diagnostics};
 use crate::fix;
 use crate::output::{Output, Record, Verdict};
 use crate::scope::Scope;
@@ -60,7 +60,7 @@ pub fn run(
         }
     }
     diagnostics.append(&mut report.diagnostics);
-    check::sort_diagnostics(&mut diagnostics);
+    sort_diagnostics(&mut diagnostics);
     let count = |class: Class| {
         diagnostics
             .iter()

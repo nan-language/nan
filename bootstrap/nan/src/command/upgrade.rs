@@ -8,7 +8,7 @@ use std::path::Path;
 
 use super::{Invocation, Trace, record};
 use crate::check;
-use crate::diagnostic::{Class, Code, Diagnostic};
+use crate::diagnostic::{Class, Code, Diagnostic, sort_diagnostics};
 use crate::output::{Output, Verdict};
 use crate::scope::Scope;
 use crate::toolchain;
@@ -57,7 +57,7 @@ pub fn language(
             .into_iter()
             .filter(|diagnostic| diagnostic.code.class() == Class::Error),
     );
-    check::sort_diagnostics(&mut diagnostics);
+    sort_diagnostics(&mut diagnostics);
     let errors = diagnostics.len();
     Ok(Output {
         command: invocation.command(&written, true),

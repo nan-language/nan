@@ -9,7 +9,7 @@ use std::path::Path;
 use super::{Invocation, Trace, apply, record};
 use crate::cache::Cache;
 use crate::check;
-use crate::diagnostic::{Class, Code, Diagnostic};
+use crate::diagnostic::{Class, Code, Diagnostic, sort_diagnostics};
 use crate::format;
 use crate::output::{Output, Record, Verdict};
 use crate::resolution::{self, Outcome};
@@ -196,7 +196,7 @@ fn synced(
                 });
             }
             errors.extend(invalid);
-            check::sort_diagnostics(&mut errors);
+            sort_diagnostics(&mut errors);
             records.extend(
                 errors
                     .iter()

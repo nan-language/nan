@@ -1,12 +1,12 @@
 # NaN
 
-NaN is a programming language made for agentic coding: performant, fast and safe, with strong versioning so that compiled NaN artefacts can reuse each other. Its toolchain is written in NaN and compiles itself. It targets Linux and Windows on x86_64 and AArch64, UEFI and bare metal.
+NaN is a programming language made for agentic coding: performant, fast and safe, with strong versioning so that compiled NaN artefacts can reuse each other. Its toolchain is written in NaN and compiles itself. It targets Linux, Windows and macOS on x86_64 and AArch64, UEFI and bare metal.
 
 The language is specified in [docs/spec](docs/spec/00-charter.md); [the primer](docs/spec/39-primer.md) is the short introduction.
 
 ## Installation
 
-On Linux, x86_64 or AArch64:
+On Linux or macOS, x86_64 or AArch64:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nan-language/nan/main/install.sh | sh
@@ -34,6 +34,7 @@ Requirements:
 
 - Linux programs: a C compiler as `cc`; for the other architecture, `x86_64-linux-gnu-gcc` or `aarch64-linux-gnu-gcc`.
 - Running Windows programs and their tests on Linux: Wine, as `wine`.
+- Running macOS programs and their tests: macOS 15 or later on a Mac of their architecture.
 - `uefi` and `bare` programs: QEMU 10.2 or later and `swtpm`; for `uefi`, the OVMF or AAVMF firmware.
 
 ## Usage
@@ -70,9 +71,9 @@ A kernel declaring loaded registries also gets an interface file, against which 
 
 ## Development
 
-`toolchain/` holds the NaN toolchain; `nan build nan` there builds it into `toolchain/.nan/images/x86_64-linux/nan`, or for another host target once `targets` in `nan/package.nan` names it, after `nan dep approve nan` for a Windows one.
+`toolchain/` holds the NaN toolchain; `nan build nan` there builds it into `toolchain/.nan/images/x86_64-linux/nan`, or for another host target once `targets` in `nan/package.nan` names it, after `nan dep approve nan` for a Windows or macOS one.
 
-`bootstrap/` holds the bootstrap compiler, in Rust with Cranelift. It built the first NaN toolchain and checks every toolchain change against its own output; it freezes when the NaN toolchain 1.0 is released. It requires [rustup](https://rustup.rs) and the linker Rust uses on the system: `cc` on Linux, the Visual Studio build tools on Windows. From `bootstrap/`:
+`bootstrap/` holds the bootstrap compiler, in Rust with Cranelift. It built the first NaN toolchain and checks every toolchain change against its own output; it freezes when the NaN toolchain 1.0 is released. It requires [rustup](https://rustup.rs) and the linker Rust uses on the system: `cc` on Linux, Xcode's command line tools on macOS, the Visual Studio build tools on Windows. From `bootstrap/`:
 
 ```bash
 rustup toolchain install

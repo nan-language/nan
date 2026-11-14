@@ -1,0 +1,86 @@
+name: macOS toolchain
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: The release tag naming the images to upload; none uploads nothing
+        type: string
+        default: ''
+
+jobs:
+  toolchain:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: macos-15-intel
+          - arch: aarch64
+            runner: macos-15
+    name: toolchain-${{ matrix.arch }}-macos
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.arch }}-macos
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain
+        working-directory: bootstrap
+        run: rustup toolchain install
+      - name: Install cargo-nextest
+        run: curl -LsSf --retry 5 --retry-all-errors https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.148/cargo-nextest-0.9.148-universal-apple-darwin.tar.gz | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            bootstrap/target
+            !bootstrap/target/tmp
+          key: macos-${{ matrix.arch }}-${{ hashFiles('bootstrap/rust-toolchain.toml', 'bootstrap/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: macos-${{ matrix.arch }}-${{ hashFiles('bootstrap/rust-toolchain.toml', 'bootstrap/Cargo.lock') }}-
+      - name: Build the bootstrap
+        working-directory: bootstrap
+        run: cargo build --release -q -p nan
+      - if: inputs.tag == ''
+        name: Run the macOS programs
+        working-directory: bootstrap
+        run: cargo nextest run --cargo-quiet --profile ci -p nan --test programs -E 'test(/macos/)'
+      # The copies of the workspace declare the macOS target of the runner's architecture, and
+      # their lock approves the escapes of the platform library's macOS variant.
+      - name: Declare the macOS target of the runner's architecture
+        run: |
+          perl -pi -e "s/^    targets x86_64-linux\$/    targets $TARGET/" toolchain/nan/package.nan
+          grep -q "^    targets $TARGET\$" toolchain/nan/package.nan
+          (cd toolchain && "$GITHUB_WORKSPACE/bootstrap/target/release/nan" dep approve nan)
+      # Each stage builds a fresh copy of toolchain/ with an empty user directory, so that no
+      # stage reuses another's proofs; the second and third stages must be equal byte for byte,
+      # and the bootstrap's stage comparison must accept the second.
+      - name: Build the NaN toolchain three times
+        run: |
+          stage() {
+            rm -rf ~/.nan "$RUNNER_TEMP/$2"
+            cp -R toolchain "$RUNNER_TEMP/$2"
+            (cd "$RUNNER_TEMP/$2" && "$1" build nan)
+            cp "$RUNNER_TEMP/$2/.nan/images/$TARGET/nan" "$RUNNER_TEMP/$2.image"
+          }
+          stage "$GITHUB_WORKSPACE/bootstrap/target/release/nan" first
+          stage "$RUNNER_TEMP/first.image" second
+          stage "$RUNNER_TEMP/second.image" third
+          cmp "$RUNNER_TEMP/second.image" "$RUNNER_TEMP/third.image"
+          rm -rf ~/.nan "$RUNNER_TEMP/compared"
+          cp -R toolchain "$RUNNER_TEMP/compared"
+          (cd "$RUNNER_TEMP/compared" && "$GITHUB_WORKSPACE/bootstrap/target/release/nan" build nan --compare-with "$RUNNER_TEMP/second.image")
+          if [ -n '${{ inputs.tag }}' ]; then
+            cp "$RUNNER_TEMP/second.image" "nan-${{ inputs.tag }}-$TARGET"
+          fi
+      - if: inputs.tag != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: nan-${{ inputs.tag }}-${{ env.TARGET }}
+          path: nan-${{ inputs.tag }}-${{ env.TARGET }}
+          if-no-files-found: error
+      - if: always() && inputs.tag == ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-macos-${{ matrix.arch }}
+          path: bootstrap/target/nextest/ci/junit.xml

@@ -183,8 +183,8 @@ fn Checker.context(self, checkers: Slice[TargetChecker], item: ty::ItemId, line:
         Some(canonical) => canonical
         None => text::String.empty(alloc)
     }
-    expect data.index < file.syntax.items.len()
-    return Context(path: take path, file: text::String.of(file.path.as_str(), alloc), line: db.head_line(item), lines: file.syntax.item_lines(file.syntax.items[data.index]), package_name: text::String.of(db.package_data(package_id).name.as_str(), alloc), directives: self.closure_directives(item), module: db.module_path(data.module), names: take distinct, apis: take apis)
+    expect data.index < file.syntax().items.len()
+    return Context(path: take path, file: text::String.of(file.path.as_str(), alloc), line: db.head_line(item), lines: file.syntax().item_lines(file.syntax().items[data.index]), package_name: text::String.of(db.package_data(package_id).name.as_str(), alloc), directives: self.closure_directives(item), module: db.module_path(data.module), names: take distinct, apis: take apis)
 } Checker.context
 
 /// The manifest directives of an item's closure set, in canonical order: its package's
@@ -201,7 +201,7 @@ fn Checker.closure_directives(self, item: ty::ItemId) -> mem::List[text::String]
     } else {
         module_data.name.as_str()
     }
-    let syntax = db.file(data.file).syntax
+    let syntax = db.file(data.file).syntax()
     expect data.index < syntax.items.len()
     let span = syntax.items[data.index]
     var aliases = mem::Set[text::String].empty(alloc)
@@ -213,7 +213,7 @@ fn Checker.closure_directives(self, item: ty::ItemId) -> mem::List[text::String]
         expect false
         return directives
     }
-    let manifest = manifest_file.syntax
+    let manifest = manifest_file.syntax()
     var tree_index: Option[usize] = None
     for index in 0..<manifest.items.len() {
         if manifest.items[index].tree.is_some() and not manifest.items[index].abandoned {
@@ -350,9 +350,7 @@ fn Session.greens_of(self, checkers: Slice[TargetChecker], scope: scope::Scope, 
             mut gathered.add(path: checker.shown_path(item).as_str(), file: db.file(db.item(item).file).path.as_str(), line: db.head_line(item), interface_hash, api: api.view(), digests: digests.view())
         }
     }
-    var found = gathered.greens(alloc)
-    mut found.sort_by(fn(left: Green, right: Green) => green_order(left, right))
-    return found
+    return gathered.greens(alloc)
 } Session.greens_of
 
 /// Last-green entries while they are gathered, their texts held in one buffer so that what
@@ -364,10 +362,12 @@ struct GreenTexts {
     entries: mem::List[GreenHead]
 } GreenTexts
 
-/// A gathered entry's line and interface hash, and the number of its api lines.
+/// A gathered entry's line and interface hash, the index of its path among the texts, from which
+/// its file and api lines follow, and the number of its api lines.
 struct GreenHead derives Copy {
     line: u32
     interface_hash: Option[hashing::HashValue]
+    from: usize
     api: usize
 } GreenHead
 
@@ -390,6 +390,7 @@ fn GreenTexts.add(
     api: Slice[text::String],
     digests: Slice[text::String],
     ) {
+    let from = self.ends.len()
     mut self.text(path)
     mut self.text(file)
     for written in api {
@@ -398,7 +399,7 @@ fn GreenTexts.add(
     for digest in digests {
         mut self.text(digest.as_str())
     }
-    mut self.entries.push(GreenHead(line: line, interface_hash: interface_hash, api: api.len() + digests.len()))
+    mut self.entries.push(GreenHead(line: line, interface_hash: interface_hash, from: from, api: api.len() + digests.len()))
 } GreenTexts.add
 
 fn GreenTexts.text(mut self, written: Str) {
@@ -406,27 +407,45 @@ fn GreenTexts.text(mut self, written: Str) {
     mut self.ends.push(self.texts.byte_len())
 } GreenTexts.text
 
-/// The gathered entries, in order.
+/// The gathered entries, by path, file and line, those alike in the order they were gathered.
 fn GreenTexts.greens(self, alloc: mem::Alloc) -> mem::List[Green] {
+    var order = mem::List[usize].empty(alloc)
+    mut order.reserve(self.entries.len())
+    for index in 0..<self.entries.len() {
+        mut order.push(index)
+    }
+    mut order.sort_by(fn(left: usize, right: usize) => self.order(left, right))
     var greens = mem::List[Green].empty(alloc)
     mut greens.reserve(self.entries.len())
-    var next: usize = 0
-    for entry in self.entries {
-        let path = self.piece(next, alloc)
-        let file = self.piece(next + 1, alloc)
+    for index in order {
+        let entry = self.entries[index]
         var api = mem::List[text::String].empty(alloc)
         mut api.reserve(entry.api)
-        for index in 0..<entry.api {
-            mut api.push(self.piece(next + 2 + index, alloc))
+        for at in 0..<entry.api {
+            mut api.push(text::String.of(self.text_at(entry.from + 2 + at), alloc))
         }
-        next = next + 2 + entry.api
-        mut greens.push(Green(path: take path, file: take file, line: entry.line, interface_hash: entry.interface_hash, api: take api))
+        mut greens.push(Green(path: text::String.of(self.text_at(entry.from), alloc), file: text::String.of(self.text_at(entry.from + 1), alloc), line: entry.line, interface_hash: entry.interface_hash, api: take api))
     }
     return greens
 } GreenTexts.greens
 
-/// A copy of text `index`.
-fn GreenTexts.piece(self, index: usize, alloc: mem::Alloc) -> text::String {
+/// How the entries at two indexes order, by path, file and line.
+fn GreenTexts.order(self, left: usize, right: usize) -> core::Ordering {
+    let one = self.entries[left]
+    let other = self.entries[right]
+    let paths = self.text_at(one.from).cmp(self.text_at(other.from))
+    if paths != core::Ordering.Equal {
+        return paths
+    }
+    let files = self.text_at(one.from + 1).cmp(self.text_at(other.from + 1))
+    if files != core::Ordering.Equal {
+        return files
+    }
+    return one.line.cmp(other.line)
+} GreenTexts.order
+
+/// Text `index`.
+proj fn GreenTexts.text_at(self, index: usize) -> Str {
     expect index < self.ends.len()
     var start: usize = 0
     if index > 0 {
@@ -434,10 +453,10 @@ fn GreenTexts.piece(self, index: usize, alloc: mem::Alloc) -> text::String {
     }
     let Some(written) = self.texts.slice_bytes(start, end: self.ends[index]) else {
         expect false
-        return text::String.empty(alloc)
+        return ""
     }
-    return text::String.of(written, alloc)
-} GreenTexts.piece
+    return written
+} GreenTexts.text_at
 
 /// An item's api lines before its digest and its interface hash, as its last-green entry holds
 /// them.
@@ -472,8 +491,8 @@ fn Checker.green_items(self, held: workspace::Workspace, scope: scope::Scope, li
         if lines.len() == 0 and scope.holds(held, path: file.path.as_str(), line: Some(db.head_line(item))) {
             mut items.push(item)
         }
-        expect data.index < file.syntax.items.len()
-        let item_lines = file.syntax.item_lines(file.syntax.items[data.index])
+        expect data.index < file.syntax().items.len()
+        let item_lines = file.syntax().item_lines(file.syntax().items[data.index])
         for at in lines {
             if at.path.as_str() != file.path.as_str() or not item_lines.contains(at.line) {
                 continue
@@ -628,16 +647,3 @@ fn context_order(left: Context, right: Context) -> core::Ordering {
     }
     return left.line.cmp(right.line)
 } context_order
-
-/// Last-green entries by path, then file path, then line.
-fn green_order(left: Green, right: Green) -> core::Ordering {
-    let paths = left.path.as_str().cmp(right.path.as_str())
-    if paths != core::Ordering.Equal {
-        return paths
-    }
-    let files = left.file.as_str().cmp(right.file.as_str())
-    if files != core::Ordering.Equal {
-        return files
-    }
-    return left.line.cmp(right.line)
-} green_order

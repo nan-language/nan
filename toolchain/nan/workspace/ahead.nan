@@ -1,4 +1,4 @@
-//! Parsing ahead: before a load parses a workspace's source files, or the std files the toolchain carries, one after another, the tasks of a crew parse those whose syntax the build cache does not hold and write it there, so that the load decodes it.
+//! Parsing ahead: before a load reads the syntax of a workspace's source files, or of the std files the toolchain carries, one after another, the tasks of a crew decode the syntax the build cache holds of each, or parse those whose syntax it does not hold and write it there, and lower its items, so that the load takes what they give.
 
 /// The batches of source files posted to the worker tasks of a command, in order, and whether
 /// any worker task serves them.
@@ -20,18 +20,30 @@ pkg fn Parsing.help(self, mut next: usize, alloc: mem::Alloc) {
     }
 } Parsing.help
 
-/// Source files to parse into the build cache, by their paths relative to the workspace root, with
-/// the cache, the toolchain hash and the grammar parsing them, and how many of their jobs are
-/// taken and ended.
+/// Source files to read the syntax of, by their paths relative to the workspace root, with the
+/// cache, the toolchain hash, the decoding and the grammar giving it, how many of their jobs are
+/// taken and ended, and the syntax given, by path, drawn through the allocator of the task giving
+/// it.
 struct ParseBatch {
     root: text::String
     cache: cache::Cache
     toolchain: hashing::HashValue
+    decoding: syntax::Decoding
     grammar: mem::Shared[syntax::Grammar]
     sources: mem::List[Source]
     taken: core::atomic::AtomicU32
     ended: core::atomic::AtomicU32
+    files: mem::OnceMap[text::String, Given]
 } ParseBatch
+
+/// The syntax a batch gave a source file, with its items lowered and the hash of its contents, and
+/// whether it parsed it as a std package's file.
+struct Given {
+    std: bool
+    file: mem::Shared[syntax::SourceFile]
+    lowered: mem::Shared[mem::List[Option[ast::Item]]]
+    content: hashing::HashValue
+} Given
 
 /// A source file's path, whether it is parsed as a std package's file, and the std file the
 /// toolchain carries that it is, if any; another is read from the workspace.
@@ -43,6 +55,7 @@ struct Source {
 
 /// Runs the batch's jobs not yet taken.
 fn ParseBatch.help(self, alloc: mem::Alloc) {
+    let user = self.cache.copied(alloc)
     loop {
         let Some(taken) = self.taken.fetch_add(1) else {
             return
@@ -53,11 +66,11 @@ fn ParseBatch.help(self, alloc: mem::Alloc) {
         let source = self.sources[usize.widen(taken)]
         match attempt source_bytes(source, root: self.root.as_str(), alloc) {
             Ok(bytes) => {
-                let key = syntax_key(self.toolchain, bytes: bytes.view(), std: source.std, alloc)
-                if not self.cache.holds(key) {
-                    let file = parsed_bytes(take bytes, std: source.std, grammar: self.grammar.contents(), alloc)
-                    discard attempt self.cache.put(key, contents: file.stored(alloc).view())
-                }
+                let content = hashing::HashValue.of(bytes.view())
+                let key = syntax_key(self.toolchain, content, std: source.std, alloc)
+                let file = cached_syntax(user, key, decoding: self.decoding, take bytes, std: source.std, grammar: self.grammar.contents(), alloc)
+                let lowered = lowered_items(file, alloc)
+                discard self.files.insert(text::String.of(source.path.as_str(), alloc), value: Given(std: source.std, file: mem::Shared.of(take file, alloc), lowered: mem::Shared.of(take lowered, alloc), content: content))
             }
             Err(_) => {}
         }
@@ -65,10 +78,21 @@ fn ParseBatch.help(self, alloc: mem::Alloc) {
     }
 } ParseBatch.help
 
-/// Parses the source files of the packages found that the build cache does not hold, on the
-/// worker tasks of `parsing` beside this task, unless none serves it or the provider uses no
-/// cache.
-fn Syntaxes.ahead(self, found: Slice[Found], root: Str, grammar: mem::Shared[syntax::Grammar], parsing: Parsing, alloc: mem::Alloc) fails platform::IoError {
+/// The syntax the batch gave the source file at `path`, when it read the same bytes and parsed
+/// them alike.
+fn ParseBatch.given(self, path: Str, bytes: Slice[u8], std: bool, alloc: mem::Alloc) -> Option[Parsed] {
+    let Some(held) = self.files.get(text::String.of(path, alloc)) else {
+        return None
+    }
+    if held.std != std or held.file.contents().source.view() != bytes {
+        return None
+    }
+    return Some(Parsed(syntax: held.file.share(), lowered: Some(held.lowered.share()), content: Some(held.content)))
+} ParseBatch.given
+
+/// Gives the source files of the packages found their syntax, on the worker tasks of `parsing`
+/// beside this task, unless none serves it or the provider uses no cache.
+fn Syntaxes.ahead(mut self, found: Slice[Found], root: Str, grammar: mem::Shared[syntax::Grammar], parsing: Parsing, alloc: mem::Alloc) fails platform::IoError {
     if not parsing.served {
         return
     }
@@ -82,9 +106,9 @@ fn Syntaxes.ahead(self, found: Slice[Found], root: Str, grammar: mem::Shared[syn
     for walked in found {
         var manifest_path = text::String.of(walked.dir.as_str(), alloc)
         mut manifest_path.append("/package.nan")
-        let parsed = self.parsed(try read_source(root, path: manifest_path.as_str(), alloc), std: false, grammar: grammar.contents(), alloc)
+        let parsed = self.parsed(path: manifest_path.as_str(), bytes: try read_source(root, path: manifest_path.as_str(), alloc), std: false, grammar: grammar.contents(), alloc)
         var ignored = mem::List[diagnostic::Diagnostic].empty(alloc)
-        let manifest = Manifest.read(parsed, path: manifest_path.as_str(), diagnostics: mut ignored, alloc)
+        let manifest = Manifest.read(parsed.syntax.contents(), path: manifest_path.as_str(), diagnostics: mut ignored, alloc)
         if not language_supported(manifest) {
             continue
         }
@@ -93,39 +117,59 @@ fn Syntaxes.ahead(self, found: Slice[Found], root: Str, grammar: mem::Shared[syn
             mut sources.push(Source(path: text::String.of(path.as_str(), alloc), std: std, carried: None))
         }
     }
-    post(take sources, root, cache: user, toolchain, grammar, parsing, alloc)
+    let batch = posted(take sources, root, cache: user, toolchain, grammar, parsing, alloc)
+    batch.contents().finish(alloc)
+    self.batch = Some(take batch)
 } Syntaxes.ahead
 
-/// Parses the std files the toolchain carries that the build cache does not hold, on the worker
-/// tasks of `parsing` beside this task, unless none serves it or the provider uses no cache.
-fn Syntaxes.ahead_carried(self, grammar: mem::Shared[syntax::Grammar], parsing: Parsing, alloc: mem::Alloc) {
+/// Gives the std files the toolchain carries their syntax, on the worker tasks of `parsing` beside
+/// this task, unless none serves it or the provider uses no cache: through `ahead`, the batch
+/// already posted for them, if any.
+fn Syntaxes.ahead_carried(mut self, ahead: Option[mem::Shared[ParseBatch]], grammar: mem::Shared[syntax::Grammar], parsing: Parsing, alloc: mem::Alloc) {
+    let batch = match ahead {
+        Some(held) => held.share()
+        None => match self.carried_batch(grammar, parsing, alloc) {
+            Some(held) => held
+            None => return
+        }
+    }
+    batch.contents().finish(alloc)
+    self.batch = Some(take batch)
+} Syntaxes.ahead_carried
+
+/// Posts a batch giving the std files the toolchain carries their syntax to the worker tasks of
+/// `parsing`, unless none serves it or the provider uses no cache.
+fn Syntaxes.carried_batch(self, grammar: mem::Shared[syntax::Grammar], parsing: Parsing, alloc: mem::Alloc) -> Option[mem::Shared[ParseBatch]] {
     if not parsing.served {
-        return
+        return None
     }
     let Some(user) = self.cache else {
-        return
+        return None
     }
     let Some(toolchain) = self.toolchain else {
-        return
+        return None
     }
     var sources = mem::List[Source].empty(alloc)
     for file in stdlib::StdFile.all(alloc) {
         let path = file.path()
         mut sources.push(Source(path: text::String.of(path, alloc), std: not path.ends_with("/package.nan"), carried: Some(file)))
     }
-    post(take sources, root: "std", cache: user, toolchain, grammar, parsing, alloc)
-} Syntaxes.ahead_carried
+    return Some(posted(take sources, root: "std", cache: user, toolchain, grammar, parsing, alloc))
+} Syntaxes.carried_batch
 
-/// Posts a batch parsing `sources` into the cache, helps run its jobs and waits for them to end.
-fn post(take sources: mem::List[Source], root: Str, cache: cache::Cache, toolchain: hashing::HashValue, grammar: mem::Shared[syntax::Grammar], parsing: Parsing, alloc: mem::Alloc) {
-    let count = sources.len()
-    let batch = mem::Shared.of(ParseBatch(root: text::String.of(root, alloc), cache: cache.copied(alloc), toolchain: toolchain, grammar: grammar.share(), sources: take sources, taken: core::atomic::AtomicU32.of(0), ended: core::atomic::AtomicU32.of(0)), alloc)
+/// A batch giving `sources` their syntax, posted to the worker tasks of `parsing`.
+fn posted(take sources: mem::List[Source], root: Str, cache: cache::Cache, toolchain: hashing::HashValue, grammar: mem::Shared[syntax::Grammar], parsing: Parsing, alloc: mem::Alloc) -> mem::Shared[ParseBatch] {
+    let batch = mem::Shared.of(ParseBatch(root: text::String.of(root, alloc), cache: cache.copied(alloc), toolchain: toolchain, decoding: syntax::Decoding.new(alloc), grammar: grammar.share(), sources: take sources, taken: core::atomic::AtomicU32.of(0), ended: core::atomic::AtomicU32.of(0), files: mem::OnceMap[text::String, Given].empty(seed: 0, alloc)), alloc)
     discard parsing.batches.push(batch.share())
-    let posted = batch.contents()
-    posted.help(alloc)
-    while usize.widen(posted.ended.load()) < count {
+    return batch
+} posted
+
+/// Helps run the batch's jobs and waits for them to end.
+fn ParseBatch.finish(self, alloc: mem::Alloc) {
+    self.help(alloc)
+    while usize.widen(self.ended.load()) < self.sources.len() {
     }
-} post
+} ParseBatch.finish
 
 /// The bytes of a source file of a batch.
 fn source_bytes(source: Source, root: Str, alloc: mem::Alloc) -> mem::Bytes fails platform::IoError {

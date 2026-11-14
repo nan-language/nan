@@ -57,14 +57,56 @@ pkg struct File {
     pkg path: text::String
     /// The index of the file's module, none for `package.nan`.
     pkg module: Option[usize]
-    pkg syntax: syntax::SourceFile
+    parsed: mem::Shared[syntax::SourceFile]
     /// Its items lowered, by index, once a check has read them; none for an item without one.
     lowering: mem::OnceMap[u8, mem::Shared[mem::List[Option[ast::Item]]]]
+    /// The hash of its contents, once read.
+    hashed: mem::OnceMap[u8, hashing::HashValue]
 } File
 
-fn File.new(take path: text::String, module: Option[usize], take parsed: syntax::SourceFile, alloc: mem::Alloc) -> File {
-    return File(path: take path, module: module, syntax: take parsed, lowering: mem::OnceMap[u8, mem::Shared[mem::List[Option[ast::Item]]]].empty(seed: 0, alloc))
+fn File.new(take path: text::String, module: Option[usize], take parsed: Parsed, alloc: mem::Alloc) -> File {
+    let Parsed(syntax: syntax, lowered: lowered, content: content) = parsed
+    let lowering = mem::OnceMap[u8, mem::Shared[mem::List[Option[ast::Item]]]].empty(seed: 0, alloc)
+    match lowered {
+        Some(items) => {
+            discard lowering.insert(0, value: take items)
+        }
+        None => {}
+    }
+    let hashed = mem::OnceMap[u8, hashing::HashValue].empty(seed: 0, alloc)
+    match content {
+        Some(hash) => {
+            discard hashed.insert(0, value: hash)
+        }
+        None => {}
+    }
+    return File(path: take path, module: module, parsed: take syntax, lowering: take lowering, hashed: take hashed)
 } File.new
+
+/// A source file's syntax, with its items lowered and the hash of its contents when they are
+/// known.
+struct Parsed {
+    syntax: mem::Shared[syntax::SourceFile]
+    lowered: Option[mem::Shared[mem::List[Option[ast::Item]]]]
+    content: Option[hashing::HashValue]
+} Parsed
+
+fn Parsed.of(take file: syntax::SourceFile, alloc: mem::Alloc) -> Parsed {
+    return Parsed(syntax: mem::Shared.of(take file, alloc), lowered: None, content: None)
+} Parsed.of
+
+/// The hash of its contents.
+pkg fn File.content_hash(self) -> hashing::HashValue {
+    match self.hashed.get(0) {
+        Some(hash) => return hash
+        None => {}
+    }
+    return self.hashed.insert(0, value: hashing::HashValue.of(self.syntax().source.view()))
+} File.content_hash
+
+pkg proj fn File.syntax(self) -> syntax::SourceFile {
+    return self.parsed.contents()
+} File.syntax
 
 /// Its items lowered, by index: none for an abandoned item or one that lowers to nothing.
 pkg proj fn File.lowered(self, alloc: mem::Alloc) -> Slice[Option[ast::Item]] {
@@ -77,21 +119,26 @@ pkg proj fn File.lowering_of(self, alloc: mem::Alloc) -> mem::Shared[mem::List[O
         Some(items) => return items
         None => {}
     }
+    return self.lowering.insert(0, value: mem::Shared.of(lowered_items(self.syntax(), alloc), alloc))
+} File.lowering_of
+
+/// The items of a file lowered, as `File.lowered` gives them.
+fn lowered_items(file: syntax::SourceFile, alloc: mem::Alloc) -> mem::List[Option[ast::Item]] {
     var items = mem::List[Option[ast::Item]].empty(alloc)
-    for item in self.syntax.items {
+    for item in file.items {
         match item.tree {
             Some(tree) => {
                 if item.abandoned {
                     mut items.push(None)
                 } else {
-                    mut items.push(ast::lower(self.syntax, tree, alloc))
+                    mut items.push(ast::lower(file, tree, alloc))
                 }
             }
             None => mut items.push(None)
         }
     }
-    return self.lowering.insert(0, value: mem::Shared.of(take items, alloc))
-} File.lowering_of
+    return items
+} lowered_items
 
 /// The workspace root of a command run in `current`: the parent of the outermost directory at or
 /// above it holding a `package.nan`, or else `current`.
@@ -204,8 +251,8 @@ pkg fn Workspace.load_ahead(
     alloc: mem::Alloc,
     ) -> Workspace fails platform::IoError {
     let walked = try Walked.of(root, alloc)
-    let syntaxes = Syntaxes.of(given, alloc)
-    try syntaxes.ahead(walked.found.view(), root, grammar, parsing, alloc)
+    var syntaxes = Syntaxes.of(given, alloc)
+    try mut syntaxes.ahead(walked.found.view(), root, grammar, parsing, alloc)
     return try take walked.loaded(root, read, given, syntaxes, grammar: grammar.contents(), alloc)
 } Workspace.load_ahead
 
@@ -405,19 +452,41 @@ pkg fn Workspace.of_stored_files(
 } Workspace.of_stored_files
 
 /// The std packages the toolchain carries, as a workspace of their own loaded when first read,
-/// its files parsed ahead by the worker tasks of `parsing`; the copies `share` makes share it.
+/// its files parsed ahead by the worker tasks of `parsing`, through the batch `posted` holds once
+/// it is posted before that read; the copies `share` makes share it.
 pkg struct CarriedStd {
     held: mem::Shared[mem::OnceMap[u8, mem::Shared[Workspace]]]
     parsing: mem::Shared[Parsing]
+    posted: mem::Shared[mem::OnceMap[u8, mem::Shared[ParseBatch]]]
 } CarriedStd
 
 pkg fn CarriedStd.unloaded(take parsing: mem::Shared[Parsing], alloc: mem::Alloc) -> CarriedStd {
-    return CarriedStd(held: mem::Shared.of(mem::OnceMap[u8, mem::Shared[Workspace]].empty(seed: 0, alloc), alloc: alloc), parsing: take parsing)
+    return CarriedStd(held: mem::Shared.of(mem::OnceMap[u8, mem::Shared[Workspace]].empty(seed: 0, alloc), alloc: alloc), parsing: take parsing, posted: mem::Shared.of(mem::OnceMap[u8, mem::Shared[ParseBatch]].empty(seed: 0, alloc), alloc: alloc))
 } CarriedStd.unloaded
 
 pkg fn CarriedStd.share(self) -> CarriedStd {
-    return CarriedStd(held: self.held.share(), parsing: self.parsing.share())
+    return CarriedStd(held: self.held.share(), parsing: self.parsing.share(), posted: self.posted.share())
 } CarriedStd.share
+
+/// Posts the std files to the worker tasks of its parsing, so that they give them their syntax
+/// from the `Syntaxes` of the user directory, the one `given` replaces, while this task does other
+/// work before the std workspace is first read.
+pkg fn CarriedStd.parse_ahead(self, grammar: mem::Shared[syntax::Grammar], given: Option[cache::HomeOverride], alloc: mem::Alloc) {
+    match Syntaxes.of(given, alloc).carried_batch(grammar, parsing: self.parsing.contents(), alloc) {
+        Some(batch) => {
+            discard self.posted.contents().insert(0, value: take batch)
+        }
+        None => {}
+    }
+} CarriedStd.parse_ahead
+
+/// The batch posted for the std files, if any.
+fn CarriedStd.ahead(self) -> Option[mem::Shared[ParseBatch]] {
+    let Some(batch) = self.posted.contents().get(0) else {
+        return None
+    }
+    return Some(batch.share())
+} CarriedStd.ahead
 
 /// The std workspace, its source files' syntax from the `Syntaxes` of the user directory, the
 /// one `given` replaces, when it is first read.
@@ -427,7 +496,7 @@ pkg proj fn CarriedStd.workspace(self, grammar: mem::Shared[syntax::Grammar], gi
         Some(loaded) => return loaded.contents()
         None => {}
     }
-    return held.insert(0, value: mem::Shared.of(Workspace.of_std(grammar, given, parsing: self.parsing.contents(), alloc), alloc: alloc)).contents()
+    return held.insert(0, value: mem::Shared.of(Workspace.of_std(grammar, given, parsing: self.parsing.contents(), ahead: self.ahead(), alloc), alloc: alloc)).contents()
 } CarriedStd.workspace
 
 /// A handle of the std workspace, as `workspace` reads it.
@@ -435,35 +504,37 @@ pkg fn CarriedStd.shared(self, grammar: mem::Shared[syntax::Grammar], given: Opt
     discard self.workspace(grammar, given, alloc)
     let Some(loaded) = self.held.contents().get(0) else {
         expect false
-        return mem::Shared.of(Workspace.of_std(grammar, given, parsing: self.parsing.contents(), alloc), alloc: alloc)
+        return mem::Shared.of(Workspace.of_std(grammar, given, parsing: self.parsing.contents(), ahead: self.ahead(), alloc), alloc: alloc)
     }
     return loaded.share()
 } CarriedStd.shared
 
-/// The std packages as a workspace of their own, whose files the locations of std items name.
-fn Workspace.of_std(grammar: mem::Shared[syntax::Grammar], given: Option[cache::HomeOverride], parsing: Parsing, alloc: mem::Alloc) -> Workspace {
+/// The std packages as a workspace of their own, whose files the locations of std items name, given
+/// their syntax by `ahead`, the batch posted for them, if any.
+fn Workspace.of_std(grammar: mem::Shared[syntax::Grammar], given: Option[cache::HomeOverride], parsing: Parsing, ahead: Option[mem::Shared[ParseBatch]], alloc: mem::Alloc) -> Workspace {
     var files = mem::List[artefact::SourceFile].empty(alloc)
     for file in stdlib::StdFile.all(alloc) {
         mut files.push(artefact::SourceFile(path: text::String.of(file.path(), alloc), content: copied_bytes(file.text().as_bytes(), alloc)))
     }
-    let syntaxes = Syntaxes.of(given, alloc)
-    syntaxes.ahead_carried(grammar, parsing, alloc)
+    var syntaxes = Syntaxes.of(given, alloc)
+    mut syntaxes.ahead_carried(ahead, grammar, parsing, alloc)
     return Workspace.of_parsed_files("std", files: files.view(), syntaxes, grammar: grammar.contents(), alloc)
 } Workspace.of_std
 
-/// Where the syntax of source files comes from: the build cache of the user directory, when the
-/// running image records its toolchain's source tree hash and the cache holds the syntax of a
-/// file's bytes under the toolchain hash, and otherwise parsing them, after which the cache
-/// receives it.
+/// Where the syntax of source files comes from: the files the worker tasks gave it ahead of the
+/// load, the build cache of the user directory, when the running image records its toolchain's
+/// source tree hash and the cache holds the syntax of a file's bytes under the toolchain hash,
+/// and otherwise parsing them, after which the cache receives it.
 pkg struct Syntaxes {
     cache: Option[cache::Cache]
     toolchain: Option[hashing::HashValue]
     decoding: Option[syntax::Decoding]
+    batch: Option[mem::Shared[ParseBatch]]
 } Syntaxes
 
 /// Syntax from parsing alone.
 pkg fn Syntaxes.parsing() -> Syntaxes {
-    return Syntaxes(cache: None, toolchain: None, decoding: None)
+    return Syntaxes(cache: None, toolchain: None, decoding: None, batch: None)
 } Syntaxes.parsing
 
 /// Syntax from the build cache of the user directory, the one `given` replaces.
@@ -477,21 +548,38 @@ pkg fn Syntaxes.of(given: Option[cache::HomeOverride], alloc: mem::Alloc) -> Syn
     let Ok(user) = opened else {
         return Syntaxes.parsing()
     }
-    return Syntaxes(cache: Some(take user), toolchain: Some(toolchain::hash(toolchain::LANGUAGES[0], tree, alloc)), decoding: Some(syntax::Decoding.new(alloc)))
+    return Syntaxes(cache: Some(take user), toolchain: Some(toolchain::hash(toolchain::LANGUAGES[0], tree, alloc)), decoding: Some(syntax::Decoding.new(alloc)), batch: None)
 } Syntaxes.of
 
-/// The syntax of a source file's bytes, parsed as a std package's file when `std` holds.
-fn Syntaxes.parsed(self, take bytes: mem::Bytes, std: bool, grammar: syntax::Grammar, alloc: mem::Alloc) -> syntax::SourceFile {
+/// The syntax of the source file at `path` holding `bytes`, parsed as a std package's file when
+/// `std` holds.
+fn Syntaxes.parsed(self, path: Str, take bytes: mem::Bytes, std: bool, grammar: syntax::Grammar, alloc: mem::Alloc) -> Parsed {
+    match self.batch {
+        Some(batch) => match batch.contents().given(path, bytes: bytes.view(), std, alloc) {
+            Some(file) => return file
+            None => {}
+        }
+        None => {}
+    }
     let Some(user) = self.cache else {
-        return parsed_bytes(take bytes, std, grammar, alloc)
+        return Parsed.of(parsed_bytes(take bytes, std, grammar, alloc), alloc)
     }
     let Some(toolchain) = self.toolchain else {
-        return parsed_bytes(take bytes, std, grammar, alloc)
+        return Parsed.of(parsed_bytes(take bytes, std, grammar, alloc), alloc)
     }
     let Some(decoding) = self.decoding else {
-        return parsed_bytes(take bytes, std, grammar, alloc)
+        return Parsed.of(parsed_bytes(take bytes, std, grammar, alloc), alloc)
     }
-    let key = syntax_key(toolchain, bytes: bytes.view(), std, alloc)
+    let content = hashing::HashValue.of(bytes.view())
+    let key = syntax_key(toolchain, content, std, alloc)
+    var parsed = Parsed.of(cached_syntax(user, key, decoding, take bytes, std, grammar, alloc), alloc)
+    parsed.content = Some(content)
+    return parsed
+} Syntaxes.parsed
+
+/// The syntax of a source file's bytes: the one the build cache holds under `key`, or else the
+/// one parsing them gives, which the cache then receives.
+fn cached_syntax(user: cache::Cache, key: hashing::HashValue, decoding: syntax::Decoding, take bytes: mem::Bytes, std: bool, grammar: syntax::Grammar, alloc: mem::Alloc) -> syntax::SourceFile {
     match attempt user.entry(key) {
         Ok(Ok(Some(held))) => {
             match decoding.file(held.view(), source: copied_bytes(bytes.view(), alloc), readable: syntax::source_text(bytes.view(), alloc), alloc) {
@@ -504,10 +592,11 @@ fn Syntaxes.parsed(self, take bytes: mem::Bytes, std: bool, grammar: syntax::Gra
     let file = parsed_bytes(take bytes, std, grammar, alloc)
     discard attempt user.put(key, contents: file.stored(alloc).view())
     return file
-} Syntaxes.parsed
+} cached_syntax
 
-/// The key of the cache entry holding the syntax of a source file's bytes under a toolchain hash.
-fn syntax_key(toolchain: hashing::HashValue, bytes: Slice[u8], std: bool, alloc: mem::Alloc) -> hashing::HashValue {
+/// The key of the cache entry holding the syntax of a source file's bytes, by the hash of its
+/// contents, under a toolchain hash.
+fn syntax_key(toolchain: hashing::HashValue, content: hashing::HashValue, std: bool, alloc: mem::Alloc) -> hashing::HashValue {
     var keyed = mem::Bytes.empty(alloc)
     mut keyed.append(b"syntax\n")
     mut keyed.append(toolchain.bytes.view())
@@ -515,7 +604,7 @@ fn syntax_key(toolchain: hashing::HashValue, bytes: Slice[u8], std: bool, alloc:
         true => mut keyed.push(1)
         false => mut keyed.push(0)
     }
-    mut keyed.append(hashing::HashValue.of(bytes).bytes.view())
+    mut keyed.append(content.bytes.view())
     return hashing::HashValue.of(keyed.view())
 } syntax_key
 
@@ -749,7 +838,7 @@ pkg fn Workspace.file(self, path: Str) -> Option[FileAt] {
 /// The bytes of a source or machine file of the workspace, by path.
 pkg proj fn Workspace.bytes(self, path: Str) -> Option[Slice[u8]] {
     match self.file(path) {
-        Some(at) => return Some(self.file_at(at).syntax.source.view())
+        Some(at) => return Some(self.file_at(at).syntax().source.view())
         None => {}
     }
     for held in self.stray {
@@ -769,7 +858,7 @@ pkg proj fn Workspace.bytes(self, path: Str) -> Option[Slice[u8]] {
 /// The text of a line of a source or machine file of the workspace, without its line end.
 pkg proj fn Workspace.line_text(self, path: Str, line: u32) -> Option[Slice[u8]] {
     match self.file(path) {
-        Some(at) => return Some(self.file_at(at).syntax.line_text(line))
+        Some(at) => return Some(self.file_at(at).syntax().line_text(line))
         None => {}
     }
     let Some(bytes) = self.bytes(path) else {
@@ -806,10 +895,10 @@ pkg proj fn Workspace.line_text(self, path: Str, line: u32) -> Option[Slice[u8]]
 pkg fn Workspace.item_location(self, canonical: Str, alloc: mem::Alloc) -> Option[diagnostic::At] {
     for at in self.files() {
         let file = self.file_at(at)
-        for item in file.syntax.items {
+        for item in file.syntax().items {
             var head: Option[u32] = None
-            for line in file.syntax.item_lines(item) {
-                if not is_comment_line(file.syntax.line_text(line)) {
+            for line in file.syntax().item_lines(item) {
+                if not is_comment_line(file.syntax().line_text(line)) {
                     head = Some(line)
                     break
                 }
@@ -853,7 +942,7 @@ pkg fn Workspace.item_at(self, path: Str, line: u32, alloc: mem::Alloc) -> Optio
 /// The path of the item holding a line of one of its files, if that item has one this
 /// implementation computes.
 pkg fn Package.item_at(self, file: File, line: u32, alloc: mem::Alloc) -> Option[ItemPath] {
-    let Some(item) = file.syntax.item_at(line) else {
+    let Some(item) = file.syntax().item_at(line) else {
         return None
     }
     let Some(tree) = item.tree else {
@@ -1150,7 +1239,7 @@ fn history_files(held_machine: Machine, modules: Slice[Module], grammar: syntax:
             }
         }
         mut written.push('\n')
-        mut files.push(File.new(text::String.of(loaded.path.as_str(), alloc), module: Some(held.module), parsed: syntax::parse(take written.into_bytes(), grammar, alloc), alloc))
+        mut files.push(File.new(text::String.of(loaded.path.as_str(), alloc), module: Some(held.module), parsed: Parsed.of(syntax::parse(take written.into_bytes(), grammar, alloc), alloc), alloc))
     }
     return files
 } history_files
@@ -1349,7 +1438,7 @@ fn Package.item_path(self, file: File, tree: syntax::Tree, alloc: mem::Alloc) ->
     let Some(path) = self.module_path(module, alloc) else {
         return None
     }
-    let Some(name) = tree.name(file.syntax, alloc) else {
+    let Some(name) = tree.name(file.syntax(), alloc) else {
         return None
     }
     let Some(dot) = last_dot(name.as_str()) else {
@@ -1419,9 +1508,9 @@ fn Package.load(
     mut sources.sort_by(fn(left: text::String, right: text::String) => left.cmp(right))
     var manifest_path = text::String.of(found.dir.as_str(), alloc)
     mut manifest_path.append("/package.nan")
-    let parsed = syntaxes.parsed(try source(manifest_path.as_str()), std: false, grammar, alloc)
+    let parsed = syntaxes.parsed(path: manifest_path.as_str(), bytes: try source(manifest_path.as_str()), std: false, grammar, alloc)
     var diagnostics = mem::List[diagnostic::Diagnostic].empty(alloc)
-    let manifest = Manifest.read(parsed, path: manifest_path.as_str(), diagnostics: mut diagnostics, alloc)
+    let manifest = Manifest.read(parsed.syntax.contents(), path: manifest_path.as_str(), diagnostics: mut diagnostics, alloc)
     var files = mem::List[File].empty(alloc)
     mut files.push(File.new(text::String.of(manifest_path.as_str(), alloc), module: None, parsed: take parsed, alloc))
     report_links(manifest, links: found.links.view(), manifest_path: manifest_path.as_str(), diagnostics: mut diagnostics, alloc)
@@ -1431,7 +1520,7 @@ fn Package.load(
     if language_supported(manifest) {
         for index in 0..<sources.len() {
             let bytes = try source(sources[index].as_str())
-            let parsed_source = syntaxes.parsed(take bytes, std, grammar, alloc)
+            let parsed_source = syntaxes.parsed(path: sources[index].as_str(), take bytes, std, grammar, alloc)
             mut files.push(File.new(text::String.of(sources[index].as_str(), alloc), module: Some(assigned[index]), parsed: take parsed_source, alloc))
         }
     }
@@ -1547,7 +1636,7 @@ fn Package.check_misplaced_manifests(mut self, alloc: mem::Alloc) {
             continue
         }
         var manifest_seen = false
-        for item in file.syntax.items {
+        for item in file.syntax().items {
             if item.abandoned {
                 continue
             }
@@ -1561,7 +1650,7 @@ fn Package.check_misplaced_manifests(mut self, alloc: mem::Alloc) {
             if manifest_file and manifest_item and not manifest_seen {
                 manifest_seen = true
             } else if manifest_file or manifest_item {
-                let Some(line) = tree.head_line(file.syntax) else {
+                let Some(line) = tree.head_line(file.syntax()) else {
                     expect false
                     continue
                 }
@@ -1583,7 +1672,7 @@ fn type_names(files: Slice[File], modules: usize, alloc: mem::Alloc) -> mem::Lis
             if file.module != Some(module) {
                 continue
             }
-            for item in file.syntax.items {
+            for item in file.syntax().items {
                 let Some(tree) = item.tree else {
                     continue
                 }
@@ -1593,7 +1682,7 @@ fn type_names(files: Slice[File], modules: usize, alloc: mem::Alloc) -> mem::Lis
                 if kind.rule != syntax::Rule.StructItem and kind.rule != syntax::Rule.EnumItem and kind.rule != syntax::Rule.LayoutItem {
                     continue
                 }
-                let Some(name) = tree.name(file.syntax, alloc) else {
+                let Some(name) = tree.name(file.syntax(), alloc) else {
                     continue
                 }
                 discard mut names.insert(take name)

@@ -238,7 +238,7 @@ fn edits_interface(workspace: workspace::Workspace, fix: diagnostic::Fix) -> boo
         let Some(at) = workspace.file(edit.path.as_str()) else {
             continue
         }
-        let file = workspace.file_at(at).syntax
+        let file = workspace.file_at(at).syntax()
         let replacement = edit.replacement
         let Some(item) = file.items.position(fn(candidate: syntax::ItemSyntax) => holds_replacement(file, item: candidate, replacement)) else {
             continue
@@ -284,11 +284,11 @@ fn changed_files(workspace: workspace::Workspace, fixed: workspace::Workspace, a
         let Some(old) = workspace.file(file.path.as_str()) else {
             continue
         }
-        if workspace.file_at(old).syntax.source.view() == file.syntax.source.view() {
+        if workspace.file_at(old).syntax().source.view() == file.syntax().source.view() {
             continue
         }
         var source = mem::Bytes.empty(alloc)
-        mut source.append(file.syntax.source.view())
+        mut source.append(file.syntax().source.view())
         discard mut changed.insert(text::String.of(file.path.as_str(), alloc), value: take source)
     }
     return changed
@@ -312,50 +312,134 @@ proj fn Invocation.agent_name(self) -> Option[Str] {
     return Some(take agent)
 } Invocation.agent_name
 
+/// An agent's last-green record: an entry per item, whose texts are pieces of `texts`.
+struct GreenRecord {
+    texts: Texts
+    entries: mem::Map[text::String, GreenEntry]
+} GreenRecord
+
 /// An entry of a last-green record: an item's location, interface hash and api lines.
 struct GreenEntry {
-    location: text::String
-    hash: text::String
-    api: mem::List[text::String]
+    location: Piece
+    hash: Piece
+    api: mem::List[Piece]
 } GreenEntry
 
-/// The entries of an agent's last-green record, by item.
-fn green_entries(root: Str, agent: Str, alloc: mem::Alloc) -> mem::Map[text::String, GreenEntry] {
-    var entries = mem::Map[text::String, GreenEntry].empty(alloc)
+/// Texts held one after another.
+struct Texts {
+    written: text::String
+} Texts
+
+/// The bytes `start..end` of texts.
+struct Piece derives Copy {
+    start: usize
+    end: usize
+} Piece
+
+proj fn Texts.at(self, piece: Piece) -> Str {
+    let Some(written) = self.written.slice_bytes(piece.start, end: piece.end) else {
+        expect false
+        return ""
+    }
+    return written
+} Texts.at
+
+/// Appends a text, giving its piece.
+fn Texts.add(mut self, written: Str) -> Piece {
+    let start = self.written.byte_len()
+    mut self.written.append(written)
+    return Piece(start: start, end: self.written.byte_len())
+} Texts.add
+
+/// The texts of pieces.
+fn Texts.lines(self, pieces: Slice[Piece], alloc: mem::Alloc) -> mem::List[text::String] {
+    var lines = mem::List[text::String].empty(alloc)
+    for piece in pieces {
+        mut lines.push(text::String.of(self.at(piece), alloc))
+    }
+    return lines
+} Texts.lines
+
+/// An agent's last-green record as its file holds it.
+fn green_record(root: Str, agent: Str, alloc: mem::Alloc) -> GreenRecord {
     var relative = text::String.of(".nan/green/", alloc)
     mut relative.append(agent)
     let Ok(written) = attempt platform::read_text(platform::join(root, name: relative.as_str(), alloc).as_str(), alloc) else {
-        return entries
+        return GreenRecord(texts: Texts(written: text::String.empty(alloc)), entries: mem::Map[text::String, GreenEntry].empty(alloc))
     }
-    var current = text::String.empty(alloc)
-    var open = false
-    for line in take text_lines(written.as_str(), alloc) {
-        if open and line.starts_with("    ") {
-            let Some(api) = line.as_str().slice_bytes(4, end: line.byte_len()) else {
-                continue
+    var last = GreenRecord(texts: Texts(written: take written), entries: mem::Map[text::String, GreenEntry].empty(alloc))
+    var open: Option[Piece] = None
+    var pending = GreenEntry(location: Piece(start: 0, end: 0), hash: Piece(start: 0, end: 0), api: mem::List[Piece].empty(alloc))
+    var start: usize = 0
+    let length = last.texts.written.byte_len()
+    while start < length {
+        let bounds = line_bounds(last.texts.written.as_bytes(), start)
+        let line = Piece(start: start, end: bounds.end)
+        start = bounds.next
+        if open.is_some() and last.texts.at(line).starts_with("    ") {
+            mut pending.api.push(Piece(start: line.start + 4, end: line.end))
+            continue
+        }
+        match open {
+            Some(key) => {
+                discard mut last.entries.insert(text::String.of(last.texts.at(key), alloc), value: take pending)
+                pending = GreenEntry(location: Piece(start: 0, end: 0), hash: Piece(start: 0, end: 0), api: mem::List[Piece].empty(alloc))
+                open = None
             }
-            var target = mut entries.at_mut(current)
-            mut target.api.push(text::String.of(api, alloc))
+            None => {}
+        }
+        if not last.texts.at(line).starts_with("item ") {
             continue
         }
-        open = false
-        if not line.starts_with("item ") {
+        let Some(fields) = entry_fields(last.texts.written.as_bytes(), from: line.start + 5, end: line.end) else {
             continue
         }
-        let Some(rest) = line.as_str().slice_bytes(5, end: line.byte_len()) else {
-            continue
-        }
-        let fields = split_spaces(rest, alloc)
-        if fields.len() < 3 {
-            continue
-        }
-        current = text::String.of(fields[0].as_str(), alloc)
-        let held = GreenEntry(location: text::String.of(fields[1].as_str(), alloc), hash: text::String.of(fields[2].as_str(), alloc), api: mem::List[text::String].empty(alloc))
-        discard mut entries.insert(text::String.of(current.as_str(), alloc), value: take held)
-        open = true
+        open = Some(fields.key)
+        pending.location = fields.location
+        pending.hash = fields.hash
     }
-    return entries
-} green_entries
+    match open {
+        Some(key) => {
+            discard mut last.entries.insert(text::String.of(last.texts.at(key), alloc), value: take pending)
+        }
+        None => {}
+    }
+    return last
+} green_record
+
+/// The first three fields of an entry's `item` line, between its spaces.
+struct EntryFields derives Copy {
+    key: Piece
+    location: Piece
+    hash: Piece
+} EntryFields
+
+/// The fields of the bytes `from..end` of a record's texts, the rest of an `item` line; none when
+/// it holds fewer than three.
+fn entry_fields(bytes: Slice[u8], from: usize, end: usize) -> Option[EntryFields] {
+    var spaces: usize = 0
+    var one: usize = 0
+    var two: usize = 0
+    var last = end
+    for at in from..<end {
+        if bytes[at] != b' ' {
+            continue
+        }
+        spaces += 1
+        if spaces == 1 {
+            one = at
+        } else if spaces == 2 {
+            two = at
+        } else {
+            last = at
+            break
+        }
+    }
+    if spaces < 2 {
+        return None
+    }
+    return Some(EntryFields(key: Piece(start: from, end: one), location: Piece(start: one + 1, end: two), hash: Piece(start: two + 1, end: last)))
+} entry_fields
 
 /// The lines of a text: split at each line feed, a carriage return ending one dropped, without a
 /// last empty line after a final line feed.
@@ -424,19 +508,20 @@ fn green_interface(green: check::Green, alloc: mem::Alloc) -> text::String {
 
 /// A `changed` record per item whose interface hash differs from its last-green entry, merging
 /// its entry's api lines with its current ones; an item without an entry has none.
-fn changed_since(entries: mem::Map[text::String, GreenEntry], greens: Slice[check::Green], writer: Option[text::String], alloc: mem::Alloc) -> mem::List[output::Record] {
+fn changed_since(last: GreenRecord, greens: Slice[check::Green], writer: Option[text::String], alloc: mem::Alloc) -> mem::List[output::Record] {
     var records = mem::List[output::Record].empty(alloc)
     for green in greens {
-        let Some(known) = entries.get(green.path) else {
+        let Some(known) = last.entries.get(green.path) else {
             continue
         }
-        if known.hash.as_str() == green_interface(green, alloc).as_str() {
+        if last.texts.at(known.hash) == green_interface(green, alloc).as_str() {
             continue
         }
         var fields = mem::List[text::String].empty(alloc)
         mut fields.push(written_for(green.path.as_str(), writer, alloc))
         mut fields.push(located(green.file.as_str(), line: green.line, alloc))
-        mut records.push(output::Record(word: text::String.of("changed", alloc), fields: take fields, lines: diff::merged(known.api.view(), new: green.api.view(), alloc)))
+        let known_api = last.texts.lines(known.api.view(), alloc)
+        mut records.push(output::Record(word: text::String.of("changed", alloc), fields: take fields, lines: diff::merged(known_api.view(), new: green.api.view(), alloc)))
     }
     return records
 } changed_since
@@ -446,23 +531,28 @@ fn changed_since(entries: mem::Map[text::String, GreenEntry], greens: Slice[chec
 /// closure sets of the lines holding one whose interface hash differs from its entry.
 fn last_green(session: check::Session, take closures: check::Checked, scope: scope::Scope, agent: Str, errors: Slice[diagnostic::At], alloc: mem::Alloc) -> mem::List[output::Record] fails platform::IoError {
     let held = session.workspace.contents()
-    var entries = green_entries(held.root.as_str(), agent, alloc)
+    let last = green_record(held.root.as_str(), agent, alloc)
     if errors.len() > 0 {
         closures.keep()
         let greens = session.greens_after(take closures, scope, lines: errors)
-        return changed_since(entries, greens: greens.view(), writer: writer_of(held, scope, alloc), alloc)
+        return changed_since(last, greens: greens.view(), writer: writer_of(held, scope, alloc), alloc)
     }
-    mut entries.retain(fn(key: text::String, value: GreenEntry) => not located_in(scope, workspace: held, location: value.location.as_str()))
+    let GreenRecord(texts: kept_texts, entries: kept_entries) = last
+    var texts = kept_texts
+    var entries = kept_entries
+    mut entries.retain(fn(key: text::String, value: GreenEntry) => not located_in(scope, workspace: held, location: texts.at(value.location)))
     let shared = closures.share(alloc)
     let greens = session.greens_after(take closures, scope, lines: mem::List[diagnostic::At].empty(alloc).view())
     shared.keep()
     for green in greens {
-        var api = mem::List[text::String].empty(alloc)
+        let location = mut texts.add(located(green.file.as_str(), line: green.line, alloc).as_str())
+        let hash = mut texts.add(green_interface(green, alloc).as_str())
+        var api = mem::List[Piece].empty(alloc)
+        mut api.reserve(green.api.len())
         for line in green.api {
-            mut api.push(text::String.of(line.as_str(), alloc))
+            mut api.push(mut texts.add(line.as_str()))
         }
-        let held_entry = GreenEntry(location: located(green.file.as_str(), line: green.line, alloc), hash: green_interface(green, alloc), api: take api)
-        discard mut entries.insert(text::String.of(green.path.as_str(), alloc), value: take held_entry)
+        discard mut entries.insert(text::String.of(green.path.as_str(), alloc), value: GreenEntry(location: location, hash: hash, api: take api))
     }
     var written = text::String.empty(alloc)
     for item in entries {
@@ -470,13 +560,13 @@ fn last_green(session: check::Session, take closures: check::Checked, scope: sco
         mut written.append("item ")
         mut written.append(item.key().as_str())
         mut written.push(' ')
-        mut written.append(kept.location.as_str())
+        mut written.append(texts.at(kept.location))
         mut written.push(' ')
-        mut written.append(kept.hash.as_str())
+        mut written.append(texts.at(kept.hash))
         mut written.push('\n')
         for line in kept.api {
             mut written.append("    ")
-            mut written.append(line.as_str())
+            mut written.append(texts.at(line))
             mut written.push('\n')
         }
     }
@@ -611,7 +701,7 @@ fn prefixed(invocation: Invocation, session: check::Session, current: Str, writt
     let Some(at) = held.file(path) else {
         return invocation.tool_error(diagnostic::Code.ToolUnknownScope, scope: written, alloc)
     }
-    let file = held.file_at(at).syntax
+    let file = held.file_at(at).syntax()
     let source = file.source.view()
     var end = source.len()
     match line {

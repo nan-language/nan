@@ -252,6 +252,7 @@ A [syntax failure](02-items.md#resynchronisation) that no other rule names is re
 - A failure that an entry of the [idiom table](#idiom-table) matches, and any other failure at a `FOREIGN` token ([punctuation and operators](01-lexical.md#punctuation-and-operators)), are errors (`syntax.foreign`).
 - A failure at `NL` or `EOF` while a `(` or `[` opened on the same logical line is unclosed is an error (`syntax.unclosed-delimiter`). Expected is the missing closers, innermost first, separated by single spaces, and the exact fix inserts them in that order, without spaces, after the last token of the logical line.
 - A `)`, `]` or `}` that is not at column 0 and whose innermost unclosed delimiter on its logical line is a `(` or `[` it does not close is an error (`syntax.mismatched-delimiter`). Expected is the closer of that delimiter, and the exact fix replaces the failing token with it.
+- A failure at a [hard keyword](01-lexical.md#keywords) where the grammar accepts `IDENT` is an error (`syntax.keyword-name`), without a fix: a hard keyword never names a declaration, a parameter or a binding. Expected is as for `syntax.unexpected-token`.
 - Any other failure is an error (`syntax.unexpected-token`), without a fix. Expected is every token that the grammar, its rejected alternatives aside, accepts at the failure, separated by `, ` in byte order of their written forms.
 
 In these diagnostics found is the failing token, and expected and found are written in [grammar notation](00-charter.md#grammar-notation): a hard keyword, `PUNCT` or `FOREIGN` token as its double-quoted spelling, a context word accepted by its spelling as its single-quoted spelling, and any other token by its name, such as `IDENT`, `INT`, `NL`, `COL0` or `EOF`; the idiom table states expected and found for the failures its entries match.
@@ -280,6 +281,12 @@ pub fn larger(left: u32 right: u32) -> u32 { // error: syntax.unexpected-token
     }
     return right
 } larger
+```
+
+```nan
+pub fn earlier(first: u32, last: u32) -> u32 { // error: syntax.keyword-name
+    return first
+} earlier
 ```
 
 ```nan
@@ -485,7 +492,7 @@ The catalogue lists every diagnostic code by family, in chapter order, linked to
 | `merge` | error | [`merge.conflict`](33-toolchain.md#conflicts), [`merge.semantic-conflict`](33-toolchain.md#conflicts), [`merge.unresolved`](33-toolchain.md#conflicts) |
 | `tool` | error | [`tool.no-workspace`](33-toolchain.md#commands), [`tool.unknown-scope`](33-toolchain.md#commands), [`tool.usage`](33-toolchain.md#commands) |
 | `internal` | internal error | [`internal.invariant`](#internal-errors), [`internal.resource-exhausted`](#internal-errors) |
-| `syntax` | error | [`syntax.foreign`](#syntax-failures), [`syntax.mismatched-delimiter`](#syntax-failures), [`syntax.unclosed-delimiter`](#syntax-failures), [`syntax.unexpected-token`](#syntax-failures) |
+| `syntax` | error | [`syntax.foreign`](#syntax-failures), [`syntax.keyword-name`](#syntax-failures), [`syntax.mismatched-delimiter`](#syntax-failures), [`syntax.unclosed-delimiter`](#syntax-failures), [`syntax.unexpected-token`](#syntax-failures) |
 | `format` | error | [`format.machine-invalid`](35-format.md#common-syntax), [`format.machine-version`](35-format.md#common-syntax), [`format.reserved-field`](35-format.md#lock) |
 | `build` | error | [`build.cache-exposed`](36-builds.md#cache), [`build.image-unreadable`](36-builds.md#stage-comparison), [`build.stage-mismatch`](36-builds.md#stage-comparison), [`build.symbolic-link`](36-builds.md#build-scripts) |
 | `language` | error | [`language.downgrade`](37-evolution.md#language-upgrades), [`language.newer-dependency`](37-evolution.md#artefacts-and-linking), [`language.unsupported`](37-evolution.md#language-versions), [`language.version-form`](37-evolution.md#language-versions) |
@@ -497,6 +504,7 @@ The catalogue lists every diagnostic code by family, in chapter order, linked to
 | `internal.invariant` | internal error | [Internal errors](#internal-errors) |
 | `internal.resource-exhausted` | internal error | [Internal errors](#internal-errors) |
 | `syntax.foreign` | error | [Syntax failures](#syntax-failures), [Idiom table](#idiom-table), [Punctuation and operators](01-lexical.md#punctuation-and-operators) |
+| `syntax.keyword-name` | error | [Syntax failures](#syntax-failures) |
 | `syntax.mismatched-delimiter` | error | [Syntax failures](#syntax-failures) |
 | `syntax.unclosed-delimiter` | error | [Syntax failures](#syntax-failures) |
 | `syntax.unexpected-token` | error | [Syntax failures](#syntax-failures) |

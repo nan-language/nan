@@ -645,6 +645,10 @@ impl Parser {
         let (code, expected_text, fix) =
             if idiom.is_some() || matches!(token.kind, TokenKind::Foreign(_)) {
                 (Code::SyntaxForeign, written_set(&expected), None)
+            } else if matches!(token.kind, TokenKind::Keyword(_))
+                && expected.contains(Term::Class(Class::Ident))
+            {
+                (Code::SyntaxKeywordName, written_set(&expected), None)
             } else if let Some(closers) = self.unclosed(at) {
                 let written: Vec<String> = closers
                     .iter()

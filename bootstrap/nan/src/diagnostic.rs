@@ -457,6 +457,7 @@ codes! {
     SuspendStackMissing = "suspend.stack-missing",
     SuspendTokenAcrossAwait = "suspend.token-across-await",
     SyntaxForeign = "syntax.foreign",
+    SyntaxKeywordName = "syntax.keyword-name",
     SyntaxMismatchedDelimiter = "syntax.mismatched-delimiter",
     SyntaxUnclosedDelimiter = "syntax.unclosed-delimiter",
     SyntaxUnexpectedToken = "syntax.unexpected-token",

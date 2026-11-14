@@ -1,0 +1,169 @@
+//! What the system running the toolchain does: files, directories, locks, processes and the machine's facts, through glibc on Linux, `libSystem` on macOS and kernel32 on Windows.
+
+const ENOENT: i32 = 2
+
+const EINTR: i32 = 4
+
+const EEXIST: i32 = 17
+
+const ENOTDIR: i32 = 20
+
+const EINVAL: i32 = 22
+
+const EPIPE: i32 = 32
+
+const ERANGE: i32 = 34
+
+const ELOOP: i32 = 62
+
+const ENAMETOOLONG: i32 = 63
+
+/// The most bytes of a path the toolchain passes, its NUL included.
+const PATH_MAX: usize = 4_096
+
+foreign fn __error() -> hw::Ptr[i32] limits notrap, terminates, noalloc convention "darwin"
+
+foreign fn getpid() -> i32 limits notrap, terminates, noalloc convention "darwin"
+
+foreign fn getuid() -> u32 limits notrap, terminates, noalloc convention "darwin"
+
+foreign fn uname(name: hw::Ptr[Utsname]) -> i32 limits notrap, terminates, noalloc convention "darwin"
+
+foreign fn strlen(start: hw::Ptr[u8]) -> usize convention "darwin"
+
+foreign fn getenv(name: hw::Ptr[u8]) -> hw::Ptr[u8] convention "darwin"
+
+foreign fn _NSGetExecutablePath(buffer: hw::Ptr[u8], size: hw::Ptr[u32]) -> i32 convention "darwin"
+
+/// The error number the last failing call of the C library on this thread set.
+fn last_code() -> i32 {
+    return trusted "the C library gives the calling thread's error number, an int that lives as long as the thread" { __error().read() }
+} last_code
+
+fn error_of(code: i32) -> platform::IoError {
+    return match code {
+        ENOENT => platform::IoError.NotFound
+        EEXIST => platform::IoError.AlreadyExists
+        EPIPE => platform::IoError.BrokenPipe
+        else => platform::IoError.Other(code)
+    }
+} error_of
+
+/// The error the last failing call of the C library on this thread gave.
+fn last_error() -> platform::IoError {
+    return error_of(last_code())
+} last_error
+
+/// Bytes as the C library reads a path or name: the bytes, then a NUL.
+struct CText {
+    bytes: Array[u8, 4_096]
+} CText
+
+/// The bytes of a `CText` before any is written.
+const NO_C_TEXT: Array[u8, 4_096] = Array[u8, 4_096].filled(0)
+
+/// The C form of bytes holding no NUL and fewer than `PATH_MAX`.
+fn c_text(bytes: Slice[u8]) -> CText fails platform::IoError {
+    if bytes.len() >= PATH_MAX {
+        fail platform::IoError.Other(ENAMETOOLONG)
+    }
+    var held = NO_C_TEXT
+    for at in 0..<bytes.len() {
+        if bytes[at] == 0 {
+            fail platform::IoError.Other(EINVAL)
+        }
+        held[at] = bytes[at]
+    }
+    return CText(bytes: held)
+} c_text
+
+/// The id of this process.
+pub fn process_id() -> u32 {
+    return getpid().to_bits()
+} process_id
+
+/// `libSystem`'s `struct utsname`, each name NUL-terminated in 256 bytes.
+layout Utsname: bytes 1280 le {
+    sysname: Array[u8, 256] at 0
+    nodename: Array[u8, 256] at 256
+    release: Array[u8, 256] at 512
+    version: Array[u8, 256] at 768
+    machine: Array[u8, 256] at 1024
+} Utsname
+
+/// Whether the machine running the toolchain is an AArch64 one, as the system names its
+/// architecture.
+pub fn on_aarch64() -> bool {
+    var raw = Utsname.from_bits(Array[u8, 1280].filled(0))
+    let buffer = hw::Ptr.of_mut(mut raw)
+    discard trusted "buffer addresses a struct utsname" { uname(buffer) }
+    let named = trusted "uname wrote a struct utsname at buffer, or left it zeroed" { buffer.read() }
+    let Some(prefix) = named.machine.view().prefix(5) else {
+        return false
+    }
+    return prefix == b"arm64" and named.machine[5] == 0
+} on_aarch64
+
+/// Whether the system running the toolchain is Windows.
+pub fn on_windows() -> bool {
+    return false
+} on_windows
+
+/// Whether the system running the toolchain is macOS.
+pub fn on_macos() -> bool {
+    return true
+} on_macos
+
+/// The path of the running image, empty when the system gives none.
+pub fn own_image(alloc: mem::Alloc) -> text::String {
+    var buffer = NO_C_TEXT
+    var size = u32.fit(PATH_MAX)
+    let found = trusted "buffer addresses size bytes and size a u32" { _NSGetExecutablePath(hw::Ptr.of_view_mut(mut buffer.view_mut()), size: hw::Ptr.of_mut(mut size)) }
+    if found != 0 {
+        return text::String.empty(alloc)
+    }
+    let path = copied_text(hw::Ptr.of_view(buffer.view()), alloc)
+    let Ok(written) = attempt text::String.try_from_utf8(path.view(), alloc) else {
+        return text::String.empty(alloc)
+    }
+    let Ok(resolved) = attempt canonicalize(written.as_str(), alloc) else {
+        return written
+    }
+    return resolved
+} own_image
+
+/// The bytes of a NUL-terminated text at `start`.
+fn copied_text(start: hw::Ptr[u8], alloc: mem::Alloc) -> mem::Bytes {
+    let length = trusted "start addresses a NUL-terminated text" { strlen(start) }
+    var copy = mem::Bytes.zeroed(length, alloc)
+    let target = hw::Ptr.of_view_mut(mut copy.view_mut())
+    trusted "start addresses length bytes before its NUL and target the length bytes of copy" {
+        start.copy(target, count: length)
+    }
+    return copy
+} copied_text
+
+/// The id of the user running this process on Linux and macOS, and 0 on Windows, where the
+/// toolchain compares no owners.
+pub fn running_user() -> u32 {
+    return trusted "getuid reads no memory" { getuid() }
+} running_user
+
+/// The home directory of the user `uid`: on Linux the one the system's user database gives, on
+/// macOS the directory `HOME` names, on Windows the running user's profile directory, which
+/// `USERPROFILE` names, with `/` separators; none when there is none.
+pub fn home(uid: u32, alloc: mem::Alloc) -> Option[text::String] fails platform::IoError {
+    let name = try c_text(b"HOME")
+    let value = trusted "name holds a NUL-terminated name" { getenv(hw::Ptr.of_view(name.bytes.view())) }
+    if value.addr() == 0 {
+        return None
+    }
+    let held = copied_text(value, alloc)
+    if held.len() == 0 {
+        return None
+    }
+    let Ok(written) = attempt text::String.try_from_utf8(held.view(), alloc) else {
+        fail platform::IoError.InvalidData
+    }
+    return Some(take written)
+} home

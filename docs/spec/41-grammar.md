@@ -259,7 +259,7 @@ place_step = "." IDENT | "[" expr "]" ;
 closure_expr = "fn" capture_list? "(" fn_type_param_list? ")" closure_body ;
 closure_body = "=>" expr | fn_result? fails_clause? uses_clause? limits_clause? block ;
 capture_list = "[" capture ( "," capture )* "]" ;
-capture = mode place_root ;
+capture = mode when_place ;
 ```
 
 ### Generics and interfaces

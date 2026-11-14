@@ -795,6 +795,7 @@ pub enum ArmBody {
 pub struct Capture {
     pub mode: Mode,
     pub token: Tok,
+    /// Its binding, or the place path of an `await when` access, its segments joined by `.`.
     pub name: Name,
 }
 

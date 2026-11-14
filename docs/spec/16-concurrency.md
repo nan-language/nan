@@ -405,7 +405,7 @@ A `when_expr` follows the `await` marker ([markers](06-statements-expressions.md
 
 - A place whose type is not a `task::Cown` is an error (`task.when-not-cown`). `take` before a place is an error (`task.when-take`), whose exact fix writes `mut`.
 - Two accesses with the same place path are an error (`task.when-duplicate`), whose exact fix deletes the second.
-- The mode applies to the cown's value; the handle place itself is read for the whole expression. Inside the body, each place path names the cown's value instead of its handle: after `mut` it is used as a `mut` parameter's place, otherwise as a read parameter's place ([modes](07-ownership.md#modes)).
+- The mode applies to the cown's value; the handle place itself is read for the whole expression. Inside the body, each place path names the cown's value instead of its handle: after `mut` it is used as a `mut` parameter's place, otherwise as a read parameter's place ([modes](07-ownership.md#modes)). A closure in the body lists it as a [capture](07-ownership.md#captures) by that path, as `fn[mut station.meter]`.
 - The body, a block or the expression after `=>`, holds no awaited call and no `await when` outside the bodies of the closures it contains; either is an error (`task.when-wait`).
 - Inside the body, each cown's value counts as a projection result for [holds](07-ownership.md#holds). A value derived from it that is live after the body ends is an error (`task.when-escape`), reported on the line holding `when`.
 - The block form has type `Unit`; in the form `=> e`, `e` is a whole `expr` that extends as far as an expression continues ([one-token lookahead](41-grammar.md#one-token-lookahead)), and the form has the type of `e` and yields its value.
@@ -475,6 +475,39 @@ test advance_adds_the_step for advance {
     let reading = try await advance(station)
     expect reading == 7
 } advance_adds_the_step
+```
+
+```nan
+pub closed struct Meter {
+    pub reading: u64
+} Meter
+
+pub closed struct Station {
+    pub meter: task::Cown[Meter]
+} Station
+
+pub fn each_value(values: Slice[u64], visit: fn(value: u64)) {
+    for value in values {
+        visit(value)
+    }
+} each_value
+
+pub fn advance_all(station: Station, steps: Slice[u64]) -> u64 fails task::Cancelled uses wait {
+    await when mut station.meter {
+        each_value(steps, visit: fn[mut station.meter](value: u64) {
+            station.meter.reading += value
+        })
+    }
+    return await when station.meter => station.meter.reading
+} advance_all
+
+test advance_all_adds_each_step for advance_all {
+    let world = testing::world()
+    let station = Station(meter: task::Cown.of(Meter(reading: 1), alloc: world.alloc))
+    let steps = Array[u64, 2].filled(3)
+    let reading = try await advance_all(station, steps: steps.view())
+    expect reading == 7
+} advance_all_adds_each_step
 ```
 
 ```nan

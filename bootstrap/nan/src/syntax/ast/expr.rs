@@ -642,11 +642,19 @@ impl Lower<'_> {
                     .filter(|capture| self.rule(*capture) == Rule::Capture)
                     .map(|capture| {
                         let mode = self.mode(capture);
-                        let root = self.find(capture, Rule::PlaceRoot).expect("a capture root");
+                        let place = self
+                            .find(capture, Rule::WhenPlace)
+                            .expect("a capture place");
+                        let root = self.find(place, Rule::PlaceRoot).expect("a capture root");
+                        let mut name = self.name(self.first(root));
+                        for field in self.idents(place) {
+                            name.text = format!("{}.{}", name.text, self.text(field));
+                            name.token = field;
+                        }
                         Capture {
                             mode,
                             token: self.first(capture),
-                            name: self.name(self.first(root)),
+                            name,
                         }
                     })
                     .collect()

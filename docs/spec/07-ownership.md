@@ -968,7 +968,7 @@ A **closure** is a function expression; a **capture** is a place of the enclosin
 closure_expr = "fn" capture_list? "(" fn_type_param_list? ")" closure_body ;
 closure_body = "=>" expr | fn_result? fails_clause? uses_clause? limits_clause? block ;
 capture_list = "[" capture ( "," capture )* "]" ;
-capture = mode place_root ;
+capture = mode when_place ;
 ```
 
 - Parameters are written as in [function types](10-effects-digests.md#function-types), each with its mode, name and type.
@@ -979,6 +979,7 @@ capture = mode place_root ;
 
 ### Captures
 
+- A capture names a binding, or, inside the body of an [`await when`](16-concurrency.md#await-when), the place path of one of its accesses, which names the cown's value there; a listed place path that names no such access names nothing ([unknown names](03-packages-modules.md#unknown-names)).
 - A capture absent from the list is a read. A Copy read capture is copied when the closure is created. Any other read capture is a read access to each place path the body reads through it, while the closure is live.
 - `mut a` is a `mut` access to `a` while the closure is live; the body uses `a` as a `mut` parameter's place.
 - `take b` moves `b` into the closure when it is created. In a closure that is not a task closure, the body uses `b` as a `mut` parameter's place. A task closure's captures follow [task closures](16-concurrency.md#task-closures) and [lending](16-concurrency.md#lending).

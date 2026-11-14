@@ -42,7 +42,7 @@ fn a_workspace_merge_prints_its_conflicts_among_its_checks_by_path_and_line() {
         ("base/example/example.nan", scale),
         ("base/example/z.nan", &limit(10)),
         ("ours/example/package.nan", MANIFEST),
-        ("ours/example/example.nan", &scale.replace("x * 2", "nope")),
+        ("ours/example/example.nan", &scale.replace("x * 2", "true")),
         ("ours/example/z.nan", &limit(20)),
         ("theirs/example/package.nan", MANIFEST),
         ("theirs/example/example.nan", scale),
@@ -52,7 +52,7 @@ fn a_workspace_merge_prints_its_conflicts_among_its_checks_by_path_and_line() {
     assert_eq!(
         records(&run.output),
         [
-            "error name.unknown example/example.nan:4",
+            "error type.mismatch example/example.nan:4",
             "error merge.conflict example/z.nan:3",
             "error merge.unresolved example/z.nan:3"
         ]

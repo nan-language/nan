@@ -407,6 +407,12 @@ pub fn finish(done: fn()) {
 ```
 
 ```nan
+pub fn finish(done: fn(byte: u8), bytes: Array[u8, 2]) {
+    defer done(bytes[0]) // error: defer.not-call
+} finish
+```
+
+```nan
 pub fn count(log: sys::Log, sent: usize) {
     defer log.info("bytes sent", value: sent + 1) // error: defer.operand-form
 } count

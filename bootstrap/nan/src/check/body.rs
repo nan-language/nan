@@ -1609,10 +1609,6 @@ impl Body<'_, '_> {
             };
             operand_form(value)
         });
-        if !receiver_ok || !args_ok {
-            self.report(call.token, Code::DeferOperandForm);
-            return TExpr::failed(call.token);
-        }
         self.ck.muted.set(self.ck.muted.get() + 1);
         let probe = self.call(
             postfix,
@@ -1623,25 +1619,29 @@ impl Body<'_, '_> {
             }),
         );
         self.ck.muted.set(self.ck.muted.get() - 1);
-        let TKind::Call(probed) = &probe.kind else {
-            if !probe.ty.has_error() {
-                self.report(call.token, Code::DeferNotCall);
-            } else {
-                self.call(
-                    postfix,
-                    None,
-                    Some(call::Markers {
-                        mode,
-                        ..Default::default()
-                    }),
-                );
-            }
-            return TExpr::failed(call.token);
+        let not_call = match &probe.kind {
+            TKind::Call(probed) => matches!(probed.callee, Callee::Value(_)),
+            _ => !probe.ty.has_error(),
         };
-        if let Callee::Value(_) = probed.callee {
+        if not_call {
             self.report(call.token, Code::DeferNotCall);
             return TExpr::failed(call.token);
         }
+        if !receiver_ok || !args_ok {
+            self.report(call.token, Code::DeferOperandForm);
+            return TExpr::failed(call.token);
+        }
+        let TKind::Call(probed) = &probe.kind else {
+            self.call(
+                postfix,
+                None,
+                Some(call::Markers {
+                    mode,
+                    ..Default::default()
+                }),
+            );
+            return TExpr::failed(call.token);
+        };
         let waits = probed.head.wait
             || probed
                 .args

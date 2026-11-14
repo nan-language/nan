@@ -2,8 +2,8 @@
 //! writes with the program's `expected` file, whose first line states the exit status. A host
 //! program runs as a process, writing standard output then standard error: a Windows program as
 //! `nan run` launches it under Wine, in a Wine prefix of its own held in a session set up first. One for another
-//! architecture than this machine's, or a Windows program where Wine does not run, is only
-//! built. A machine program boots under its emulator,
+//! architecture or system than this machine's, or a Windows program where Wine does not run, is
+//! only built. A machine program boots under its emulator,
 //! writing the serial port until it ends the emulator through the exit port; on a UEFI target the
 //! firmware writes first, so its output only ends with the expected text. A machine program with an
 //! `emulator` file boots once per line of it, the line's words added to the emulator's arguments.
@@ -232,7 +232,7 @@ fn program(path: &Utf8Path, expected: String) -> datatest_stable::Result<()> {
     let mut runs = Vec::new();
     let (arch, kind) = target.rsplit_once('-').expect("a concrete target");
     match kind {
-        "linux" if arch != std::env::consts::ARCH => {}
+        "linux" | "macos" if arch != std::env::consts::ARCH || kind != std::env::consts::OS => {}
         "windows" => {
             if let Some((status, written)) = run_windows(&tmp, &root, name)? {
                 runs.push((
@@ -244,7 +244,7 @@ fn program(path: &Utf8Path, expected: String) -> datatest_stable::Result<()> {
                 ));
             }
         }
-        "linux" => {
+        "linux" | "macos" => {
             let (status, written) = run_host(&root, &target, name)?;
             runs.push((
                 String::new(),

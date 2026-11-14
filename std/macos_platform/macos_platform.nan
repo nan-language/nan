@@ -1,0 +1,125 @@
+//! The macOS entry landing fn, the waits of descriptors on the executors' kqueue and errors.
+
+foreign fn __error() -> hw::Ptr[i32] limits notrap, terminates, noalloc convention "darwin"
+
+foreign fn close(fd: i32) -> i32 convention "darwin"
+
+/// `fcntl`, whose argument is variadic: Apple's AArch64 convention passes it on the stack, where
+/// the ninth argument lies, and the x86_64 one in the third argument's register, so it is passed
+/// as both.
+foreign fn fcntl(fd: i32, command: i32, argument: u64, unused3: u64, unused4: u64, unused5: u64, unused6: u64, unused7: u64, stacked_argument: u64) -> i32 convention "darwin"
+
+/// Waits until a descriptor is ready for a kqueue filter, `READABLE` or `WRITABLE`, and gives the
+/// event's data, the bytes the descriptor holds to read or its room to write, or the negated error
+/// number of a wait the system refuses. Cancelling it deletes the wait and returns only once no
+/// thread delivers it.
+pkg fn watch(fd: i32, filter: i16) -> i64 fails task::Cancelled uses wait
+
+const READABLE: i16 = -1
+
+const WRITABLE: i16 = -2
+
+/// The error numbers of an interrupted call, an existing file, a call on a descriptor that is
+/// not ready and a connect in progress.
+const EINTR: i32 = 4
+
+const EEXIST: i32 = 17
+
+const EAGAIN: i32 = 35
+
+const EINPROGRESS: i32 = 36
+
+/// The `fcntl` commands setting a descriptor's flags and its status flags, and the flags closing
+/// it on exec and making a call on it that it is not ready for fail with `EAGAIN`.
+const SET_DESCRIPTOR_FLAGS: i32 = 2
+
+const SET_STATUS_FLAGS: i32 = 4
+
+const CLOSE_ON_EXEC: u64 = 1
+
+const NON_BLOCKING: u64 = 4
+
+/// The error number of the calling thread's last failing call.
+pkg fn last_error() -> i32 {
+    return trusted "libSystem gives the calling thread's code number, which lives as long as the thread" { __error().read() }
+} last_error
+
+/// The address of a view's first byte.
+pkg fn address_of(bytes: Slice[u8]) -> u64 {
+    return u64.widen(hw::Ptr.of_view(bytes).addr())
+} address_of
+
+/// Closes a descriptor on exec and makes each call on it that it is not ready for fail with
+/// `EAGAIN`: whether the system accepted.
+pkg fn unblock(fd: i32) -> bool {
+    let closed = fcntl(fd, command: SET_DESCRIPTOR_FLAGS, argument: CLOSE_ON_EXEC, unused3: 0, unused4: 0, unused5: 0, unused6: 0, unused7: 0, stacked_argument: CLOSE_ON_EXEC)
+    let unblocked = fcntl(fd, command: SET_STATUS_FLAGS, argument: NON_BLOCKING, unused3: 0, unused4: 0, unused5: 0, unused6: 0, unused7: 0, stacked_argument: NON_BLOCKING)
+    return closed == 0 and unblocked == 0
+} unblock
+
+/// Closes a descriptor.
+pkg fn release(fd: i32) {
+    discard close(fd)
+} release
+
+/// The host entry landing fn: mints the root grant and gives it the program's arguments and
+/// environment, as Untrusted byte strings.
+pub landing fn enter(count: i32, arguments: hw::Ptr[hw::Ptr[u8]], environment: hw::Ptr[hw::Ptr[u8]]) -> host::World limits stack 65_536 {
+    var world = hw::mint_root()
+    let alloc = world.alloc
+    var args = mem::List[mem::Bytes].empty(alloc)
+    var index: isize = 1
+    while index < isize.widen(count) {
+        let text = trusted "dyld passes `count` arguments, each a NUL-terminated text" { arguments.offset(index).read() }
+        mut args.push(c_bytes(text, alloc))
+        index += 1
+    }
+    world.args = Untrusted.of(take args)
+    var variables = mem::Map[mem::Bytes, mem::Bytes].empty(alloc)
+    var at: isize = 0
+    loop {
+        let text = trusted "the environment is a list of NUL-terminated texts ending with a zero address" { environment.offset(at).read() }
+        if text.addr() == 0 {
+            break
+        }
+        add_variable(mut variables, text: c_bytes(text, alloc), alloc)
+        at += 1
+    }
+    world.environment = Untrusted.of(take variables)
+    return world
+} enter
+
+/// The bytes of a NUL-terminated text, without the NUL.
+fn c_bytes(text: hw::Ptr[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    var at: isize = 0
+    loop {
+        let byte = trusted "the text ends with a NUL" { text.offset(at).read() }
+        if byte == 0 {
+            return bytes
+        }
+        mut bytes.push(byte)
+        at += 1
+    }
+} c_bytes
+
+/// Adds a `NAME=value` environment entry, a text without `=` naming an empty value.
+fn add_variable(mut variables: mem::Map[mem::Bytes, mem::Bytes], take text: mem::Bytes, alloc: mem::Alloc) {
+    let view = text.view()
+    var split = view.len()
+    for at in 0..<view.len() {
+        if view[at] == b'=' and split == view.len() {
+            split = at
+        }
+    }
+    var name = mem::Bytes.empty(alloc)
+    var value = mem::Bytes.empty(alloc)
+    for at in 0..<view.len() {
+        if at < split {
+            mut name.push(view[at])
+        } else if at > split {
+            mut value.push(view[at])
+        }
+    }
+    discard mut variables.insert(take name, take value)
+} add_variable

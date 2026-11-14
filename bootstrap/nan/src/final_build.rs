@@ -57,13 +57,6 @@ pub fn build(
         let reason = "a nanos program builds only against a kernel's interface file";
         return Ok(Build::failed(vec![bundle::interface_error(source, reason)]));
     }
-    if target.kind() == Some(Kind::Macos) {
-        let unavailable = Diagnostic::new(Code::TargetImageUnavailable);
-        return Ok(Build::failed(vec![bundle::at_manifest(
-            source,
-            unavailable,
-        )]));
-    }
     let mut diagnostics: Vec<Diagnostic> =
         check::reported(workspace, &crate::scope::Scope::Workspace);
     let std = crate::stdlib::packages();
@@ -407,8 +400,8 @@ pub fn program_tasks(workspace: &Workspace) -> Vec<TaskStack> {
 
 /// Writes the image of a lowered object at `image` through a staged file beside it, replacing any
 /// earlier image at once: on a Linux target an executable the target's linker links, giving the
-/// linker's output when it fails; on a Windows or machine target the image writer's, entered by
-/// the program entry seam.
+/// linker's output when it fails; on a Windows, macOS or machine target the image writer's,
+/// entered by the program entry seam.
 pub fn write_image(target: Target, object: &[u8], image: &Path) -> io::Result<Result<(), String>> {
     let directory = image.parent().expect("an image lies in a directory");
     fs::create_dir_all(directory)?;
@@ -419,16 +412,21 @@ pub fn write_image(target: Target, object: &[u8], image: &Path) -> io::Result<Re
     let staged =
         |extension: &str| directory.join(format!(".{name}.{}.{extension}", std::process::id()));
     let new = staged("new");
-    match target.kind() {
-        Some(Kind::Windows) => {
-            let bytes = crate::image::write(target, object, lower::host::windows::ENTRY);
+    let entry = match target.kind() {
+        Some(Kind::Windows) => Some(lower::host::windows::ENTRY),
+        Some(Kind::Macos) => Some(lower::host::posix::ENTRY),
+        _ if target.is_machine() => Some(lower::machine::ENTRY),
+        _ => None,
+    };
+    match entry {
+        Some(entry) => {
+            let bytes = crate::image::write(target, object, entry, &name);
             fs::write(&new, bytes)?;
+            if target.kind() == Some(Kind::Macos) {
+                crate::system::make_executable(&new)?;
+            }
         }
-        _ if target.is_machine() => {
-            let bytes = crate::image::write(target, object, lower::machine::ENTRY);
-            fs::write(&new, bytes)?;
-        }
-        _ => {
+        None => {
             let staged_object = staged("o");
             fs::write(&staged_object, object)?;
             let linked = lower::host::linux::link(target, &staged_object, &new);

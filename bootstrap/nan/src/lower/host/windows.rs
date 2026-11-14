@@ -217,14 +217,6 @@ impl Lowering<'_, '_> {
         system_site(fx, call);
         fx.b.inst_results(call)[0]
     }
-
-    fn arch(&self) -> Arch {
-        self.ck
-            .db
-            .target
-            .arch()
-            .expect("a Windows target's architecture")
-    }
 }
 
 /// Records a call of the system's code as a stub's, which uses at most the stub call bound of
@@ -854,7 +846,7 @@ pub fn take_packets(lo: &mut Lowering, fx: &mut Fx, wait: Option<Value>) {
             handle_packet(lo, fx, key, overlapped);
         });
     });
-    expire(lo, fx);
+    timers::expire(lo, fx);
 }
 
 /// Handles a packet of the completion port: a request's completion is delivered to its
@@ -877,23 +869,7 @@ fn handle_packet(lo: &mut Lowering, fx: &mut Fx, key: Value, overlapped: Value) 
 
 /// The milliseconds until the first timer is due, rounded up, `INFINITE` without one.
 fn first_timeout(lo: &mut Lowering, fx: &mut Fx) -> Value {
-    let state_address = lo.state(fx);
-    let lock = fx.offset(state_address, state::TIMER_LOCK);
-    lo.call_routine(fx, Routine::Lock, &[lock]);
-    let first = fx.load(PTR, state_address, state::TIMERS);
-    let armed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, first, 0);
-    let due = fx.choose(
-        armed,
-        &[PTR],
-        |fx| vec![fx.load(PTR, first, operation::DUE)],
-        |fx| vec![fx.int(PTR, -1)],
-    )[0];
-    lo.call_routine(fx, Routine::Unlock, &[lock]);
-    let now = lo.now_ns(fx);
-    let ahead = fx.b.ins().icmp(IntCC::UnsignedGreaterThan, due, now);
-    let left = fx.b.ins().isub(due, now);
-    let zero = fx.ptr(0);
-    let left = fx.b.ins().select(ahead, left, zero);
+    let (armed, left) = timers::first_due_in(lo, fx);
     let per_ms = fx.ptr(timers::NS_PER_MS);
     let ms = fx.b.ins().udiv(left, per_ms);
     let rest = fx.b.ins().urem(left, per_ms);
@@ -928,55 +904,12 @@ pub fn define_clock_now(lo: &mut Lowering, fx: &mut Fx) {
     fx.b.ins().return_(&[now]);
 }
 
-/// Arms a timer of the monotonic clock due `ns` nanoseconds from now, through `TimerArm`.
-pub fn arm(lo: &mut Lowering, fx: &mut Fx, op: Value, ns: Value) {
-    lo.call_routine(fx, Routine::TimerArm, &[op, ns]);
-}
-
 /// The body of `TimerArm`: arms the timer in the timers the runtime keeps, and wakes a thread
 /// waiting idle, so that it waits no longer than the timer.
 pub fn arm_timer(lo: &mut Lowering, fx: &mut Fx, op: Value, ns: Value) {
-    let state_address = lo.state(fx);
-    let lock = fx.offset(state_address, state::TIMER_LOCK);
-    lo.call_routine(fx, Routine::Lock, &[lock]);
-    let now = lo.now_ns(fx);
-    let due = timers::due_after(fx, now, ns);
-    timers::arm(lo, fx, op, due);
-    lo.call_routine(fx, Routine::Unlock, &[lock]);
+    timers::arm_shared(lo, fx, op, ns);
     let none = fx.ptr(0);
     post(lo, fx, KEY_WAKE, none);
-}
-
-/// Takes each timer due out of the timers, one at a time under the timer lock, and delivers its
-/// expiry outside it.
-fn expire(lo: &mut Lowering, fx: &mut Fx) {
-    let now = lo.now_ns(fx);
-    fx.repeat(&[], |fx, _| {
-        let state_address = lo.state(fx);
-        let lock = fx.offset(state_address, state::TIMER_LOCK);
-        lo.call_routine(fx, Routine::Lock, &[lock]);
-        let first = fx.load(PTR, state_address, state::TIMERS);
-        let armed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, first, 0);
-        let due = fx.choose(
-            armed,
-            &[types::I8],
-            |fx| {
-                let due = fx.load(PTR, first, operation::DUE);
-                vec![fx.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, due, now)]
-            },
-            |fx| vec![fx.int(types::I8, 0)],
-        )[0];
-        fx.when(due, |fx| {
-            timers::disarm(lo, fx, first);
-            timers::claim(fx, first);
-        });
-        lo.call_routine(fx, Routine::Unlock, &[lock]);
-        fx.when(due, |fx| {
-            let expired = fx.int(types::I32, tasks::EXPIRED);
-            tasks::deliver(lo, fx, first, expired);
-        });
-        (due, Vec::new())
-    });
 }
 
 /// Asks once for the cancellation of an operation whose record stays valid during the call: a

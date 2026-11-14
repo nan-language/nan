@@ -232,7 +232,7 @@ impl Lowering<'_, '_> {
     /// installed on: its line on x86_64, and on AArch64 its shared peripheral interrupt. The
     /// caller holds the bindings lock.
     fn mask_line(&mut self, fx: &mut Fx, record: Value, masked: bool) {
-        match self.machine_arch() {
+        match self.arch() {
             Arch::Amd64 => {
                 let line = fx.load(PTR, record, device::LINE);
                 let lined = fx.b.ins().icmp_imm_s(IntCC::NotEqual, line, 0);
@@ -255,7 +255,7 @@ impl Lowering<'_, '_> {
     /// once a device is installed on it and none of them is masked. The caller holds the
     /// bindings lock.
     fn line_unmasked(&mut self, fx: &mut Fx, record: Value) {
-        let (installed, masked) = match self.machine_arch() {
+        let (installed, masked) = match self.arch() {
             Arch::Amd64 => {
                 let slot = fx.load(PTR, record, device::BINDING);
                 let line = fx.load(PTR, record, device::LINE);
@@ -375,7 +375,7 @@ impl Lowering<'_, '_> {
             Some(cpu) => (fx.b.ins().iadd_imm_s(cpu, 1), cpu),
             None => (fx.ptr(0), fx.ptr(0)),
         };
-        let aarch64 = self.machine_arch() == Arch::Aarch64;
+        let aarch64 = self.arch() == Arch::Aarch64;
         if aarch64 {
             let taken = self.installed_for(fx, vector, Some(target));
             fx.when(taken, |fx| {
@@ -457,7 +457,7 @@ impl Lowering<'_, '_> {
         validated: bool,
     ) -> Value {
         let flags = self.lock_bindings(fx);
-        let outcome = match self.machine_arch() {
+        let outcome = match self.arch() {
             Arch::Amd64 => self.x64_install_msi(fx, record, cpu, source, validated),
             Arch::Aarch64 => self.its_install(fx, record, cpu, source),
         };
@@ -480,7 +480,7 @@ impl Lowering<'_, '_> {
         active_low: Value,
     ) -> Value {
         let flags = self.lock_bindings(fx);
-        let outcome = match self.machine_arch() {
+        let outcome = match self.arch() {
             Arch::Amd64 => self.x64_install_line(fx, record, line, source, edge, active_low),
             Arch::Aarch64 => self.aarch64_install_line(fx, record, line, edge),
         };
@@ -635,7 +635,7 @@ impl Lowering<'_, '_> {
         })[0];
         let next = fx.load(PTR, record, device::NEXT);
         fx.atomic_store(next, link);
-        if self.machine_arch() == Arch::Amd64 {
+        if self.arch() == Arch::Amd64 {
             let message = fx.load(PTR, record, device::MESSAGE);
             let remapped = self.is_remapped(fx, message);
             fx.when(remapped, |fx| {
@@ -644,7 +644,7 @@ impl Lowering<'_, '_> {
             });
             self.x64_line_left(fx, record, slot);
         }
-        if self.machine_arch() == Arch::Aarch64 {
+        if self.arch() == Arch::Aarch64 {
             let vector = fx.load(PTR, record, device::VECTOR);
             let lpi = fx.b.ins().icmp_imm_s(
                 IntCC::UnsignedGreaterThanOrEqual,

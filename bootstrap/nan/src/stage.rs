@@ -76,12 +76,12 @@ fn roots(artefacts: Vec<Vec<u8>>) -> Option<BTreeMap<String, Hash>> {
         .collect()
 }
 
-/// The artefacts the one section named `.nan` of an ELF64 or PE32+ file holds; none when the file
-/// is neither or holds no such section, or several.
+/// The artefacts the one section named `.nan` of an ELF64 or PE32+ file, or `__nan` of a Mach-O
+/// file, holds; none when the file is none of them or holds no such section, or several.
 fn section(image: &[u8]) -> Option<Vec<Vec<u8>>> {
     let found: Vec<&[u8]> = sections(image)?
         .into_iter()
-        .filter(|(name, _)| *name == b".nan")
+        .filter(|(name, _)| *name == b".nan" || *name == b"__nan")
         .map(|(_, contents)| contents)
         .collect::<Option<_>>()?;
     let [content] = found[..] else {
@@ -110,10 +110,13 @@ fn number(bytes: &[u8], at: usize, width: usize) -> Option<usize> {
 /// A section of a file: its name and its contents, none when the file does not hold them.
 type Section<'a> = (&'a [u8], Option<&'a [u8]>);
 
-/// The sections of a little-endian ELF64 or PE32+ file; none for any other file.
+/// The sections of a little-endian ELF64, PE32+ or Mach-O file; none for any other file.
 fn sections(image: &[u8]) -> Option<Vec<Section<'_>>> {
     if image.get(..2)? == b"MZ" {
         return pe_sections(image);
+    }
+    if image.get(..4)? == [0xCF, 0xFA, 0xED, 0xFE] {
+        return macho_sections(image);
     }
     if image.get(..6)? != [0x7F, b'E', b'L', b'F', 2, 1] {
         return None;
@@ -138,6 +141,26 @@ fn sections(image: &[u8]) -> Option<Vec<Section<'_>>> {
             Some((named, contents(index)))
         })
         .collect()
+}
+
+/// The sections of a 64-bit Mach-O file, each name without its padding.
+fn macho_sections(image: &[u8]) -> Option<Vec<Section<'_>>> {
+    let mut sections = Vec::new();
+    let mut at = 32;
+    for _ in 0..number(image, 16, 4)? {
+        if number(image, at, 4)? == 0x19 {
+            for index in 0..number(image, at + 64, 4)? {
+                let header = at + 72 + 80 * index;
+                let field = image.get(header..header.checked_add(16)?)?;
+                let name = field.split(|byte| *byte == 0).next()?;
+                let size = number(image, header + 40, 8)?;
+                let offset = number(image, header + 48, 4)?;
+                sections.push((name, image.get(offset..offset.checked_add(size)?)));
+            }
+        }
+        at = at.checked_add(number(image, at + 4, 4)?)?;
+    }
+    Some(sections)
 }
 
 /// The sections of a PE32+ file, each name without its padding.

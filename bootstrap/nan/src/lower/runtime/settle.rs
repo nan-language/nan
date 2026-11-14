@@ -359,7 +359,8 @@ fn stop(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
                             return;
                         }
                         let pthread = fx.load(PTR, thread, tasks::thread::SYSTEM);
-                        let signal = fx.int(types::I32, i64::from(host::linux::SIGURG));
+                        let signal = host::posix::stop_signal(lo);
+                        let signal = fx.int(types::I32, i64::from(signal));
                         lo.call_libc(fx, "pthread_kill", &[pthread, signal], &[types::I32]);
                     });
                     vec![running]

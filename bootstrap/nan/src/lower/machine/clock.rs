@@ -115,7 +115,7 @@ impl Lowering<'_, '_> {
     /// chosen.
     pub(super) fn start_clock(&mut self, fx: &mut Fx) {
         let state_address = self.state(fx);
-        let (base, scale) = match self.machine_arch() {
+        let (base, scale) = match self.arch() {
             Arch::Amd64 => self.start_x64_clock(fx),
             Arch::Aarch64 => {
                 let frequency = self.read_sysreg(fx, super::aarch64::CNTFRQ_EL0);
@@ -397,7 +397,7 @@ impl Lowering<'_, '_> {
     /// memory: the HPET's where it is the x86_64 clock's source, none otherwise.
     pub fn clock_registers_extent(&mut self, fx: &mut Fx) -> (Value, Value) {
         let zero = fx.ptr(0);
-        if self.machine_arch() == Arch::Aarch64 {
+        if self.arch() == Arch::Aarch64 {
             return (zero, zero);
         }
         let state_address = self.state(fx);
@@ -414,7 +414,7 @@ impl Lowering<'_, '_> {
     /// The clock's counter: on x86_64 the time-stamp counter, or the HPET's or PM timer's count
     /// extended; on AArch64 the virtual counter.
     fn clock_count(&mut self, fx: &mut Fx) -> Value {
-        if self.machine_arch() == Arch::Aarch64 {
+        if self.arch() == Arch::Aarch64 {
             return self.read_sysreg(fx, super::aarch64::CNTVCT_EL0);
         }
         let state_address = self.state(fx);
@@ -464,7 +464,7 @@ impl Lowering<'_, '_> {
     /// Starts the running CPU's timer as it starts taking interrupts: its rate measured on
     /// x86_64, its first pacing tick a period from now.
     pub(super) fn start_timer(&mut self, fx: &mut Fx) {
-        let rate = match self.machine_arch() {
+        let rate = match self.arch() {
             Arch::Amd64 => self.x64_timer_rate(fx),
             Arch::Aarch64 => self.aarch64_timer_rate(fx),
         };
@@ -509,7 +509,7 @@ impl Lowering<'_, '_> {
         let ticks = fx.b.ins().umax(ticks, one);
         let most = fx.ptr(MOST_TICKS);
         let ticks = fx.b.ins().umin(ticks, most);
-        match self.machine_arch() {
+        match self.arch() {
             Arch::Amd64 => self.x64_set_timer(fx, ticks),
             Arch::Aarch64 => self.aarch64_set_timer(fx, ticks),
         }

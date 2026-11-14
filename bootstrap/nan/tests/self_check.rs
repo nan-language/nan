@@ -865,9 +865,9 @@ fn renumbered(text: &str, numbers: &mut std::collections::HashMap<String, usize>
 }
 
 /// Runs the images of `program` for `target` that each toolchain built in its workspace and
-/// compares what both write and the statuses they end with: a host program's standard streams
+/// compares what both write and the statuses they end with: a Linux program's standard streams
 /// when this machine has its architecture, a Windows one's under Wine, a machine program's serial
-/// port under its emulator.
+/// port under its emulator; a macOS program runs on no machine the harness runs on.
 fn compare_program(
     toolchain: &Toolchain,
     bootstrap: &Path,
@@ -877,6 +877,7 @@ fn compare_program(
 ) -> Result<(), String> {
     match target.split_once('-') {
         Some((arch, "linux" | "windows")) if arch != std::env::consts::ARCH => Ok(()),
+        Some((_, "macos")) => Ok(()),
         Some((_, "linux")) => compare_processes(bootstrap, store, program, target),
         Some((_, "windows")) => compare_wine(toolchain, bootstrap, store, program),
         _ => compare_boots(toolchain, bootstrap, store, program),
@@ -1038,8 +1039,8 @@ fn compare_example(
             let (_, status) = compare(toolchain, dir, store, &["build", &program.0])?;
             if status == Some(0) {
                 let host = program.1.strip_suffix("-linux");
-                let windows = program.1.ends_with("-windows");
-                compare_lowered(toolchain, dir, store, &program.0, host.is_some() || windows)?;
+                let other = program.1.ends_with("-windows") || program.1.ends_with("-macos");
+                compare_lowered(toolchain, dir, store, &program.0, host.is_some() || other)?;
                 if host == Some(std::env::consts::ARCH) {
                     compare_processes(dir, store, &program.0, &program.1)?;
                 }
@@ -1061,13 +1062,15 @@ fn compare_example(
 }
 
 /// The concrete targets.
-const TARGETS: [&str; 8] = [
+const TARGETS: [&str; 10] = [
     "x86_64-linux",
     "x86_64-windows",
+    "x86_64-macos",
     "x86_64-uefi",
     "x86_64-bare",
     "aarch64-linux",
     "aarch64-windows",
+    "aarch64-macos",
     "aarch64-uefi",
     "aarch64-bare",
 ];
@@ -1170,7 +1173,9 @@ fn program(path: &Utf8Path, _: String) -> datatest_stable::Result<()> {
     if !bundles.is_empty() {
         compare_bundled(&toolchain, &dir, &store, name, &target, &bundles)?;
     }
-    let host = target.ends_with("-linux") || target.ends_with("-windows");
+    let host = ["-linux", "-windows", "-macos"]
+        .iter()
+        .any(|system| target.ends_with(system));
     compare_lowered(&toolchain, &dir, &store, name, host)?;
     if bundles.is_empty() {
         compare_program(&toolchain, &dir, &store, name, &target)?;

@@ -173,11 +173,15 @@ pub enum Routine {
     /// `(kind, handle, a, b, c) -> (cancelled, result)`: runs a Windows request on a handle and
     /// waits for its completion or its acknowledged cancellation.
     Request,
+    /// `(fd, filter) -> (cancelled, result)`: waits on a macOS target's kqueue until a
+    /// descriptor is ready for a filter, or for its acknowledged cancellation.
+    Watch,
     /// `() -> Never`: runs the executor's scheduler on the calling thread.
     Schedule,
     /// `(thread) -> Never`: the start routine of an executor thread.
     ThreadMain,
-    /// `(operation) -> Never`: the start routine of the thread reading termination requests.
+    /// `(operation) -> Never`: the start routine of the thread reading termination requests, given
+    /// on a macOS target its kqueue.
     Terminations,
     /// `(size) -> region`: a cancelling construct's new record of `size` bytes, enclosed by
     /// the running task's region.
@@ -204,10 +208,10 @@ pub enum Routine {
     Yield,
     /// `(seed, stream, index) -> value`: value `index` of a stream of a seed.
     Stream,
-    /// `() -> nanoseconds`: a kernel's clock, or a Windows target's monotonic clock.
+    /// `() -> nanoseconds`: a kernel's clock, or a Windows or macOS target's monotonic clock.
     ClockNow,
-    /// `(op, ns)`: arms a timer of a kernel's clock, or of a Windows target's monotonic clock,
-    /// expiring `ns` nanoseconds from now.
+    /// `(op, ns)`: arms a timer of a kernel's clock, or of a Windows or macOS target's monotonic
+    /// clock, expiring `ns` nanoseconds from now.
     TimerArm,
     /// `(choices, low, high, signed) -> value`: a draw of a property test's case.
     Draw,
@@ -280,6 +284,7 @@ impl Routine {
             Routine::Nested => "_NSstack_switch_nested",
             Routine::IoSubmit => "_NSstack_switch_io_submit",
             Routine::Request => "_NSstack_switch_request",
+            Routine::Watch => "_NSstack_switch_watch",
             Routine::Schedule => "_NSstack_switch_schedule",
             Routine::ThreadMain => "_NSstack_switch_thread_main",
             Routine::Terminations => "_NSstack_switch_terminations",
@@ -373,6 +378,7 @@ impl Routine {
             Routine::Origin | Routine::Init | Routine::Thread | Routine::ClockNow => (&[], &[P]),
             Routine::IoSubmit => (&[P], &[types::I8, types::I32]),
             Routine::Request => (&[P, P, P, P, P], &[types::I8, types::I64]),
+            Routine::Watch => (&[types::I32, types::I16], &[types::I8, types::I64]),
         }
     }
 
@@ -516,7 +522,8 @@ pub mod state {
     /// The first of the arms whose charge left their band, linked through the arms.
     pub const LEFT: u64 = 544;
     /// On a Windows target, the process's I/O completion port and the index of the thread-local
-    /// slot holding the running executor thread's record.
+    /// slot holding the running executor thread's record; on a macOS target, the executors'
+    /// kqueue and the key of the thread-specific value holding that record.
     pub const PORT: u64 = 552;
     pub const TLS_INDEX: u64 = 560;
     pub const SIZE: u64 = 568;
@@ -650,7 +657,7 @@ impl Lowering<'_, '_> {
             !self.machine(),
             "the C library function {name} in a machine image"
         );
-        let mut signature = Signature::new(CALL_CONV);
+        let mut signature = Signature::new(self.system_convention());
         signature
             .params
             .extend(params.iter().map(|ty| AbiParam::new(*ty)));
@@ -787,12 +794,16 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         Routine::Nested => segments::nested(lo, fx),
         Routine::Turn => serial::define_turn(lo, fx),
         Routine::ClockNow if lo.windows() => super::host::windows::define_clock_now(lo, fx),
+        Routine::ClockNow if lo.macos() => super::host::macos::define_clock_now(lo, fx),
         Routine::ClockNow => lo.define_clock_now(fx),
         Routine::TimerArm => {
             let params = fx.entry();
-            match lo.windows() {
-                true => super::host::windows::arm_timer(lo, fx, params[0], params[1]),
-                false => lo.arm_clock(fx, params[0], params[1]),
+            if lo.windows() {
+                super::host::windows::arm_timer(lo, fx, params[0], params[1]);
+            } else if lo.macos() {
+                super::host::macos::arm_timer(lo, fx, params[0], params[1]);
+            } else {
+                lo.arm_clock(fx, params[0], params[1]);
             }
             fx.b.ins().return_(&[]);
         }
@@ -807,9 +818,10 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         | Routine::RecordFree
         | Routine::RecordResize => system::define(lo, fx, routine),
         Routine::Preempt | Routine::Overflow | Routine::CpuLimit | Routine::Terminations => {
-            super::host::linux::define(lo, fx, routine)
+            super::host::posix::define(lo, fx, routine)
         }
         Routine::Request => super::host::windows::define_request(lo, fx),
+        Routine::Watch => super::host::macos::define_watch(lo, fx),
     }
 }
 

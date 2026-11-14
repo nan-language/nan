@@ -1,10 +1,12 @@
-//! The image writer: links the relocatable object of a Windows or machine target's lowering into
-//! its image, a PE32+ console program on a Windows target, a PE32+ EFI application on a UEFI
-//! target, a static ELF64 executable on a bare target, or a bundle. It lays the object's sections
-//! out in segments, one per access kind, resolves its symbols and applies its relocations.
+//! The image writer: links the relocatable object of a Windows, macOS or machine target's
+//! lowering into its image, a PE32+ console program on a Windows target, a Mach-O executable on a
+//! macOS target, a PE32+ EFI application on a UEFI target, a static ELF64 executable on a bare
+//! target, or a bundle. It lays the object's sections out in segments, one per access kind,
+//! resolves its symbols and applies its relocations.
 
 pub mod bundle;
 mod elf;
+mod macho;
 mod object;
 mod pe;
 
@@ -36,21 +38,26 @@ pub const SEGMENT_TABLE_BYTES: u64 = 8 + 24 * MOST_SEGMENTS;
 pub const RELOCATION_HEADER: &str = "_NSrelocs";
 pub const RELOCATION_HEADER_BYTES: usize = 40;
 
-/// The image of a Windows or machine target linking an object lowering wrote, entered at the
-/// symbol `entry`.
-pub fn write(target: Target, object: &[u8], entry: &str) -> Vec<u8> {
+/// The image named `name` of a Windows, macOS or machine target linking an object lowering
+/// wrote, entered at the symbol `entry`.
+pub fn write(target: Target, object: &[u8], entry: &str, name: &str) -> Vec<u8> {
     let arch = target.arch().expect("a concrete target's architecture");
     match target.kind() {
         Some(workspace::Kind::Windows) => {
-            let linked = link(object, pe::base(pe::Program::Console), Imports::Table);
+            let base = pe::base(pe::Program::Console);
+            let linked = link(object, base, PAGE, Imports::Table);
             pe::write(&linked, linked.symbol(entry), arch, pe::Program::Console)
         }
+        Some(workspace::Kind::Macos) => {
+            let linked = link(object, macho::base(), macho::PAGE, Imports::Got);
+            macho::write(&linked, linked.symbol(entry), arch, name)
+        }
         Some(workspace::Kind::Uefi) => {
-            let linked = link(object, pe::base(pe::Program::Efi), Imports::None);
+            let linked = link(object, pe::base(pe::Program::Efi), PAGE, Imports::None);
             pe::write(&linked, linked.symbol(entry), arch, pe::Program::Efi)
         }
         Some(workspace::Kind::Bare) => {
-            let linked = link(object, elf::base(arch), Imports::None);
+            let linked = link(object, elf::base(arch), PAGE, Imports::None);
             elf::write(&linked, linked.symbol(entry), arch)
         }
         _ => panic!("the image writer builds no {} image", target.name()),
@@ -68,6 +75,10 @@ enum Imports {
     /// A Windows image's: each is an `IMPORT_PREFIX` symbol naming a word of the import address
     /// table, which the system's loader fills with the address of the function it names.
     Table,
+    /// A macOS image's: each is a function whose address code loads through its word of the
+    /// global offset table, which dyld fills with the address of the `libSystem` function it
+    /// names.
+    Got,
 }
 
 /// The prefix of the symbol naming the import address table's word of a function a Windows image
@@ -99,7 +110,8 @@ struct Segment {
 /// holding the address of a symbol it imports, with that symbol's name; a Windows image's words
 /// are its import address table, the last segment, where each library's functions follow each
 /// other in order and end with a zero word, and each name is the library's, `!` and the
-/// function's. Its unallocated sections are the object's.
+/// function's, and a macOS image's are the words of its global offset table naming an undefined
+/// symbol. Its unallocated sections are the object's.
 struct Linked {
     segments: Vec<Segment>,
     symbols: HashMap<String, u64>,
@@ -212,10 +224,18 @@ mod reloc {
     pub const X64_ABS64: u32 = 1;
     pub const X64_PC32: u32 = 2;
     pub const X64_PLT32: u32 = 4;
+    pub const X64_GOTPCREL: u32 = 9;
     pub const A64_ABS64: u32 = 257;
     pub const A64_ADR_PREL_PG_HI21: u32 = 275;
     pub const A64_ADD_ABS_LO12_NC: u32 = 277;
     pub const A64_CALL26: u32 = 283;
+    pub const A64_ADR_GOT_PAGE: u32 = 311;
+    pub const A64_LD64_GOT_LO12_NC: u32 = 312;
+
+    /// Whether a relocation addresses its symbol's word of the global offset table.
+    pub fn through_got(kind: u32) -> bool {
+        matches!(kind, X64_GOTPCREL | A64_ADR_GOT_PAGE | A64_LD64_GOT_LO12_NC)
+    }
 }
 
 /// Patches the 32-bit AArch64 instruction at `at` in `bytes`, replacing the bits `field` covers
@@ -231,9 +251,9 @@ fn patch_a64(bytes: &mut [u8], at: usize, field: u32, value: u32) {
 const IMPORT_STUB: [u8; 8] = [0xff, 0x25, 0x02, 0x00, 0x00, 0x00, 0xcc, 0xcc];
 const IMPORT_STUB_BYTES: u64 = 16;
 
-/// Links an object with its first segment at `base`, treating its undefined symbols as `imports`
-/// says.
-fn link(object: &[u8], base: u64, imports: Imports) -> Linked {
+/// Links an object with its first segment at `base` and each other segment at the next multiple
+/// of `align`, treating its undefined symbols as `imports` says.
+fn link(object: &[u8], base: u64, align: u64, imports: Imports) -> Linked {
     let mut object = object::read(object);
     let unallocated = std::mem::take(&mut object.unallocated);
     let undefined = |symbol: &object::Symbol| symbol.section.is_none() && !symbol.name.is_empty();
@@ -255,10 +275,24 @@ fn link(object: &[u8], base: u64, imports: Imports) -> Linked {
         imports == Imports::Bundle || called.is_empty(),
         "a call of an undefined symbol in an image"
     );
+    let mut got: Vec<String> = object
+        .sections
+        .iter()
+        .flat_map(|section| &section.relocations)
+        .filter(|relocation| reloc::through_got(relocation.kind))
+        .map(|relocation| object.symbols[relocation.symbol].name.clone())
+        .collect();
+    got.sort();
+    got.dedup();
+    assert!(
+        imports == Imports::Got || got.is_empty(),
+        "a global offset table in an image without one"
+    );
     let mut placed: Vec<Option<u64>> = vec![None; object.sections.len()];
     let mut segments: Vec<Segment> = Vec::new();
     let mut next = base;
     let mut stubs = 0;
+    let mut got_start = 0;
     for (kind, access) in [
         (Kind::Text, Access::Execute),
         (Kind::ReadOnly, Access::Read),
@@ -298,8 +332,14 @@ fn link(object: &[u8], base: u64, imports: Imports) -> Linked {
             stubs = segment.address + offset;
             segment.size = segment.bytes.len() as u64;
         }
+        if kind == Kind::ReadOnly && !got.is_empty() {
+            let offset = segment.size.next_multiple_of(8);
+            got_start = segment.address + offset;
+            segment.size = offset + 8 * got.len() as u64;
+            segment.bytes.resize(segment.size as usize, 0);
+        }
         if segment.size > 0 {
-            next = (segment.address + segment.size).next_multiple_of(PAGE);
+            next = (segment.address + segment.size).next_multiple_of(align);
             segments.push(segment);
         }
     }
@@ -360,6 +400,22 @@ fn link(object: &[u8], base: u64, imports: Imports) -> Linked {
         .map(|symbol| (symbol.name.clone(), address_of(symbol)))
         .collect();
     let mut absolute = Vec::new();
+    for (index, name) in got.iter().enumerate() {
+        let slot = got_start + 8 * index as u64;
+        table.insert(name.clone(), slot);
+        match symbols.get(name) {
+            Some(address) => {
+                let segment = segments
+                    .iter_mut()
+                    .find(|segment| segment.access == Access::Read)
+                    .expect("the segment of the global offset table");
+                let at = (slot - segment.address) as usize;
+                segment.bytes[at..at + 8].copy_from_slice(&address.to_le_bytes());
+                absolute.push(slot);
+            }
+            None => imported.push((slot, name.clone())),
+        }
+    }
     for (index, section) in object.sections.iter().enumerate() {
         let Some(start) = placed[index].filter(|_| !section.relocations.is_empty()) else {
             continue;
@@ -373,6 +429,9 @@ fn link(object: &[u8], base: u64, imports: Imports) -> Linked {
             let symbol = &object.symbols[relocation.symbol];
             let at = (place - segment.address) as usize;
             let target = match called.iter().position(|name| *name == symbol.name) {
+                _ if reloc::through_got(relocation.kind) => {
+                    table[&symbol.name] as i64 + relocation.addend
+                }
                 Some(index) if undefined(symbol) => {
                     (stubs + index as u64 * IMPORT_STUB_BYTES) as i64 + relocation.addend
                 }
@@ -397,7 +456,7 @@ fn link(object: &[u8], base: u64, imports: Imports) -> Linked {
                     segment.bytes[at..at + 8].copy_from_slice(&target.to_le_bytes());
                     absolute.push(place);
                 }
-                reloc::X64_PC32 | reloc::X64_PLT32 => {
+                reloc::X64_PC32 | reloc::X64_PLT32 | reloc::X64_GOTPCREL => {
                     let value = i32::try_from(relative).expect("a relative address within 2 GiB");
                     segment.bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
                 }
@@ -412,7 +471,7 @@ fn link(object: &[u8], base: u64, imports: Imports) -> Linked {
                 }
                 // The address of the 4 KiB page the target lies in, relative to the page the
                 // instruction lies in, in units of pages, held in the split immediate.
-                reloc::A64_ADR_PREL_PG_HI21 => {
+                reloc::A64_ADR_PREL_PG_HI21 | reloc::A64_ADR_GOT_PAGE => {
                     let pages = ((target & !0xFFF) - (place & !0xFFF) as i64) >> 12;
                     assert!(
                         (-(1 << 20)..1 << 20).contains(&pages),
@@ -427,7 +486,13 @@ fn link(object: &[u8], base: u64, imports: Imports) -> Linked {
                     let low = (target & 0xFFF) as u32;
                     patch_a64(&mut segment.bytes, at, 0x003F_FC00, low << 10);
                 }
-                other => panic!("relocation type {other} in a machine image"),
+                // The target word's low 12 bits in units of words, the offset of the load from
+                // the page the previous instruction formed.
+                reloc::A64_LD64_GOT_LO12_NC => {
+                    let low = (target & 0xFFF) as u32 >> 3;
+                    patch_a64(&mut segment.bytes, at, 0x003F_FC00, low << 10);
+                }
+                other => panic!("relocation type {other} in an image"),
             }
         }
     }

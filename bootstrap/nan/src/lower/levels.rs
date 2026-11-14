@@ -68,6 +68,12 @@ const HWCAP_ASIMDDP: i64 = 1 << 20;
 const PF_ARM_ATOMICS: i64 = 34;
 const PF_ARM_DOT_PRODUCT: i64 = 43;
 
+/// The macOS system settings reporting LSE atomics and the dot product instructions, and
+/// AVX-512, whose register state macOS enables in a thread once it first uses it.
+const FEAT_LSE: &[u8] = b"hw.optional.arm.FEAT_LSE\0";
+const FEAT_DOTPROD: &[u8] = b"hw.optional.arm.FEAT_DotProd\0";
+const AVX512F: &[u8] = b"hw.optional.avx512f\0";
+
 /// The encoding of `ID_AA64ISAR0_EL1` for the `ReadSysReg` stub, and its fields: atomics at bit
 /// 20, at least 2 with LSE, and dot product at bit 44, at least 1 with it.
 const ID_AA64ISAR0_EL1: u16 = 0x4030;
@@ -105,6 +111,15 @@ impl Lowering<'_, '_> {
                 }
                 missing
             }
+            Level::Aarch64Dotprod if self.macos() => {
+                let mut missing = fx.int(types::I8, 0);
+                for feature in [FEAT_LSE, FEAT_DOTPROD] {
+                    let present = self.system_setting(fx, feature);
+                    let absent = fx.b.ins().icmp_imm_s(IntCC::Equal, present, 0);
+                    missing = fx.b.ins().bor(missing, absent);
+                }
+                missing
+            }
             Level::Aarch64Dotprod => {
                 let kind = fx.ptr(AT_HWCAP);
                 let hwcap = self.call_libc(fx, "getauxval", &[kind], &[PTR])[0];
@@ -119,7 +134,9 @@ impl Lowering<'_, '_> {
     }
 
     /// Whether the processor lacks an extension of an x86_64 level, or on a host target the
-    /// operating system leaves the register state of its AVX or AVX-512 extensions disabled.
+    /// operating system leaves the register state of its AVX or AVX-512 extensions disabled; on
+    /// macOS, which enables the AVX-512 state of a thread once it first uses it, whether the
+    /// system reports AVX-512.
     fn x64_missing(&mut self, fx: &mut Fx, level: Level) -> Value {
         let mut bits = V2.to_vec();
         if level != Level::X64V2 {
@@ -161,13 +178,18 @@ impl Lowering<'_, '_> {
         if !self.machine() {
             let state = match level {
                 Level::X64V2 => 0,
-                Level::X64V4 => AVX512_STATE,
+                Level::X64V4 if !self.macos() => AVX512_STATE,
                 _ => AVX_STATE,
             };
             if state != 0 {
                 let xcr0 = self.call_stub(fx, Stub::Xgetbv, &[])[0];
                 let disabled = lacks(fx, xcr0, state);
                 missing = fx.b.ins().bor(missing, disabled);
+            }
+            if level == Level::X64V4 && self.macos() {
+                let reported = self.system_setting(fx, AVX512F);
+                let absent = fx.b.ins().icmp_imm_s(IntCC::Equal, reported, 0);
+                missing = fx.b.ins().bor(missing, absent);
             }
         }
         missing

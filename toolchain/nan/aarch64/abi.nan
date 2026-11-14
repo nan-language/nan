@@ -1,4 +1,4 @@
-//! The AArch64 procedure call standard: where a signature's parameters and results pass, in registers or on the stack. The UEFI firmware's convention reserves `x18` but places arguments the same way, so one placement serves both the System V and the firmware conventions.
+//! The AArch64 procedure call standard: where a signature's parameters and results pass, in registers or on the stack. The UEFI firmware's convention reserves `x18` but places arguments the same way, so one placement serves both the System V and the firmware conventions; Apple's starts a 128-bit argument at any register and packs stacked arguments by their size.
 
 /// Where a value passes: in a register, or on the stack at an offset from the stack pointer at the
 /// call.
@@ -18,18 +18,21 @@ pkg struct Places {
 /// The places of a signature: integers and pointers in `x0` to `x7`, a 128-bit one in a pair of
 /// them starting at an even one, floats in `v0` to `v7`, and the rest on the stack in order, each
 /// in 8 bytes or a 128-bit one in 16 aligned to 16, which take a multiple of 16 bytes. Results go
-/// in registers the same way.
+/// in registers the same way. Under Apple's convention a 128-bit argument starts at any register
+/// and each stacked argument takes its own size, aligned to it.
 pkg fn places(sig: clif::Signature, alloc: mem::Alloc) -> Places {
+    let apple = sig.call_conv == clif::CallConv.AppleAarch64
     var params = mem::List[Place].empty(alloc)
-    let stack = place_values(sig.params.view(), placed: mut params)
+    let stack = place_values(sig.params.view(), placed: mut params, apple: apple)
     var returns = mem::List[Place].empty(alloc)
-    let returned = place_values(sig.returns.view(), placed: mut returns)
+    let returned = place_values(sig.returns.view(), placed: mut returns, apple: false)
     expect returned == 0
     return Places(params: take params, returns: take returns, stack: (stack + 15) & ~15u32)
 } places
 
-/// Appends the places of values to `placed`, giving the bytes of stack they take.
-fn place_values(values: Slice[clif::AbiParam], mut placed: mem::List[Place]) -> u32 {
+/// Appends the places of values to `placed`, packed as Apple's convention packs arguments when
+/// `apple`, giving the bytes of stack they take.
+fn place_values(values: Slice[clif::AbiParam], mut placed: mem::List[Place], apple: bool) -> u32 {
     var ints: u32 = 0
     var vectors: u32 = 0
     var stack: u32 = 0
@@ -38,7 +41,9 @@ fn place_values(values: Slice[clif::AbiParam], mut placed: mem::List[Place]) -> 
         let ty = value.value_type
         if ty == clif::Type.Int128 {
             if ints + 2 <= 8 {
-                ints += ints % 2
+                if not apple {
+                    ints += ints % 2
+                }
                 mut placed.push(Place.Reg(xreg(ints)))
                 mut placed.push(Place.Reg(xreg(ints + 1)))
                 ints += 2
@@ -54,6 +59,12 @@ fn place_values(values: Slice[clif::AbiParam], mut placed: mem::List[Place]) -> 
         } else if not ty.is_float() and ints < 8 {
             mut placed.push(Place.Reg(xreg(ints)))
             ints += 1
+        } else if apple {
+            let size = ty.bits() / 8
+            expect size > 0
+            stack = (stack + (size - 1)) & ~(size - 1)
+            mut placed.push(Place.Stack(stack))
+            stack += size
         } else {
             mut placed.push(Place.Stack(stack))
             stack += 8

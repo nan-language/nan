@@ -1,0 +1,89 @@
+//! The wall clock, the random source and log records of macOS.
+
+foreign fn clock_gettime_nsec_np(clock: i32) -> u64 limits stack 256 convention "darwin"
+
+foreign fn getentropy(buffer: hw::Ptr[u8], len: usize) -> i32 limits stack 256 convention "darwin"
+
+/// The clock `clock_gettime_nsec_np` reads as the real-time clock.
+const REALTIME: i32 = 0
+
+/// The most bytes one call of `getentropy` fills.
+const ENTROPY_LIMIT: usize = 256
+
+/// The nanoseconds of the real-time clock since the Unix epoch.
+pkg fn wall_ns() -> u64 {
+    return clock_gettime_nsec_np(REALTIME)
+} wall_ns
+
+pkg fn random_fill(mut buf: SliceMut[u8]) {
+    var done: usize = 0
+    while done < buf.len() {
+        let Some(parts) = mut buf.split_at_mut(done) else {
+            return
+        }
+        var rest = parts.tail
+        var len = rest.len()
+        if len > ENTROPY_LIMIT {
+            len = ENTROPY_LIMIT
+        }
+        if getentropy(hw::Ptr.of_view_mut(mut rest), len) == 0 {
+            done += len
+        }
+    }
+} random_fill
+
+/// Writes every byte of a buffer's prefix to standard error.
+fn write_err(bytes: Slice[u8]) {
+    var done: usize = 0
+    while done < bytes.len() {
+        let Some(parts) = bytes.split_at(done) else {
+            return
+        }
+        let count = write(2, buffer: hw::Ptr.of_view(parts.tail), count: parts.tail.len())
+        if count <= 0 {
+            return
+        }
+        done += usize.fit(count)
+    }
+} write_err
+
+/// Writes one log record to standard error: the level, `: `, the message, a space and the
+/// rendering, each line feed written as `\n`, then a line feed.
+pkg fn log_line(level: Str, message: Str, rendering: Str) {
+    var line = Array[u8, 4_096].filled(0)
+    var len: usize = 0
+    len = append_escaped(mut line, at: len, text: level.as_bytes())
+    len = append_escaped(mut line, at: len, text: b": ")
+    len = append_escaped(mut line, at: len, text: message.as_bytes())
+    len = append_escaped(mut line, at: len, text: b" ")
+    len = append_escaped(mut line, at: len, text: rendering.as_bytes())
+    let Some(written) = line.view().prefix(len) else {
+        return
+    }
+    write_err(written)
+    write_err(b"\n")
+} log_line
+
+/// Appends a text to a line from `at`, each line feed as `\n`, flushing a full line; returns
+/// the line's new length.
+fn append_escaped(mut line: Array[u8, 4_096], at: usize, text: Slice[u8]) -> usize {
+    var len = at
+    for byte in text {
+        if len + 2 > 4_096 {
+            let Some(full) = line.view().prefix(len) else {
+                return len
+            }
+            write_err(full)
+            len = 0
+        }
+        if byte == b'\n' {
+            line[len] = b'\\'
+            line[len + 1] = b'n'
+            len += 2
+        } else {
+            line[len] = byte
+            len += 1
+        }
+    }
+    return len
+} append_escaped

@@ -1,4 +1,4 @@
-//! The image writer: links the relocatable object of a Windows or machine target's lowering into its image, a PE32+ console program on a Windows target, a PE32+ EFI application on a UEFI target, a static ELF64 executable on a bare target, or a bundle. It lays the object's sections out in segments, one per access kind, resolves its symbols and applies its relocations.
+//! The image writer: links the relocatable object of a Windows, macOS or machine target's lowering into its image, a PE32+ console program on a Windows target, a Mach-O executable on a macOS target, a PE32+ EFI application on a UEFI target, a static ELF64 executable on a bare target, or a bundle. It lays the object's sections out in segments, one per access kind, resolves its symbols and applies its relocations.
 
 /// The size of a page, to which every segment is aligned.
 const PAGE: u64 = 4_096
@@ -26,24 +26,28 @@ pkg const RELOCATION_HEADER: Str = "_NSrelocs"
 
 pkg const RELOCATION_HEADER_BYTES: usize = 40
 
-/// The image of a Windows or machine target linking an object lowering wrote, entered at the
-/// symbol `entry`.
-pkg fn write(target: workspace::Target, object: Slice[u8], entry: Str, alloc: mem::Alloc) -> mem::Bytes {
+/// The image named `name` of a Windows, macOS or machine target linking an object lowering
+/// wrote, entered at the symbol `entry`.
+pkg fn write(target: workspace::Target, object: Slice[u8], entry: Str, name: Str, alloc: mem::Alloc) -> mem::Bytes {
     let Some(arch) = target.arch() else {
         expect false
         return mem::Bytes.empty(alloc)
     }
     match target.kind() {
         Some(workspace::Kind.Windows) => {
-            let linked = link(object, base: pe_base(Program.Console), imports: Imports.Table, alloc)
+            let linked = link(object, base: pe_base(Program.Console), align: PAGE, imports: Imports.Table, alloc)
             return pe_write(linked, entry: linked.symbol(entry), arch, program: Program.Console, alloc)
         }
+        Some(workspace::Kind.Macos) => {
+            let linked = link(object, base: macho_base(), align: MACHO_PAGE, imports: Imports.Got, alloc)
+            return macho_write(linked, entry: linked.symbol(entry), arch, name, alloc)
+        }
         Some(workspace::Kind.Uefi) => {
-            let linked = link(object, base: pe_base(Program.Efi), imports: Imports.None, alloc)
+            let linked = link(object, base: pe_base(Program.Efi), align: PAGE, imports: Imports.None, alloc)
             return pe_write(linked, entry: linked.symbol(entry), arch, program: Program.Efi, alloc)
         }
         Some(workspace::Kind.Bare) => {
-            let linked = link(object, base: elf_base(arch), imports: Imports.None, alloc)
+            let linked = link(object, base: elf_base(arch), align: PAGE, imports: Imports.None, alloc)
             return elf_write(linked, entry: linked.symbol(entry), arch, alloc)
         }
         else => {
@@ -57,11 +61,13 @@ pkg fn write(target: workspace::Target, object: Slice[u8], entry: Str, alloc: me
 /// absolute addresses of one are imports, and its calls of one go through an import stub after
 /// the object's code; a Windows image's are each an `IMPORT_PREFIX` symbol naming a word of the
 /// import address table, which the system's loader fills with the address of the function it
-/// names.
+/// names; a macOS image's are functions whose address code loads through its word of the global
+/// offset table, which dyld fills with the address of the `libSystem` function it names.
 enum Imports derives Copy, Eq {
     None
     Bundle
     Table
+    Got
 } Imports
 
 /// The prefix of the symbol naming the import address table's word of a function a Windows image
@@ -100,7 +106,8 @@ fn Segment.contains(self, address: u64) -> bool = address >= self.address and ad
 /// address of each 8-byte absolute address its relocations wrote, and each word holding the
 /// address of a symbol it imports; a Windows image's words are its import address table, the
 /// last segment, where each library's functions follow each other in order and end with a zero
-/// word, and each name is the library's, `!` and the function's.
+/// word, and each name is the library's, `!` and the function's, and a macOS image's are the
+/// words of its global offset table naming an undefined symbol.
 struct Linked {
     segments: mem::List[Segment]
     symbols: mem::Map[text::String, u64]
@@ -243,10 +250,16 @@ fn Linked.record_segments(mut self, alloc: mem::Alloc) {
 const ABS64: u32 = 1
 const PC32: u32 = 2
 const PLT32: u32 = 4
+const GOTPCREL: u32 = 9
 const A64_ABS64: u32 = 257
 const A64_ADR_PREL_PG_HI21: u32 = 275
 const A64_ADD_ABS_LO12_NC: u32 = 277
 const A64_CALL26: u32 = 283
+const A64_ADR_GOT_PAGE: u32 = 311
+const A64_LD64_GOT_LO12_NC: u32 = 312
+
+/// Whether a relocation addresses its symbol's word of the global offset table.
+fn through_got(kind: u32) -> bool = kind == GOTPCREL or kind == A64_ADR_GOT_PAGE or kind == A64_LD64_GOT_LO12_NC
 
 /// Patches the 32-bit AArch64 instruction at `offset` in `bytes`, replacing the bits `field`
 /// covers with `value`.
@@ -268,25 +281,32 @@ fn next_multiple_of(value: u64, multiple: u64) -> u64 {
     return value + (multiple - rest)
 } next_multiple_of
 
-/// Links an object with its first segment at `base`, treating its undefined symbols as `imports`
-/// says.
-fn link(object: Slice[u8], base: u64, imports: Imports, alloc: mem::Alloc) -> Linked {
+/// Links an object with its first segment at `base` and each other segment at the next multiple
+/// of `align`, treating its undefined symbols as `imports` says.
+fn link(object: Slice[u8], base: u64, align: u64, imports: Imports, alloc: mem::Alloc) -> Linked {
     var read_object = read(object, alloc)
     let called = called_imports(read_object, alloc)
     expect imports == Imports.Bundle or called.len() == 0
+    let got = got_names(read_object, alloc)
+    expect imports == Imports.Got or got.len() == 0
     var placed = mem::List[Option[u64]].empty(alloc)
     for _ in read_object.sections {
         mut placed.push(None)
     }
     var segments = mem::List[Segment].empty(alloc)
     let sections = read_object.sections.view()
-    var next = add_segment(mut segments, mut placed, sections, address: base, access: Access.Execute, stubs: u64.widen(called.len()), alloc)
+    var next = add_segment(mut segments, mut placed, sections, address: base, access: Access.Execute, stubs: u64.widen(called.len()), words: 0, align, alloc)
     var stubs: u64 = 0
     if called.len() > 0 and segments.len() > 0 {
         stubs = segments[0].address + segments[0].size - u64.widen(called.len()) * IMPORT_STUB_BYTES
     }
-    next = add_segment(mut segments, mut placed, sections, address: next, access: Access.Read, stubs: 0, alloc)
-    next = add_segment(mut segments, mut placed, sections, address: next, access: Access.Write, stubs: 0, alloc)
+    next = add_segment(mut segments, mut placed, sections, address: next, access: Access.Read, stubs: 0, words: u64.widen(got.len()), align, alloc)
+    var got_start: u64 = 0
+    if got.len() > 0 and segments.len() > 0 {
+        let read_only = segments[segments.len() - 1]
+        got_start = read_only.address + read_only.size - 8 * u64.widen(got.len())
+    }
+    next = add_segment(mut segments, mut placed, sections, address: next, access: Access.Write, stubs: 0, words: 0, align, alloc)
     var imported = mem::List[Import].empty(alloc)
     for index in 0..<called.len() {
         mut imported.push(Import(address: stubs + u64.widen(index) * IMPORT_STUB_BYTES + 8, name: text::String.of(called[index].as_str(), alloc)))
@@ -295,20 +315,9 @@ fn link(object: Slice[u8], base: u64, imports: Imports, alloc: mem::Alloc) -> Li
     if imports == Imports.Table {
         mut segments.push(import_table(read_object, at: next, mut imported, mut table, alloc))
     }
-    var symbols = mem::Map[text::String, u64].empty(alloc)
-    for symbol in read_object.symbols {
-        let Some(section) = symbol.section else {
-            continue
-        }
-        expect section < placed.len()
-        let Some(start) = placed[section] else {
-            continue
-        }
-        if not symbol.name.is_empty() {
-            discard mut symbols.insert(text::String.of(symbol.name.as_str(), alloc), value: start + symbol.value)
-        }
-    }
+    let symbols = defined_symbols(read_object, placed: placed.view(), alloc)
     var absolute = mem::List[u64].empty(alloc)
+    bind_got(got.view(), start: got_start, symbols, mut table, mut segments, mut absolute, mut imported, alloc)
     expect placed.len() == read_object.sections.len()
     for index in 0..<read_object.sections.len() {
         let Some(start) = placed[index] else {
@@ -327,7 +336,13 @@ fn link(object: Slice[u8], base: u64, imports: Imports, alloc: mem::Alloc) -> Li
             let symbol = read_object.symbols[relocation.symbol]
             let place = start + relocation.offset
             var target: i64 = 0
-            if undefined(symbol) {
+            if through_got(relocation.kind) {
+                let Some(slot) = table.get_by(fn(key: text::String) => key.as_str().cmp(symbol.name.as_str())) else {
+                    expect false
+                    continue
+                }
+                target = i64.from_bits(slot) + relocation.addend
+            } else if undefined(symbol) {
                 let Some(imported_at) = import_target(called, table, name: symbol.name.as_str(), stubs) else {
                     expect imports == Imports.Bundle and (relocation.kind == ABS64 or relocation.kind == A64_ABS64)
                     mut imported.push(Import(address: place, name: text::String.of(symbol.name.as_str(), alloc)))
@@ -385,6 +400,70 @@ fn import_table(read_object: Object, at: u64, mut imported: mem::List[Import], m
     object::resize(mut zeros, length: usize.widen(words))
     return Segment(address: at, access: Access.Write, bytes: take zeros, size: words)
 } import_table
+
+/// The names of the symbols an object's relocations address through the global offset table,
+/// each once, in byte order.
+fn got_names(read_object: Object, alloc: mem::Alloc) -> mem::List[text::String] {
+    var names = mem::List[text::String].empty(alloc)
+    for section in read_object.sections {
+        for relocation in section.relocations {
+            expect relocation.symbol < read_object.symbols.len()
+            let symbol = read_object.symbols[relocation.symbol]
+            if through_got(relocation.kind) and names.position(fn(name: text::String) => name == symbol.name).is_none() {
+                mut names.push(text::String.of(symbol.name.as_str(), alloc))
+            }
+        }
+    }
+    mut names.sort_by(fn(left: text::String, right: text::String) => left.as_str().cmp(right.as_str()))
+    return names
+} got_names
+
+/// The addresses of an object's named symbols defined in its placed sections.
+fn defined_symbols(read_object: Object, placed: Slice[Option[u64]], alloc: mem::Alloc) -> mem::Map[text::String, u64] {
+    var symbols = mem::Map[text::String, u64].empty(alloc)
+    for symbol in read_object.symbols {
+        let Some(section) = symbol.section else {
+            continue
+        }
+        expect section < placed.len()
+        let Some(start) = placed[section] else {
+            continue
+        }
+        if not symbol.name.is_empty() {
+            discard mut symbols.insert(text::String.of(symbol.name.as_str(), alloc), value: start + symbol.value)
+        }
+    }
+    return symbols
+} defined_symbols
+
+/// Lays out the words of the global offset table from `start`, one per name, in `table`: a
+/// defined symbol's word holds its address, an absolute address, and an undefined one's is
+/// imported.
+fn bind_got(got: Slice[text::String], start: u64, symbols: mem::Map[text::String, u64], mut table: mem::Map[text::String, u64], mut segments: mem::List[Segment], mut absolute: mem::List[u64], mut imported: mem::List[Import], alloc: mem::Alloc) {
+    for index in 0..<got.len() {
+        let slot = start + 8 * u64.widen(index)
+        discard mut table.insert(text::String.of(got[index].as_str(), alloc), value: slot)
+        match symbols.get_by(fn(key: text::String) => key.as_str().cmp(got[index].as_str())) {
+            Some(address) => {
+                fill_word(mut segments, at: slot, value: address)
+                mut absolute.push(slot)
+            }
+            None => mut imported.push(Import(address: slot, name: text::String.of(got[index].as_str(), alloc)))
+        }
+    }
+} bind_got
+
+/// Writes a word at an address of the segment holding it.
+fn fill_word(mut segments: mem::List[Segment], at: u64, value: u64) {
+    let Some(index) = segments.position(fn(segment: Segment) => segment.contains(at)) else {
+        expect false
+        return
+    }
+    expect segments[index].contains(at)
+    let offset = usize.widen(at - segments[index].address)
+    var bytes = mut segments[index].bytes.view_mut()
+    mut bytes.write_u64_le(offset, value: value)
+} fill_word
 
 /// The names of the undefined symbols an object calls, in the order of their first calls.
 fn called_imports(read_object: Object, alloc: mem::Alloc) -> mem::List[text::String] {
@@ -463,9 +542,10 @@ fn import_order(left: Import, right: Import) -> core::Ordering {
 } import_order
 
 /// Adds the segment of an access at an address when it holds any section, its sections of
-/// zeros after the others and a code segment's `stubs` import stubs after its code, returning the
-/// address of the next segment.
-fn add_segment(mut segments: mem::List[Segment], mut placed: mem::List[Option[u64]], sections: Slice[ObjectSection], address: u64, access: Access, stubs: u64, alloc: mem::Alloc) -> u64 {
+/// zeros after the others, a code segment's `stubs` import stubs after its code and a read-only
+/// segment's `words` words of the global offset table after its sections, returning the address
+/// of the next segment, the next multiple of `align`.
+fn add_segment(mut segments: mem::List[Segment], mut placed: mem::List[Option[u64]], sections: Slice[ObjectSection], address: u64, access: Access, stubs: u64, words: u64, align: u64, alloc: mem::Alloc) -> u64 {
     var segment = Segment(address: address, access: access, bytes: mem::Bytes.empty(alloc), size: 0)
     match access {
         Access.Execute => place_kind(mut segment, mut placed, sections, kind: Kind.Text)
@@ -485,10 +565,14 @@ fn add_segment(mut segments: mem::List[Segment], mut placed: mem::List[Option[u6
         }
         segment.size = u64.widen(segment.bytes.len())
     }
+    if words > 0 {
+        segment.size = next_multiple_of(segment.size, multiple: 8) + 8 * words
+        object::resize(mut segment.bytes, length: usize.widen(segment.size))
+    }
     if segment.size == 0 {
         return address
     }
-    let next = next_multiple_of(segment.address + segment.size, multiple: PAGE)
+    let next = next_multiple_of(segment.address + segment.size, multiple: align)
     mut segments.push(take segment)
     return next
 } add_segment
@@ -538,7 +622,7 @@ fn Segment.relocate(mut self, at: u64, kind: u32, target: i64, mut absolute: mem
             mut bytes.write_u64_le(offset, value: target.to_bits())
             mut absolute.push(at)
         }
-        PC32 or PLT32 => {
+        PC32 or PLT32 or GOTPCREL => {
             let Some(displacement) = i32.checked_fit(relative) else {
                 expect false
                 return
@@ -551,7 +635,7 @@ fn Segment.relocate(mut self, at: u64, kind: u32, target: i64, mut absolute: mem
             expect count >= -(1 << 25) and count < (1 << 25)
             patch_a64(mut bytes, offset: offset, field: 0x03FF_FFFF, value: u32.truncate(count.to_bits()))
         }
-        A64_ADR_PREL_PG_HI21 => {
+        A64_ADR_PREL_PG_HI21 or A64_ADR_GOT_PAGE => {
             // The address of the 4 KiB page the target lies in, relative to the page the
             // instruction lies in, in units of pages, held in the split immediate.
             let pages = ((target & ~0xFFF) - i64.from_bits(at & ~0xFFF)).div_trunc(1 << 12)
@@ -563,6 +647,12 @@ fn Segment.relocate(mut self, at: u64, kind: u32, target: i64, mut absolute: mem
         A64_ADD_ABS_LO12_NC => {
             // The target's low 12 bits, added to the page the previous instruction formed.
             let low = u32.truncate((target & 0xFFF).to_bits())
+            patch_a64(mut bytes, offset: offset, field: 0x003F_FC00, value: low << 10)
+        }
+        A64_LD64_GOT_LO12_NC => {
+            // The target word's low 12 bits in units of words, the offset of the load from the
+            // page the previous instruction formed.
+            let low = u32.truncate((target & 0xFFF).to_bits()) >> 3
             patch_a64(mut bytes, offset: offset, field: 0x003F_FC00, value: low << 10)
         }
         else => {

@@ -149,10 +149,10 @@ fn windows_convention(arch: workspace::Arch) -> clif::CallConv {
 fn Lowering.call_system(mut self, mut fx: Fx, name: Str, args: Slice[clif::Value], returns: Slice[clif::Type]) -> mem::List[clif::Value] {
     var signature = clif::Signature.new(windows_convention(self.arch()), alloc: self.alloc)
     for arg in args {
-        mut signature.params.push(clif::AbiParam(value_type: fx.b.value_type(arg)))
+        mut signature.params.push(clif::AbiParam.new(fx.b.value_type(arg)))
     }
     for returned in returns {
-        mut signature.returns.push(clif::AbiParam(value_type: returned))
+        mut signature.returns.push(clif::AbiParam.new(returned))
     }
     let call = mut self.call_imported(mut fx, name, signature: take signature, args)
     return fx.b.inst_results(call, alloc: fx.alloc)
@@ -182,23 +182,14 @@ fn Lowering.call_address(mut self, mut fx: Fx, function: clif::Value, args: Slic
     return first_result(fx.b.inst_results(call, alloc: fx.alloc))
 } Lowering.call_address
 
-/// The architecture of the target.
-fn Lowering.arch(self) -> workspace::Arch {
-    let Some(arch) = self.ck.db().target.arch() else {
-        expect false
-        return workspace::Arch.Amd64
-    }
-    return arch
-} Lowering.arch
-
 /// The signature, under the system's calling convention, of a function of `params`
 /// pointer-sized arguments giving a result of type `result`.
 fn windows_callback(lo: Lowering, params: usize, result: clif::Type) -> clif::Signature {
     var signature = clif::Signature.new(windows_convention(lo.arch()), alloc: lo.alloc)
     for _ in 0usize..<params {
-        mut signature.params.push(clif::AbiParam(value_type: PTR))
+        mut signature.params.push(clif::AbiParam.new(PTR))
     }
-    mut signature.returns.push(clif::AbiParam(value_type: result))
+    mut signature.returns.push(clif::AbiParam.new(result))
     return signature
 } windows_callback
 
@@ -772,7 +763,7 @@ fn windows_take_packets(mut lo: Lowering, mut fx: Fx, wait: Option[clif::Value])
             windows_handle_packet(mut lo, fx: mut fx2, key, overlapped)
         })
     })
-    windows_expire(mut lo, mut fx)
+    expire_timers(mut lo, mut fx)
 } windows_take_packets
 
 /// Handles a packet of the completion port: a request's completion is delivered to its
@@ -795,27 +786,10 @@ fn windows_handle_packet(mut lo: Lowering, mut fx: Fx, key: clif::Value, overlap
 
 /// The milliseconds until the first timer is due, rounded up, `WAIT_INFINITE` without one.
 fn windows_first_timeout(mut lo: Lowering, mut fx: Fx) -> clif::Value {
-    let state_address = mut lo.state(mut fx)
-    let lock = mut fx.offset(state_address, offset: STATE_TIMER_LOCK)
-    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
-    let earliest = mut fx.load(PTR, addr: state_address, offset: STATE_TIMERS)
-    let armed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: earliest, y: 0)
-    let due = mut fx.choose(armed, results: fx.types1(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
-        let first_due = mut fx1.load(PTR, addr: earliest, offset: OPERATION_DUE)
-        return fx1.list1(first_due)
-    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
-        let never = mut fx1.int(PTR, value: -1)
-        return fx1.list1(never)
-    })
-    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
-    let now = mut lo.now_ns(mut fx)
-    let ahead = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: due[0], y: now)
-    let difference = mut fx.b.isub(due[0], y: now)
-    let zero = mut fx.ptr(0)
-    let left = mut fx.b.select(ahead, x: difference, y: zero)
+    let due = first_due_in(mut lo, mut fx)
     let per_ms = mut fx.ptr(NS_PER_MS)
-    let whole_ms = mut fx.b.udiv(left, y: per_ms)
-    let rest = mut fx.b.urem(left, y: per_ms)
+    let whole_ms = mut fx.b.udiv(due.left, y: per_ms)
+    let rest = mut fx.b.urem(due.left, y: per_ms)
     let partial = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: rest, y: 0)
     let partial_word = mut fx.b.uextend(PTR, x: partial)
     let rounded = mut fx.b.iadd(whole_ms, y: partial_word)
@@ -823,7 +797,7 @@ fn windows_first_timeout(mut lo: Lowering, mut fx: Fx) -> clif::Value {
     let bounded = mut fx.b.umin(rounded, y: longest)
     let ms = mut fx.b.ireduce(clif::Type.Int32, x: bounded)
     let forever = mut fx.int(clif::Type.Int32, value: WAIT_INFINITE)
-    return mut fx.b.select(armed, x: ms, y: forever)
+    return mut fx.b.select(due.armed, x: ms, y: forever)
 } windows_first_timeout
 
 /// `ClockNow`: the nanoseconds of the monotonic clock, the performance counter's.
@@ -847,55 +821,13 @@ fn windows_define_clock_now(mut lo: Lowering, mut fx: Fx) {
     mut fx.b.ret(fx.list1(now).view())
 } windows_define_clock_now
 
-/// Arms a timer of the monotonic clock due `ns` nanoseconds from now, through `TimerArm`.
-fn windows_arm(mut lo: Lowering, mut fx: Fx, op: clif::Value, ns: clif::Value) {
-    discard mut lo.call_routine(mut fx, routine: Routine.TimerArm, args: fx.list2(op, b: ns).view())
-} windows_arm
-
 /// The body of `TimerArm`: arms the timer in the timers the runtime keeps, and wakes a thread
 /// waiting idle, so that it waits no longer than the timer.
 fn windows_arm_timer(mut lo: Lowering, mut fx: Fx, op: clif::Value, ns: clif::Value) {
-    let state_address = mut lo.state(mut fx)
-    let lock = mut fx.offset(state_address, offset: STATE_TIMER_LOCK)
-    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
-    let now = mut lo.now_ns(mut fx)
-    let due = due_after(mut fx, now, delay: ns)
-    arm(mut lo, mut fx, op, due)
-    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+    arm_shared(mut lo, mut fx, op, ns)
     let none = mut fx.ptr(0)
     windows_post(mut lo, mut fx, key: KEY_WAKE, overlapped: none)
 } windows_arm_timer
-
-/// Takes each timer due out of the timers, one at a time under the timer lock, and delivers its
-/// expiry outside it.
-fn windows_expire(mut lo: Lowering, mut fx: Fx) {
-    let now = mut lo.now_ns(mut fx)
-    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
-        let state_address = mut lo.state(mut fx1)
-        let lock = mut fx1.offset(state_address, offset: STATE_TIMER_LOCK)
-        discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: fx1.list1(lock).view())
-        let earliest = mut fx1.load(PTR, addr: state_address, offset: STATE_TIMERS)
-        let armed = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: earliest, y: 0)
-        let due = mut fx1.choose(armed, results: fx1.types1(clif::Type.Int8).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
-            let first_due = mut fx2.load(PTR, addr: earliest, offset: OPERATION_DUE)
-            let passed = mut fx2.b.icmp(clif::IntCC.UnsignedLessThanOrEqual, x: first_due, y: now)
-            return fx2.list1(passed)
-        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
-            let no = mut fx2.int(clif::Type.Int8, value: 0)
-            return fx2.list1(no)
-        })
-        mut fx1.if_true(due[0], then: fn[mut lo](mut fx2: Fx) {
-            disarm(mut lo, fx: mut fx2, op: earliest)
-            claim_timer(mut fx2, op: earliest)
-        })
-        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: fx1.list1(lock).view())
-        mut fx1.if_true(due[0], then: fn[mut lo](mut fx2: Fx) {
-            let expired = mut fx2.int(clif::Type.Int32, value: TASKS_EXPIRED)
-            deliver(mut lo, fx: mut fx2, op: earliest, result: expired)
-        })
-        return Pass(again: due[0], next: mem::List[clif::Value].empty(fx1.alloc))
-    })
-} windows_expire
 
 /// Asks once for the cancellation of an operation whose record stays valid during the call: a
 /// timer armed and not expired leaves the timers and completes cancelled at once, and a request

@@ -199,7 +199,7 @@ impl Lowering<'_, '_> {
         let (seam, at) = self.user_path();
         let seam = self.func_ref(fx, seam);
         let seam = fx.b.ins().func_addr(PTR, seam);
-        let enter = match self.machine_arch() {
+        let enter = match self.arch() {
             Arch::Amd64 => X64_ENTER,
             Arch::Aarch64 => AARCH64_ENTER,
         };
@@ -225,7 +225,7 @@ impl Lowering<'_, '_> {
     /// root takes the running root's ASID with bit 7 flipped, whose translations the user path
     /// drops.
     pub fn split_roots(&mut self, fx: &mut Fx, root: Value) -> (Value, Value) {
-        match self.machine_arch() {
+        match self.arch() {
             Arch::Amd64 => {
                 let running = self.call_stub(fx, Stub::ReadCr3, &[])[0];
                 let pcid = fx.b.ins().band_imm_s(running, PCID_MASK);

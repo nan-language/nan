@@ -1,0 +1,805 @@
+//! Writes Mach-O images: the executables of the macOS targets, position-independent and linked against `libSystem`, which dyld loads and enters at the program entry seam. Each segment of the linked object is a segment of the image with one section, the object's unallocated sections follow in the read-only segment `__NAN`, and `__LINKEDIT` holds what dyld reads: the rebasing of each absolute address, the binding of each imported function's word and the image's ad-hoc code signature.
+
+/// The size of a page, to which every segment is aligned in memory and in the file: AArch64
+/// macOS maps 16 KiB pages.
+const MACHO_PAGE: u64 = 0x4000
+
+/// The address of the image's header, the start of `__TEXT`, above the 4 GiB `__PAGEZERO` every
+/// 64-bit executable reserves.
+const MACHO_IMAGE_BASE: u64 = 0x1_0000_0000
+
+/// The address of the image's first section, after the page holding its headers.
+fn macho_base() -> u64 = MACHO_IMAGE_BASE + MACHO_PAGE
+
+const MH_MAGIC_64: u32 = 0xFEED_FACF
+
+const CPU_TYPE_X86_64: u32 = 0x0100_0007
+
+const CPU_TYPE_ARM64: u32 = 0x0100_000C
+
+const CPU_SUBTYPE_X86_64_ALL: u32 = 3
+
+const CPU_SUBTYPE_ARM64_ALL: u32 = 0
+
+const MH_EXECUTE: u32 = 2
+
+/// Linked by dyld, two-level namespace binding and position-independent.
+const MH_FLAGS: u32 = 0x20_0084
+
+const MACHO_HEADER_SIZE: u64 = 32
+
+const LC_SEGMENT_64: u32 = 0x19
+
+const LC_SYMTAB: u32 = 0x2
+
+const LC_DYSYMTAB: u32 = 0xB
+
+const LC_LOAD_DYLIB: u32 = 0xC
+
+const LC_LOAD_DYLINKER: u32 = 0xE
+
+const LC_UUID: u32 = 0x1B
+
+const LC_CODE_SIGNATURE: u32 = 0x1D
+
+const LC_BUILD_VERSION: u32 = 0x32
+
+const LC_DYLD_INFO_ONLY: u32 = 0x8000_0022
+
+const LC_MAIN: u32 = 0x8000_0028
+
+const SEGMENT_COMMAND_SIZE: u64 = 72
+
+const MACHO_SECTION_SIZE: u64 = 80
+
+/// The protections of a segment's memory.
+const VM_READ: u32 = 1
+
+const VM_WRITE: u32 = 2
+
+const VM_EXECUTE: u32 = 4
+
+/// The flag of a segment dyld makes read-only once it has rebased and bound it.
+const SG_READ_ONLY: u32 = 0x10
+
+/// The types and attributes of sections: code, data, and data the system zero-fills.
+const S_REGULAR: u32 = 0
+
+const S_ZEROFILL: u32 = 1
+
+const S_CODE: u32 = 0x8000_0400
+
+/// The alignment of the section starting a segment, as a power of two: the cache line functions
+/// start at.
+const SEGMENT_ALIGN: u32 = 6
+
+const DYLINKER: Str = "/usr/lib/dyld"
+
+const LIBSYSTEM: Str = "/usr/lib/libSystem.B.dylib"
+
+/// The versions of `libSystem` the image needs, 1.0.0, and of macOS, 15.0, which the image names
+/// its minimum and the SDK it was built for.
+const LIBSYSTEM_VERSION: u32 = 0x0001_0000
+
+const MACOS_VERSION: u32 = 0x000F_0000
+
+const PLATFORM_MACOS: u32 = 1
+
+/// The opcodes of rebasing and binding information.
+const REBASE_TYPE_POINTER: u8 = 0x11
+
+const REBASE_SEGMENT_AND_OFFSET: u8 = 0x20
+
+const REBASE_ADD_ADDRESS: u8 = 0x30
+
+const REBASE_ONCE: u8 = 0x51
+
+const BIND_LIBSYSTEM: u8 = 0x11
+
+const BIND_TYPE_POINTER: u8 = 0x51
+
+const BIND_SYMBOL: u8 = 0x40
+
+const BIND_SEGMENT_AND_OFFSET: u8 = 0x70
+
+const BIND_ONCE: u8 = 0x90
+
+/// The symbol every executable exports, naming its header.
+const HEADER_SYMBOL: Str = "__mh_execute_header"
+
+const N_SECT_EXTERNAL: u8 = 0x0F
+
+const REFERENCED_DYNAMICALLY: u16 = 0x10
+
+/// The code signature: an embedded signature holding one code directory, of version 0x20400,
+/// ad-hoc and linker-signed, hashing each 4 KiB page of the file before it with SHA-256, the
+/// executable segment that of a main binary. Its fields are big-endian.
+const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xFADE_0CC0
+
+const CSMAGIC_CODEDIRECTORY: u32 = 0xFADE_0C02
+
+const CODE_DIRECTORY_VERSION: u32 = 0x2_0400
+
+const CS_ADHOC_LINKER_SIGNED: u32 = 0x2_0002
+
+const CS_HASHTYPE_SHA256: u8 = 2
+
+const CS_EXECSEG_MAIN_BINARY: u64 = 1
+
+const SIGNATURE_PAGE_BITS: u8 = 12
+
+const SIGNATURE_PAGE: u64 = 4_096
+
+const SUPER_BLOB: u64 = 12
+
+const BLOB_INDEX: u64 = 8
+
+const CODE_DIRECTORY: u64 = 88
+
+/// A section of a segment: its name, address and size, its offset in the file, zero for one the
+/// system zero-fills, its alignment as a power of two, and its type.
+struct MachoSection {
+    name: text::String
+    address: u64
+    size: u64
+    offset: u64
+    align: u32
+    kind: u32
+} MachoSection
+
+/// A segment of the image: its name, address and size in memory, its offset and size in the
+/// file, its protection, its flags and its sections.
+struct MachoSegment {
+    name: text::String
+    address: u64
+    size: u64
+    offset: u64
+    file_size: u64
+    protection: u32
+    flags: u32
+    sections: mem::List[MachoSection]
+} MachoSegment
+
+/// Bytes the file holds at an offset.
+struct Placed {
+    at: u64
+    data: mem::Bytes
+} Placed
+
+/// The segments of an image before `__LINKEDIT`, the bytes the file holds for them, where their
+/// file ends and the address `__LINKEDIT` starts at.
+struct MachoLayout {
+    segments: mem::List[MachoSegment]
+    contents: mem::List[Placed]
+    file_end: u64
+    address: u64
+} MachoLayout
+
+/// Where an address lies: the index of its segment and its offset there.
+struct SegmentOffset derives Copy {
+    index: u8
+    offset: u64
+} SegmentOffset
+
+/// The offsets and sizes of what `__LINKEDIT` holds before the code signature.
+struct Linkedit {
+    data: mem::Bytes
+    rebase: Placement
+    bind: Placement
+    export: Placement
+    symtab: Placement
+    strtab: Placement
+} Linkedit
+
+/// The offset of a part of the file and its size.
+struct Placement derives Copy {
+    at: u32
+    size: u32
+} Placement
+
+/// The bytes of the Mach-O image named `name` holding the linked object's segments, linked from
+/// `macho_base()` and entered at the address `entry`; its imports are words of its read-only
+/// segment, which dyld binds to the functions of `libSystem` they name.
+fn macho_write(linked: Linked, entry: u64, arch: workspace::Arch, name: Str, alloc: mem::Alloc) -> mem::Bytes {
+    var laid = macho_layout(linked, alloc)
+    let linkedit = linkedit_of(linked, laid, alloc)
+    let signature_at = laid.file_end + u64.widen(linkedit.data.len())
+    let signature_bytes = signature_size(signature_at, name)
+    let edit_size = u64.widen(linkedit.data.len()) + signature_bytes
+    mut laid.segments.push(MachoSegment(name: text::String.of("__LINKEDIT", alloc), address: laid.address, size: next_multiple_of(edit_size, multiple: MACHO_PAGE), offset: laid.file_end, file_size: edit_size, protection: VM_READ, flags: 0, sections: mem::List[MachoSection].empty(alloc)))
+    var commands = mem::Bytes.empty(alloc)
+    for segment in laid.segments {
+        segment_command(mut commands, segment)
+    }
+    let uuid_at = info_commands(mut commands, linkedit, entry, sealed: Placement(at: u32.truncate(signature_at), size: u32.truncate(signature_bytes)), alloc)
+    expect MACHO_HEADER_SIZE + u64.widen(commands.len()) <= MACHO_PAGE
+    var out = mem::Bytes.empty(alloc)
+    macho_header(mut out, arch, commands: u32.truncate(u64.widen(laid.segments.len()) + 9), size: u32.truncate(u64.widen(commands.len())))
+    mut out.append(commands.view())
+    for placed in laid.contents {
+        object::resize(mut out, length: usize.widen(placed.at))
+        mut out.append(placed.data.view())
+    }
+    object::resize(mut out, length: usize.widen(laid.file_end))
+    mut out.append(linkedit.data.view())
+    let uuid = sha256(out.view(), start: 0, end: out.len())
+    var bytes = mut out.view_mut()
+    for at in 0..<16usize {
+        bytes[uuid_at + at] = uuid[at]
+    }
+    expect laid.segments.len() > 1
+    let text = laid.segments[1]
+    let seal = macho_sign(out.view(), name, text: text.offset, text_size: text.file_size, alloc)
+    mut out.append(seal.view())
+    return out
+} macho_write
+
+/// Writes the Mach-O header of an executable of an architecture with `commands` load commands of
+/// `size` bytes.
+fn macho_header(mut out: mem::Bytes, arch: workspace::Arch, commands: u32, size: u32) {
+    object::append_u32(mut out, value: MH_MAGIC_64)
+    match arch {
+        workspace::Arch.Amd64 => {
+            object::append_u32(mut out, value: CPU_TYPE_X86_64)
+            object::append_u32(mut out, value: CPU_SUBTYPE_X86_64_ALL)
+        }
+        workspace::Arch.Aarch64 => {
+            object::append_u32(mut out, value: CPU_TYPE_ARM64)
+            object::append_u32(mut out, value: CPU_SUBTYPE_ARM64_ALL)
+        }
+    }
+    object::append_u32(mut out, value: MH_EXECUTE)
+    object::append_u32(mut out, value: commands)
+    object::append_u32(mut out, value: size)
+    object::append_u32(mut out, value: MH_FLAGS)
+    object::append_u32(mut out, value: 0)
+} macho_header
+
+/// The image's segments before `__LINKEDIT`: `__PAGEZERO`, one per segment of the linked object,
+/// then `__NAN` when the object has unallocated sections.
+fn macho_layout(linked: Linked, alloc: mem::Alloc) -> MachoLayout {
+    var laid = MachoLayout(segments: mem::List[MachoSegment].empty(alloc), contents: mem::List[Placed].empty(alloc), file_end: 0, address: 0)
+    mut laid.segments.push(MachoSegment(name: text::String.of("__PAGEZERO", alloc), address: 0, size: MACHO_IMAGE_BASE, offset: 0, file_size: 0, protection: 0, flags: 0, sections: mem::List[MachoSection].empty(alloc)))
+    for segment in linked.segments {
+        let image_segment = linked_segment(segment, mut laid, alloc)
+        mut laid.segments.push(take image_segment)
+    }
+    laid.address = next_multiple_of(linked.end(), multiple: MACHO_PAGE)
+    if linked.unallocated.len() > 0 {
+        let nan_segment = host_segment(linked.unallocated.view(), mut laid, alloc)
+        mut laid.segments.push(take nan_segment)
+    }
+    return laid
+} macho_layout
+
+/// The image's segment of a segment of the linked object, `__TEXT` starting at the image's
+/// header; its bytes join the laid's contents, after its file end.
+fn linked_segment(segment: Segment, mut laid: MachoLayout, alloc: mem::Alloc) -> MachoSegment {
+    var start = segment.address
+    var protection = VM_READ | VM_WRITE
+    var flags: u32 = 0
+    var kind = S_REGULAR
+    match segment.access {
+        Access.Execute => {
+            start = MACHO_IMAGE_BASE
+            protection = VM_READ | VM_EXECUTE
+            kind = S_CODE
+        }
+        Access.Read => {
+            flags = SG_READ_ONLY
+        }
+        Access.Write => {}
+    }
+    let name: Str = match segment.access {
+        Access.Execute => "__TEXT"
+        Access.Read => "__DATA_CONST"
+        Access.Write => "__DATA"
+    }
+    let section: Str = match segment.access {
+        Access.Execute => "__text"
+        Access.Read => "__const"
+        Access.Write => "__data"
+    }
+    let size = next_multiple_of(segment.address + segment.size - start, multiple: MACHO_PAGE)
+    let filled = u64.widen(segment.bytes.len())
+    var file_size = next_multiple_of(segment.address + filled - start, multiple: MACHO_PAGE)
+    if file_size > size {
+        file_size = size
+    }
+    let offset = laid.file_end
+    laid.file_end = offset + file_size
+    let at = offset + segment.address - start
+    var sections = mem::List[MachoSection].empty(alloc)
+    mut sections.push(MachoSection(name: text::String.of(section, alloc), address: segment.address, size: filled, offset: at, align: SEGMENT_ALIGN, kind: kind))
+    if segment.size > filled {
+        mut sections.push(MachoSection(name: text::String.of("__bss", alloc), address: segment.address + filled, size: segment.size - filled, offset: 0, align: 0, kind: S_ZEROFILL))
+    }
+    var copied = mem::Bytes.empty(alloc)
+    mut copied.append(segment.bytes.view())
+    mut laid.contents.push(Placed(at: at, data: take copied))
+    return MachoSegment(name: text::String.of(name, alloc), address: start, size: size, offset: offset, file_size: file_size, protection: protection, flags: flags, sections: take sections)
+} linked_segment
+
+/// The read-only segment `__NAN` holding the object's unallocated sections, each named `__` and
+/// its name without dots, at the laid's address and file end, which it moves past itself.
+fn host_segment(unallocated: Slice[Unallocated], mut laid: MachoLayout, alloc: mem::Alloc) -> MachoSegment {
+    var sections = mem::List[MachoSection].empty(alloc)
+    var at: u64 = 0
+    for part in unallocated {
+        var spelt = text::String.of("__", alloc)
+        for c in part.name.as_str() {
+            if c != '.' {
+                mut spelt.push(c)
+            }
+        }
+        var copied = mem::Bytes.empty(alloc)
+        mut copied.append(part.data.view())
+        mut laid.contents.push(Placed(at: laid.file_end + at, data: take copied))
+        mut sections.push(MachoSection(name: take spelt, address: laid.address + at, size: u64.widen(part.data.len()), offset: laid.file_end + at, align: 0, kind: S_REGULAR))
+        at += u64.widen(part.data.len())
+    }
+    let size = next_multiple_of(at, multiple: MACHO_PAGE)
+    let segment = MachoSegment(name: text::String.of("__NAN", alloc), address: laid.address, size: size, offset: laid.file_end, file_size: size, protection: VM_READ, flags: 0, sections: take sections)
+    laid.address += size
+    laid.file_end += size
+    return segment
+} host_segment
+
+/// The segment an address lies in and its offset there.
+fn segment_of(segments: Slice[MachoSegment], at: u64) -> SegmentOffset {
+    for index in 0..<segments.len() {
+        let segment = segments[index]
+        if at >= segment.address and at - segment.address < segment.size {
+            return SegmentOffset(index: u8.truncate(index), offset: at - segment.address)
+        }
+    }
+    expect false
+    return SegmentOffset(index: 0, offset: 0)
+} segment_of
+
+/// What `__LINKEDIT` holds before the code signature, which starts at the laid's file end:
+/// the rebasing and binding information, the export trie, the symbol table and its strings.
+fn linkedit_of(linked: Linked, laid: MachoLayout, alloc: mem::Alloc) -> Linkedit {
+    var data = mem::Bytes.empty(alloc)
+    let rebase = placed_part(mut data, start: laid.file_end, part: rebase_info(linked.absolute.view(), segments: laid.segments.view(), alloc))
+    let bind = placed_part(mut data, start: laid.file_end, part: bind_info(linked.imports.view(), segments: laid.segments.view(), alloc))
+    let export = placed_part(mut data, start: laid.file_end, part: export_trie(alloc))
+    var symbols = mem::Bytes.empty(alloc)
+    object::append_u32(mut symbols, value: 1)
+    mut symbols.push(N_SECT_EXTERNAL)
+    mut symbols.push(1)
+    object::append_u16(mut symbols, value: REFERENCED_DYNAMICALLY)
+    object::append_u64(mut symbols, value: MACHO_IMAGE_BASE)
+    let symtab = placed_part(mut data, start: laid.file_end, part: take symbols)
+    var strings = mem::Bytes.empty(alloc)
+    mut strings.push(0)
+    mut strings.append(HEADER_SYMBOL.as_bytes())
+    mut strings.push(0)
+    pad(mut strings, align: 8)
+    let strtab = placed_part(mut data, start: laid.file_end, part: take strings)
+    pad(mut data, align: 16)
+    return Linkedit(data: take data, rebase: rebase, bind: bind, export: export, symtab: symtab, strtab: strtab)
+} linkedit_of
+
+/// Appends a part to `__LINKEDIT`'s data, padded to 8 bytes, giving its offset in the file, whose
+/// `__LINKEDIT` starts at `start`, and its size.
+fn placed_part(mut data: mem::Bytes, start: u64, take part: mem::Bytes) -> Placement {
+    let at = start + u64.widen(data.len())
+    let size = part.len()
+    mut data.append(part.view())
+    pad(mut data, align: 8)
+    return Placement(at: u32.truncate(at), size: u32.truncate(u64.widen(size)))
+} placed_part
+
+/// Appends the load commands after the segments': the information dyld reads, the symbol tables,
+/// dyld itself, the image's id, the system it runs on, its entry, `libSystem` and its code
+/// signature; gives where in the image the id lies, to be filled once the rest is written.
+fn info_commands(mut commands: mem::Bytes, linkedit: Linkedit, entry: u64, sealed: Placement, alloc: mem::Alloc) -> usize {
+    begin_command(mut commands, kind: LC_DYLD_INFO_ONLY, words: 10)
+    append_placement(mut commands, part: linkedit.rebase)
+    append_placement(mut commands, part: linkedit.bind)
+    object::resize(mut commands, length: commands.len() + 16)
+    append_placement(mut commands, part: linkedit.export)
+    begin_command(mut commands, kind: LC_SYMTAB, words: 4)
+    object::append_u32(mut commands, value: linkedit.symtab.at)
+    object::append_u32(mut commands, value: 1)
+    append_placement(mut commands, part: linkedit.strtab)
+    begin_command(mut commands, kind: LC_DYSYMTAB, words: 18)
+    object::resize(mut commands, length: commands.len() + 12)
+    object::append_u32(mut commands, value: 1)
+    object::append_u32(mut commands, value: 1)
+    object::resize(mut commands, length: commands.len() + 52)
+    path_command(mut commands, kind: LC_LOAD_DYLINKER, words: mem::List[u32].empty(alloc).view(), path: DYLINKER)
+    let uuid_at = usize.widen(MACHO_HEADER_SIZE) + commands.len() + 8
+    begin_command(mut commands, kind: LC_UUID, words: 4)
+    object::resize(mut commands, length: commands.len() + 16)
+    begin_command(mut commands, kind: LC_BUILD_VERSION, words: 4)
+    object::append_u32(mut commands, value: PLATFORM_MACOS)
+    object::append_u32(mut commands, value: MACOS_VERSION)
+    object::append_u32(mut commands, value: MACOS_VERSION)
+    object::append_u32(mut commands, value: 0)
+    begin_command(mut commands, kind: LC_MAIN, words: 4)
+    object::append_u64(mut commands, value: entry - MACHO_IMAGE_BASE)
+    object::append_u64(mut commands, value: 0)
+    var dylib = mem::List[u32].empty(alloc)
+    mut dylib.push(2)
+    mut dylib.push(LIBSYSTEM_VERSION)
+    mut dylib.push(LIBSYSTEM_VERSION)
+    path_command(mut commands, kind: LC_LOAD_DYLIB, words: dylib.view(), path: LIBSYSTEM)
+    begin_command(mut commands, kind: LC_CODE_SIGNATURE, words: 2)
+    append_placement(mut commands, part: sealed)
+    return uuid_at
+} info_commands
+
+/// Appends a part's offset and size.
+fn append_placement(mut out: mem::Bytes, part: Placement) {
+    object::append_u32(mut out, value: part.at)
+    object::append_u32(mut out, value: part.size)
+} append_placement
+
+/// Pads bytes with zeros to a multiple of `align`.
+fn pad(mut out: mem::Bytes, align: usize) {
+    let rest = out.len() % align
+    if rest != 0 {
+        object::resize(mut out, length: out.len() + (align - rest))
+    }
+} pad
+
+/// Appends the kind and size of a load command of `words` 32-bit words, which follow.
+fn begin_command(mut out: mem::Bytes, kind: u32, words: u32) {
+    object::append_u32(mut out, value: kind)
+    object::append_u32(mut out, value: 8 + 4 * words)
+} begin_command
+
+/// Appends a load command of 32-bit words followed by a path, which the word after its size
+/// locates, padded to 8 bytes.
+fn path_command(mut out: mem::Bytes, kind: u32, words: Slice[u32], path: Str) {
+    let fixed = 12 + 4 * words.len()
+    let size = fixed + path.byte_len() + 1
+    let padded = size + (8 - size % 8) % 8
+    object::append_u32(mut out, value: kind)
+    object::append_u32(mut out, value: u32.truncate(u64.widen(padded)))
+    object::append_u32(mut out, value: u32.truncate(u64.widen(fixed)))
+    for word in words {
+        object::append_u32(mut out, value: word)
+    }
+    let start = out.len()
+    mut out.append(path.as_bytes())
+    object::resize(mut out, length: start + padded - fixed)
+} path_command
+
+/// Appends a name of 16 bytes, padded with zeros.
+fn name16(mut out: mem::Bytes, name: Str) {
+    let start = out.len()
+    mut out.append(name.as_bytes())
+    object::resize(mut out, length: start + 16)
+} name16
+
+/// Appends the load command of a segment and its sections.
+fn segment_command(mut out: mem::Bytes, segment: MachoSegment) {
+    let size = SEGMENT_COMMAND_SIZE + MACHO_SECTION_SIZE * u64.widen(segment.sections.len())
+    object::append_u32(mut out, value: LC_SEGMENT_64)
+    object::append_u32(mut out, value: u32.truncate(size))
+    name16(mut out, name: segment.name.as_str())
+    object::append_u64(mut out, value: segment.address)
+    object::append_u64(mut out, value: segment.size)
+    object::append_u64(mut out, value: segment.offset)
+    object::append_u64(mut out, value: segment.file_size)
+    object::append_u32(mut out, value: segment.protection)
+    object::append_u32(mut out, value: segment.protection)
+    object::append_u32(mut out, value: u32.truncate(u64.widen(segment.sections.len())))
+    object::append_u32(mut out, value: segment.flags)
+    for section in segment.sections {
+        name16(mut out, name: section.name.as_str())
+        name16(mut out, name: segment.name.as_str())
+        object::append_u64(mut out, value: section.address)
+        object::append_u64(mut out, value: section.size)
+        object::append_u32(mut out, value: u32.truncate(section.offset))
+        object::append_u32(mut out, value: section.align)
+        object::resize(mut out, length: out.len() + 8)
+        object::append_u32(mut out, value: section.kind)
+        object::resize(mut out, length: out.len() + 12)
+    }
+} segment_command
+
+/// Appends an unsigned LEB128 number.
+fn uleb(mut out: mem::Bytes, value: u64) {
+    var left = value
+    loop {
+        let byte = u8.truncate(left & 0x7F)
+        left = left >> 7
+        if left == 0 {
+            mut out.push(byte)
+            return
+        }
+        mut out.push(byte | 0x80)
+    }
+} uleb
+
+/// The rebasing information sliding each 8-byte absolute address, in address order.
+fn rebase_info(absolute: Slice[u64], segments: Slice[MachoSegment], alloc: mem::Alloc) -> mem::Bytes {
+    var out = mem::Bytes.empty(alloc)
+    mut out.push(REBASE_TYPE_POINTER)
+    var started = false
+    var cursor = SegmentOffset(index: 0, offset: 0)
+    for at in absolute {
+        let place = segment_of(segments, at)
+        expect usize.widen(place.index) < segments.len()
+        expect (segments[usize.widen(place.index)].protection & VM_EXECUTE) == 0
+        if started and place.index == cursor.index and place.offset >= cursor.offset {
+            if place.offset > cursor.offset {
+                mut out.push(REBASE_ADD_ADDRESS)
+                uleb(mut out, value: place.offset - cursor.offset)
+            }
+        } else {
+            mut out.push(REBASE_SEGMENT_AND_OFFSET | place.index)
+            uleb(mut out, value: place.offset)
+        }
+        mut out.push(REBASE_ONCE)
+        started = true
+        cursor = SegmentOffset(index: place.index, offset: place.offset + 8)
+    }
+    mut out.push(0)
+    return out
+} rebase_info
+
+/// The binding information setting each imported word to the address of the `libSystem`
+/// function it names.
+fn bind_info(imports: Slice[Import], segments: Slice[MachoSegment], alloc: mem::Alloc) -> mem::Bytes {
+    var out = mem::Bytes.empty(alloc)
+    mut out.push(BIND_LIBSYSTEM)
+    mut out.push(BIND_TYPE_POINTER)
+    for import in imports {
+        mut out.push(BIND_SYMBOL)
+        mut out.push(b'_')
+        mut out.append(import.name.as_str().as_bytes())
+        mut out.push(0)
+        let place = segment_of(segments, at: import.address)
+        mut out.push(BIND_SEGMENT_AND_OFFSET | place.index)
+        uleb(mut out, value: place.offset)
+        mut out.push(BIND_ONCE)
+    }
+    mut out.push(0)
+    return out
+} bind_info
+
+/// The export trie: the header's symbol at offset 0, a regular symbol.
+fn export_trie(alloc: mem::Alloc) -> mem::Bytes {
+    var out = mem::Bytes.empty(alloc)
+    mut out.push(0)
+    mut out.push(1)
+    mut out.append(HEADER_SYMBOL.as_bytes())
+    mut out.push(0)
+    uleb(mut out, value: u64.widen(out.len()) + 1)
+    mut out.push(2)
+    object::resize(mut out, length: out.len() + 3)
+    return out
+} export_trie
+
+/// The size of the code signature of the `signed` bytes before it, identified by `name`.
+fn signature_size(signed: u64, name: Str) -> u64 {
+    let pages = (signed + SIGNATURE_PAGE - 1) / SIGNATURE_PAGE
+    return SUPER_BLOB + BLOB_INDEX + CODE_DIRECTORY + u64.widen(name.byte_len()) + 1 + 32 * pages
+} signature_size
+
+/// Appends a 32-bit word, most significant byte first.
+fn append_be32(mut out: mem::Bytes, value: u32) {
+    for at in 0..<4u32 {
+        mut out.push(u8.truncate(value >> (24 - 8 * at)))
+    }
+} append_be32
+
+/// Appends a 64-bit word, most significant byte first.
+fn append_be64(mut out: mem::Bytes, value: u64) {
+    for at in 0..<8u32 {
+        mut out.push(u8.truncate(value >> (56 - 8 * at)))
+    }
+} append_be64
+
+/// The ad-hoc code signature of an executable's bytes, identified by `name`, whose executable
+/// segment lies at `text` for `text_size` bytes.
+fn macho_sign(signed: Slice[u8], name: Str, text: u64, text_size: u64, alloc: mem::Alloc) -> mem::Bytes {
+    let size = signature_size(u64.widen(signed.len()), name)
+    let directory = SUPER_BLOB + BLOB_INDEX
+    let pages = (u64.widen(signed.len()) + SIGNATURE_PAGE - 1) / SIGNATURE_PAGE
+    var out = mem::Bytes.empty(alloc)
+    append_be32(mut out, value: CSMAGIC_EMBEDDED_SIGNATURE)
+    append_be32(mut out, value: u32.truncate(size))
+    append_be32(mut out, value: 1)
+    append_be32(mut out, value: 0)
+    append_be32(mut out, value: u32.truncate(directory))
+    append_be32(mut out, value: CSMAGIC_CODEDIRECTORY)
+    append_be32(mut out, value: u32.truncate(size - directory))
+    append_be32(mut out, value: CODE_DIRECTORY_VERSION)
+    append_be32(mut out, value: CS_ADHOC_LINKER_SIGNED)
+    append_be32(mut out, value: u32.truncate(CODE_DIRECTORY + u64.widen(name.byte_len()) + 1))
+    append_be32(mut out, value: u32.truncate(CODE_DIRECTORY))
+    append_be32(mut out, value: 0)
+    append_be32(mut out, value: u32.truncate(pages))
+    append_be32(mut out, value: u32.truncate(u64.widen(signed.len())))
+    mut out.push(32)
+    mut out.push(CS_HASHTYPE_SHA256)
+    mut out.push(0)
+    mut out.push(SIGNATURE_PAGE_BITS)
+    object::resize(mut out, length: out.len() + 16)
+    append_be64(mut out, value: 0)
+    append_be64(mut out, value: text)
+    append_be64(mut out, value: text_size)
+    append_be64(mut out, value: CS_EXECSEG_MAIN_BINARY)
+    mut out.append(name.as_bytes())
+    mut out.push(0)
+    var start: usize = 0
+    while start < signed.len() {
+        var end = start + usize.widen(SIGNATURE_PAGE)
+        if end > signed.len() {
+            end = signed.len()
+        }
+        mut out.append(sha256(signed, start, end).view())
+        start = end
+    }
+    return out
+} macho_sign
+
+/// The SHA-256 digest of the bytes from `start` to `end`.
+fn sha256(bytes: Slice[u8], start: usize, end: usize) -> Array[u8, 32] {
+    expect start <= end and end <= bytes.len()
+    var state = sha256_initial()
+    var block = Array[u8, 64].filled(0)
+    var filled: usize = 0
+    for at in start..<end {
+        block[filled] = bytes[at]
+        filled += 1
+        if filled == 64 {
+            state = sha256_compressed(state, block)
+            filled = 0
+        }
+    }
+    block[filled] = 0x80
+    filled += 1
+    if filled > 56 {
+        for at in filled..<64usize {
+            block[at] = 0
+        }
+        state = sha256_compressed(state, block)
+        filled = 0
+    }
+    for at in filled..<56usize {
+        block[at] = 0
+    }
+    let bits = u64.widen(end - start) << 3
+    for at in 0..<8u32 {
+        block[usize.widen(56 + at)] = u8.truncate(bits >> (56 - 8 * at))
+    }
+    state = sha256_compressed(state, block)
+    var out = Array[u8, 32].filled(0)
+    for word in 0..<8usize {
+        for at in 0..<4u32 {
+            out[4 * word + usize.widen(at)] = u8.truncate(state[word] >> (24 - 8 * at))
+        }
+    }
+    return out
+} sha256
+
+fn sha256_initial() -> Array[u32, 8] {
+    var state = Array[u32, 8].filled(0x6A09_E667)
+    state[1] = 0xBB67_AE85
+    state[2] = 0x3C6E_F372
+    state[3] = 0xA54F_F53A
+    state[4] = 0x510E_527F
+    state[5] = 0x9B05_688C
+    state[6] = 0x1F83_D9AB
+    state[7] = 0x5BE0_CD19
+    return state
+} sha256_initial
+
+fn rotated32(value: u32, by: u32) -> u32
+    requires by > 0 and by < 32
+{
+    return (value >> by) | (value << (32 - by))
+} rotated32
+
+fn sha256_compressed(state: Array[u32, 8], block: Array[u8, 64]) -> Array[u32, 8] {
+    var w = Array[u32, 64].filled(0)
+    for i in 0..<16usize {
+        w[i] = block.view().u32_be(4 * i)
+    }
+    for i in 16..<64usize {
+        let s0 = rotated32(w[i - 15], by: 7) ^ rotated32(w[i - 15], by: 18) ^ (w[i - 15] >> 3)
+        let s1 = rotated32(w[i - 2], by: 17) ^ rotated32(w[i - 2], by: 19) ^ (w[i - 2] >> 10)
+        w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1)
+    }
+    var v = state
+    for i in 0..<64usize {
+        let e = v[4]
+        let a = v[0]
+        let sum1 = rotated32(e, by: 6) ^ rotated32(e, by: 11) ^ rotated32(e, by: 25)
+        let choice = (e & v[5]) ^ ((~e) & v[6])
+        let t1 = v[7].wrapping_add(sum1).wrapping_add(choice).wrapping_add(SHA256_ROUND[i]).wrapping_add(w[i])
+        let sum0 = rotated32(a, by: 2) ^ rotated32(a, by: 13) ^ rotated32(a, by: 22)
+        let majority = (a & v[1]) ^ (a & v[2]) ^ (v[1] & v[2])
+        v[7] = v[6]
+        v[6] = v[5]
+        v[5] = e
+        v[4] = v[3].wrapping_add(t1)
+        v[3] = v[2]
+        v[2] = v[1]
+        v[1] = a
+        v[0] = t1.wrapping_add(sum0.wrapping_add(majority))
+    }
+    var out = state
+    for i in 0..<8usize {
+        out[i] = out[i].wrapping_add(v[i])
+    }
+    return out
+} sha256_compressed
+
+/// The round constants of SHA-256.
+const SHA256_ROUND: Array[u32, 64] = sha256_rounds()
+
+fn sha256_rounds() -> Array[u32, 64] {
+    var rounds = Array[u32, 64].filled(0x428A_2F98)
+    rounds[1] = 0x7137_4491
+    rounds[2] = 0xB5C0_FBCF
+    rounds[3] = 0xE9B5_DBA5
+    rounds[4] = 0x3956_C25B
+    rounds[5] = 0x59F1_11F1
+    rounds[6] = 0x923F_82A4
+    rounds[7] = 0xAB1C_5ED5
+    rounds[8] = 0xD807_AA98
+    rounds[9] = 0x1283_5B01
+    rounds[10] = 0x2431_85BE
+    rounds[11] = 0x550C_7DC3
+    rounds[12] = 0x72BE_5D74
+    rounds[13] = 0x80DE_B1FE
+    rounds[14] = 0x9BDC_06A7
+    rounds[15] = 0xC19B_F174
+    rounds[16] = 0xE49B_69C1
+    rounds[17] = 0xEFBE_4786
+    rounds[18] = 0x0FC1_9DC6
+    rounds[19] = 0x240C_A1CC
+    rounds[20] = 0x2DE9_2C6F
+    rounds[21] = 0x4A74_84AA
+    rounds[22] = 0x5CB0_A9DC
+    rounds[23] = 0x76F9_88DA
+    rounds[24] = 0x983E_5152
+    rounds[25] = 0xA831_C66D
+    rounds[26] = 0xB003_27C8
+    rounds[27] = 0xBF59_7FC7
+    rounds[28] = 0xC6E0_0BF3
+    rounds[29] = 0xD5A7_9147
+    rounds[30] = 0x06CA_6351
+    rounds[31] = 0x1429_2967
+    rounds[32] = 0x27B7_0A85
+    rounds[33] = 0x2E1B_2138
+    rounds[34] = 0x4D2C_6DFC
+    rounds[35] = 0x5338_0D13
+    rounds[36] = 0x650A_7354
+    rounds[37] = 0x766A_0ABB
+    rounds[38] = 0x81C2_C92E
+    rounds[39] = 0x9272_2C85
+    rounds[40] = 0xA2BF_E8A1
+    rounds[41] = 0xA81A_664B
+    rounds[42] = 0xC24B_8B70
+    rounds[43] = 0xC76C_51A3
+    rounds[44] = 0xD192_E819
+    rounds[45] = 0xD699_0624
+    rounds[46] = 0xF40E_3585
+    rounds[47] = 0x106A_A070
+    rounds[48] = 0x19A4_C116
+    rounds[49] = 0x1E37_6C08
+    rounds[50] = 0x2748_774C
+    rounds[51] = 0x34B0_BCB5
+    rounds[52] = 0x391C_0CB3
+    rounds[53] = 0x4ED8_AA4A
+    rounds[54] = 0x5B9C_CA4F
+    rounds[55] = 0x682E_6FF3
+    rounds[56] = 0x748F_82EE
+    rounds[57] = 0x78A5_636F
+    rounds[58] = 0x84C8_7814
+    rounds[59] = 0x8CC7_0208
+    rounds[60] = 0x90BE_FFFA
+    rounds[61] = 0xA450_6CEB
+    rounds[62] = 0xBEF9_A3F7
+    rounds[63] = 0xC671_78F2
+    return rounds
+} sha256_rounds

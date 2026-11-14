@@ -1,0 +1,259 @@
+//! The file operations of `sys::Fs` and `sys::fs::File` beneath a directory's descriptor.
+
+/// `openat`, whose mode is a variadic argument: Apple's AArch64 convention passes it on the
+/// stack, where the ninth argument lies, and the x86_64 one in the fourth argument's register, so
+/// it is passed as both.
+foreign fn openat(dir: i32, path: hw::Ptr[u8], flags: i32, mode: u64, unused4: u64, unused5: u64, unused6: u64, unused7: u64, stacked_mode: u64) -> i32 convention "darwin"
+
+foreign fn mkdirat(dir: i32, path: hw::Ptr[u8], mode: u16) -> i32 convention "darwin"
+
+foreign fn unlinkat(dir: i32, path: hw::Ptr[u8], flags: i32) -> i32 convention "darwin"
+
+/// The open flags of a file read from, written to after truncation or created, and of a
+/// directory, each closed on exec and resolved beneath the directory it opens from.
+const READ_ONLY: i32 = 0x0100_1000
+
+const WRITE_CREATE: i32 = 0x0100_1601
+
+const DIRECTORY: i32 = 0x0110_1000
+
+/// The modes of a file and of a directory the platform creates.
+const FILE_MODE: u64 = 0x1A4
+
+const DIRECTORY_MODE: u16 = 0x1ED
+
+/// The longest path the platform functions join, in bytes, its NUL excluded.
+const PATH_LIMIT: usize = 4_095
+
+/// The directory holding the entry a joined path names, opened beneath the directory the path
+/// starts from, and the offset of the entry's name in the path; the directory the path starts
+/// from itself for a path of one segment.
+struct Parent {
+    fd: i32
+    name: usize
+} Parent
+
+/// `prefix`, `/` when it is not empty, `path` and a NUL, in a buffer; false when it is too long.
+fn joined(prefix: Str, path: Str, mut buffer: Array[u8, 4_096]) -> bool {
+    let head = prefix.as_bytes()
+    let tail = path.as_bytes()
+    var separator: usize = 0
+    if head.len() > 0 {
+        separator = 1
+    }
+    if head.len() + separator + tail.len() > PATH_LIMIT {
+        return false
+    }
+    var at: usize = 0
+    for byte in head {
+        buffer[at] = byte
+        at += 1
+    }
+    if separator == 1 {
+        buffer[at] = b'/'
+        at += 1
+    }
+    for byte in tail {
+        buffer[at] = byte
+        at += 1
+    }
+    buffer[at] = 0
+    return true
+} joined
+
+/// The failure of an error number of a file operation.
+fn failure(code: i32) -> sys::fs::FsError {
+    return match code {
+        2 => sys::fs::FsError.NotFound
+        28 or 69 => sys::fs::FsError.NoSpace
+        else => sys::fs::FsError.Denied
+    }
+} failure
+
+/// Opens a NUL-terminated path from a directory with `flags`, creating a file with `mode`.
+fn open_path(dir: i32, path: Slice[u8], flags: i32, mode: u64) -> i32 {
+    return openat(dir, path: hw::Ptr.of_view(path), flags, mode, unused4: 0, unused5: 0, unused6: 0, unused7: 0, stacked_mode: mode)
+} open_path
+
+/// Opens the directory holding the entry a joined path names, beneath `dir`.
+fn open_parent(dir: i32, path: Array[u8, 4_096]) -> Parent fails sys::fs::FsError {
+    var name: usize = 0
+    var end: usize = 0
+    while path[end] != 0 {
+        if path[end] == b'/' {
+            name = end + 1
+        }
+        end += 1
+    }
+    if name == 0 {
+        return Parent(fd: dir, name: 0)
+    }
+    var parent = path
+    parent[name - 1] = 0
+    let fd = open_path(dir, path: parent.view(), flags: DIRECTORY, mode: 0)
+    if fd < 0 {
+        fail failure(last_error())
+    }
+    return Parent(fd: fd, name: name)
+} open_parent
+
+/// Closes the directory `open_parent` opened, unless it is the one the path starts from.
+fn close_parent(dir: i32, parent: Parent) {
+    if parent.fd != dir {
+        release(parent.fd)
+    }
+} close_parent
+
+/// Creates each missing directory of a joined path's parent, in its own parent opened beneath
+/// `dir`.
+fn make_parents(dir: i32, path: Array[u8, 4_096]) fails sys::fs::FsError {
+    var partial = Array[u8, 4_096].filled(0)
+    var at: usize = 0
+    while path[at] != 0 {
+        if path[at] == b'/' {
+            let parent = try open_parent(dir, path: partial)
+            let Some(parts) = partial.view().split_at(parent.name) else {
+                close_parent(dir, parent)
+                return
+            }
+            let made = mkdirat(parent.fd, path: hw::Ptr.of_view(parts.tail), mode: DIRECTORY_MODE)
+            let code = last_error()
+            close_parent(dir, parent)
+            if made != 0 and code != EEXIST {
+                fail failure(code)
+            }
+        }
+        partial[at] = path[at]
+        at += 1
+    }
+} make_parents
+
+/// Opens a path beneath a directory with `flags`, creating its missing directories first and
+/// the file with mode 0644 when the flags create it: the new descriptor.
+fn open_beneath(dir: i32, prefix: Str, path: Str, flags: i32) -> i32 fails sys::fs::FsError {
+    var buffer = Array[u8, 4_096].filled(0)
+    if not joined(prefix, path, mut buffer) {
+        fail sys::fs::FsError.InvalidPath
+    }
+    var mode: u64 = 0
+    if flags == WRITE_CREATE {
+        mode = FILE_MODE
+        try make_parents(dir, path: buffer)
+    }
+    let fd = open_path(dir, path: buffer.view(), flags, mode)
+    if fd < 0 {
+        fail failure(last_error())
+    }
+    return fd
+} open_beneath
+
+/// Reads at most `len` bytes at `address` from a file at its position: the count, 0 at its end.
+fn read_file(fd: i32, address: u64, len: usize) -> usize fails sys::fs::FsError {
+    loop {
+        let count = read(fd, buffer: address, count: len)
+        if count >= 0 {
+            return usize.fit(count)
+        }
+        let code = last_error()
+        if code != EINTR {
+            fail failure(code)
+        }
+    }
+} read_file
+
+/// Writes a prefix of `data` to a file at its position: the count written, at least 1 when
+/// `data` is not empty.
+fn write_file(fd: i32, data: Slice[u8]) -> usize fails sys::fs::FsError {
+    loop {
+        let count = write(fd, buffer: hw::Ptr.of_view(data), count: data.len())
+        if count >= 0 {
+            return usize.fit(count)
+        }
+        let code = last_error()
+        if code != EINTR {
+            fail failure(code)
+        }
+    }
+} write_file
+
+pkg fn fs_open(dir: i32, prefix: Str, path: Str) -> i32 fails sys::fs::FsError {
+    return try open_beneath(dir, prefix, path, flags: READ_ONLY)
+} fs_open
+
+pkg fn fs_create(dir: i32, prefix: Str, path: Str) -> i32 fails sys::fs::FsError {
+    return try open_beneath(dir, prefix, path, flags: WRITE_CREATE)
+} fs_create
+
+pkg fn fs_read_all(dir: i32, prefix: Str, path: Str, alloc: mem::Alloc) -> mem::Bytes fails sys::fs::FsError {
+    let fd = try open_beneath(dir, prefix, path, flags: READ_ONLY)
+    defer release(fd)
+    var contents = mem::Bytes.empty(alloc)
+    var chunk = Array[u8, 4_096].filled(0)
+    loop {
+        let address = u64.widen(hw::Ptr.of_view_mut(mut chunk.view_mut()).addr())
+        let count = try read_file(fd, address, len: 4_096)
+        if count == 0 {
+            return contents
+        }
+        let Some(filled) = chunk.view().prefix(count) else {
+            return contents
+        }
+        mut contents.append(filled)
+    }
+} fs_read_all
+
+pkg fn fs_write_all(dir: i32, prefix: Str, path: Str, data: Slice[u8]) fails sys::fs::FsError {
+    let fd = try open_beneath(dir, prefix, path, flags: WRITE_CREATE)
+    defer release(fd)
+    var done: usize = 0
+    while done < data.len() {
+        let Some(parts) = data.split_at(done) else {
+            return
+        }
+        let count = try write_file(fd, data: parts.tail)
+        if count == 0 {
+            fail sys::fs::FsError.NoSpace
+        }
+        done += count
+    }
+} fs_write_all
+
+pkg fn fs_remove(dir: i32, prefix: Str, path: Str) fails sys::fs::FsError {
+    var buffer = Array[u8, 4_096].filled(0)
+    if not joined(prefix, path, mut buffer) {
+        fail sys::fs::FsError.InvalidPath
+    }
+    let parent = try open_parent(dir, path: buffer)
+    let Some(parts) = buffer.view().split_at(parent.name) else {
+        close_parent(dir, parent)
+        fail sys::fs::FsError.InvalidPath
+    }
+    let removed = unlinkat(parent.fd, path: hw::Ptr.of_view(parts.tail), flags: 0)
+    let code = last_error()
+    close_parent(dir, parent)
+    if removed != 0 {
+        fail failure(code)
+    }
+} fs_remove
+
+pkg fn file_read(fd: i32, address: u64, len: usize) -> usize fails sys::fs::FsError {
+    return try read_file(fd, address, len)
+} file_read
+
+pkg fn file_write(fd: i32, data: Slice[u8]) -> usize fails sys::fs::FsError {
+    return try write_file(fd, data)
+} file_write
+
+pkg fn file_byte_len(fd: i32) -> u64 fails sys::fs::FsError {
+    let position = lseek(fd, offset: 0, whence: SEEK_CURRENT)
+    if position < 0 {
+        fail failure(last_error())
+    }
+    let end = lseek(fd, offset: 0, whence: SEEK_END)
+    let code = last_error()
+    discard lseek(fd, offset: position, whence: SEEK_START)
+    if end < 0 {
+        fail failure(code)
+    }
+    return u64.fit(end)
+} file_byte_len

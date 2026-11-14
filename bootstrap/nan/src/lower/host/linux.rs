@@ -1,7 +1,6 @@
-//! The Linux targets: everything Linux-specific. The program entry seam `main`, which the C
-//! library's start-up code calls; the executor threads, one per processor of the process's
-//! affinity set, each with its io_uring; termination requests, which a thread of their own reads
-//! from a `signalfd`; the support routines' calls into the system; and linking the image with the
+//! The Linux targets: everything Linux-specific. The executor threads, one per processor of the
+//! process's affinity set, each with its io_uring; termination requests, which a thread of their
+//! own reads from a `signalfd`; the values and layouts of glibc; and linking the image with the
 //! target's linker.
 //!
 //! An operation record is what a completion reaches: the task waiting on it, its result, how far its completion has been delivered, the
@@ -14,27 +13,23 @@ use std::path::Path;
 use std::process::Command;
 
 use cranelift_codegen::ir::{
-    AbiParam, AtomicRmwOp, InstBuilder, MemFlagsData, Signature, TrapCode, Value, condcodes::IntCC,
-    types,
+    AtomicRmwOp, InstBuilder, MemFlagsData, TrapCode, Value, condcodes::IntCC, types,
 };
-use cranelift_module::{Linkage, Module};
 
+use super::super::Lowering;
 use super::super::fx::{Fx, PTR};
 use super::super::machine::Stub;
-use super::super::runtime::system::{self, unavailable_unless};
+use super::super::runtime::system::unavailable_unless;
 use super::super::runtime::tasks::{self, kind, operation, thread};
-use super::super::runtime::{Routine, memory, state};
-use super::super::{CALL_CONV, Lowering, Program, lines};
+use super::super::runtime::{Routine, state};
 use super::Context;
+use super::posix::{self, Posix};
 use crate::workspace::{Arch, Target};
 
+/// The `mmap` protection and flags of an io_uring's queues.
 mod mmap {
     pub const READ_WRITE: i64 = 3;
-    pub const NONE: i64 = 0;
-    pub const PRIVATE_ANONYMOUS: i64 = 0x22;
-    pub const STACK: i64 = 0x2_4022;
     pub const SHARED_POPULATE: i64 = 0x8001;
-    pub const FAILED: i64 = -1;
 }
 
 /// The io_uring system calls, their constants and the opcodes the runtime submits itself.
@@ -64,31 +59,28 @@ mod ring {
     pub const SIZE: u64 = 80;
 }
 
-/// The signal asking a thread to stop the task it runs, the signal of a fault, and that of an
-/// exceeded processor time limit.
-pub const SIGURG: i32 = 23;
-const SIGSEGV: i32 = 11;
-const SIGXCPU: i32 = 24;
+/// The signal of a fault.
+pub const SIGSEGV: i32 = 11;
 
-/// The resource limit of processor time, and the seconds a test run may use.
-const RLIMIT_CPU: i64 = 0;
-const CPU_SECONDS: u64 = 10;
-
-/// The `sigaction` flags of the runtime's handlers: given a `siginfo_t` and a context, run on
-/// the thread's signal stack, and restarting interrupted system calls.
-const SA_SIGINFO: i64 = 4;
-const SA_ONSTACK: i64 = 0x0800_0000;
-const SA_RESTART: i64 = 0x1000_0000;
-
-/// The size of a `struct sigaction` and the offset of its flags.
-const SIGACTION: u64 = 152;
-const SIGACTION_FLAGS: u64 = 136;
-
-/// The offset of the fault address in a `siginfo_t`.
-const FAULT_ADDRESS: u64 = 16;
+/// The values and layouts of glibc.
+pub const POSIX: Posix = Posix {
+    map_anonymous: 0x22,
+    map_stack: 0x2_4022,
+    stop: 23,
+    faults: &[SIGSEGV],
+    cpu_limit: 24,
+    sigaction: 152,
+    sigaction_flags: 136,
+    siginfo: 4,
+    on_stack: 0x0800_0000,
+    restart: 0x1000_0000,
+    stack_size: 16,
+    stack_flags: 8,
+    fault_address: 16,
+};
 
 /// The offsets of the registers a stop or fault handler reads and redirects in a `ucontext_t`.
-fn context(target: Target) -> Context {
+pub fn context(target: Target) -> Context {
     match target.arch().expect("a Linux target's architecture") {
         Arch::Amd64 => Context {
             arg: 40 + 8 * 8,
@@ -107,184 +99,12 @@ fn context(target: Target) -> Context {
     }
 }
 
-/// The size of each thread's signal stack and of its stack for stack overflow reports.
-const SIGNAL_STACK: u64 = 65_536;
-
-/// The termination request signals and the length of a `signalfd_siginfo`.
-const SIGNALS: [i64; 3] = [1, 2, 15];
+/// The length of a `signalfd_siginfo`.
 const SIGINFO: u64 = 128;
-const SIGPIPE: i64 = 13;
 
 /// The `getauxval` type of the hardware capabilities, and their AArch64 bit for `PSTATE.DIT`.
 const AT_HWCAP: u64 = 16;
 const HWCAP_DIT: i64 = 1 << 24;
-
-/// Defines the program entry seam `main` and the glue running the entry function as the first
-/// task.
-pub fn entry_seam(lo: &mut Lowering, program: &Program) {
-    let entry = super::entry_task(lo, program);
-    let mut signature = Signature::new(CALL_CONV);
-    signature.params.push(AbiParam::new(types::I32));
-    signature.params.push(AbiParam::new(PTR));
-    signature.params.push(AbiParam::new(PTR));
-    signature.returns.push(AbiParam::new(types::I32));
-    let id = lo
-        .module
-        .declare_function("main", Linkage::Export, &signature)
-        .expect("the program entry seam");
-    lo.define(id, signature, lines::HIDDEN | lines::CRITICAL, |lo, fx| {
-        let params = fx.entry();
-        lo.check_level(fx);
-        system::start(lo, fx);
-        super::run_entry(lo, fx, program, entry, &params);
-    });
-}
-
-/// Defines the entry seam `main` of a test image, whose arguments after the program's name are
-/// the texts naming its run.
-pub fn test_seam(lo: &mut Lowering, entry: cranelift_module::FuncId) {
-    let mut signature = Signature::new(CALL_CONV);
-    signature.params.push(AbiParam::new(types::I32));
-    signature.params.push(AbiParam::new(PTR));
-    signature.params.push(AbiParam::new(PTR));
-    signature.returns.push(AbiParam::new(types::I32));
-    let id = lo
-        .module
-        .declare_function("main", Linkage::Export, &signature)
-        .expect("the test entry seam");
-    lo.define(id, signature, lines::HIDDEN | lines::CRITICAL, |lo, fx| {
-        let params = fx.entry();
-        system::start(lo, fx);
-        let count = fx.b.ins().uextend(PTR, params[0]);
-        let count = fx.b.ins().iadd_imm_s(count, -1);
-        let texts = fx.b.ins().iadd_imm_s(params[1], 8);
-        super::super::test_image::start_run(lo, fx, entry, count, texts);
-    });
-}
-
-/// Writes a byte range to a descriptor, whole unless the descriptor refuses.
-pub fn write_all(lo: &mut Lowering, fx: &mut Fx, fd: i64, text: Value, len: Value) {
-    let fd = fx.int(types::I32, fd);
-    fx.repeat(&[text, len], |fx, state| {
-        let (at, left) = (state[0], state[1]);
-        let written = lo.call_libc(fx, "write", &[fd, at, left], &[PTR])[0];
-        let progressed = fx.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, written, 0);
-        let next_at = fx.b.ins().iadd(at, written);
-        let next_left = fx.b.ins().isub(left, written);
-        let zero = fx.ptr(0);
-        let next_left = fx.b.ins().select(progressed, next_left, zero);
-        let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, next_left, 0);
-        (more, vec![next_at, next_left])
-    });
-}
-
-pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
-    let params = fx.entry();
-    match routine {
-        Routine::RecordAlloc => {
-            let one = fx.ptr(1);
-            let address = lo.call_libc(fx, "calloc", &[one, params[0]], &[PTR])[0];
-            fx.b.ins().return_(&[address]);
-        }
-        Routine::RecordFree => {
-            lo.call_libc(fx, "free", &[params[0]], &[]);
-            fx.b.ins().return_(&[]);
-        }
-        Routine::RecordResize => {
-            let address = lo.call_libc(fx, "realloc", &[params[0], params[1]], &[PTR])[0];
-            fx.b.ins().return_(&[address]);
-        }
-        Routine::Exit => {
-            let status = fx.b.ins().ireduce(types::I32, params[0]);
-            lo.call_libc(fx, "_exit", &[status], &[]);
-            fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
-        }
-        Routine::Preempt => preempt(lo, fx, params[2]),
-        Routine::Terminations => terminations(lo, fx, params[0]),
-        Routine::Overflow => overflow(lo, fx, params[1], params[2]),
-        Routine::CpuLimit => {
-            let status = fx.int(types::I32, i64::from(super::super::test_image::TIMED_OUT));
-            lo.call_libc(fx, "_exit", &[status], &[]);
-            fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
-        }
-        _ => unreachable!("a host routine"),
-    }
-}
-
-/// Records the running thread in its record and gives it a signal stack and a stack for stack
-/// overflow reports; nonzero when the system refuses one.
-pub fn thread_signals(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
-    let pthread = lo.call_libc(fx, "pthread_self", &[], &[PTR])[0];
-    fx.store(pthread, record, thread::SYSTEM);
-    let size = fx.ptr(SIGNAL_STACK);
-    let signal_stack = map_stack(lo, fx, size, true);
-    let trap_stack = map_stack(lo, fx, size, true);
-    let no_signal = fx.b.ins().icmp_imm_s(IntCC::Equal, signal_stack, 0);
-    let no_trap = fx.b.ins().icmp_imm_s(IntCC::Equal, trap_stack, 0);
-    let refused = fx.b.ins().bor(no_signal, no_trap);
-    fx.choose_in(
-        lo,
-        refused,
-        &[types::I8],
-        |_, fx| vec![fx.int(types::I8, 1)],
-        |lo, fx| {
-            let top = fx.b.ins().iadd_imm_s(trap_stack, SIGNAL_STACK as i64);
-            fx.store(top, record, thread::TRAP_STACK);
-            let stack = fx.slot(24, 8);
-            fx.store(signal_stack, stack, 0);
-            let zero = fx.ptr(0);
-            fx.store(zero, stack, 8);
-            fx.store(size, stack, 16);
-            lo.call_libc(fx, "sigaltstack", &[stack, zero], &[types::I32]);
-            vec![fx.int(types::I8, 0)]
-        },
-    )[0]
-}
-
-/// Installs a routine as the handler of a signal, run on the thread's signal stack.
-fn install_handler(lo: &mut Lowering, fx: &mut Fx, signal: i32, routine: Routine, restart: bool) {
-    let action = fx.slot(SIGACTION, 8);
-    let zero = fx.ptr(0);
-    let size = fx.ptr(SIGACTION);
-    lo.call_routine(fx, Routine::Fill, &[action, zero, size]);
-    let handler = lo.routine(routine);
-    let handler = lo.func_ref(fx, handler);
-    let handler = fx.b.ins().func_addr(PTR, handler);
-    fx.store(handler, action, 0);
-    let restart = if restart { SA_RESTART } else { 0 };
-    let flags = fx.int(types::I32, SA_SIGINFO | SA_ONSTACK | restart);
-    fx.store(flags, action, SIGACTION_FLAGS);
-    let signal = fx.int(types::I32, i64::from(signal));
-    lo.call_libc(fx, "sigaction", &[signal, action, zero], &[types::I32]);
-}
-
-/// `Preempt(signal, info, context)`: the handler of the stop signal, which stops the task the
-/// thread runs when it may stop there.
-fn preempt(lo: &mut Lowering, fx: &mut Fx, context: Value) {
-    let thread = lo.thread(fx);
-    let inside = fx.b.ins().icmp_imm_s(IntCC::NotEqual, thread, 0);
-    fx.when(inside, |fx| {
-        super::stop_interrupted(lo, fx, thread, context, self::context(lo.ck.db.target));
-    });
-    fx.b.ins().return_(&[]);
-}
-
-/// `Overflow(signal, info, context)`: the handler of a fault. A fault in the guard region of
-/// the running task's stack resumes in `OverflowRaise` on the thread's trap stack; any other
-/// fault restores the default action and faults again.
-fn overflow(lo: &mut Lowering, fx: &mut Fx, info: Value, context: Value) {
-    let fault = fx.load(PTR, info, FAULT_ADDRESS);
-    let thread = lo.thread(fx);
-    let ctx = self::context(lo.ck.db.target);
-    let guarded = super::overflow_interrupted(lo, fx, thread, fault, context, ctx);
-    let other = fx.b.ins().bxor_imm_s(guarded, 1);
-    fx.when(other, |fx| {
-        let signal = fx.int(types::I32, i64::from(SIGSEGV));
-        let default = fx.ptr(0);
-        lo.call_libc(fx, "signal", &[signal, default], &[PTR]);
-    });
-    fx.b.ins().return_(&[]);
-}
 
 /// The executor threads of `Init`: one per processor of the affinity set with its ring, the
 /// calling thread being the first, and the reading of termination requests, after the
@@ -294,7 +114,10 @@ pub fn start_threads(lo: &mut Lowering, fx: &mut Fx) {
     constant_time(lo, fx);
     let state_address = lo.state(fx);
     if lo.seeded() {
-        start_seeded(lo, fx);
+        posix::start_seeded(lo, fx, |lo, fx, record| {
+            let slot = lo.thread_slot(fx);
+            fx.store(record, slot, 0);
+        });
         return;
     }
     let count = processors(lo, fx);
@@ -320,16 +143,12 @@ pub fn start_threads(lo: &mut Lowering, fx: &mut Fx) {
     let first = fx.load(PTR, threads, 0);
     let slot = lo.thread_slot(fx);
     fx.store(first, slot, 0);
-    let refused = thread_signals(lo, fx, first);
+    let refused = posix::thread_signals(lo, fx, first);
     fx.when(refused, |fx| {
         let one = fx.ptr(1);
         fx.b.ins().return_(&[one]);
     });
-    install_handler(lo, fx, SIGURG, Routine::Preempt, true);
-    install_handler(lo, fx, SIGSEGV, Routine::Overflow, false);
-    let ignore = fx.ptr(1);
-    let pipe = fx.int(types::I32, SIGPIPE);
-    lo.call_libc(fx, "signal", &[pipe, ignore], &[PTR]);
+    posix::install_handlers(lo, fx);
     read_signals(lo, fx);
     let thread_main = lo.routine(Routine::ThreadMain);
     let thread_main = lo.func_ref(fx, thread_main);
@@ -370,42 +189,6 @@ fn constant_time(lo: &mut Lowering, fx: &mut Fx) {
     });
 }
 
-/// The executor of `Init` for the seeded scheduler: the calling thread is the one executor
-/// thread, without a ring; a fault reports a stack overflow, and the run ends with status `TIMED_OUT` once it has
-/// used 10 seconds of processor time.
-fn start_seeded(lo: &mut Lowering, fx: &mut Fx) {
-    let state_address = lo.state(fx);
-    let one = fx.ptr(1);
-    fx.store(one, state_address, state::THREAD_COUNT);
-    let eight = fx.ptr(8);
-    let threads = lo.call_libc(fx, "calloc", &[one, eight], &[PTR])[0];
-    unavailable_unless(fx, threads);
-    fx.store(threads, state_address, state::THREADS);
-    let size = fx.ptr(thread::SIZE);
-    let record = lo.call_libc(fx, "calloc", &[one, size], &[PTR])[0];
-    unavailable_unless(fx, record);
-    fx.store(record, threads, 0);
-    let slot = lo.thread_slot(fx);
-    fx.store(record, slot, 0);
-    let refused = thread_signals(lo, fx, record);
-    fx.when(refused, |fx| {
-        let one = fx.ptr(1);
-        fx.b.ins().return_(&[one]);
-    });
-    install_handler(lo, fx, SIGSEGV, Routine::Overflow, false);
-    install_handler(lo, fx, SIGXCPU, Routine::CpuLimit, false);
-    let limit = fx.slot(16, 8);
-    let soft = fx.ptr(CPU_SECONDS);
-    let hard = fx.ptr(CPU_SECONDS + 2);
-    fx.store(soft, limit, 0);
-    fx.store(hard, limit, 8);
-    let cpu = fx.int(types::I32, RLIMIT_CPU);
-    lo.call_libc(fx, "setrlimit", &[cpu, limit], &[types::I32]);
-    let ignore = fx.ptr(1);
-    let pipe = fx.int(types::I32, SIGPIPE);
-    lo.call_libc(fx, "signal", &[pipe, ignore], &[PTR]);
-}
-
 /// The number of processors in the process's affinity set, at least 1.
 fn processors(lo: &mut Lowering, fx: &mut Fx) -> Value {
     let mask = fx.slot(128, 8);
@@ -431,7 +214,7 @@ fn read_signals(lo: &mut Lowering, fx: &mut Fx) {
     let zero = fx.ptr(0);
     let size = fx.ptr(128);
     lo.call_routine(fx, Routine::Fill, &[mask, zero, size]);
-    let bits = SIGNALS
+    let bits = posix::SIGNALS
         .iter()
         .fold(0i64, |bits, signal| bits | 1 << (signal - 1));
     let bits = fx.int(PTR, bits);
@@ -474,7 +257,7 @@ fn read_signals(lo: &mut Lowering, fx: &mut Fx) {
 /// `Terminations(op)`: reads each termination request from the `signalfd` of `op`, then
 /// passes the first with `op` to the first executor thread's ring and ends the process at once
 /// at a later one, whatever the executor threads run.
-fn terminations(lo: &mut Lowering, fx: &mut Fx, op: Value) {
+pub fn terminations(lo: &mut Lowering, fx: &mut Fx, op: Value) {
     let record = fx.load(PTR, op, operation::THREAD);
     let slot = lo.thread_slot(fx);
     fx.store(record, slot, 0);
@@ -922,86 +705,6 @@ pub fn wake_idle(lo: &mut Lowering, fx: &mut Fx) {
     });
 }
 
-/// Maps `count` chunks aligned to their size, zero when the system refuses.
-pub fn map_chunks(lo: &mut Lowering, fx: &mut Fx, count: Value) -> Value {
-    let len = fx.b.ins().imul_imm_s(count, memory::CHUNK as i64);
-    let padded = fx.b.ins().iadd_imm_s(len, memory::CHUNK as i64);
-    let zero = fx.ptr(0);
-    let protection = fx.int(types::I32, mmap::READ_WRITE);
-    let flags = fx.int(types::I32, mmap::PRIVATE_ANONYMOUS);
-    let no_fd = fx.int(types::I32, -1);
-    let base = lo.call_libc(
-        fx,
-        "mmap",
-        &[zero, padded, protection, flags, no_fd, zero],
-        &[PTR],
-    )[0];
-    let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, base, mmap::FAILED);
-    fx.choose_in(
-        lo,
-        failed,
-        &[PTR],
-        |_, fx| vec![fx.ptr(0)],
-        |lo, fx| {
-            let bumped = fx.b.ins().iadd_imm_s(base, memory::CHUNK as i64 - 1);
-            let aligned = fx.b.ins().band_imm_s(bumped, !(memory::CHUNK as i64 - 1));
-            let head = fx.b.ins().isub(aligned, base);
-            let has_head = fx.b.ins().icmp_imm_s(IntCC::NotEqual, head, 0);
-            fx.when(has_head, |fx| unmap(lo, fx, base, head));
-            let end = fx.b.ins().iadd(aligned, len);
-            let mapped_end = fx.b.ins().iadd(base, padded);
-            let tail = fx.b.ins().isub(mapped_end, end);
-            let has_tail = fx.b.ins().icmp_imm_s(IntCC::NotEqual, tail, 0);
-            fx.when(has_tail, |fx| unmap(lo, fx, end, tail));
-            vec![aligned]
-        },
-    )[0]
-}
-
-/// Unmaps memory.
-pub fn unmap(lo: &mut Lowering, fx: &mut Fx, address: Value, len: Value) {
-    lo.call_libc(fx, "munmap", &[address, len], &[types::I32]);
-}
-
-/// Maps a stack of `len` bytes, its lowest page an inaccessible guard when `guarded`, zero when
-/// the system refuses.
-pub fn map_stack(lo: &mut Lowering, fx: &mut Fx, len: Value, guarded: bool) -> Value {
-    let zero = fx.ptr(0);
-    let protection = fx.int(types::I32, mmap::READ_WRITE);
-    let flags = fx.int(types::I32, mmap::STACK);
-    let no_fd = fx.int(types::I32, -1);
-    let base = lo.call_libc(
-        fx,
-        "mmap",
-        &[zero, len, protection, flags, no_fd, zero],
-        &[PTR],
-    )[0];
-    let failed = fx.b.ins().icmp_imm_s(IntCC::Equal, base, mmap::FAILED);
-    fx.choose_in(
-        lo,
-        failed,
-        &[PTR],
-        |_, fx| vec![fx.ptr(0)],
-        |lo, fx| {
-            if guarded {
-                protect_guard(lo, fx, base, false);
-            }
-            vec![base]
-        },
-    )[0]
-}
-
-/// Makes the guard region at the base of a stack inaccessible, or accessible again.
-pub fn protect_guard(lo: &mut Lowering, fx: &mut Fx, base: Value, accessible: bool) {
-    let guard = fx.ptr(tasks::GUARD);
-    let protection = match accessible {
-        true => mmap::READ_WRITE,
-        false => mmap::NONE,
-    };
-    let protection = fx.int(types::I32, protection);
-    lo.call_libc(fx, "mprotect", &[base, guard, protection], &[types::I32]);
-}
-
 /// A system call through the C library's `syscall`, its arguments padded to six words.
 fn syscall(lo: &mut Lowering, fx: &mut Fx, number: Value, args: &[Value]) -> Value {
     let mut words = vec![number];
@@ -1043,6 +746,3 @@ pub fn link(target: Target, object: &Path, image: &Path) -> Result<(), String> {
         Err(error) => Err(error.to_string()),
     }
 }
-
-#[cfg(test)]
-mod tests;

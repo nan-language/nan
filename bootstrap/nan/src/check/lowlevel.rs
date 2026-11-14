@@ -312,6 +312,7 @@ impl Checker<'_> {
             };
             if span.1 >= units {
                 self.report(item, field.name.token, Code::LayoutOutOfRange);
+                rejected = true;
                 continue;
             }
             for unit in span.0..=span.1 {

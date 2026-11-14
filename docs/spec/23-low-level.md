@@ -1502,7 +1502,7 @@ convention_clause = 'convention' TEXT ;
 | `"aapcs64"` | the Procedure Call Standard for the Arm 64-bit Architecture, with `x18` reserved for the platform | `aarch64-uefi` |
 
 - Any other convention text is an error (`trusted.convention-unknown`).
-- A convention clause, on a foreign fn or a [function type](10-effects-digests.md#function-types), in a package declaring a target that the convention's row does not list, `any` included, is an error (`trusted.convention-target`).
+- A convention clause, on a foreign fn or a [function type](10-effects-digests.md#function-types), checked under a target that the convention's row does not list, `any` included, is an error (`trusted.convention-target`). A clause in a [target variant](03-packages-modules.md#target-variants) is checked only under the targets the variant matches, so each variant of a module may call its system under that system's convention.
 
 ```nan
 // file: procinfo/package.nan
@@ -1627,6 +1627,42 @@ foreign fn getpid() -> i32 limits notrap, terminates, noalloc convention "aapcs6
 
 pub fn process_id() -> i32 {
     return getpid()
+} process_id
+```
+
+```nan
+// file: procinfo/package.nan
+//! Process facts on Linux and Windows.
+
+package procinfo {
+    language 1
+    targets x86_64-linux, x86_64-windows
+    allow trusted in system
+} procinfo
+
+// file: procinfo/procinfo.nan
+//! Gives the process id on each system.
+
+pub fn process_id() -> u32 {
+    return system::process_id()
+} process_id
+
+// file: procinfo/system@linux/system.nan
+//! Reads the process id from the system.
+
+foreign fn getpid() -> i32 limits notrap, terminates, noalloc convention "sysv"
+
+pkg fn process_id() -> u32 {
+    return getpid().to_bits()
+} process_id
+
+// file: procinfo/system@windows/system.nan
+//! Reads the process id from the system.
+
+foreign fn GetCurrentProcessId() -> u32 limits notrap, terminates, noalloc convention "win64"
+
+pkg fn process_id() -> u32 {
+    return GetCurrentProcessId()
 } process_id
 ```
 

@@ -639,22 +639,13 @@ impl Checker<'_> {
         }
     }
 
-    /// A convention clause: a known convention serving every target its package declares.
+    /// A convention clause: a known convention serving the target its item is checked under.
     pub fn check_convention(&self, item: ItemId, token: Tok, convention: &str) {
         let Some((_, targets)) = CONVENTIONS.iter().find(|(name, _)| *name == convention) else {
             self.report(item, token, Code::TrustedConventionUnknown);
             return;
         };
-        let package = self.db.package(self.db.package_of(item));
-        let declared = package
-            .source
-            .manifest
-            .iter()
-            .flat_map(|manifest| &manifest.targets);
-        if declared
-            .into_iter()
-            .any(|declared| !targets.contains(declared))
-        {
+        if !targets.contains(&self.db.target) {
             self.report(item, token, Code::TrustedConventionTarget);
         }
     }

@@ -27,12 +27,10 @@ The **NaN front end** is the part of the NaN toolchain that implements `nan chec
 
 ### Self-hosting
 
-For each Linux target, the NaN toolchain the bootstrap built for that target builds the NaN toolchain for it: the image it writes is the target's **first self-built toolchain**. Each first self-built toolchain is checked against the bootstrap by two checks:
+For each host target, the NaN toolchain the bootstrap built for that target builds the NaN toolchain for it: the image it writes is the target's **first self-built toolchain**. Each first self-built toolchain is checked against the bootstrap by two checks:
 
 - **Diverse double-compiling:** the first self-built toolchain builds the NaN toolchain into an image equal, byte for byte, to itself.
 - **Stage comparison:** the bootstrap's `nan build --compare-with` against the first self-built toolchain reports no error ([stage comparison](36-builds.md#stage-comparison)).
-
-For `x86_64-windows`, the first self-built toolchain of `x86_64-linux` builds the NaN toolchain, and the image it writes builds the NaN toolchain again: that image is the target's first self-built toolchain, checked by both checks. The first self-built toolchain of `x86_64-windows` builds the NaN toolchain for `aarch64-windows`, and the bootstrap's stage comparison against that image reports no error.
 
 Each later NaN toolchain is built by its checked predecessor.
 

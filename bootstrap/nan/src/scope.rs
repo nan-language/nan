@@ -46,11 +46,7 @@ impl Scope {
             Some(Scope::Workspace)
         } else if text.ends_with(".nan") {
             workspace.file(text).map(|_| Scope::File(text.to_owned()))
-        } else if let Some((path, line)) = text
-            .rsplit_once(':')
-            .filter(|(path, _)| path.ends_with(".nan"))
-            .and_then(|(path, line)| Some((path, line.parse::<u32>().ok()?)))
-        {
+        } else if let Some((path, line)) = location(text) {
             let (_, file) = workspace.file(path)?;
             let item = file.syntax.item_at(line)?;
             Some(Scope::Lines(path.to_owned(), file.syntax.item_lines(item)))
@@ -142,6 +138,12 @@ fn named(workspace: &Workspace, text: &str, relative: Option<usize>) -> Option<S
         }
         _ => None,
     }
+}
+
+/// The file and line a location argument, `<path>:<line>`, names.
+pub fn location(text: &str) -> Option<(&str, u32)> {
+    let (path, line) = text.rsplit_once(':')?;
+    Some((path, line.parse().ok()?)).filter(|_| path.ends_with(".nan"))
 }
 
 /// The lines of the item of `module` named `name`, or of the member `Type.member` it names.

@@ -13,7 +13,7 @@ use crate::fix;
 use crate::hash;
 use crate::journal;
 use crate::output::{self, Output, Record, Verdict};
-use crate::scope::Scope;
+use crate::scope::{self, Scope};
 use crate::syntax::file::{SourceFile, parse};
 use crate::syntax::token::TokenKind;
 use crate::workspace::Workspace;
@@ -187,7 +187,8 @@ pub fn rename(
         return Ok(invocation.tool_error(Code::ToolUsage, &written));
     };
     trace.scope = Some(written.clone());
-    let Some(fix) = check::renamed(workspace, path, lines, name) else {
+    let located = scope::location(operand).map(|(_, line)| line);
+    let Some(fix) = check::renamed(workspace, path, lines, located, name) else {
         return Ok(invocation.tool_error(Code::ToolUnknownScope, &written));
     };
     write_checked(
@@ -221,7 +222,8 @@ pub fn move_item(
         return Ok(invocation.tool_error(Code::ToolUsage, &written));
     };
     trace.scope = Some(written.clone());
-    match check::moved(workspace, path, lines, module) {
+    let located = scope::location(operand).map(|(_, line)| line);
+    match check::moved(workspace, path, lines, located, module) {
         None => Ok(invocation.tool_error(Code::ToolUnknownScope, &written)),
         Some(Err(())) => {
             let diagnostic = Diagnostic::at(Code::EditMoveInvalid, path, *lines.start());

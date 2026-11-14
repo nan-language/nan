@@ -53,8 +53,15 @@ pub struct Span {
 
 impl Checker<'_> {
     /// What lines of a workspace file declare: the item whose head they hold, or the field,
-    /// variant or interface method they hold the name of.
-    pub fn target_at(&self, path: &str, lines: &RangeInclusive<u32>) -> Option<Target> {
+    /// variant or interface method they hold the name of. A location's line names the member
+    /// whose name it holds, or else the item holding it.
+    pub fn target_at(
+        &self,
+        path: &str,
+        lines: &RangeInclusive<u32>,
+        located: Option<u32>,
+    ) -> Option<Target> {
+        let lines = &located.map_or_else(|| lines.clone(), |line| line..=line);
         let db = &self.db;
         let item = (0..db.items.len())
             .map(|index| ItemId(index as u32))
@@ -72,7 +79,7 @@ impl Checker<'_> {
             return Some(Target::Item(item));
         }
         let on = |name: &ast::Name| lines.contains(&data.line(name.token));
-        match &data.ast.kind {
+        let member = match &data.ast.kind {
             ItemKind::Struct(structure) => structure
                 .fields()
                 .find(|field| on(&field.name))
@@ -88,7 +95,8 @@ impl Checker<'_> {
                 .find(|method| on(&method.name))
                 .map(|method| Target::Method(item, method.name.text.clone())),
             _ => None,
-        }
+        };
+        member.or(located.map(|_| Target::Item(item)))
     }
 
     /// The spans writing a target's name: its declaration, the labels naming it, and each path,

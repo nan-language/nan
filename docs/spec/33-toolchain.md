@@ -357,6 +357,8 @@ failed edit replace meter::mean --expect afl2l7z66yterlysb2 --from narrow.txt: f
 
 Moving a member, a function named after a type without that type, or an item into a missing module or another package, is an error (`edit.move-invalid`).
 
+The `<item>` of either may be a location: on the line of a field, variant or interface method's name it names that member, and on any other line the item holding that line.
+
 ```nan
 // file: meter/package.nan
 //! Running totals.
@@ -526,6 +528,56 @@ item dial dial/package.nan:3 aewxtbsozrifcaapvs ae3zxgwyu4zkem6q5j
 item parts::STEPS dial/parts/parts.nan:3 agn47kacyncbltxtj3 aflyfqif2whiiohao7
     pub const STEPS: u64 = 10
 ok show dial: records 7
+```
+
+```nan
+// file: tally/package.nan
+//! Running tallies.
+
+package tally {
+    language 1
+    targets any
+} tally
+
+// file: tally/tally.nan
+//! Tallies of samples.
+
+/// A running tally.
+pub closed struct Counter {
+    pub total: u64
+} Counter
+
+pub fn reset() -> Counter = Counter(total: 0)
+```
+
+The location of the field's line names the field, and that of the function's line the function:
+
+```text
+$ nan edit rename tally/tally.nan:5 sum
+ok edit rename tally/tally.nan:5 sum: files 1, errors 0, incomplete 0
+wrote tally/tally.nan
+ok edit rename tally/tally.nan:5 sum: files 1, errors 0, incomplete 0
+$ nan edit rename tally/tally.nan:8 cleared
+ok edit rename tally/tally.nan:8 cleared: files 1, errors 0, incomplete 0
+wrote tally/tally.nan
+ok edit rename tally/tally.nan:8 cleared: files 1, errors 0, incomplete 0
+$ nan show tally
+ok show tally: records 4
+module tally
+    Tallies of samples.
+item tally tally/package.nan:3 af6z5rwfl442ktqxbx aekd7s4rorsge6scd4
+    package tally {
+        language 1
+        targets any
+    } tally
+item tally::Counter tally/tally.nan:4 agi6myv5jrs5rhpvxl ahqcopzt4m4q6wyqhj
+    /// A running tally.
+    pub closed struct Counter {
+        pub sum: u64
+    } Counter
+item tally::cleared tally/tally.nan:8 afvlf7kjn3lck5pz5f ah5areav2g3usq5knx
+    pub fn cleared() -> Counter = Counter(sum: 0)
+ok show tally: records 4
 ```
 
 ## Merge driver

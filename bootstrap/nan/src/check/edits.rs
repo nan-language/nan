@@ -37,7 +37,8 @@ pub fn identity(workspace: &Workspace, path: &str, line: u32) -> Option<String> 
     }
 }
 
-/// The edit renaming the item or member declared on lines of a workspace file to `name`: each
+/// The edit renaming the item or member declared on lines of a workspace file, or named by a
+/// location's line, to `name`: each
 /// span writing its name rewritten, the rename tombstone it needs, or without one the old paths
 /// of the tombstones retiring members of a type it renames, and each rename tombstone it then
 /// takes removed.
@@ -45,6 +46,7 @@ pub fn renamed(
     workspace: &Workspace,
     path: &str,
     lines: &RangeInclusive<u32>,
+    located: Option<u32>,
     name: &str,
 ) -> Option<Fix> {
     let std = crate::stdlib::packages();
@@ -53,7 +55,7 @@ pub fn renamed(
     let mut retaken = Vec::new();
     let mut found = false;
     for (_, checker) in checked_closures(workspace, std) {
-        let Some(target) = checker.target_at(path, lines) else {
+        let Some(target) = checker.target_at(path, lines, located) else {
             continue;
         };
         found = true;
@@ -172,18 +174,20 @@ impl Checker<'_> {
     }
 }
 
-/// The edit moving the item declared on lines of a workspace file into the module of its package
-/// named `module`: none when the lines declare nothing, an error when the move is invalid.
+/// The edit moving the item declared on lines of a workspace file, or named by a location's line,
+/// into the module of its package named `module`: none when the lines declare nothing, an error
+/// when the move is invalid.
 pub fn moved(
     workspace: &Workspace,
     path: &str,
     lines: &RangeInclusive<u32>,
+    located: Option<u32>,
     module: &str,
 ) -> Option<Result<Move, ()>> {
     let std = crate::stdlib::packages();
     let (source, _) = workspace.file(path)?;
     let closure = workspace.closure_of(source)?;
     let checker = checked(workspace, closure, std, *check_targets(source).first()?);
-    let target = checker.target_at(path, lines)?;
+    let target = checker.target_at(path, lines, located)?;
     Some(checker.moving(&target, module).ok_or(()))
 }

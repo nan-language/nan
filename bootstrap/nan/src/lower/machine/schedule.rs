@@ -17,7 +17,7 @@ use super::super::call::Invoked;
 use super::super::fx::{Fx, PTR};
 use super::super::layout::Shape;
 use super::super::runtime::tasks::{self, task, thread};
-use super::super::runtime::{Routine, fetch_add, report, state, timers};
+use super::super::runtime::{Routine, fetch_add, report, state, tables, timers};
 use super::super::stack::{Family, Kind};
 use super::super::supplied::Supply;
 use super::super::supplied::tasks::accounts;
@@ -245,7 +245,7 @@ impl Lowering<'_, '_> {
     }
 
     /// An `hw::TaskView` of a task in a slot: its record's address, its executor's handle and
-    /// share, the CPU it last ran on, the nanoseconds it ran and the earliest of its deadlines.
+    /// share, read from the executor while it is live, the CPU it last ran on, the nanoseconds it ran and the earliest of its deadlines.
     fn task_view(&mut self, fx: &mut Fx, view_ty: &Ty, record: Value) -> Held {
         let layout = self.layout(view_ty);
         let slot = fx.slot(layout.size, layout.align);
@@ -256,7 +256,8 @@ impl Lowering<'_, '_> {
         let at = field(self, "executor").offset;
         fx.store(executor, slot, at);
         let share = field(self, "share");
-        let packed = fx.load(PTR, record, task::SHARE);
+        let started = fx.load(PTR, record, task::SHARE);
+        let packed = tables::executor_share(self, fx, executor, started);
         let share_at = fx.offset(slot, share.offset);
         accounts::unpack_share(self, fx, &share.ty, packed, share_at);
         let last = field(self, "last_cpu");

@@ -742,9 +742,33 @@ fn read_live(
 /// The share and the serial executor's handle of the executor's entry a handle names, read
 /// without the lock; a root grant's share and none for a stale handle.
 pub fn executor_terms(lo: &mut Lowering, fx: &mut Fx, handle: Value) -> (Value, Value) {
+    let (live, [share, serial]) = executor_words(lo, fx, handle, [EXECUTOR_SHARE, entry::SERIAL]);
+    let root = fx.ptr(ROOT_SHARE);
+    let none = fx.ptr(0);
+    (
+        fx.b.ins().select(live, share, root),
+        fx.b.ins().select(live, serial, none),
+    )
+}
+
+/// The share of the executor's entry a handle names, read without the lock, or `stale` for a
+/// stale handle.
+pub fn executor_share(lo: &mut Lowering, fx: &mut Fx, handle: Value, stale: Value) -> Value {
+    let (live, [share]) = executor_words(lo, fx, handle, [EXECUTOR_SHARE]);
+    fx.b.ins().select(live, share, stale)
+}
+
+/// Whether the executor's entry a handle names is live, and the words of that entry at `words`,
+/// read without the lock.
+fn executor_words<const N: usize>(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    handle: Value,
+    words: [u64; N],
+) -> (Value, [Value; N]) {
     let record = entry_at(lo, fx, handle);
     let flags = MemFlagsData::trusted();
-    let [share, serial] = [EXECUTOR_SHARE, entry::SERIAL].map(|word| {
+    let read = words.map(|word| {
         let at = fx.offset(record, word);
         fx.b.ins().atomic_load(PTR, flags, at)
     });
@@ -755,13 +779,7 @@ pub fn executor_terms(lo: &mut Lowering, fx: &mut Fx, handle: Value) -> (Value, 
     let wanted = fx.b.ins().ireduce(types::I32, wanted);
     let same = fx.b.ins().icmp(IntCC::Equal, generation, wanted);
     let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, live, 0);
-    let live = fx.b.ins().band(same, live);
-    let root = fx.ptr(ROOT_SHARE);
-    let none = fx.ptr(0);
-    (
-        fx.b.ins().select(live, share, root),
-        fx.b.ins().select(live, serial, none),
-    )
+    (fx.b.ins().band(same, live), read)
 }
 
 /// A copy in runtime memory of the text of the live entry a handle names, taken under the lock,

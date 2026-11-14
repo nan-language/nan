@@ -1,6 +1,6 @@
 //! Executors and their accounts: `task::Executor.coarse`, `split`, `split_on` and `serial`, which
 //! derive an entry from an executor's, and the members of `task::Account`, which owns the entry
-//! `split`, `split_on` or `serial` derived. An executor's share is one word: its weight in the low 32 bits, its class in
+//! `split`, `split_on` or `serial` derived and changes its share through `reshare`. An executor's share is one word: its weight in the low 32 bits, its class in
 //! the next 8 and its reservation in parts per million above them.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
@@ -23,18 +23,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         "task::Executor.coarse" => sys::coarse(lo, fx, supply, tables::EXECUTOR_RESOLUTION),
         "task::Executor.split" | "task::Executor.split_on" => {
             derive(lo, fx, supply, |lo, fx, record| {
-                let share_ty = supply.abi.params[1].0.ty().clone();
-                let share = supply.param(1);
-                let address = match share {
-                    Held::Address(address) => address,
-                    other => {
-                        let layout = lo.layout(&share_ty);
-                        let slot = fx.slot(layout.size, layout.align);
-                        lo.store_held(fx, slot, other, &share_ty);
-                        slot
-                    }
-                };
-                let packed = pack_share(lo, fx, &share_ty, address);
+                let packed = share_word(lo, fx, supply);
                 fx.store(packed, record, tables::EXECUTOR_SHARE);
                 if supply.member() == "split_on" {
                     let cell = fx.load(PTR, supply.param(2).address(), 0);
@@ -71,6 +60,21 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             )[0];
             lo.call_routine(fx, Routine::Unlock, &[lock]);
             supply.ret(lo, fx, Held::Scalar(used));
+        }
+        "task::Account.reshare" => {
+            let handle = fx.load(PTR, supply.param(0).address(), 0);
+            let packed = share_word(lo, fx, supply);
+            let state_address = lo.state(fx);
+            let lock = fx.offset(state_address, state::LOCK);
+            lo.call_routine(fx, Routine::Lock, &[lock]);
+            let record = tables::live_entry(lo, fx, handle);
+            let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record, 0);
+            fx.when(live, |fx| {
+                let at = fx.offset(record, tables::EXECUTOR_SHARE);
+                fx.atomic_store(packed, at);
+            });
+            lo.call_routine(fx, Routine::Unlock, &[lock]);
+            supply.done(lo, fx);
         }
         "task::Account.close" => {
             let handle = fx.load(PTR, supply.param(0).address(), 0);
@@ -111,6 +115,21 @@ fn derive(
     let sret = supply.sret.expect("an account's address");
     fx.store(owned, sret, 0);
     supply.done(lo, fx);
+}
+
+/// The word of the `task::Share` an operation takes as its second parameter.
+fn share_word(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> Value {
+    let share_ty = supply.abi.params[1].0.ty().clone();
+    let address = match supply.param(1) {
+        Held::Address(address) => address,
+        other => {
+            let layout = lo.layout(&share_ty);
+            let slot = fx.slot(layout.size, layout.align);
+            lo.store_held(fx, slot, other, &share_ty);
+            slot
+        }
+    };
+    pack_share(lo, fx, &share_ty, address)
 }
 
 /// The word of a `task::Share` at an address.

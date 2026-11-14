@@ -118,6 +118,7 @@ pub fn member(
             Val::Int(i128::from(place(&exec.fields()[ENTRY]).extent))
         }
         ("task::Account", "used_ns") => Val::Int(0),
+        ("task::Account", "reshare") => Val::Unit,
         ("task::Account", "close") => {
             let exec = interp.deref(&args[0]).fields()[0].clone();
             let entry = place(&exec.fields()[ENTRY]);

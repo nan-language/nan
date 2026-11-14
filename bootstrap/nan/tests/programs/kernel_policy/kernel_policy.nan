@@ -1,4 +1,4 @@
-//! Runs every task bound to CPU 0 in 1 ms slices keyed by deadline or weighted time but those of class 3, which CPU 0 steals from CPU 1 by halves while CPU 1 steals from CPU 0 before, idling in `mwait`, waking from a sleep, ordering tasks by deadline, sharing the CPU by weight, passing a serial executor's turn by seed, running tasks of class 1, seen under their account's id, in slices of 1 ns, which end before they run, and giving the sleeps of class 2 a slack.
+//! Runs every task bound to CPU 0 in 1 ms slices keyed by deadline or weighted time but those of class 3, which CPU 0 steals from CPU 1 by halves while CPU 1 steals from CPU 0 before, idling in `mwait`, waking from a sleep, ordering tasks by deadline, sharing the CPU by weight, passing a serial executor's turn by seed, running tasks of class 1, seen under their account's id, in slices of 1 ns, which end before they run, placing a running task under the class its account's share takes as it runs, and giving the sleeps of class 2 a slack.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -239,6 +239,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
         if probe.contents().brief.load() == brief.id() {
             say(text: "brief account\n")
         }
+        try await reshare_run(exec, clock, probe: probe.contents())
         try await steal_run(exec, clock, probe: probe.contents())
         try await slack_run(exec, clock, probe: probe.contents())
     })
@@ -271,6 +272,48 @@ fn spin_for(clock: sys::Clock, ns: u64) {
         }
     }
 } spin_for
+
+/// The nanoseconds a task waits for the policy to place it under the class its account's share
+/// takes as it runs.
+const PLACEMENT_NS: u64 = 1_000_000_000
+
+/// Runs a task on an account of class 0 that gives its account class 1 once the task runs, then
+/// writes whether the policy placed the task under class 1.
+fn reshare_run(exec: task::Executor, clock: sys::Clock, probe: Probe) fails task::Cancelled uses wait {
+    let moved = exec.split(task::Share(weight: 1, class: 0, reserve_ppm: 0))
+    defer take moved.close()
+    discard probe.brief.swap(0)
+    let placed = moved.id()
+    let started = core::atomic::AtomicBool.of(false)
+    try await task::scope(moved.executor(), body: fn(s: task::Scope) {
+        discard s.spawn(fn() limits stack 4_096 {
+            discard started.swap(true)
+            spin_until_placed(clock, probe, placed)
+        })
+        while not started.load() {
+        }
+        moved.reshare(task::Share(weight: 1, class: 1, reserve_ppm: 0))
+    })
+    if probe.brief.load() == placed {
+        say(text: "reshared account\n")
+    }
+} reshare_run
+
+/// Spins until the policy places a task of class 1 on the executor `placed`, for at most
+/// `PLACEMENT_NS` of the clock.
+fn spin_until_placed(clock: sys::Clock, probe: Probe, placed: u64) {
+    let Ok(start) = attempt clock.elapsed_ns() else {
+        return
+    }
+    while probe.brief.load() != placed {
+        let Ok(now) = attempt clock.elapsed_ns() else {
+            return
+        }
+        if now - start >= PLACEMENT_NS {
+            return
+        }
+    }
+} spin_until_placed
 
 /// Runs four tasks of class 3 spinning on CPU 1, from which CPU 0 steals once, then writes how
 /// many of them ran on CPU 0 and whether every other task stayed bound to it.

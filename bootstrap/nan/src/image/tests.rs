@@ -336,3 +336,76 @@ fn a_console_program_imports_each_function_from_its_library_through_its_table() 
         "the terminating entry"
     );
 }
+
+#[test]
+fn a_console_program_holds_the_objects_unallocated_sections_after_its_relocations() {
+    let mut module = module("x86_64-unknown-none-elf");
+    let signature = module.make_signature();
+    let entry = module
+        .declare_function("entry", Linkage::Local, &signature)
+        .expect("a function");
+    let slot = module
+        .declare_data(
+            &format!("{IMPORT_PREFIX}ExitProcess"),
+            Linkage::Import,
+            false,
+            false,
+        )
+        .expect("an import");
+    let relocation = ModuleReloc {
+        offset: 2,
+        kind: Reloc::Abs8,
+        name: slot.into(),
+        addend: 0,
+    };
+    let code = [0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc3];
+    module
+        .define_function_bytes(entry, 16, &code, &[relocation])
+        .expect("the entry");
+    let mut product = module.finish();
+    for (name, bytes) in [(".nan", &b"artefacts"[..]), (".nan.tree", &b"tree"[..])] {
+        let id = product.object.add_section(
+            Vec::new(),
+            name.as_bytes().to_vec(),
+            cranelift_object::object::SectionKind::Other,
+        );
+        product.object.append_section_data(id, bytes, 1);
+    }
+    let object = product.emit().expect("an object");
+    let base = pe::base(pe::Program::Console);
+    let linked = link(&object, base, Imports::Table);
+    let image = pe::write(&linked, base, workspace::Arch::Amd64, pe::Program::Console);
+    let u32_at = |at: usize| u32::from_le_bytes(image[at..at + 4].try_into().expect("four bytes"));
+    let count = u16::from_le_bytes([image[0x46], image[0x47]]) as usize;
+    let optional = 0x40 + 4 + 20;
+    let headers: Vec<(&[u8], u32, u32, u32, u32)> = (0..count)
+        .map(|index| {
+            let at = optional + 240 + 40 * index;
+            let name = image[at..at + 8]
+                .split(|byte| *byte == 0)
+                .next()
+                .expect("a name");
+            (
+                name,
+                u32_at(at + 8),
+                u32_at(at + 12),
+                u32_at(at + 20),
+                u32_at(at + 36),
+            )
+        })
+        .collect();
+    let [.., relocations, artefacts, tree] = &headers[..] else {
+        panic!("{count} sections");
+    };
+    assert_eq!(relocations.0, b".reloc");
+    let expected: [(&[u8], &[u8]); 2] = [(b".nan", b"artefacts"), (b".nantree", b"tree")];
+    for (&(name, size, rva, offset, flags), (wanted, bytes)) in
+        [artefacts, tree].into_iter().zip(expected)
+    {
+        assert_eq!(name, wanted);
+        assert_eq!(&image[offset as usize..(offset + size) as usize], bytes);
+        assert_eq!((rva % 0x1000, flags), (0, 0x4200_0040));
+    }
+    assert!(artefacts.2 > relocations.2 && tree.2 > artefacts.2);
+    assert_eq!(u32_at(optional + 56), (tree.2 + 4).next_multiple_of(0x1000));
+}

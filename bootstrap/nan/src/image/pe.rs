@@ -1,7 +1,7 @@
 //! Writes PE32+ images: the console programs of the Windows targets, which import functions of
 //! the system's libraries, and the EFI applications of the UEFI targets, each with one section per segment
 //! and the base relocations of every 64-bit absolute address, so the system or the firmware may
-//! load it anywhere.
+//! load it anywhere, then the object's unallocated sections.
 
 use super::{Access, Linked, PAGE};
 use crate::workspace::Arch;
@@ -69,9 +69,21 @@ const EXECUTE: u32 = 0x2000_0000;
 const READ: u32 = 0x4000_0000;
 const WRITE: u32 = 0x8000_0000;
 
+/// The name of the image section holding an unallocated section of the object: its name without
+/// the dots after its first character, which fits the 8 bytes of a section name.
+fn section_name(name: &str) -> Vec<u8> {
+    let spelt: String = name
+        .char_indices()
+        .filter(|(at, c)| *at == 0 || *c != '.')
+        .map(|(_, c)| c)
+        .collect();
+    assert!(spelt.len() <= 8, "a section name of at most 8 bytes");
+    spelt.into_bytes()
+}
+
 /// A section of the image: its name, its RVA, its bytes, its size in memory and its flags.
 struct Section {
-    name: &'static [u8],
+    name: Vec<u8>,
     rva: u64,
     bytes: Vec<u8>,
     size: u64,
@@ -174,7 +186,7 @@ pub fn write(linked: &Linked, entry: u64, arch: Arch, program: Program) -> Vec<u
                 Access::Write => (b".data", INITIALIZED | READ | WRITE),
             };
             Section {
-                name,
+                name: name.to_vec(),
                 rva: segment.address - image_base,
                 bytes: segment.bytes.clone(),
                 size: segment.size,
@@ -195,7 +207,7 @@ pub fn write(linked: &Linked, entry: u64, arch: Arch, program: Program) -> Vec<u
         let section = sections
             .last_mut()
             .expect("a console program's import table");
-        section.name = b".idata";
+        section.name = b".idata".to_vec();
         imports = Some(import_directory(section, &functions));
     }
     let relocations: Vec<u64> = linked
@@ -212,13 +224,24 @@ pub fn write(linked: &Linked, entry: u64, arch: Arch, program: Program) -> Vec<u
     let relocation_bytes = base_relocations(&relocations);
     let relocation_size = relocation_bytes.len() as u64;
     sections.push(Section {
-        name: b".reloc",
+        name: b".reloc".to_vec(),
         rva: relocation_rva,
         size: relocation_size.max(1),
         bytes: relocation_bytes,
         flags: INITIALIZED | DISCARDABLE | READ,
     });
-    let image_size = (relocation_rva + relocation_size.max(1)).next_multiple_of(PAGE);
+    for (name, bytes) in &linked.unallocated {
+        let previous = sections.last().expect("the relocation section");
+        sections.push(Section {
+            name: section_name(name),
+            rva: (previous.rva + previous.size).next_multiple_of(PAGE),
+            size: bytes.len() as u64,
+            bytes: bytes.clone(),
+            flags: INITIALIZED | DISCARDABLE | READ,
+        });
+    }
+    let last = sections.last().expect("the relocation section");
+    let image_size = (last.rva + last.size).next_multiple_of(PAGE);
     let headers_size =
         (HEADERS + SECTION_HEADER * sections.len() as u64).next_multiple_of(FILE_ALIGNMENT);
     let sum = |flag: u32| -> u32 {
@@ -290,7 +313,7 @@ pub fn write(linked: &Linked, entry: u64, arch: Arch, program: Program) -> Vec<u
     let mut placed = Vec::new();
     for section in &sections {
         let mut name = [0u8; 8];
-        name[..section.name.len()].copy_from_slice(section.name);
+        name[..section.name.len()].copy_from_slice(&section.name);
         let length = (section.bytes.len() as u64).next_multiple_of(FILE_ALIGNMENT);
         out.extend_from_slice(&name);
         out.extend_from_slice(&(section.size as u32).to_le_bytes());

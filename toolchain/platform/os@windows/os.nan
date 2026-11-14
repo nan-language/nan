@@ -1,0 +1,224 @@
+//! What the system running the toolchain does: files, directories, locks, processes and the machine's facts, through glibc on Linux and kernel32 on Windows.
+
+const ERROR_FILE_NOT_FOUND: u32 = 2
+
+const ERROR_PATH_NOT_FOUND: u32 = 3
+
+const ERROR_ACCESS_DENIED: u32 = 5
+
+const ERROR_NO_MORE_FILES: u32 = 18
+
+const ERROR_FILE_EXISTS: u32 = 80
+
+const ERROR_BROKEN_PIPE: u32 = 109
+
+const ERROR_INVALID_NAME: u32 = 123
+
+const ERROR_ALREADY_EXISTS: u32 = 183
+
+const ERROR_FILENAME_EXCED_RANGE: u32 = 206
+
+const ERROR_NO_DATA: u32 = 232
+
+/// The UTF-16 code units a path or name buffer holds, its NUL included.
+const WIDE_UNITS: usize = 2_048
+
+/// `GetNativeSystemInfo`'s architecture of an AArch64 machine.
+const ARM64: u16 = 12
+
+foreign fn GetLastError() -> u32 convention "win64"
+
+foreign fn GetCurrentProcessId() -> u32 convention "win64"
+
+foreign fn GetNativeSystemInfo(info: hw::Ptr[SystemInfo]) convention "win64"
+
+foreign fn GetModuleFileNameW(module: u64, name: hw::Ptr[u16], size: u32) -> u32 convention "win64"
+
+foreign fn GetEnvironmentVariableW(name: hw::Ptr[u16], value: hw::Ptr[u16], size: u32) -> u32 convention "win64"
+
+foreign fn CloseHandle(handle: u64) -> i32 convention "win64"
+
+/// Windows' `SYSTEM_INFO` on 64-bit Windows.
+layout SystemInfo: bytes 48 le {
+    architecture: u16 at 0
+    reserved: u16 at 2
+    page_size: u32 at 4
+    lowest: u64 at 8
+    highest: u64 at 16
+    active: u64 at 24
+    count: u32 at 32
+    kind: u32 at 36
+    granularity: u32 at 40
+    level: u16 at 44
+    revision: u16 at 46
+} SystemInfo
+
+fn error_of(code: u32) -> platform::IoError {
+    return match code {
+        ERROR_FILE_NOT_FOUND or ERROR_PATH_NOT_FOUND => platform::IoError.NotFound
+        ERROR_FILE_EXISTS or ERROR_ALREADY_EXISTS => platform::IoError.AlreadyExists
+        ERROR_BROKEN_PIPE or ERROR_NO_DATA => platform::IoError.BrokenPipe
+        else => platform::IoError.Other(i32.from_bits(code))
+    }
+} error_of
+
+/// The error code the last failing call of the system on this thread gave.
+fn last_code() -> u32 {
+    return trusted "GetLastError reads the calling thread's last error code" { GetLastError() }
+} last_code
+
+/// The error the last failing call of the system on this thread gave.
+fn last_error() -> platform::IoError {
+    return error_of(last_code())
+} last_error
+
+/// Fails with the last error when a call of the system reported failure with 0.
+fn checked(succeeded: i32) fails platform::IoError {
+    if succeeded == 0 {
+        fail last_error()
+    }
+} checked
+
+/// Closes a handle this process holds and no other part of it uses.
+fn release(handle: u64) {
+    discard trusted "handle is a handle this process opened and closes once" { CloseHandle(handle) }
+} release
+
+/// A text as the system reads a path or name: UTF-16 code units, then a NUL.
+struct Wide {
+    units: Array[u16, 2_048]
+} Wide
+
+/// The units of a `Wide` before any is written.
+const NO_WIDE: Array[u16, 2_048] = Array[u16, 2_048].filled(0)
+
+/// The wide form of a text holding no NUL and fewer than `WIDE_UNITS` code units.
+fn wide(written: Str) -> Wide fails platform::IoError {
+    var held = Wide(units: NO_WIDE)
+    discard try put_wide(mut held, at: 0, written)
+    return held
+} wide
+
+/// Writes the code units of `written` into `held` from `at`, before its NUL; gives where the NUL
+/// then lies.
+fn put_wide(mut held: Wide, at: usize, written: Str) -> usize fails platform::IoError {
+    var next = at
+    for c in written {
+        let value = c.to_bits()
+        if value == 0 {
+            fail platform::IoError.Other(i32.from_bits(ERROR_INVALID_NAME))
+        }
+        if next >= WIDE_UNITS - 2 {
+            fail platform::IoError.Other(i32.from_bits(ERROR_FILENAME_EXCED_RANGE))
+        }
+        if value < 0x1_0000 {
+            held.units[next] = u16.truncate(value)
+            next += 1
+            continue
+        }
+        let above = value - 0x1_0000
+        held.units[next] = 0xD800 | u16.truncate(above >> 10)
+        held.units[next + 1] = 0xDC00 | u16.truncate(above & 0x3FF)
+        next += 2
+    }
+    return next
+} put_wide
+
+/// The text that UTF-16 code units hold, each `\` written `/` when `slashed`; none when they hold
+/// an unpaired surrogate.
+fn narrow(units: Slice[u16], slashed: bool, alloc: mem::Alloc) -> Option[text::String] {
+    var written = text::String.empty(alloc)
+    var at: usize = 0
+    while at < units.len() {
+        var value = u32.widen(units[at])
+        at += 1
+        if value >= 0xD800 and value < 0xDC00 and at < units.len() {
+            let low = u32.widen(units[at])
+            if low >= 0xDC00 and low < 0xE000 {
+                value = 0x1_0000 + ((value - 0xD800) << 10) + (low - 0xDC00)
+                at += 1
+            }
+        }
+        if slashed and value == 0x5C {
+            value = 0x2F
+        }
+        let Some(c) = char.checked_from_bits(value) else {
+            return None
+        }
+        mut written.push(c)
+    }
+    return Some(take written)
+} narrow
+
+/// The text a call writing at most `WIDE_UNITS` code units into `buffer` gave, `length` being
+/// what it returned: its length without its NUL, or 0 on failure, or the room it needs when that
+/// exceeds the buffer's. `InvalidData` when the text holds an unpaired surrogate.
+fn written_wide(buffer: Wide, length: u32, slashed: bool, alloc: mem::Alloc) -> text::String fails platform::IoError {
+    if length == 0 {
+        fail last_error()
+    }
+    let Some(units) = buffer.units.view().prefix(usize.widen(length)) else {
+        fail platform::IoError.Other(i32.from_bits(ERROR_FILENAME_EXCED_RANGE))
+    }
+    let Some(written) = narrow(units, slashed, alloc) else {
+        fail platform::IoError.InvalidData
+    }
+    return written
+} written_wide
+
+/// The id of this process.
+pub fn process_id() -> u32 {
+    return trusted "GetCurrentProcessId reads no memory" { GetCurrentProcessId() }
+} process_id
+
+/// Whether the machine running the toolchain is an AArch64 one, as the system names its
+/// architecture.
+pub fn on_aarch64() -> bool {
+    var raw = SystemInfo.from_bits(Array[u8, 48].filled(0))
+    let buffer = hw::Ptr.of_mut(mut raw)
+    trusted "buffer addresses a SYSTEM_INFO" {
+        GetNativeSystemInfo(buffer)
+    }
+    let held = trusted "GetNativeSystemInfo wrote a SYSTEM_INFO at buffer" { buffer.read() }
+    return held.architecture == ARM64
+} on_aarch64
+
+/// Whether the system running the toolchain is Windows.
+pub fn on_windows() -> bool {
+    return true
+} on_windows
+
+/// The path of the running image, empty when the system gives none.
+pub fn own_image(alloc: mem::Alloc) -> text::String {
+    var buffer = Wide(units: NO_WIDE)
+    let length = trusted "buffer addresses WIDE_UNITS code units, and module 0 names the running image" { GetModuleFileNameW(0, name: hw::Ptr.of_view_mut(mut buffer.units.view_mut()), size: u32.fit(WIDE_UNITS)) }
+    if usize.widen(length) >= WIDE_UNITS {
+        return text::String.empty(alloc)
+    }
+    let Ok(written) = attempt written_wide(buffer, length, slashed: true, alloc) else {
+        return text::String.empty(alloc)
+    }
+    return written
+} own_image
+
+/// The id of the user running this process on Linux, and 0 on Windows, where the toolchain compares
+/// no owners.
+pub fn running_user() -> u32 {
+    return 0
+} running_user
+
+/// The home directory of the user `uid`: on Linux the one the system's user database gives, on
+/// Windows the running user's profile directory, which `USERPROFILE` names, with `/` separators;
+/// none when there is none.
+pub fn home(uid: u32, alloc: mem::Alloc) -> Option[text::String] fails platform::IoError {
+    let name = try wide("USERPROFILE")
+    var buffer = Wide(units: NO_WIDE)
+    let length = trusted "name holds a NUL-terminated name and buffer addresses WIDE_UNITS code units" { GetEnvironmentVariableW(hw::Ptr.of_view(name.units.view()), value: hw::Ptr.of_view_mut(mut buffer.units.view_mut()), size: u32.fit(WIDE_UNITS)) }
+    if length == 0 {
+        return None
+    }
+    if usize.widen(length) >= WIDE_UNITS {
+        fail platform::IoError.Other(i32.from_bits(ERROR_FILENAME_EXCED_RANGE))
+    }
+    return Some(try written_wide(buffer, length, slashed: true, alloc))
+} home

@@ -1502,6 +1502,7 @@ convention_clause = 'convention' TEXT ;
 | --- | --- | --- |
 | `"sysv"` | the calling convention of the System V ABI for the target's architecture: the AMD64 one on x86_64 and the Procedure Call Standard for the Arm 64-bit Architecture on AArch64 | `x86_64-linux`, `aarch64-linux` |
 | `"win64"` | the calling convention of 64-bit Windows for the target's architecture: the Microsoft x64 one on x86_64 and, on AArch64, the Procedure Call Standard for the Arm 64-bit Architecture with `x18` reserved for the platform | `x86_64-windows`, `x86_64-uefi`, `aarch64-windows` |
+| `"darwin"` | the calling convention of macOS for the target's architecture: the System V AMD64 one on x86_64 and, on AArch64, Apple's variant of the Procedure Call Standard for the Arm 64-bit Architecture, which reserves `x18` for the platform, has the caller extend an argument narrower than 32 bits to 32 bits, aligns an argument on the stack to its own size and passes variadic arguments on the stack | `x86_64-macos`, `aarch64-macos` |
 | `"aapcs64"` | the Procedure Call Standard for the Arm 64-bit Architecture, with `x18` reserved for the platform | `aarch64-uefi` |
 
 - Any other convention text is an error (`trusted.convention-unknown`).
@@ -1590,6 +1591,26 @@ foreign fn GetCurrentProcessId() -> u32 limits notrap, terminates, noalloc conve
 
 pub fn process_id() -> u32 {
     return GetCurrentProcessId()
+} process_id
+```
+
+```nan
+// file: procinfo/package.nan
+//! Process facts on both macOS architectures.
+
+package procinfo {
+    language 1
+    targets aarch64-macos, x86_64-macos
+    allow trusted in procinfo
+} procinfo
+
+// file: procinfo/procinfo.nan
+//! Reads the process id from the system.
+
+foreign fn getpid() -> i32 limits notrap, terminates, noalloc convention "darwin"
+
+pub fn process_id() -> i32 {
+    return getpid()
 } process_id
 ```
 

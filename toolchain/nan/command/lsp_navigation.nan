@@ -1,0 +1,466 @@
+//! The language server's navigation: definitions, references, hovers, document and workspace symbols, implementations and call hierarchies.
+
+const KIND_METHOD: u64 = 6
+const KIND_FIELD: u64 = 8
+const KIND_ENUM: u64 = 10
+const KIND_INTERFACE: u64 = 11
+const KIND_FUNCTION: u64 = 12
+const KIND_VARIABLE: u64 = 13
+const KIND_CONSTANT: u64 = 14
+const KIND_ENUM_MEMBER: u64 = 22
+const KIND_STRUCT: u64 = 23
+
+/// The most symbols `workspace/symbol` answers with.
+const MOST_SYMBOLS: usize = 256
+
+/// A document of the workspace a request names, with the byte of its position.
+struct Positioned {
+    opened: Opened
+    at: u32
+} Positioned
+
+/// A file's item a symbol shows: its name, symbol kind and name token.
+struct NamedItem {
+    name: text::String
+    kind: u64
+    token: u32
+} NamedItem
+
+/// An item of the workspace `workspace/symbol` lists: its name, file, the byte its name starts
+/// at, its symbol kind and name token, and the path of the module holding it.
+struct FoundSymbol {
+    name: text::String
+    path: text::String
+    start: u32
+    kind: u64
+    token: u32
+    container: text::String
+} FoundSymbol
+
+/// The location of a span.
+fn Server.located(self, session: check::Session, span: check::Span, alloc: mem::Alloc) -> Json {
+    return self.location(session, path: span.path.as_str(), span: diagnostic::Span(start: span.start, end: span.end), alloc)
+} Server.located
+
+/// The document a request's params name, the session, and the byte of its position.
+fn Server.positioned(self, params: Json, alloc: mem::Alloc) -> Option[Positioned] {
+    let Some(opened) = self.document(params, alloc) else {
+        return None
+    }
+    let Some(at) = self.offset(opened, params) else {
+        return None
+    }
+    return Some(Positioned(opened: take opened, at: at))
+} Server.positioned
+
+/// `textDocument/definition`: the name declaring what the name at the position names.
+fn Server.definition(self, params: Json, alloc: mem::Alloc) -> Option[Json] {
+    let Some(asked) = self.positioned(params, alloc) else {
+        return None
+    }
+    let session = asked.opened.session
+    return match session.definition(asked.opened.path.as_str(), at: asked.at) {
+        Some(span) => Some(self.located(session, span, alloc))
+        None => Some(Json.Null)
+    }
+} Server.definition
+
+/// `textDocument/references`: the names of the workspace writing what the name at the position
+/// names.
+fn Server.references(self, params: Json, alloc: mem::Alloc) -> Option[Json] {
+    let Some(asked) = self.positioned(params, alloc) else {
+        return None
+    }
+    let declaration = match params.at("context", inner: "includeDeclaration") {
+        Some(given) => given.to_bool() == Some(true)
+        None => false
+    }
+    let session = asked.opened.session
+    var locations = mem::List[Json].empty(alloc)
+    for span in session.references(asked.opened.path.as_str(), at: asked.at, declaration) {
+        mut locations.push(self.located(session, span, alloc))
+    }
+    return Some(Json.Array(take locations))
+} Server.references
+
+/// `textDocument/hover`: what the name at the position names, described in a NaN code block.
+fn Server.hover(self, params: Json, alloc: mem::Alloc) -> Option[Json] {
+    let Some(asked) = self.positioned(params, alloc) else {
+        return None
+    }
+    let session = asked.opened.session
+    let Some(hovered) = session.hover(asked.opened.path.as_str(), at: asked.at) else {
+        return Some(Json.Null)
+    }
+    let Some(source) = session.workspace.contents().bytes(asked.opened.path.as_str()) else {
+        return None
+    }
+    var contents = mem::List[Member].empty(alloc)
+    mut contents.push(Member.of("kind", value: Json.text("markdown", alloc), alloc))
+    mut contents.push(Member.of("value", value: Json.Text(fenced(hovered.lines.view(), alloc)), alloc))
+    var members = mem::List[Member].empty(alloc)
+    mut members.push(Member.of("contents", value: Json.Object(take contents), alloc))
+    mut members.push(Member.of("range", value: range_json(source, start: hovered.span.start, end: hovered.span.end, encoding: self.encoding, alloc), alloc))
+    return Some(Json.Object(take members))
+} Server.hover
+
+/// Lines as a Markdown code block of NaN, fenced by more backticks than any run they hold.
+fn fenced(lines: Slice[text::String], alloc: mem::Alloc) -> text::String {
+    var longest: usize = 2
+    for line in lines {
+        var ticks: usize = 0
+        for c in line.as_str() {
+            if c != '`' {
+                ticks = 0
+                continue
+            }
+            ticks += 1
+            if ticks > longest {
+                longest = ticks
+            }
+        }
+    }
+    var fence = text::String.empty(alloc)
+    for _ in 0..=longest {
+        mut fence.push('`')
+    }
+    var written = text::String.of(fence.as_str(), alloc)
+    mut written.append("nan\n")
+    for index in 0..<lines.len() {
+        if index > 0 {
+            mut written.push('\n')
+        }
+        mut written.append(lines[index].as_str())
+    }
+    mut written.push('\n')
+    mut written.append(fence.as_str())
+    return written
+} fenced
+
+/// `textDocument/documentSymbol`: the document's items, with their fields, variants and
+/// interface methods.
+fn Server.document_symbols(self, params: Json, alloc: mem::Alloc) -> Option[Json] {
+    let Some(opened) = self.document(params, alloc) else {
+        return None
+    }
+    let held = opened.session.workspace.contents()
+    var symbols = mem::List[Json].empty(alloc)
+    let Some(at) = held.file(opened.path.as_str()) else {
+        return Some(Json.Array(take symbols))
+    }
+    let file = held.file_at(at)
+    let syntax = file.syntax()
+    for index in 0..<syntax.items.len() {
+        let Some(named) = named_item(file, index, alloc) else {
+            continue
+        }
+        let lines = syntax.item_lines(syntax.items[index])
+        let start = syntax.lines[usize.widen(lines.low) - 1].start
+        let end = syntax.lines[usize.widen(lines.high) - 1].end
+        var children = mem::List[Json].empty(alloc)
+        for member in take item_members(file, index, alloc) {
+            let span = line_bytes(syntax.source.view(), line: syntax.tokens[usize.widen(member.token)].line)
+            mut children.push(symbol_json(take member.name, kind: member.kind, range: range_json(syntax.source.view(), start: span.start, end: span.end, encoding: self.encoding, alloc), selection: self.token_range(syntax, token: member.token, alloc), alloc))
+        }
+        var written = symbol_members(take named.name, kind: named.kind, range: range_json(syntax.source.view(), start: start, end: end, encoding: self.encoding, alloc), selection: self.token_range(syntax, token: named.token, alloc), alloc)
+        if children.len() > 0 {
+            mut written.push(Member.of("children", value: Json.Array(take children), alloc))
+        }
+        mut symbols.push(Json.Object(take written))
+    }
+    return Some(Json.Array(take symbols))
+} Server.document_symbols
+
+/// A document symbol.
+fn symbol_json(take name: text::String, kind: u64, take range: Json, take selection: Json, alloc: mem::Alloc) -> Json {
+    return Json.Object(symbol_members(take name, kind, range: take range, selection: take selection, alloc))
+} symbol_json
+
+/// The members of a document symbol.
+fn symbol_members(take name: text::String, kind: u64, take range: Json, take selection: Json, alloc: mem::Alloc) -> mem::List[Member] {
+    var members = mem::List[Member].empty(alloc)
+    mut members.push(Member.of("name", value: Json.Text(take name), alloc))
+    mut members.push(Member.of("kind", value: Json.number(kind, alloc), alloc))
+    mut members.push(Member.of("range", value: take range, alloc))
+    mut members.push(Member.of("selectionRange", value: take selection, alloc))
+    return members
+} symbol_members
+
+/// The range of a token of a source file.
+fn Server.token_range(self, syntax: syntax::SourceFile, token: u32, alloc: mem::Alloc) -> Json {
+    let at = syntax.tokens[usize.widen(token)]
+    return range_json(syntax.source.view(), start: at.start, end: at.end, encoding: self.encoding, alloc)
+} Server.token_range
+
+/// The name, symbol kind and name token of a file's item that a symbol shows: a function, type,
+/// interface, protocol, const, registry, contribution or test.
+fn named_item(file: workspace::File, index: usize, alloc: mem::Alloc) -> Option[NamedItem] {
+    let lowered = file.lowered(alloc)
+    if index >= lowered.len() {
+        return None
+    }
+    let Some(item) = lowered[index] else {
+        return None
+    }
+    let kind = match item.kind {
+        ast::ItemKind.Fn(function) => match function.label.owner.is_some() {
+            true => KIND_METHOD
+            false => KIND_FUNCTION
+        }
+        ast::ItemKind.Test(_) => KIND_FUNCTION
+        ast::ItemKind.Struct(_) or ast::ItemKind.Layout(_) or ast::ItemKind.Registers(_) => KIND_STRUCT
+        ast::ItemKind.Enum(_) => KIND_ENUM
+        ast::ItemKind.Interface(_) or ast::ItemKind.Protocol(_) => KIND_INTERFACE
+        ast::ItemKind.Const(_) or ast::ItemKind.Contribute(_) => KIND_CONSTANT
+        ast::ItemKind.Registry(_) => KIND_VARIABLE
+        else => return None
+    }
+    let Some(name) = item.name(alloc) else {
+        return None
+    }
+    let Some(declared) = check::declared_name(item, alloc) else {
+        return None
+    }
+    return Some(NamedItem(name: take name, kind: kind, token: declared.token))
+} named_item
+
+/// The fields, variants and interface methods a file's item declares, with their symbol kinds
+/// and name tokens.
+fn item_members(file: workspace::File, index: usize, alloc: mem::Alloc) -> mem::List[NamedItem] {
+    var members = mem::List[NamedItem].empty(alloc)
+    let lowered = file.lowered(alloc)
+    if index >= lowered.len() {
+        return members
+    }
+    let Some(item) = lowered[index] else {
+        return members
+    }
+    match item.kind {
+        ast::ItemKind.Struct(structure) => {
+            for field in structure.fields() {
+                mut members.push(NamedItem(name: text::String.of(field.name.text.as_str(), alloc), kind: KIND_FIELD, token: field.name.token))
+            }
+        }
+        ast::ItemKind.Enum(enumeration) => {
+            for variant in enumeration.variants {
+                mut members.push(NamedItem(name: text::String.of(variant.name.text.as_str(), alloc), kind: KIND_ENUM_MEMBER, token: variant.name.token))
+            }
+        }
+        ast::ItemKind.Interface(declaring) => {
+            for method in declaring.methods {
+                mut members.push(NamedItem(name: text::String.of(method.name.text.as_str(), alloc), kind: KIND_METHOD, token: method.name.token))
+            }
+        }
+        else => {}
+    }
+    return members
+} item_members
+
+/// `workspace/symbol`: the items of the workspace's files whose folded name holds the folded
+/// query, by name, path and position, at most `MOST_SYMBOLS`.
+fn Server.workspace_symbols(self, params: Json, alloc: mem::Alloc) -> Option[Json] {
+    let Some(query_value) = params.get("query") else {
+        return None
+    }
+    let Some(query) = query_value.as_str() else {
+        return None
+    }
+    let wanted = check::fold(query, alloc)
+    var symbols = mem::List[Json].empty(alloc)
+    let Some(session) = self.session(alloc) else {
+        return Some(Json.Array(take symbols))
+    }
+    let held = session.workspace.contents()
+    var found = mem::List[FoundSymbol].empty(alloc)
+    for at in held.files() {
+        let file = held.file_at(at)
+        let pack = held.packages[at.package_index].contents()
+        for index in 0..<file.syntax().items.len() {
+            let Some(named) = named_item(file, index, alloc) else {
+                continue
+            }
+            if check::fold(named.name.as_str(), alloc).find(wanted.as_str()).is_none() {
+                continue
+            }
+            let token = file.syntax().tokens[usize.widen(named.token)]
+            let container = container_of(pack, file, line: token.line, alloc)
+            mut found.push(FoundSymbol(name: take named.name, path: text::String.of(file.path.as_str(), alloc), start: token.start, kind: named.kind, token: named.token, container: take container))
+        }
+    }
+    mut found.sort_by(fn(left: FoundSymbol, right: FoundSymbol) -> core::Ordering {
+        let by_name = left.name.cmp(right.name)
+        if by_name != core::Ordering.Equal {
+            return by_name
+        }
+        let by_path = left.path.cmp(right.path)
+        if by_path != core::Ordering.Equal {
+            return by_path
+        }
+        return left.start.cmp(right.start)
+    })
+    mut found.truncate(MOST_SYMBOLS)
+    for symbol in take found {
+        mut symbols.push(self.symbol_information(session, take symbol, alloc))
+    }
+    return Some(Json.Array(take symbols))
+} Server.workspace_symbols
+
+/// The path of the module holding the item at a line of a file.
+fn container_of(pack: workspace::Package, file: workspace::File, line: u32, alloc: mem::Alloc) -> text::String {
+    let Some(path) = pack.item_at(file, line, alloc) else {
+        return text::String.empty(alloc)
+    }
+    let canonical = path.canonical(alloc)
+    let bytes = canonical.as_bytes()
+    var cut = bytes.len()
+    var index: usize = 0
+    while index + 1 < bytes.len() {
+        if bytes[index] == b':' and bytes[index + 1] == b':' {
+            cut = index
+        }
+        index += 1
+    }
+    let Some(container) = canonical.slice_bytes(0, end: cut) else {
+        return text::String.empty(alloc)
+    }
+    return text::String.of(container, alloc)
+} container_of
+
+/// A symbol `workspace/symbol` lists, as the protocol writes it.
+fn Server.symbol_information(self, session: check::Session, take symbol: FoundSymbol, alloc: mem::Alloc) -> Json {
+    var members = mem::List[Member].empty(alloc)
+    let held = session.workspace.contents()
+    var span = diagnostic::Span(start: 0, end: 0)
+    match held.file(symbol.path.as_str()) {
+        Some(at) => {
+            let token = held.file_at(at).syntax().tokens[usize.widen(symbol.token)]
+            span = diagnostic::Span(start: token.start, end: token.end)
+        }
+        None => {}
+    }
+    mut members.push(Member.of("name", value: Json.Text(take symbol.name), alloc))
+    mut members.push(Member.of("kind", value: Json.number(symbol.kind, alloc), alloc))
+    mut members.push(Member.of("location", value: self.location(session, path: symbol.path.as_str(), span, alloc), alloc))
+    mut members.push(Member.of("containerName", value: Json.Text(take symbol.container), alloc))
+    return Json.Object(take members)
+} Server.symbol_information
+
+/// `textDocument/implementation`: the impl lines naming the interface or type the name at the
+/// position names, or the functions implementing the interface method it names.
+fn Server.implementations(self, params: Json, alloc: mem::Alloc) -> Option[Json] {
+    let Some(asked) = self.positioned(params, alloc) else {
+        return None
+    }
+    let session = asked.opened.session
+    var locations = mem::List[Json].empty(alloc)
+    for span in session.implementations(asked.opened.path.as_str(), at: asked.at) {
+        mut locations.push(self.located(session, span, alloc))
+    }
+    return Some(Json.Array(take locations))
+} Server.implementations
+
+/// A function as a call hierarchy item.
+fn Server.call_item(self, session: check::Session, function: check::ShownFunction, alloc: mem::Alloc) -> Json {
+    let source = match session.workspace.contents().bytes(function.item.path.as_str()) {
+        Some(bytes) => bytes
+        None => b""
+    }
+    let kind = match function.member {
+        true => KIND_METHOD
+        false => KIND_FUNCTION
+    }
+    var members = mem::List[Member].empty(alloc)
+    mut members.push(Member.of("name", value: Json.text(function.name.as_str(), alloc), alloc))
+    mut members.push(Member.of("kind", value: Json.number(kind, alloc), alloc))
+    mut members.push(Member.of("uri", value: Json.Text(self.uri(function.item.path.as_str(), alloc)), alloc))
+    mut members.push(Member.of("range", value: range_json(source, start: function.item.start, end: function.item.end, encoding: self.encoding, alloc), alloc))
+    mut members.push(Member.of("selectionRange", value: range_json(source, start: function.selection.start, end: function.selection.end, encoding: self.encoding, alloc), alloc))
+    return Json.Object(take members)
+} Server.call_item
+
+/// `textDocument/prepareCallHierarchy`: the function the name at the position names.
+fn Server.prepare_calls(self, params: Json, alloc: mem::Alloc) -> Option[Json] {
+    let Some(asked) = self.positioned(params, alloc) else {
+        return None
+    }
+    let session = asked.opened.session
+    let Some(function) = session.function_at(asked.opened.path.as_str(), at: asked.at) else {
+        return Some(Json.Null)
+    }
+    var items = mem::List[Json].empty(alloc)
+    mut items.push(self.call_item(session, function, alloc))
+    return Some(Json.Array(take items))
+} Server.prepare_calls
+
+/// The workspace path of a call hierarchy item of a request's params, the session, and the byte
+/// its selection starts at.
+fn Server.called_item(self, params: Json, alloc: mem::Alloc) -> Option[Positioned] {
+    let Some(item) = params.get("item") else {
+        return None
+    }
+    let Some(uri_value) = item.get("uri") else {
+        return None
+    }
+    let Some(uri) = uri_value.as_str() else {
+        return None
+    }
+    let Some(path) = self.workspace_path(uri, alloc) else {
+        return None
+    }
+    let Some(session) = self.session(alloc) else {
+        return None
+    }
+    let Some(start) = item.at("selectionRange", inner: "start") else {
+        return None
+    }
+    let Some(source) = session.workspace.contents().bytes(path.as_str()) else {
+        return None
+    }
+    let Some(at) = offset_of(source, position: start, encoding: self.encoding) else {
+        return None
+    }
+    return Some(Positioned(opened: Opened(path: take path, session: take session), at: at))
+} Server.called_item
+
+/// Calls of other functions as the protocol writes them: each function, with the ranges of its
+/// calls.
+fn Server.calls_json(self, session: check::Session, found: Slice[check::CallsOf], key: Str, alloc: mem::Alloc) -> Json {
+    var written = mem::List[Json].empty(alloc)
+    for calling in found {
+        var ranges = mem::List[Json].empty(alloc)
+        for call in calling.calls {
+            let source = match session.workspace.contents().bytes(call.path.as_str()) {
+                Some(bytes) => bytes
+                None => b""
+            }
+            mut ranges.push(range_json(source, start: call.start, end: call.end, encoding: self.encoding, alloc))
+        }
+        var members = mem::List[Member].empty(alloc)
+        mut members.push(Member.of(key, value: self.call_item(session, function: calling.function, alloc), alloc))
+        mut members.push(Member.of("fromRanges", value: Json.Array(take ranges), alloc))
+        mut written.push(Json.Object(take members))
+    }
+    return Json.Array(take written)
+} Server.calls_json
+
+/// `callHierarchy/incomingCalls`: the functions calling the item's function, each with its
+/// calls.
+fn Server.incoming_calls(self, params: Json, alloc: mem::Alloc) -> Option[Json] {
+    let Some(asked) = self.called_item(params, alloc) else {
+        return None
+    }
+    let session = asked.opened.session
+    let found = session.callers(asked.opened.path.as_str(), at: asked.at)
+    return Some(self.calls_json(session, found: found.view(), key: "from", alloc))
+} Server.incoming_calls
+
+/// `callHierarchy/outgoingCalls`: the functions of the workspace the item's function calls,
+/// each with the calls in it.
+fn Server.outgoing_calls(self, params: Json, alloc: mem::Alloc) -> Option[Json] {
+    let Some(asked) = self.called_item(params, alloc) else {
+        return None
+    }
+    let session = asked.opened.session
+    let found = session.callees(asked.opened.path.as_str(), at: asked.at)
+    return Some(self.calls_json(session, found: found.view(), key: "to", alloc))
+} Server.outgoing_calls

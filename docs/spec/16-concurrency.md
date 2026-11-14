@@ -789,6 +789,37 @@ pub fn Account.close(take self)
 - A **serial** executor runs at most one task at a time among the tasks started on it or on an executor deriving from it through no other serial executor; these are its tasks. A task of it runs only while it holds the executor's **turn**: a task becoming ready takes the turn when no task holds it, and otherwise waits. When the holder suspends, ends or stops, it passes the turn to a waiting task, or frees it when none waits; a preempted holder keeps it. The task taking the turn is at position w mod k among the k waiting tasks, the one that waited last first, w being value n of stream 1 of the executor's seed as the [seeded scheduler](22-testing.md#seeded-scheduler) computes stream values, where n counts the turn's earlier passes to a waiting task. A run making the same tasks of a serial executor ready in the same order, each while the same task holds the turn or while none does, thus passes its turn in the same order, whatever its timing. Once the executor is stale, its tasks run without a turn.
 
 ```nan
+// file: pool/package.nan
+//! Accounts of a pool of executors.
+
+package pool {
+    language 1
+    targets x86_64-host
+} pool
+
+// file: pool/pool.nan
+//! Checks of accounts.
+
+/// Whether an account split from `exec` and one serial on it keep their ids, which differ, have
+/// run for no time, and have revoked their executors once closed.
+pub fn accounts_hold(exec: task::Executor) -> bool
+    example accounts_hold(testing::world().exec)
+{
+    let split = exec.split(task::Share(weight: 1, class: 0, reserve_ppm: 0))
+    let serial = exec.serial(7)
+    let kept = split.id() == split.id() and serial.id() == serial.id()
+    let distinct = split.id() != serial.id()
+    let idle = split.used_ns() == 0 and serial.used_ns() == 0
+    let executor = split.executor()
+    let live = (attempt executor.coarse(1)).is_ok()
+    take split.close()
+    take serial.close()
+    let revoked = (attempt executor.coarse(1)).is_err()
+    return kept and distinct and idle and live and revoked
+} accounts_hold
+```
+
+```nan
 // file: counter/package.nan
 //! Counts hits from two tasks on the host.
 

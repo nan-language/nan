@@ -143,7 +143,7 @@ fn named(workspace: &Workspace, text: &str, relative: Option<usize>) -> Option<S
 /// The file and line a location argument, `<path>:<line>`, names.
 pub fn location(text: &str) -> Option<(&str, u32)> {
     let (path, line) = text.rsplit_once(':')?;
-    Some((path, line.parse().ok()?)).filter(|_| path.ends_with(".nan"))
+    path.ends_with(".nan").then_some((path, line.parse().ok()?))
 }
 
 /// The lines of the item of `module` named `name`, or of the member `Type.member` it names.

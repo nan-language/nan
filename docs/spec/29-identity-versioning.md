@@ -326,7 +326,7 @@ The **exported items** of a release are its `pub` items, impl lines and contribu
 
 - **identical** when its interface hash, behaviour epoch and digest are unchanged;
 - **additive** when it is new, or when each change to its interface form is compatible for every role, its epoch is unchanged and its digest gains no fact or set element and keeps terminates;
-- **breaking** otherwise, including when it is removed or loses `pub` without a `preserves` tombstone forwarding it.
+- **breaking** otherwise, including when it is removed or loses `pub` without a `preserves` tombstone forwarding it. A function named after a type is forwarded by the tombstone forwarding its type, to the function of the same name of the type it forwards to.
 
 The **release class** is the worst class over the exported items and targets, in the order identical, additive, breaking. A release without a parent is additive. No option, file or command lowers a computed class.
 

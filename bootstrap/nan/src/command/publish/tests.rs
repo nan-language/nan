@@ -54,6 +54,45 @@ fn a_new_variant_of_an_open_enum_is_additive_and_a_removed_one_breaking() {
 }
 
 #[test]
+fn renaming_or_moving_a_type_forwards_the_functions_named_after_it() {
+    let scratch = Scratch::new(&[
+        (
+            "meter/package.nan",
+            "//! Running totals.\n\npackage meter {\n    language 1\n    targets any\n} meter\n",
+        ),
+        (
+            "meter/meter.nan",
+            "//! Totals of samples.\n\n/// A running total.\npub closed struct Counter {\n    pub count: u64\n} Counter\n\n/// The total of a counter.\npub fn Counter.total(self) -> u64 = self.count\n",
+        ),
+        (
+            "meter/parts/parts.nan",
+            "//! Parts.\n\npub const ONE: u64 = 1\n",
+        ),
+    ]);
+    let dir = &scratch.0;
+    let name = format!(
+        "nan-test/{}",
+        dir.file_name().expect("a directory name").to_string_lossy()
+    );
+    run_in(dir, "api update");
+    run_in(dir, &format!("publish --local meter --name {name}"));
+    for edit in [
+        "edit rename meter::Counter Tally",
+        "edit move meter::Tally parts",
+    ] {
+        assert_eq!(run_in(dir, edit).status, 0, "{edit}");
+        run_in(dir, "api update");
+        let published = run_in(dir, "publish --local meter");
+        assert_eq!(
+            classes(&published.output),
+            "additive identical",
+            "{edit}: {}",
+            published.output
+        );
+    }
+}
+
+#[test]
 fn a_release_published_as_a_principal_is_read_only_from_its_pinned_and_trusted_key_until_forged() {
     let scratch = Scratch::new(&[(
         "procinfo/package.nan",

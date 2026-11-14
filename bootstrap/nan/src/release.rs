@@ -209,8 +209,9 @@ pub fn replaces(old: &Entry, new: &Entry, old_path: &str, new_path: &str) -> boo
 /// The class of each exported item of a release relative to its parent's, by canonical path,
 /// removed items included: identical when its interface hash, epoch and digests are unchanged;
 /// additive when it is new, when its interface changes only as `compatible` holds it and its
-/// digests gain no fact, or when it is removed while a `preserves` tombstone forwards it to a
-/// replacement that keeps its interface; breaking otherwise.
+/// digests gain no fact, or when it is removed while a `preserves` tombstone forwards it, or a
+/// function named after a type its type, to a replacement that keeps its interface; breaking
+/// otherwise.
 pub fn classes(
     parent: &BTreeMap<String, Entry>,
     release: &BTreeMap<String, Entry>,
@@ -255,7 +256,14 @@ pub fn classes(
             Some(Forward::Path(new)) => release
                 .get(new)
                 .is_some_and(|entry| replaces(old, entry, path, new)),
-            None => false,
+            None => path.rsplit_once('.').is_some_and(|(owner, member)| {
+                let Some(Forward::Path(new)) = forwards.get(owner) else {
+                    return false;
+                };
+                release
+                    .get(&format!("{new}.{member}"))
+                    .is_some_and(|entry| replaces(old, entry, owner, new))
+            }),
         };
         let class = if kept {
             Class::Additive

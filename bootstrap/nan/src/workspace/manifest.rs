@@ -25,22 +25,25 @@ impl Arch {
     }
 }
 
-/// What a concrete target's programs run on: Linux, Windows, UEFI firmware, the bare machine or
-/// a running NaN OS kernel.
+/// What a concrete target's programs run on: Linux, Windows, macOS, UEFI firmware, the bare
+/// machine or a running NaN OS kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Kind {
     Linux,
     Windows,
+    Macos,
     Uefi,
     Bare,
     Nanos,
 }
 
 impl Kind {
-    /// The system running the toolchain: Windows or Linux.
+    /// The system running the toolchain: Linux, Windows or macOS.
     pub fn running() -> Kind {
         if cfg!(windows) {
             Kind::Windows
+        } else if cfg!(target_os = "macos") {
+            Kind::Macos
         } else {
             Kind::Linux
         }
@@ -51,10 +54,12 @@ impl Kind {
 pub enum Target {
     X64Linux,
     X64Windows,
+    X64Macos,
     X64Uefi,
     X64Bare,
     Aarch64Linux,
     Aarch64Windows,
+    Aarch64Macos,
     Aarch64Uefi,
     Aarch64Bare,
     X64Nanos,
@@ -70,13 +75,15 @@ impl Target {
     }
 
     /// The concrete targets.
-    pub const CONCRETE: [Target; 10] = [
+    pub const CONCRETE: [Target; 12] = [
         Target::X64Linux,
         Target::X64Windows,
+        Target::X64Macos,
         Target::X64Uefi,
         Target::X64Bare,
         Target::Aarch64Linux,
         Target::Aarch64Windows,
+        Target::Aarch64Macos,
         Target::Aarch64Uefi,
         Target::Aarch64Bare,
         Target::X64Nanos,
@@ -87,10 +94,12 @@ impl Target {
         match self {
             Target::X64Linux => "x86_64-linux",
             Target::X64Windows => "x86_64-windows",
+            Target::X64Macos => "x86_64-macos",
             Target::X64Uefi => "x86_64-uefi",
             Target::X64Bare => "x86_64-bare",
             Target::Aarch64Linux => "aarch64-linux",
             Target::Aarch64Windows => "aarch64-windows",
+            Target::Aarch64Macos => "aarch64-macos",
             Target::Aarch64Uefi => "aarch64-uefi",
             Target::Aarch64Bare => "aarch64-bare",
             Target::X64Nanos => "x86_64-nanos",
@@ -119,11 +128,13 @@ impl Target {
         match self {
             Target::X64Linux
             | Target::X64Windows
+            | Target::X64Macos
             | Target::X64Uefi
             | Target::X64Bare
             | Target::X64Nanos => Some(Arch::Amd64),
             Target::Aarch64Linux
             | Target::Aarch64Windows
+            | Target::Aarch64Macos
             | Target::Aarch64Uefi
             | Target::Aarch64Bare
             | Target::Aarch64Nanos => Some(Arch::Aarch64),
@@ -136,6 +147,7 @@ impl Target {
         match self {
             Target::X64Linux | Target::Aarch64Linux => Some(Kind::Linux),
             Target::X64Windows | Target::Aarch64Windows => Some(Kind::Windows),
+            Target::X64Macos | Target::Aarch64Macos => Some(Kind::Macos),
             Target::X64Uefi | Target::Aarch64Uefi => Some(Kind::Uefi),
             Target::X64Bare | Target::Aarch64Bare => Some(Kind::Bare),
             Target::X64Nanos | Target::Aarch64Nanos => Some(Kind::Nanos),
@@ -143,10 +155,10 @@ impl Target {
         }
     }
 
-    /// Whether the target is a host target, a Linux or Windows one, whose programs run as
+    /// Whether the target is a host target, a Linux, Windows or macOS one, whose programs run as
     /// processes of an operating system.
     pub fn is_host(self) -> bool {
-        matches!(self.kind(), Some(Kind::Linux | Kind::Windows))
+        matches!(self.kind(), Some(Kind::Linux | Kind::Windows | Kind::Macos))
     }
 
     /// Whether the target is a machine target, a UEFI or bare one, whose image the
@@ -171,6 +183,7 @@ impl Target {
         let kind = match self.kind() {
             Some(Kind::Linux) => "linux",
             Some(Kind::Windows) => "windows",
+            Some(Kind::Macos) => "macos",
             Some(Kind::Uefi) => "uefi",
             Some(Kind::Bare) => "bare",
             Some(Kind::Nanos) => "nanos",
@@ -185,6 +198,7 @@ impl Target {
         match self.kind()? {
             Kind::Linux => Some("linux_platform"),
             Kind::Windows => Some("windows_platform"),
+            Kind::Macos => Some("macos_platform"),
             Kind::Uefi => Some("uefi_platform"),
             Kind::Bare => Some("bare_platform"),
             Kind::Nanos => None,
@@ -194,7 +208,7 @@ impl Target {
     /// The module and name of the root grant a concrete target's entry takes; `any` has none.
     pub fn root_grant(self) -> Option<(&'static str, &'static str)> {
         match self.kind()? {
-            Kind::Linux | Kind::Windows => Some(("host", "World")),
+            Kind::Linux | Kind::Windows | Kind::Macos => Some(("host", "World")),
             Kind::Uefi => Some(("boot", "Machine")),
             Kind::Bare => Some(("boot", "Kernel")),
             Kind::Nanos => Some(("nanos", "World")),
@@ -207,7 +221,7 @@ impl Target {
             Some(Kind::Windows) => ".exe",
             Some(Kind::Uefi) => ".efi",
             Some(Kind::Bare) => ".elf",
-            Some(Kind::Linux | Kind::Nanos) | None => "",
+            Some(Kind::Linux | Kind::Macos | Kind::Nanos) | None => "",
         }
     }
 }

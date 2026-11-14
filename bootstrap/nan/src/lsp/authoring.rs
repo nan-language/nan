@@ -159,14 +159,14 @@ pub fn semantic_tokens(server: &Server, params: &Json) -> Option<Json> {
         let (at_line, at_character) = text::line_character(text, classed.start, server.encoding);
         let (_, end_character) = text::line_character(text, classed.end, server.encoding);
         let relative = match at_line == line {
-            true => at_character - character,
+            true => at_character.saturating_sub(character),
             false => at_character,
         };
         let modifiers = u64::from(classed.declaration) | u64::from(classed.readonly) << 1;
         data.extend([
-            u64::from(at_line - line),
+            u64::from(at_line.saturating_sub(line)),
             u64::from(relative),
-            u64::from(end_character - at_character),
+            u64::from(end_character.saturating_sub(at_character)),
             token_type(classed.class),
             modifiers,
         ]);

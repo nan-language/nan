@@ -88,10 +88,8 @@ pkg fn Session.completions(self, path: Str, at: u32) -> mem::List[Completion] {
     if end > source.len() {
         end = source.len()
     }
-    var start = end
-    while start > 0 and is_name_byte(source[start - 1]) {
-        start -= 1
-    }
+    expect end <= source.len()
+    let start = name_start(source, end)
     var part = text::String.empty(alloc)
     for index in start..<end {
         match char.checked_from_bits(u32.widen(source[index])) {
@@ -132,6 +130,19 @@ fn Session.closed_session(self, path: Str, source: Slice[u8], end: usize) -> Ses
     return self.over(mem::Shared.of(take overlaid, alloc: alloc), alloc)
 } Session.closed_session
 
+/// The start of the identifier ending at a byte of a source.
+fn name_start(source: Slice[u8], end: usize) -> usize {
+    var start = end
+    while start > 0 {
+        expect start <= source.len()
+        if not is_name_byte(source[start - 1]) {
+            break
+        }
+        start -= 1
+    }
+    return start
+} name_start
+
 /// Whether a byte may be part of an identifier.
 fn is_name_byte(byte: u8) -> bool {
     return (byte >= b'a' and byte <= b'z') or (byte >= b'A' and byte <= b'Z') or (byte >= b'0' and byte <= b'9') or byte == b'_'
@@ -140,6 +151,7 @@ fn is_name_byte(byte: u8) -> bool {
 /// The names that may follow a byte of an item where an identifier starts: after `::`, `.`, or
 /// elsewhere.
 fn Checker.context_completions(self, item: ty::ItemId, source: Slice[u8], start: usize) -> mem::List[Completion] {
+    expect start <= source.len()
     if start >= 2 and source[start - 1] == b':' and source[start - 2] == b':' {
         return self.path_completions(item, before: source, end: start - 2)
     }
@@ -163,9 +175,13 @@ pkg fn Session.signature(self, path: Str, at: u32) -> Option[Signature] {
     let Some(callee) = syntax.previous(call.open) else {
         return None
     }
-    if syntax.tokens[callee].kind != syntax::TokenKind.Ident {
+    let Some(callee_token) = syntax.tokens.get(callee) else {
         return None
     }
+    if callee_token.kind != syntax::TokenKind.Ident {
+        return None
+    }
+    expect usize.widen(at) <= syntax.source.len()
     var spaced = mem::Bytes.empty(self.alloc)
     for index in 0..<usize.widen(at) {
         mut spaced.push(syntax.source[index])
@@ -178,7 +194,7 @@ pkg fn Session.signature(self, path: Str, at: u32) -> Option[Signature] {
     let Some(checker) = closed.file_checker(path) else {
         return None
     }
-    let Some(named) = checker.named_at(path, at: syntax.tokens[callee].start) else {
+    let Some(named) = checker.named_at(path, at: callee_token.start) else {
         return None
     }
     let NameAt.Target(RenameTarget.Item(function)) = named.named else {
@@ -201,7 +217,9 @@ fn opened_call(syntax: syntax::SourceFile, at: u32) -> Option[OpenedCall] {
     var token = syntax.tokens.len()
     while token > 0 {
         token -= 1
-        let found = syntax.tokens[token]
+        let Some(found) = syntax.tokens.get(token) else {
+            return None
+        }
         if found.end > at or found.kind.is_virtual() {
             if found.kind == syntax::TokenKind.Col0 and found.start < at {
                 return None
@@ -210,7 +228,7 @@ fn opened_call(syntax: syntax::SourceFile, at: u32) -> Option[OpenedCall] {
         }
         match found.kind {
             syntax::TokenKind.Punct(syntax::Punct.RParen) or syntax::TokenKind.Punct(syntax::Punct.RBracket) => {
-                depth += 1
+                depth = depth.saturating_add(1)
             }
             syntax::TokenKind.Punct(syntax::Punct.LParen) => {
                 if depth == 0 {
@@ -224,7 +242,7 @@ fn opened_call(syntax: syntax::SourceFile, at: u32) -> Option[OpenedCall] {
             syntax::TokenKind.Punct(syntax::Punct.LBrace) or syntax::TokenKind.Punct(syntax::Punct.RBrace) => return None
             syntax::TokenKind.Punct(syntax::Punct.Comma) => {
                 if depth == 0 {
-                    commas += 1
+                    commas = commas.saturating_add(1)
                 }
             }
             else => {}
@@ -246,7 +264,7 @@ fn Checker.signature_of(self, function: ty::ItemId, syntax: syntax::SourceFile, 
     let listed = written_parameters(label.as_str(), alloc: self.alloc())
     var implied: usize = 0
     let receiver = match syntax.previous(callee) {
-        Some(dot) => syntax.tokens[dot].kind == syntax::TokenKind.Punct(syntax::Punct.Dot) and value_before(syntax, dot)
+        Some(dot) => is_dot(syntax, token: dot) and value_before(syntax, dot)
         None => false
     }
     let takes_self = match head.head.params.get(0) {
@@ -256,7 +274,7 @@ fn Checker.signature_of(self, function: ty::ItemId, syntax: syntax::SourceFile, 
     if receiver and takes_self {
         implied = 1
     }
-    var active = call.commas + implied
+    var active = call.commas.saturating_add(implied)
     match argument_label(syntax, open: call.open, at) {
         Some(token) => {
             for index in 0..<head.head.params.len() {
@@ -271,6 +289,14 @@ fn Checker.signature_of(self, function: ty::ItemId, syntax: syntax::SourceFile, 
     return Some(Signature(label: text::String.of(label.as_str(), alloc: self.alloc()), parameters: take listed, active: active))
 } Checker.signature_of
 
+/// Whether a token of a source is `.`.
+fn is_dot(syntax: syntax::SourceFile, token: usize) -> bool {
+    return match syntax.tokens.get(token) {
+        Some(found) => found.kind == syntax::TokenKind.Punct(syntax::Punct.Dot)
+        None => false
+    }
+} is_dot
+
 /// Whether the token before a `.` writes a value rather than a type, by the case of its first
 /// letter.
 fn value_before(syntax: syntax::SourceFile, dot: usize) -> bool {
@@ -284,6 +310,7 @@ fn value_before(syntax: syntax::SourceFile, dot: usize) -> bool {
 /// The token of the label the argument being written up to a byte gives itself, when it starts
 /// with one.
 fn argument_label(syntax: syntax::SourceFile, open: usize, at: u32) -> Option[usize] {
+    expect open < syntax.tokens.len()
     var start = open
     var depth: usize = 0
     for token in (open + 1)..<syntax.tokens.len() {
@@ -293,7 +320,7 @@ fn argument_label(syntax: syntax::SourceFile, open: usize, at: u32) -> Option[us
         }
         match found.kind {
             syntax::TokenKind.Punct(syntax::Punct.LParen) or syntax::TokenKind.Punct(syntax::Punct.LBracket) => {
-                depth += 1
+                depth = depth.saturating_add(1)
             }
             syntax::TokenKind.Punct(syntax::Punct.RParen) or syntax::TokenKind.Punct(syntax::Punct.RBracket) => {
                 depth = depth.saturating_sub(1)
@@ -306,6 +333,7 @@ fn argument_label(syntax: syntax::SourceFile, open: usize, at: u32) -> Option[us
             else => {}
         }
     }
+    expect start < syntax.tokens.len()
     let name = syntax.next(start + 1)
     let colon = syntax.next(name + 1)
     if colon >= syntax.tokens.len() {
@@ -338,7 +366,7 @@ fn written_parameters(head: Str, alloc: mem::Alloc) -> mem::List[text::String] {
     for index in (open + 1)..<bytes.len() {
         let byte = bytes[index]
         if byte == b'(' or byte == b'[' {
-            depth += 1
+            depth = depth.saturating_add(1)
         } else if byte == b']' or (byte == b')' and depth > 0) {
             depth = depth.saturating_sub(1)
         } else if (byte == b')' or byte == b',') and depth == 0 {
@@ -355,15 +383,13 @@ fn written_parameters(head: Str, alloc: mem::Alloc) -> mem::List[text::String] {
 /// Adds the text of a head's bytes `start..<end` without the spaces around it, when it is not
 /// empty.
 fn push_parameter(mut parameters: mem::List[text::String], head: Str, start: usize, end: usize, alloc: mem::Alloc) {
-    var from = start
-    var to = end
     let bytes = head.as_bytes()
-    while from < to and bytes[from] == b' ' {
+    expect end <= bytes.len()
+    var from = start
+    while from < end and bytes[from] == b' ' {
         from += 1
     }
-    while to > from and bytes[to - 1] == b' ' {
-        to -= 1
-    }
+    let to = trimmed_end(bytes, from, end, trimmed: b' ')
     if from == to {
         return
     }
@@ -421,7 +447,7 @@ fn Checker.hint_item(self, item: ty::ItemId, start: u32, end: u32, mut hints: me
     let syntax = db.syntax(item)
     for id in bound {
         let local = body.local(id)
-        let token = syntax.tokens[usize.widen(local.token)]
+        let token = syntax.token(local.token)
         let next = syntax.next(usize.widen(local.token) + 1)
         let typed = next < syntax.tokens.len() and syntax.tokens[next].kind == syntax::TokenKind.Punct(syntax::Punct.Colon)
         if not typed and token.end >= start and token.end <= end {
@@ -541,7 +567,7 @@ fn keyword_completions(alloc: mem::Alloc) -> mem::List[Completion] {
             return found
         }
         mut found.push(Completion(label: text::String.of(keyword.spelling(), alloc), offered: Offered.Keyword, detail: text::String.empty(alloc)))
-        index += 1
+        index = index.saturating_add(1)
     }
 } keyword_completions
 
@@ -564,6 +590,9 @@ fn closed_source(source: Slice[u8], end: usize, grammar: syntax::Grammar, alloc:
     while at < source.len() and source[at] != b'\n' {
         at += 1
     }
+    if at >= source.len() {
+        return closed
+    }
     at += 1
     while at < source.len() {
         let byte = source[at]
@@ -577,6 +606,9 @@ fn closed_source(source: Slice[u8], end: usize, grammar: syntax::Grammar, alloc:
         }
         while at < source.len() and source[at] != b'\n' {
             at += 1
+        }
+        if at >= source.len() {
+            return closed
         }
         at += 1
     }
@@ -625,24 +657,30 @@ fn Checker.head_written(self, item: ty::ItemId) -> text::String {
 fn trimmed_head(line: Str, alloc: mem::Alloc) -> text::String {
     let bytes = line.as_bytes()
     var from: usize = 0
-    var to = bytes.len()
-    while from < to and bytes[from] == b' ' {
+    while from < bytes.len() and bytes[from] == b' ' {
         from += 1
     }
-    while to > from and bytes[to - 1] == b' ' {
-        to -= 1
-    }
-    while to > from and bytes[to - 1] == b'{' {
-        to -= 1
-    }
-    while to > from and bytes[to - 1] == b' ' {
-        to -= 1
-    }
+    let spaced = trimmed_end(bytes, from, end: bytes.len(), trimmed: b' ')
+    let braced = trimmed_end(bytes, from, end: spaced, trimmed: b'{')
+    let to = trimmed_end(bytes, from, end: braced, trimmed: b' ')
     let Some(kept) = line.slice_bytes(from, end: to) else {
         return text::String.empty(alloc)
     }
     return text::String.of(kept, alloc)
 } trimmed_head
+
+/// The end of the bytes `from..<end` without the run of `trimmed` bytes ending them.
+fn trimmed_end(bytes: Slice[u8], from: usize, end: usize, trimmed: u8) -> usize {
+    var to = end
+    while to > from {
+        expect to <= bytes.len()
+        if bytes[to - 1] != trimmed {
+            break
+        }
+        to -= 1
+    }
+    return to
+} trimmed_end
 
 /// The members the type before a `.` at a byte of an item offers: a type path's variants and the
 /// functions named after it; a value's fields its module sees and the functions named after its
@@ -696,7 +734,7 @@ struct Receiver derives Copy {
 /// Keeps as the receiver the shortest expression ending at a byte that an expression holds.
 fn Checker.receiver_ending(self, item: ty::ItemId, expr: TExpr, dot: u32, mut receiver: Option[Receiver]) {
     let syntax = self.db().syntax(item)
-    let ends = syntax.tokens[usize.widen(expr.last)].end == dot
+    let ends = syntax.token(expr.last).end == dot
     let shorter = match receiver {
         Some(known) => expr.token > known.token
         None => true
@@ -712,7 +750,7 @@ fn Checker.type_before(self, item: ty::ItemId, at: u32) -> Option[ty::ItemId] {
     let holder = self.holder(item)
     let syntax = self.holder_syntax(holder)
     for written in holder.paths(self) {
-        if syntax.tokens[usize.widen(written.path.last().token)].end != at {
+        if syntax.token(written.path.last().token).end != at {
             continue
         }
         let Ok(Named.Item(found)) = self.db().resolve(holder.module, path: written.path) else {
@@ -735,7 +773,7 @@ fn Checker.variants(self, owner: ty::ItemId) -> mem::List[Completion] {
     }
     let syntax = self.db().syntax(owner)
     for variant in enumeration.variants {
-        let line = output::printable(syntax.line_text(syntax.tokens[usize.widen(variant.name.token)].line), alloc)
+        let line = output::printable(syntax.line_text(syntax.token(variant.name.token).line), alloc)
         mut found.push(Completion(label: text::String.of(variant.name.text.as_str(), alloc), offered: Offered.Variant, detail: trimmed_head(line.as_str(), alloc)))
     }
     return found
@@ -761,7 +799,7 @@ fn Checker.fields(self, owner: ty::ItemId, module: ty::ModuleId) -> mem::List[Co
         if not seen {
             continue
         }
-        let line = output::printable(syntax.line_text(syntax.tokens[usize.widen(field.name.token)].line), alloc)
+        let line = output::printable(syntax.line_text(syntax.token(field.name.token).line), alloc)
         mut found.push(Completion(label: text::String.of(field.name.text.as_str(), alloc), offered: Offered.Field, detail: trimmed_head(line.as_str(), alloc)))
     }
     return found
@@ -811,10 +849,9 @@ fn Checker.path_completions(self, item: ty::ItemId, before: Slice[u8], end: usiz
     var segments = mem::List[ast::Name].empty(alloc)
     var last = end
     loop {
-        var start = last
-        while start > 0 and is_name_byte(before[start - 1]) {
-            start -= 1
-        }
+        expect last <= before.len()
+        let start = name_start(before, end: last)
+        expect start <= last
         if start == last {
             break
         }
@@ -932,7 +969,7 @@ fn Checker.local_completions(self, item: ty::ItemId, at: u32) -> mem::List[Compl
     let typed = self.typed(item)
     var previous: Option[u32] = None
     for introduced in firsts {
-        if previous == Some(introduced) or syntax.tokens[usize.widen(introduced)].end > at {
+        if previous == Some(introduced) or syntax.token(introduced).end > at {
             previous = Some(introduced)
             continue
         }

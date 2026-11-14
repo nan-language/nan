@@ -275,20 +275,25 @@ fn Session.file_checker(self, path: Str) -> Option[Checker] {
 /// The token of an item's syntax at a byte that may write a name: an identifier, `self` or a
 /// doc comment holding it, or else one ending at it.
 fn naming_token(source: syntax::SourceFile, item: syntax::ItemSyntax, at: u32) -> Option[u32] {
+    expect item.end <= source.tokens.len()
     var holding: Option[usize] = None
+    var holding_names = false
     var ending: Option[usize] = None
+    var ending_names = false
     for token in item.head..<item.end {
         let found = source.tokens[token]
         if holding.is_none() and found.start <= at and at < found.end {
             holding = Some(token)
+            holding_names = writes_name(found.kind)
         }
         if ending.is_none() and found.end == at {
             ending = Some(token)
+            ending_names = writes_name(found.kind)
         }
     }
     match holding {
         Some(token) => {
-            if writes_name(source, token) {
+            if holding_names {
                 return Some(u32.fit(token))
             }
         }
@@ -297,15 +302,15 @@ fn naming_token(source: syntax::SourceFile, item: syntax::ItemSyntax, at: u32) -
     let Some(token) = ending else {
         return None
     }
-    if writes_name(source, token) {
+    if ending_names {
         return Some(u32.fit(token))
     }
     return None
 } naming_token
 
-/// Whether a token may write a name: an identifier, `self` or a doc comment.
-fn writes_name(source: syntax::SourceFile, token: usize) -> bool {
-    return match source.tokens[token].kind {
+/// Whether a token of a kind may write a name: an identifier, `self` or a doc comment.
+fn writes_name(kind: syntax::TokenKind) -> bool {
+    return match kind {
         syntax::TokenKind.Ident or syntax::TokenKind.Doc or syntax::TokenKind.Keyword(syntax::Keyword.SelfValue) => true
         else => false
     }
@@ -319,12 +324,11 @@ fn Checker.item_holding(self, path: Str, at: u32) -> Option[ty::ItemId] {
         if db.item_file(item).path.as_str() != path {
             continue
         }
-        let syntax = db.syntax(item)
-        let data = db.item(item)
-        let lines = syntax.item_lines(syntax.items[data.index])
-        let start = syntax.lines[usize.widen(lines.low) - 1].start
-        let end = syntax.lines[usize.widen(lines.high) - 1].end
-        if at >= start and at <= end {
+        let Some(held) = db.syntax(item).items.get(db.item(item).index) else {
+            continue
+        }
+        let span = db.syntax(item).item_bytes(held)
+        if at >= span.start and at <= span.end {
             return Some(item)
         }
     }
@@ -338,10 +342,13 @@ fn Checker.named_at(self, path: Str, at: u32) -> Option[NameFound] {
     }
     let db = self.db()
     let syntax = db.syntax(item)
-    let Some(token) = naming_token(syntax, item: syntax.items[db.item(item).index], at) else {
+    let Some(held) = syntax.items.get(db.item(item).index) else {
         return None
     }
-    if syntax.tokens[usize.widen(token)].kind == syntax::TokenKind.Doc {
+    let Some(token) = naming_token(syntax, item: held, at) else {
+        return None
+    }
+    if syntax.token(token).kind == syntax::TokenKind.Doc {
         return self.doc_named(item, path, at)
     }
     let Some(named) = self.named(item, token) else {
@@ -475,7 +482,7 @@ fn Checker.doc_named(self, item: ty::ItemId, path: Str, at: u32) -> Option[NameF
         let Some(member) = reference.member else {
             continue
         }
-        let end = member.offset + u32.fit(member.name.byte_len())
+        let end = member.offset.saturating_add(u32.fit(member.name.byte_len()))
         if at < member.offset or at > end {
             continue
         }
@@ -690,11 +697,12 @@ fn Checker.names_in_impl(self, line: ty::ItemId, named: ty::ItemId) -> bool {
 /// The bytes of an item's lines, without the last line's end.
 fn Checker.item_span(self, item: ty::ItemId) -> Span {
     let db = self.db()
-    let syntax = db.syntax(item)
-    let lines = syntax.item_lines(syntax.items[db.item(item).index])
-    let start = syntax.lines[usize.widen(lines.low) - 1].start
-    let end = syntax.lines[usize.widen(lines.high) - 1].end
-    return Span(path: text::String.of(db.item_file(item).path.as_str(), alloc: self.alloc()), start: start, end: end)
+    let path = text::String.of(db.item_file(item).path.as_str(), alloc: self.alloc())
+    let Some(held) = db.syntax(item).items.get(db.item(item).index) else {
+        return Span(path: take path, start: 0, end: 0)
+    }
+    let span = db.syntax(item).item_bytes(held)
+    return Span(path: take path, start: span.start, end: span.end)
 } Checker.item_span
 
 /// The function item the name at a byte of a workspace file names.

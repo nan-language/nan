@@ -441,3 +441,146 @@ fn symbols_implementations_and_calls_list_the_workspace() {
         .collect();
     assert_eq!(calls, [(27, 17)]);
 }
+
+/// The sample package's text with a line written in part after `total`'s first statement, and
+/// the position ending it.
+fn written_in_part(line: &str) -> (String, u64, u64) {
+    let marker = "    let raised = gauge.raised(STEP)\n";
+    let text = GAUGE.replace(marker, &format!("{marker}{line}\n"));
+    (text, 28, line.len() as u64)
+}
+
+#[test]
+fn authoring_completes_signs_hints_and_classes() {
+    let files = [("app/package.nan", MANIFEST), ("app/app.nan", GAUGE)];
+    let lines = [
+        "    let x = gauge.",
+        "    let y = ra",
+        "    let z = app::",
+        "    let w = gauge.raised(",
+    ];
+    let (written, _) = session(&files, |root| {
+        let uri = format!("{root}/app/app.nan");
+        let mut sent = Vec::new();
+        for (id, line) in (1..).zip(lines) {
+            let (text, line, character) = written_in_part(line);
+            let change = Json::object(vec![
+                (
+                    "textDocument",
+                    Json::object(vec![
+                        ("uri", Json::Text(uri.clone())),
+                        ("text", Json::Text(text.clone())),
+                    ]),
+                ),
+                (
+                    "contentChanges",
+                    Json::Array(vec![Json::object(vec![("text", Json::Text(text))])]),
+                ),
+            ]);
+            let method = match id {
+                1 => "textDocument/didOpen",
+                _ => "textDocument/didChange",
+            };
+            sent.push(notification(method, change));
+            let asked = match id {
+                4 => "textDocument/signatureHelp",
+                _ => "textDocument/completion",
+            };
+            sent.push(request(id, asked, at(root, "app/app.nan", line, character)));
+        }
+        let whole = Json::object(vec![
+            ("textDocument", document(root, "app/app.nan")),
+            (
+                "contentChanges",
+                Json::Array(vec![Json::object(vec![("text", Json::text(GAUGE))])]),
+            ),
+        ]);
+        sent.push(notification("textDocument/didChange", whole));
+        let range =
+            json::parse(br#"{"start":{"line":0,"character":0},"end":{"line":40,"character":0}}"#)
+                .expect("a range");
+        sent.push(request(
+            5,
+            "textDocument/inlayHint",
+            Json::object(vec![
+                ("textDocument", document(root, "app/app.nan")),
+                ("range", range),
+            ]),
+        ));
+        sent.push(request(
+            6,
+            "textDocument/semanticTokens/full",
+            Json::object(vec![("textDocument", document(root, "app/app.nan"))]),
+        ));
+        sent
+    });
+    let labels = |id: u64| -> Vec<String> {
+        result(&written, id)
+            .get("items")
+            .map_or(&[][..], Json::elements)
+            .iter()
+            .filter_map(|item| item.get("label").and_then(Json::as_str).map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(labels(1), ["level", "level_of", "limit", "raised"]);
+    assert_eq!(labels(2), ["Range", "raised"], "a local and the core vocabulary");
+    assert_eq!(labels(3), ["Gauge", "Leveled", "STEP", "total"]);
+    let signed = result(&written, 4);
+    assert_eq!(
+        signed
+            .at(&["signatures"])
+            .and_then(|all| all.elements().first())
+            .and_then(|first| first.get("label"))
+            .and_then(Json::as_str),
+        Some("pub fn Gauge.raised(self, by: u32) -> u32")
+    );
+    assert_eq!(
+        signed.get("activeParameter").and_then(Json::as_u32),
+        Some(1)
+    );
+    let hints: Vec<(u32, u32, &str)> = result(&written, 5)
+        .elements()
+        .iter()
+        .map(|hint| {
+            let position = hint.get("position").expect("a position");
+            (
+                position
+                    .get("line")
+                    .and_then(Json::as_u32)
+                    .unwrap_or_default(),
+                position
+                    .get("character")
+                    .and_then(Json::as_u32)
+                    .unwrap_or_default(),
+                hint.get("label").and_then(Json::as_str).unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(hints, [(22, 12, ": u32"), (27, 14, ": u32")]);
+    let data: Vec<u32> = result(&written, 6)
+        .get("data")
+        .map_or(&[][..], Json::elements)
+        .iter()
+        .filter_map(Json::as_u32)
+        .collect();
+    let mut tokens = Vec::new();
+    let (mut line, mut character) = (0, 0);
+    for token in data.chunks(5) {
+        character = match token[0] {
+            0 => character + token[1],
+            _ => token[1],
+        };
+        line += token[0];
+        tokens.push((line, character, token[2], token[3], token[4]));
+    }
+    assert_eq!(
+        tokens[0],
+        (0, 0, 11, 12, 0),
+        "the file summary is a comment"
+    );
+    assert!(tokens.contains(&(2, 10, 4, 6, 3)), "STEP declares a const");
+    assert!(
+        tokens.contains(&(27, 23, 6, 10, 0)),
+        "raised names a method"
+    );
+}

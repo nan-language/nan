@@ -74,7 +74,7 @@ impl Checker<'_> {
         if code == Code::NameUnknown {
             let span = self.path_span(item, token);
             if !self.path_abandoned(item, span) {
-                self.report_unknown(item, span, self.type_candidates(item), None);
+                self.report_unknown(item, span, Vec::new(), self.type_candidates(item), None);
             }
             return;
         }

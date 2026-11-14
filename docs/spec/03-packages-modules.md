@@ -741,7 +741,7 @@ A use **names nothing** when its name, path or member reaches nothing under [Pat
 2. A path through an alias a `dep` directive declares that names a `pub` item or member in a newer release of the alias's source is an error (`name.newer-release`) naming that release and the command `nan dep sync`, without an exact fix. The newer releases are the named releases under the alias's store name with a greater [publication index](29-identity-versioning.md#local-store) than the locked one, of which the diagnostic names the earliest.
 3. Any other such use is an error (`name.unknown`).
 
-A `name.unknown` diagnostic ranks **candidates**, the names legal at the use's position: names in scope, paths to items visible from the module as it writes them, and, after `.`, the visible members of the type before it. A candidate **fits** when the use's line checks without error with the candidate in its place. Candidates rank fitting first, then by the distance between their folded form and the use's, then in byte order. The folded form of a path is its segments' folded forms joined by `::`, and the distance is the fewest insertions, deletions, substitutions and transpositions of adjacent characters turning one into the other, no character being edited twice. A candidate has distance 0 when replacing a run of the use's underscore-separated words that the [controlled vocabulary](28-stdlib.md#controlled-vocabulary) lists as a synonym with that synonym's verb gives the candidate. The diagnostic lists the first 5 candidates whose distance is at most a third of the length of the longer of the two folded forms, rounded up, and offers each fitting one as an exact fix.
+A `name.unknown` diagnostic ranks **candidates**, the names legal at the use's position: names in scope, paths to items visible from the module as it writes them, and, after `.`, the visible members of the type before it. A candidate **fits** when the use's line checks without error with the candidate in its place. Candidates rank fitting first, then by the distance between their folded form and the use's, then in byte order. The folded form of a path is its segments' folded forms joined by `::`, and the distance is the fewest insertions, deletions, substitutions and transpositions of adjacent characters turning one into the other, no character being edited twice. A candidate has distance 0 when replacing a run of the use's underscore-separated words that the [controlled vocabulary](28-stdlib.md#controlled-vocabulary) lists as a synonym with that synonym's verb gives the candidate. The diagnostic lists the first 5 candidates whose distance is at most a third of the length of the longer of the two folded forms, rounded up, and offers each fitting one as an exact fix. A member that a std type declares only for other instantiations of it, such as [`Option.value_or`](28-stdlib.md#option-and-result-members), is no candidate: the diagnostic lists before the candidates the note `<member> exists only when T is <condition>`, `<member>` being its canonical path and `<condition>` the instantiations its owning chapter gives it.
 
 When no candidate is within that distance and the use is the callee of a call, as a bare name or as a member of a type declared in the current module, the diagnostic offers a stub as an exact fix: a private function named like the use, `Type.name` for a member, inserted after the item holding the call, whose body is `return todo "<name>"`, or `todo "<name>"` without a result, `<name>` being the function's name.
 
@@ -777,6 +777,23 @@ pub fn Tally.is_full(self) -> bool {
 pub fn Tally.is_empty(self) -> bool {
     return self.count == 0
 } Tally.is_empty
+```
+
+```nan
+const DIGITS: Array[u8, 3] = Array[u8, 3].filled(7)
+
+pub const ALL: Slice[u8] = DIGITS.view()
+
+pub const HEAD: Slice[u8] = ALL.prefix(2).value_or(ALL) // error: name.unknown
+```
+
+```text
+$ nan check
+failed check .: errors 1, incomplete 0
+error name.unknown example/example.nan:6 example::HEAD
+    pub const HEAD: Slice[u8] = ALL.prefix(2).value_or(ALL) // error: name.unknown
+    because note - - core::Option.value_or exists only when T is Copy
+failed check .: errors 1, incomplete 0
 ```
 
 ```nan

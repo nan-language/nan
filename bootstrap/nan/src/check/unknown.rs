@@ -61,13 +61,14 @@ const LISTED: usize = 5;
 
 impl Checker<'_> {
     /// Reports an unknown name written over the tokens `(first, last)` of an item: a path that a
-    /// newer release of its alias's source names as such, otherwise with the candidates near it
-    /// among `candidates` listed as notes and offered as exact fixes, or, when none is near,
-    /// `stub` inserted after the item.
+    /// newer release of its alias's source names as such, otherwise with `notes`, then the
+    /// candidates near it among `candidates`, listed as notes, the candidates offered as exact
+    /// fixes, or, when none is near, `stub` inserted after the item.
     pub fn report_unknown(
         &self,
         item: ItemId,
         (first, last): (Tok, Tok),
+        notes: Vec<Reason>,
         candidates: Vec<String>,
         stub: Option<String>,
     ) {
@@ -76,13 +77,13 @@ impl Checker<'_> {
             return;
         }
         let near = near(&written, candidates);
-        let because = near
-            .iter()
-            .map(|candidate| Reason {
+        let because = notes
+            .into_iter()
+            .chain(near.iter().map(|candidate| Reason {
                 role: Role::Note,
                 subject: candidate.clone(),
                 at: None,
-            })
+            }))
             .collect();
         let fixes: Vec<Fix> = if near.is_empty() {
             stub.into_iter()

@@ -363,7 +363,8 @@ impl<'c, 'a> Body<'c, 'a> {
         candidates.extend(super::resolve::core_vocabulary().map(str::to_owned));
         let span = self.ck.path_span(self.item, token);
         if !self.ck.path_abandoned(self.item, span) {
-            self.ck.report_unknown(self.item, span, candidates, stub);
+            self.ck
+                .report_unknown(self.item, span, Vec::new(), candidates, stub);
         }
     }
 
@@ -373,9 +374,14 @@ impl<'c, 'a> Body<'c, 'a> {
         if type_key(ty).is_some_and(|key| self.ck.member_abandoned(key)) {
             return;
         }
+        let notes = self
+            .ck
+            .instantiation_note(ty, &name.text)
+            .into_iter()
+            .collect();
         let candidates = self.ck.member_candidates(self.module, ty);
         self.ck
-            .report_unknown(self.item, (name.token, name.token), candidates, stub);
+            .report_unknown(self.item, (name.token, name.token), notes, candidates, stub);
     }
 
     /// Reports a value of a type found where another is expected: `secret.public-use` for a

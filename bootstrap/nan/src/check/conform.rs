@@ -782,6 +782,25 @@ impl Checker<'_> {
         })
     }
 
+    /// The note of a `name.unknown` for the member `name` of `ty` when a std member of that name
+    /// exists only for other instantiations of its type: that member and its instantiations.
+    pub fn instantiation_note(&self, ty: &Ty, name: &str) -> Option<Reason> {
+        let functions = self.db.members.get(&type_key(ty)?)?.get(name)?;
+        let function = *functions
+            .iter()
+            .find(|function| !self.member_exists(**function, ty))?;
+        let receivers = self.receivers(function)?;
+        Some(Reason {
+            role: ReasonRole::Note,
+            subject: format!(
+                "{} exists only when T is {}",
+                self.db.canonical(function),
+                receivers.condition()
+            ),
+            at: None,
+        })
+    }
+
     /// The type a struct or enum's item is, applied to its own parameters, for a type key.
     pub fn own_type(&self, item: ItemId) -> Ty {
         let args: Vec<Arg> = self.sig(item).generics.iter().map(param_arg).collect();
@@ -1210,6 +1229,26 @@ enum Receivers {
 }
 
 impl Receivers {
+    /// The instantiations these receivers admit, as a `name.unknown` note writes them.
+    fn condition(self) -> &'static str {
+        match self {
+            Receivers::Copy => "Copy",
+            Receivers::Bytes => "u8",
+            Receivers::ByteContents => "Slice[u8], SliceMut[u8], Array[u8, N] or mem::Bytes",
+            Receivers::WritableByteContents => "SliceMut[u8], Array[u8, N] or mem::Bytes",
+            Receivers::OwnedBytes => "mem::Bytes",
+            Receivers::Clearable => "Array[u8, N], mem::Bytes or hw::Dma",
+            Receivers::Stepped => "an integer type or char",
+            Receivers::Integer => "an integer type",
+            Receivers::Lanes => "an integer type or an integer lane type",
+            Receivers::Multiplied => {
+                "an integer type or an integer lane type of 16-bit lanes or wider"
+            }
+            Receivers::Wide => "u64 or i64",
+            Receivers::Bool => "bool",
+        }
+    }
+
     /// Whether these receivers include all of `inner`'s.
     fn include(self, inner: Receivers) -> bool {
         self == inner

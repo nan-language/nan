@@ -79,7 +79,13 @@ impl Checker<'_> {
                 Some(Code::NameUnknown) => {
                     let span = self.path_span(item, error.token);
                     if !self.path_abandoned(item, span) {
-                        self.report_unknown(item, span, self.item_candidates(module), None);
+                        self.report_unknown(
+                            item,
+                            span,
+                            Vec::new(),
+                            self.item_candidates(module),
+                            None,
+                        );
                     }
                 }
                 Some(code) => self.report_problem(item, error.token, code),
@@ -92,7 +98,7 @@ impl Checker<'_> {
             if !candidates.contains(&member.text) {
                 if !self.member_abandoned(key) {
                     let span = (member.token, member.token);
-                    self.report_unknown(item, span, candidates, None);
+                    self.report_unknown(item, span, Vec::new(), candidates, None);
                 }
                 return;
             }

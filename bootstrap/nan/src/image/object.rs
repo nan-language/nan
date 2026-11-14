@@ -38,8 +38,12 @@ pub struct Relocation {
 pub struct Object {
     pub sections: Vec<Section>,
     pub symbols: Vec<Symbol>,
+    /// The name and contents of each section holding data that no address reaches, such as
+    /// `.nan`: its `SHT_PROGBITS` sections with contents and without `SHF_ALLOC`.
+    pub unallocated: Vec<(String, Vec<u8>)>,
 }
 
+const SHT_PROGBITS: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
 const SHT_RELA: u32 = 4;
 const SHT_NOBITS: u32 = 8;
@@ -72,6 +76,7 @@ fn name_at(strings: &[u8], at: usize) -> String {
 }
 
 struct Header {
+    name: u32,
     kind: u32,
     flags: u64,
     offset: usize,
@@ -93,6 +98,7 @@ pub fn read(bytes: &[u8]) -> Object {
         .map(|index| {
             let at = table + index * 64;
             Header {
+                name: u32_at(bytes, at),
                 kind: u32_at(bytes, at + 4),
                 flags: u64_at(bytes, at + 8),
                 offset: u64_at(bytes, at + 24) as usize,
@@ -104,6 +110,19 @@ pub fn read(bytes: &[u8]) -> Object {
         })
         .collect();
     let contents = |header: &Header| &bytes[header.offset..header.offset + header.size];
+    let names = contents(&headers[u16_at(bytes, 0x3E) as usize]);
+    let unallocated = headers
+        .iter()
+        .filter(|header| {
+            header.kind == SHT_PROGBITS && header.flags & SHF_ALLOC == 0 && header.size > 0
+        })
+        .map(|header| {
+            (
+                name_at(names, header.name as usize),
+                contents(header).to_vec(),
+            )
+        })
+        .collect();
     let mut sections: Vec<Section> = headers
         .iter()
         .map(|header| {
@@ -156,5 +175,9 @@ pub fn read(bytes: &[u8]) -> Object {
             });
         }
     }
-    Object { sections, symbols }
+    Object {
+        sections,
+        symbols,
+        unallocated,
+    }
 }

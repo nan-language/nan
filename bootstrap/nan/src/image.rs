@@ -99,12 +99,13 @@ struct Segment {
 /// holding the address of a symbol it imports, with that symbol's name; a Windows image's words
 /// are its import address table, the last segment, where each library's functions follow each
 /// other in order and end with a zero word, and each name is the library's, `!` and the
-/// function's.
+/// function's. Its unallocated sections are the object's.
 struct Linked {
     segments: Vec<Segment>,
     symbols: HashMap<String, u64>,
     absolute: Vec<u64>,
     imports: Vec<(u64, String)>,
+    unallocated: Vec<(String, Vec<u8>)>,
 }
 
 impl Linked {
@@ -233,7 +234,8 @@ const IMPORT_STUB_BYTES: u64 = 16;
 /// Links an object with its first segment at `base`, treating its undefined symbols as `imports`
 /// says.
 fn link(object: &[u8], base: u64, imports: Imports) -> Linked {
-    let object = object::read(object);
+    let mut object = object::read(object);
+    let unallocated = std::mem::take(&mut object.unallocated);
     let undefined = |symbol: &object::Symbol| symbol.section.is_none() && !symbol.name.is_empty();
     let mut called: Vec<String> = Vec::new();
     for relocation in object
@@ -435,6 +437,7 @@ fn link(object: &[u8], base: u64, imports: Imports) -> Linked {
         symbols,
         absolute,
         imports: imported,
+        unallocated,
     };
     linked.record_relocations(base);
     linked.record_extent(base);

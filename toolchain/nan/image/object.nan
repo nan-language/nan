@@ -34,11 +34,21 @@ struct Relocation derives Copy {
     addend: i64
 } Relocation
 
+/// A section of the object holding data that no address reaches, such as `.nan`: its name and
+/// its contents.
+struct Unallocated {
+    name: text::String
+    data: mem::Bytes
+} Unallocated
+
 struct Object {
     sections: mem::List[ObjectSection]
     symbols: mem::List[Symbol]
+    /// Its `SHT_PROGBITS` sections with contents and without `SHF_ALLOC`.
+    unallocated: mem::List[Unallocated]
 } Object
 
+const SHT_PROGBITS: u32 = 1
 const SHT_SYMTAB: u32 = 2
 const SHT_RELA: u32 = 4
 const SHT_NOBITS: u32 = 8
@@ -67,6 +77,7 @@ fn name_at(strings: Slice[u8], at: usize, alloc: mem::Alloc) -> text::String {
 } name_at
 
 struct Header derives Copy {
+    name: u32
     kind: u32
     flags: u64
     offset: usize
@@ -130,14 +141,26 @@ fn read(bytes: Slice[u8], alloc: mem::Alloc) -> Object {
     let count = usize.widen(bytes.u16_le(0x3C))
     let Some(whole) = bytes.prefix(bytes.len()) else {
         expect false
-        return Object(sections: mem::List[ObjectSection].empty(alloc), symbols: mem::List[Symbol].empty(alloc))
+        return Object(sections: mem::List[ObjectSection].empty(alloc), symbols: mem::List[Symbol].empty(alloc), unallocated: mem::List[Unallocated].empty(alloc))
     }
     let object = ObjectBytes(bytes: take whole)
     let table = object.from_offset(usize.widen(bytes.u64_le(0x28)))
     var headers = mem::List[Header].empty(alloc)
     for index in 0..<count {
         let at = index * 64
-        mut headers.push(Header(kind: table.u32_le(at + 4), flags: table.u64_le(at + 8), offset: usize.widen(table.u64_le(at + 24)), size: usize.widen(table.u64_le(at + 32)), link: table.u32_le(at + 40), info: table.u32_le(at + 44), align: table.u64_le(at + 48)))
+        mut headers.push(Header(name: table.u32_le(at), kind: table.u32_le(at + 4), flags: table.u64_le(at + 8), offset: usize.widen(table.u64_le(at + 24)), size: usize.widen(table.u64_le(at + 32)), link: table.u32_le(at + 40), info: table.u32_le(at + 44), align: table.u64_le(at + 48)))
+    }
+    let names_index = usize.widen(bytes.u16_le(0x3E))
+    expect names_index < headers.len()
+    let names = object.contents(headers[names_index])
+    var unallocated = mem::List[Unallocated].empty(alloc)
+    for header in headers {
+        if header.kind != SHT_PROGBITS or (header.flags & SHF_ALLOC) != 0 or header.size == 0 {
+            continue
+        }
+        var data = mem::Bytes.empty(alloc)
+        mut data.append(object.contents(header))
+        mut unallocated.push(Unallocated(name: name_at(names, at: usize.widen(header.name), alloc), data: take data))
     }
     var sections = mem::List[ObjectSection].empty(alloc)
     for header in headers {
@@ -175,5 +198,5 @@ fn read(bytes: Slice[u8], alloc: mem::Alloc) -> Object {
             mut section.relocations.push(Relocation(offset: entries.u64_le(at), kind: u32.truncate(info), symbol: usize.widen(info >> 32), addend: i64.from_bits(entries.u64_le(at + 16))))
         }
     }
-    return Object(sections: take sections, symbols: take symbols)
+    return Object(sections: take sections, symbols: take symbols, unallocated: take unallocated)
 } read

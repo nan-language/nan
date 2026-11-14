@@ -1,4 +1,4 @@
-//! Writes PE32+ images: the console programs of the Windows targets, which import functions of the system's libraries, and the EFI applications of the UEFI targets, each with one section per segment and the base relocations of every 64-bit absolute address, so the system or the firmware may load it anywhere.
+//! Writes PE32+ images: the console programs of the Windows targets, which import functions of the system's libraries, and the EFI applications of the UEFI targets, each with one section per segment and the base relocations of every 64-bit absolute address, so the system or the firmware may load it anywhere, then the object's unallocated sections.
 
 /// What a PE image runs as: a Windows console program or an EFI application.
 enum Program derives Copy, Eq {
@@ -62,6 +62,19 @@ const MEM_DISCARDABLE: u32 = 0x0200_0000
 const MEM_EXECUTE: u32 = 0x2000_0000
 const MEM_READ: u32 = 0x4000_0000
 const MEM_WRITE: u32 = 0x8000_0000
+
+/// The name of the image section holding an unallocated section of the object: its name without
+/// the dots after its first character, which fits the 8 bytes of a section name.
+fn section_name(name: Str, alloc: mem::Alloc) -> text::String {
+    var spelt = text::String.empty(alloc)
+    for c in name {
+        if spelt.is_empty() or c != '.' {
+            mut spelt.push(c)
+        }
+    }
+    expect spelt.byte_len() <= 8
+    return spelt
+} section_name
 
 /// A section of the image: its name, its RVA, its bytes, its size in memory and its flags.
 struct PeSection {
@@ -285,7 +298,15 @@ fn pe_write(linked: Linked, entry: u64, arch: workspace::Arch, program: Program,
         relocation_memory = 1
     }
     mut sections.push(PeSection(name: text::String.of(".reloc", alloc), rva: relocation_rva, bytes: take relocation_bytes, size: relocation_memory, flags: INITIALIZED | MEM_DISCARDABLE | MEM_READ))
-    let image_size = next_multiple_of(relocation_rva + relocation_memory, multiple: PAGE)
+    var end_rva = relocation_rva + relocation_memory
+    for held in linked.unallocated {
+        let rva = next_multiple_of(end_rva, multiple: PAGE)
+        var data = mem::Bytes.empty(alloc)
+        mut data.append(held.data.view())
+        end_rva = rva + u64.widen(held.data.len())
+        mut sections.push(PeSection(name: section_name(held.name.as_str(), alloc), rva: rva, bytes: take data, size: u64.widen(held.data.len()), flags: INITIALIZED | MEM_DISCARDABLE | MEM_READ))
+    }
+    let image_size = next_multiple_of(end_rva, multiple: PAGE)
     let headers_size = next_multiple_of(PE_HEADERS + PE_SECTION_HEADER * u64.widen(sections.len()), multiple: FILE_ALIGNMENT)
     var out = mem::Bytes.empty(alloc)
     write_headers(mut out, sections: sections.view(), sizes: Sizes(program: program, image_base: image_base, entry: entry, image: image_size, headers: headers_size, relocation_rva: relocation_rva, relocation_size: relocation_size, imports: imports), arch)

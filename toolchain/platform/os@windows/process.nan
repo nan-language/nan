@@ -1,0 +1,674 @@
+//! Programs started as child processes with their arguments, this process's environment with the variables they set, their standard streams and their working directory, waited for to their end or ended; and this process ended with a program it runs.
+
+/// The flag of `STARTUPINFOW` giving the started program its standard handles.
+const STARTF_USESTDHANDLES: u32 = 0x100
+
+/// The flag of `CreateProcessW` marking an environment block of UTF-16 code units.
+const CREATE_UNICODE_ENVIRONMENT: u32 = 0x400
+
+const DUPLICATE_SAME_ACCESS: u32 = 2
+
+/// The access to a process that reads its times.
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000
+
+/// The handle standing for this process.
+const CURRENT_PROCESS: u64 = 0xFFFF_FFFF_FFFF_FFFF
+
+const INFINITE: u32 = 0xFFFF_FFFF
+
+const WAIT_OBJECT_0: u32 = 0
+
+const WAIT_TIMEOUT: u32 = 0x102
+
+/// The exit code a killed program ends with.
+const KILLED: u32 = 1
+
+/// The most UTF-16 code units of a command line, its NUL included.
+const COMMAND_UNITS: usize = 32_768
+
+const ERROR_INVALID_PARAMETER: u32 = 87
+
+/// Windows' `STARTUPINFOW` on 64-bit Windows.
+layout StartupInfo: bytes 104 le {
+    size: u32 at 0
+    padding: u32 at 4
+    reserved: u64 at 8
+    desktop: u64 at 16
+    title: u64 at 24
+    x: u32 at 32
+    y: u32 at 36
+    width: u32 at 40
+    height: u32 at 44
+    columns: u32 at 48
+    rows: u32 at 52
+    fill: u32 at 56
+    flags: u32 at 60
+    show: u16 at 64
+    reserved_size: u16 at 66
+    padding_end: u32 at 68
+    reserved_data: u64 at 72
+    input: u64 at 80
+    output: u64 at 88
+    errors: u64 at 96
+} StartupInfo
+
+/// Windows' `PROCESS_INFORMATION` on 64-bit Windows.
+layout ProcessInformation: bytes 24 le {
+    process: u64 at 0
+    thread: u64 at 8
+    id: u32 at 16
+    thread_id: u32 at 20
+} ProcessInformation
+
+foreign fn CreateProcessW(application: u64, command: hw::Ptr[u16], process_security: u64, thread_security: u64, inherit: i32, flags: u32, environment: hw::Ptr[u16], directory: hw::Ptr[u16], startup: hw::Ptr[StartupInfo], information: hw::Ptr[ProcessInformation]) -> i32 convention "win64"
+
+foreign fn WaitForSingleObject(handle: u64, milliseconds: u32) -> u32 convention "win64"
+
+foreign fn GetExitCodeProcess(process: u64, code: hw::Ptr[u32]) -> i32 convention "win64"
+
+foreign fn TerminateProcess(process: u64, code: u32) -> i32 convention "win64"
+
+foreign fn ExitProcess(code: u32) convention "win64"
+
+foreign fn OpenProcess(access: u32, inherit: i32, id: u32) -> u64 convention "win64"
+
+foreign fn GetProcessTimes(process: u64, created: hw::Ptr[u64], exited: hw::Ptr[u64], kernel: hw::Ptr[u64], user: hw::Ptr[u64]) -> i32 convention "win64"
+
+foreign fn DuplicateHandle(source_process: u64, source: u64, target_process: u64, target: hw::Ptr[u64], access: u32, inherit: i32, options: u32) -> i32 convention "win64"
+
+foreign fn GetTempPathW(size: u32, buffer: hw::Ptr[u16]) -> u32 convention "win64"
+
+foreign fn GetTempFileNameW(dir: hw::Ptr[u16], prefix: hw::Ptr[u16], unique: u32, name: hw::Ptr[u16]) -> u32 convention "win64"
+
+foreign fn GetEnvironmentStringsW() -> hw::Ptr[u16] convention "win64"
+
+foreign fn FreeEnvironmentStringsW(block: hw::Ptr[u16]) -> i32 convention "win64"
+
+foreign fn GetProcessAffinityMask(process: u64, mask: hw::Ptr[u64], system: hw::Ptr[u64]) -> i32 convention "win64"
+
+foreign fn QueryPerformanceCounter(count: hw::Ptr[i64]) -> i32 convention "win64"
+
+foreign fn QueryPerformanceFrequency(frequency: hw::Ptr[i64]) -> i32 convention "win64"
+
+foreign fn Sleep(milliseconds: u32) convention "win64"
+
+/// The handles a program started finds as its standard input, output and error, 0 for one not
+/// opened; this process closes them once the program has started or ended.
+struct Handles derives Copy {
+    input: u64
+    out: u64
+    err: u64
+} Handles
+
+const NO_HANDLES: Handles = Handles(input: 0, out: 0, err: 0)
+
+/// A program started as a child of this process: its process handle and id.
+struct Child derives Copy {
+    process: u64
+    id: u32
+} Child
+
+/// Runs a program the system's search finds, a name holding `/` being its path, given its arguments
+/// after its name, to its end: its standard input `input`, or the null device for none; its
+/// standard output captured; its standard error captured, or the null device unless
+/// `capture_errors`. On Linux it starts with no signal blocked and `SIGPIPE` at its default action.
+pub fn run_output(program: Str, args: Slice[text::String], take input: Option[mem::Bytes], capture_errors: bool, alloc: mem::Alloc) -> platform::Output fails platform::IoError {
+    let env = mem::List[text::String].empty(alloc)
+    return try run_output_with(program, args, env: env.view(), input: take input, capture_errors, alloc)
+} run_output
+
+/// Runs a program as `run_output` does, with this process's environment with the variables that
+/// the `NAME=VALUE` entries of `env` give set.
+pub fn run_output_with(program: Str, args: Slice[text::String], env: Slice[text::String], take input: Option[mem::Bytes], capture_errors: bool, alloc: mem::Alloc) -> platform::Output fails platform::IoError {
+    var handles = NO_HANDLES
+    let ran = attempt captured(mut handles, program, args, env, input: take input, capture_errors, alloc)
+    close_all(handles)
+    return match ran {
+        Ok(output) => output
+        Err(error) => fail error
+    }
+} run_output_with
+
+/// Runs a program to its end as `run_output_with` does, the handles it opens recorded in
+/// `handles`.
+fn captured(mut handles: Handles, program: Str, args: Slice[text::String], env: Slice[text::String], take input: Option[mem::Bytes], capture_errors: bool, alloc: mem::Alloc) -> platform::Output fails platform::IoError {
+    match input {
+        Some(bytes) => {
+            handles.input = try temporary()
+            try write_handle(handles.input, data: bytes.view())
+            try rewind(handles.input)
+        }
+        None => {
+            handles.input = try null_device()
+        }
+    }
+    handles.out = try temporary()
+    if capture_errors {
+        handles.err = try temporary()
+    } else {
+        handles.err = try null_device()
+    }
+    let child = try spawn(program, args, handles, dir: None, env, alloc)
+    let status = try waited(child)
+    let out_bytes = try written_to(handles.out, alloc)
+    var err_bytes = mem::Bytes.empty(alloc)
+    if capture_errors {
+        err_bytes = try written_to(handles.err, alloc)
+    }
+    return platform::Output(status: status, stdout: take out_bytes, stderr: take err_bytes)
+} captured
+
+/// Runs a program the system's search finds, given its arguments after its name, in the directory
+/// `dir`, to its end, its standard input the null device and its standard output and error
+/// captured; asks `within` with its process id, between waits of `poll_ms` milliseconds, whether it
+/// may go on, and once that gives false or fails, kills it and gives none or the failure.
+pub fn run_bounded(program: Str, args: Slice[text::String], dir: Str, poll_ms: i32, within: fn(id: u32) -> bool fails platform::IoError, alloc: mem::Alloc) -> Option[platform::Output] fails platform::IoError {
+    var handles = NO_HANDLES
+    let ran = attempt bounded(mut handles, program, args, dir, poll_ms, within, alloc)
+    close_all(handles)
+    return match ran {
+        Ok(output) => output
+        Err(error) => fail error
+    }
+} run_bounded
+
+/// Runs a program as `run_bounded` does, the handles it opens recorded in `handles`.
+fn bounded(mut handles: Handles, program: Str, args: Slice[text::String], dir: Str, poll_ms: i32, within: fn(id: u32) -> bool fails platform::IoError, alloc: mem::Alloc) -> Option[platform::Output] fails platform::IoError {
+    handles.input = try null_device()
+    handles.out = try temporary()
+    handles.err = try temporary()
+    let child = try spawn(program, args, handles, dir: Some(dir), env: mem::List[text::String].empty(alloc).view(), alloc)
+    loop {
+        let waited_for = trusted "child.process is a process this process started" { WaitForSingleObject(child.process, milliseconds: poll_ms.to_bits()) }
+        if waited_for == WAIT_OBJECT_0 {
+            break
+        }
+        let going = attempt within(child.id)
+        if waited_for != WAIT_TIMEOUT or going != Ok(true) {
+            force_end(child)
+            let Err(error) = going else {
+                return None
+            }
+            fail error
+        }
+    }
+    let status = try exit_status(child)
+    let out_bytes = try written_to(handles.out, alloc)
+    let err_bytes = try written_to(handles.err, alloc)
+    return Some(platform::Output(status: status, stdout: take out_bytes, stderr: take err_bytes))
+} bounded
+
+/// Runs a program the system's search finds, given its arguments after its name, with this
+/// process's standard streams, in the directory `dir`, to its end. On Linux a termination request,
+/// `SIGHUP`, `SIGINT` or `SIGTERM`, meanwhile ends this process as the signal's default action
+/// does.
+pub fn run_attached(program: Str, args: Slice[text::String], dir: Str, alloc: mem::Alloc) -> platform::Status fails platform::IoError {
+    var handles = NO_HANDLES
+    let started = attempt inheriting(mut handles, program, args, dir: Some(dir), env: mem::List[text::String].empty(alloc).view(), alloc)
+    close_all(handles)
+    let Ok(child) = started else {
+        let Err(error) = started else {
+            fail platform::IoError.Other(0)
+        }
+        fail error
+    }
+    return try waited(child)
+} run_attached
+
+/// Starts a program with this process's standard streams, the handles it opens recorded in
+/// `handles`.
+fn inheriting(mut handles: Handles, program: Str, args: Slice[text::String], dir: Option[Str], env: Slice[text::String], alloc: mem::Alloc) -> Child fails platform::IoError {
+    handles.input = try inherited(STD_INPUT_HANDLE)
+    handles.out = try inherited(STD_OUTPUT_HANDLE)
+    handles.err = try inherited(STD_ERROR_HANDLE)
+    return try spawn(program, args, handles, dir, env, alloc)
+} inheriting
+
+/// A program started in the background, until `end`.
+pub open struct Background derives Copy {
+    process: u64
+} Background
+
+/// Starts a program the system's search finds, given its arguments after its name, in the directory
+/// `dir`, with its standard streams the null device.
+pub fn start_background(program: Str, args: Slice[text::String], dir: Str, alloc: mem::Alloc) -> Background fails platform::IoError {
+    var handles = NO_HANDLES
+    let started = attempt silent(mut handles, program, args, dir, alloc)
+    close_all(handles)
+    return match started {
+        Ok(child) => Background(process: child.process)
+        Err(error) => fail error
+    }
+} start_background
+
+/// Starts a program with its standard streams the null device, the handles it opens recorded in
+/// `handles`.
+fn silent(mut handles: Handles, program: Str, args: Slice[text::String], dir: Str, alloc: mem::Alloc) -> Child fails platform::IoError {
+    handles.input = try null_device()
+    handles.out = try null_device()
+    handles.err = try null_device()
+    return try spawn(program, args, handles, dir: Some(dir), env: mem::List[text::String].empty(alloc).view(), alloc)
+} silent
+
+/// Whether the program has not ended.
+pub fn Background.running(self) -> bool fails platform::IoError {
+    let waited_for = trusted "self.process is a process this process started" { WaitForSingleObject(self.process, milliseconds: 0) }
+    if waited_for == WAIT_TIMEOUT {
+        return true
+    }
+    if waited_for == WAIT_OBJECT_0 {
+        return false
+    }
+    fail last_error()
+} Background.running
+
+/// Kills the program and waits for its end.
+pub fn Background.end(self) {
+    force_end(Child(process: self.process, id: 0))
+} Background.end
+
+/// Waits a number of milliseconds.
+pub fn sleep_ms(milliseconds: i32) {
+    trusted "Sleep reads no memory" {
+        Sleep(milliseconds.to_bits())
+    }
+} sleep_ms
+
+/// Hands this process over to a program the system's search finds, a name holding `/` being its
+/// path, given its arguments after its name, with this process's environment with the variables
+/// that the `NAME=VALUE` entries of `env` give set and this process's standard streams: on Linux
+/// the program replaces this process, with no signal blocked and `SIGPIPE` at its default action,
+/// and on Windows this process runs it to its end and ends with its exit code. Returns only when
+/// the system refuses to start it, with the failure.
+pub fn replace_process(program: Str, args: Slice[text::String], env: Slice[text::String], alloc: mem::Alloc) -> platform::IoError {
+    var handles = NO_HANDLES
+    let started = attempt inheriting(mut handles, program, args, dir: None, env, alloc)
+    close_all(handles)
+    let Ok(child) = started else {
+        let Err(error) = started else {
+            return platform::IoError.Other(0)
+        }
+        return error
+    }
+    discard trusted "child.process is a process this process started" { WaitForSingleObject(child.process, milliseconds: INFINITE) }
+    var code: u32 = 0
+    let read = trusted "child.process is a process this process started and code a DWORD" { GetExitCodeProcess(child.process, code: hw::Ptr.of_mut(mut code)) }
+    if read == 0 {
+        return last_error()
+    }
+    trusted "ExitProcess ends this process" {
+        ExitProcess(code)
+    }
+    return platform::IoError.Other(0)
+} replace_process
+
+/// The number of processors in this process's affinity set, at least one.
+pub fn processors() -> usize {
+    var mask: u64 = 0
+    var system: u64 = 0
+    let read = trusted "mask and system address a DWORD_PTR each" { GetProcessAffinityMask(CURRENT_PROCESS, mask: hw::Ptr.of_mut(mut mask), system: hw::Ptr.of_mut(mut system)) }
+    if read == 0 or mask == 0 {
+        return 1
+    }
+    return usize.widen(mask.count_ones())
+} processors
+
+/// The nanoseconds of the system's monotonic clock.
+pub fn monotonic_nanos() -> u64 {
+    var count: i64 = 0
+    var frequency: i64 = 0
+    discard trusted "count addresses a LARGE_INTEGER" { QueryPerformanceCounter(hw::Ptr.of_mut(mut count)) }
+    discard trusted "frequency addresses a LARGE_INTEGER" { QueryPerformanceFrequency(hw::Ptr.of_mut(mut frequency)) }
+    let ticks = count.to_bits()
+    let per_second = frequency.to_bits()
+    if per_second == 0 {
+        return 0
+    }
+    let whole = ticks / per_second
+    let part = ticks % per_second
+    return whole.wrapping_mul(1_000_000_000).wrapping_add(part.wrapping_mul(1_000_000_000) / per_second)
+} monotonic_nanos
+
+/// The milliseconds of host processor time a process has used, its threads' in user and kernel
+/// mode.
+pub fn processor_time(pid: u32, alloc: mem::Alloc) -> u64 fails platform::IoError {
+    let process = trusted "OpenProcess reads no memory" { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, inherit: 0, id: pid) }
+    if process == 0 {
+        fail last_error()
+    }
+    var created: u64 = 0
+    var exited: u64 = 0
+    var kernel: u64 = 0
+    var user: u64 = 0
+    let read = trusted "process is open, and created, exited, kernel and user address a FILETIME each" { GetProcessTimes(process, created: hw::Ptr.of_mut(mut created), exited: hw::Ptr.of_mut(mut exited), kernel: hw::Ptr.of_mut(mut kernel), user: hw::Ptr.of_mut(mut user)) }
+    if read == 0 {
+        let error = last_error()
+        release(process)
+        fail error
+    }
+    release(process)
+    return kernel.wrapping_add(user) / 10_000
+} processor_time
+
+/// Starts a program the system finds as `CreateProcessW` does, given its arguments after its name,
+/// with this process's environment with the variables that the `NAME=VALUE` entries of `env` give
+/// set, `handles` as its standard handles, in the directory `dir` or this process's for none.
+fn spawn(program: Str, args: Slice[text::String], handles: Handles, dir: Option[Str], env: Slice[text::String], alloc: mem::Alloc) -> Child fails platform::IoError {
+    var line = try command_line(program, args, alloc)
+    var block = mem::List[u16].empty(alloc)
+    var flags: u32 = 0
+    var environment: hw::Ptr[u16] = hw::Ptr.of_addr(0)
+    if env.len() > 0 {
+        block = try environment_block(env, alloc)
+        flags = CREATE_UNICODE_ENVIRONMENT
+        environment = hw::Ptr.of_view(block.view())
+    }
+    var directory = Wide(units: NO_WIDE)
+    var directory_at: hw::Ptr[u16] = hw::Ptr.of_addr(0)
+    match dir {
+        Some(path) => {
+            directory = try wide(path)
+            directory_at = hw::Ptr.of_view(directory.units.view())
+        }
+        None => {}
+    }
+    var startup = StartupInfo.from_bits(Array[u8, 104].filled(0))
+    startup.size = 104
+    startup.flags = STARTF_USESTDHANDLES
+    startup.input = handles.input
+    startup.output = handles.out
+    startup.errors = handles.err
+    var information = ProcessInformation.from_bits(Array[u8, 24].filled(0))
+    let information_at = hw::Ptr.of_mut(mut information)
+    let started = trusted "line holds a NUL-terminated command line, environment a NUL-terminated block or null, directory_at a NUL-terminated path or null, startup a STARTUPINFOW and information_at a PROCESS_INFORMATION" { CreateProcessW(application: 0, command: hw::Ptr.of_view_mut(mut line.view_mut()), process_security: 0, thread_security: 0, inherit: 1, flags, environment, directory: directory_at, startup: hw::Ptr.of_mut(mut startup), information: information_at) }
+    if started == 0 {
+        fail last_error()
+    }
+    let held = trusted "CreateProcessW wrote a PROCESS_INFORMATION at information_at" { information_at.read() }
+    release(held.thread)
+    return Child(process: held.process, id: held.id)
+} spawn
+
+/// Waits for a program's end and gives how it ended.
+fn waited(child: Child) -> platform::Status fails platform::IoError {
+    let waited_for = trusted "child.process is a process this process started" { WaitForSingleObject(child.process, milliseconds: INFINITE) }
+    if waited_for != WAIT_OBJECT_0 {
+        let error = last_error()
+        release(child.process)
+        fail error
+    }
+    return try exit_status(child)
+} waited
+
+/// How an ended program ended; releases its process handle.
+fn exit_status(child: Child) -> platform::Status fails platform::IoError {
+    var code: u32 = 0
+    let read = trusted "child.process is a process this process started and code a DWORD" { GetExitCodeProcess(child.process, code: hw::Ptr.of_mut(mut code)) }
+    if read == 0 {
+        let error = last_error()
+        release(child.process)
+        fail error
+    }
+    release(child.process)
+    return platform::Status.Exited(i32.from_bits(code))
+} exit_status
+
+/// Kills a program, waits for its end and releases its process handle.
+fn force_end(child: Child) {
+    discard trusted "child.process is a process this process started" { TerminateProcess(child.process, code: KILLED) }
+    discard trusted "child.process is a process this process started" { WaitForSingleObject(child.process, milliseconds: INFINITE) }
+    release(child.process)
+} force_end
+
+/// Closes the handles a start opened.
+fn close_all(handles: Handles) {
+    close_opened(handles.input)
+    close_opened(handles.out)
+    close_opened(handles.err)
+} close_all
+
+/// Closes a handle a start opened, none for 0.
+fn close_opened(handle: u64) {
+    if handle != 0 {
+        release(handle)
+    }
+} close_opened
+
+/// Security attributes making a handle the programs this process starts inherit.
+fn inheritable() -> SecurityAttributes {
+    var security = SecurityAttributes.from_bits(Array[u8, 24].filled(0))
+    security.size = 24
+    security.inherit = 1
+    return security
+} inheritable
+
+/// An inheritable handle of the null device.
+fn null_device() -> u64 fails platform::IoError {
+    let name = try wide("NUL")
+    var security = inheritable()
+    let handle = trusted "name holds a NUL-terminated name and security a SECURITY_ATTRIBUTES" { CreateFileW(hw::Ptr.of_view(name.units.view()), access: GENERIC_READ | GENERIC_WRITE, share: SHARE_ALL, security: hw::Ptr.of_mut(mut security), disposition: OPEN_EXISTING, flags: 0, template: 0) }
+    if handle == INVALID_HANDLE {
+        fail last_error()
+    }
+    return handle
+} null_device
+
+/// An inheritable handle of a new temporary file, which the system deletes once its last handle
+/// closes.
+fn temporary() -> u64 fails platform::IoError {
+    var dir = Wide(units: NO_WIDE)
+    let length = trusted "dir addresses WIDE_UNITS code units" { GetTempPathW(u32.fit(WIDE_UNITS), buffer: hw::Ptr.of_view_mut(mut dir.units.view_mut())) }
+    if length == 0 {
+        fail last_error()
+    }
+    if usize.widen(length) >= WIDE_UNITS - 16 {
+        fail platform::IoError.Other(i32.from_bits(ERROR_FILENAME_EXCED_RANGE))
+    }
+    let prefix = try wide("nan")
+    var name = Wide(units: NO_WIDE)
+    let named = trusted "dir and prefix hold NUL-terminated texts and name addresses WIDE_UNITS code units" { GetTempFileNameW(hw::Ptr.of_view(dir.units.view()), prefix: hw::Ptr.of_view(prefix.units.view()), unique: 0, name: hw::Ptr.of_view_mut(mut name.units.view_mut())) }
+    if named == 0 {
+        fail last_error()
+    }
+    var security = inheritable()
+    let handle = trusted "name holds a NUL-terminated path and security a SECURITY_ATTRIBUTES" { CreateFileW(hw::Ptr.of_view(name.units.view()), access: GENERIC_READ | GENERIC_WRITE, share: SHARE_ALL, security: hw::Ptr.of_mut(mut security), disposition: OPEN_EXISTING, flags: FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, template: 0) }
+    if handle == INVALID_HANDLE {
+        let error = last_error()
+        discard trusted "name holds a NUL-terminated path" { DeleteFileW(hw::Ptr.of_view(name.units.view())) }
+        fail error
+    }
+    return handle
+} temporary
+
+/// An inheritable copy of one of this process's standard handles, 0 when it has none.
+fn inherited(which: u32) -> u64 fails platform::IoError {
+    let own = std_handle(which)
+    if own == 0 or own == INVALID_HANDLE {
+        return 0
+    }
+    var copy: u64 = 0
+    try checked(trusted "own is a handle of this process and copy addresses a HANDLE" { DuplicateHandle(CURRENT_PROCESS, source: own, target_process: CURRENT_PROCESS, target: hw::Ptr.of_mut(mut copy), access: 0, inherit: 1, options: DUPLICATE_SAME_ACCESS) })
+    return copy
+} inherited
+
+/// Moves an open file's position to its start.
+fn rewind(handle: u64) fails platform::IoError {
+    try checked(trusted "a null pointer asks for no new position" { SetFilePointerEx(handle, distance: 0, position: hw::Ptr.of_addr(0), method: FILE_BEGIN) })
+} rewind
+
+/// What a program wrote to a temporary file.
+fn written_to(handle: u64, alloc: mem::Alloc) -> mem::Bytes fails platform::IoError {
+    try rewind(handle)
+    return try read_rest(handle, alloc)
+} written_to
+
+/// The command line of a program and its arguments, then a NUL: the program's path quoted whole,
+/// with `\` separators, and each argument as the Microsoft C runtime splits a command line.
+fn command_line(program: Str, args: Slice[text::String], alloc: mem::Alloc) -> mem::List[u16] fails platform::IoError {
+    var line = mem::List[u16].empty(alloc)
+    mut line.push(0x22)
+    for c in program {
+        if c == '"' {
+            fail platform::IoError.Other(i32.from_bits(ERROR_INVALID_PARAMETER))
+        }
+        if c == '/' {
+            mut line.push(0x5C)
+            continue
+        }
+        try push_char(mut line, c)
+    }
+    mut line.push(0x22)
+    for arg in args {
+        mut line.push(0x20)
+        try push_argument(mut line, written: arg.as_str())
+    }
+    mut line.push(0)
+    if line.len() > COMMAND_UNITS {
+        fail platform::IoError.Other(i32.from_bits(ERROR_FILENAME_EXCED_RANGE))
+    }
+    return line
+} command_line
+
+/// Appends an argument as the Microsoft C runtime reads it back: as it is when it is not empty
+/// and holds no white space or quote, and otherwise quoted, each quote and the backslashes before
+/// it or before the closing quote escaped.
+fn push_argument(mut line: mem::List[u16], written: Str) fails platform::IoError {
+    var plain = not written.is_empty()
+    for c in written {
+        if c == ' ' or c == '\t' or c == '\n' or c == '\u{B}' or c == '"' {
+            plain = false
+        }
+    }
+    if plain {
+        for c in written {
+            try push_char(mut line, c)
+        }
+        return
+    }
+    mut line.push(0x22)
+    var backslashes: usize = 0
+    for c in written {
+        if c == '\\' {
+            backslashes += 1
+            mut line.push(0x5C)
+            continue
+        }
+        if c == '"' {
+            push_backslashes(mut line, count: backslashes + 1)
+            mut line.push(0x22)
+            backslashes = 0
+            continue
+        }
+        backslashes = 0
+        try push_char(mut line, c)
+    }
+    push_backslashes(mut line, count: backslashes)
+    mut line.push(0x22)
+} push_argument
+
+fn push_backslashes(mut line: mem::List[u16], count: usize) {
+    for _ in 0..<count {
+        mut line.push(0x5C)
+    }
+} push_backslashes
+
+/// Appends the UTF-16 code units of a character other than NUL.
+fn push_char(mut units: mem::List[u16], c: char) fails platform::IoError {
+    let value = c.to_bits()
+    if value == 0 {
+        fail platform::IoError.Other(i32.from_bits(ERROR_INVALID_PARAMETER))
+    }
+    if value < 0x1_0000 {
+        mut units.push(u16.truncate(value))
+        return
+    }
+    let above = value - 0x1_0000
+    mut units.push(0xD800 | u16.truncate(above >> 10))
+    mut units.push(0xDC00 | u16.truncate(above & 0x3FF))
+} push_char
+
+/// This process's environment block with the variables that the `NAME=VALUE` entries of `env`
+/// give set, names compared ignoring ASCII case as Windows compares them.
+fn environment_block(env: Slice[text::String], alloc: mem::Alloc) -> mem::List[u16] fails platform::IoError {
+    var given = mem::List[mem::List[u16]].empty(alloc)
+    for entry in env {
+        var units = mem::List[u16].empty(alloc)
+        for c in entry.as_str() {
+            try push_char(mut units, c)
+        }
+        mut given.push(take units)
+    }
+    var block = mem::List[u16].empty(alloc)
+    let start = trusted "GetEnvironmentStringsW gives this process's environment block" { GetEnvironmentStringsW() }
+    if start.addr() == 0 {
+        fail last_error()
+    }
+    var at: isize = 0
+    loop {
+        var entry = mem::List[u16].empty(alloc)
+        loop {
+            let unit = trusted "start addresses an environment block, whose entries each end with a NUL and which an empty entry ends" { start.offset(at).read() }
+            at = at.wrapping_add(1)
+            if unit == 0 {
+                break
+            }
+            mut entry.push(unit)
+        }
+        if entry.len() == 0 {
+            break
+        }
+        if not replaced(entry.view(), given: given.view()) {
+            for unit in entry {
+                mut block.push(unit)
+            }
+            mut block.push(0)
+        }
+    }
+    discard trusted "start is the environment block GetEnvironmentStringsW gave, freed once" { FreeEnvironmentStringsW(start) }
+    for units in given {
+        for unit in units {
+            mut block.push(unit)
+        }
+        mut block.push(0)
+    }
+    mut block.push(0)
+    return block
+} environment_block
+
+/// Whether one of the `NAME=VALUE` entries `given` sets the variable of an environment entry.
+fn replaced(entry: Slice[u16], given: Slice[mem::List[u16]]) -> bool {
+    for units in given {
+        if same_name(entry, right: units.view()) {
+            return true
+        }
+    }
+    return false
+} replaced
+
+/// Whether two `NAME=VALUE` entries name one variable, ignoring ASCII case; a name holds at least
+/// one unit, so that the entries Windows keeps per drive, starting with `=`, name theirs.
+fn same_name(left: Slice[u16], right: Slice[u16]) -> bool {
+    var at: usize = 0
+    loop {
+        if at >= left.len() or at >= right.len() {
+            return false
+        }
+        let one = left[at]
+        let other = right[at]
+        if at > 0 and one == 0x3D and other == 0x3D {
+            return true
+        }
+        if folded(one) != folded(other) {
+            return false
+        }
+        at += 1
+    }
+} same_name
+
+/// A UTF-16 code unit with an ASCII uppercase letter made lowercase.
+fn folded(unit: u16) -> u16 {
+    if unit >= 0x41 and unit <= 0x5A {
+        return unit + 0x20
+    }
+    return unit
+} folded

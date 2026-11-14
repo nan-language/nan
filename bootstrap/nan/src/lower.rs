@@ -482,8 +482,7 @@ pub fn lower(ck: &Checker, program: &Program) -> Lowered {
         false => host::linux::entry_seam(&mut lowering, program),
     }
     lowering.drain();
-    let sections = (!lowering.windows()).then_some((&program.section[..], &program.tree));
-    lowering.finish(sections)
+    lowering.finish(Some((&program.section, &program.tree)))
 }
 
 /// Lowers the reach of a final build for a machine target: the entry function and the target's

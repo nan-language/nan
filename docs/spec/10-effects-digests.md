@@ -127,6 +127,23 @@ api example::percent_of example/example.nan:2
 ok show example::percent_of --api: records 1
 ```
 
+A call of a `mem::Alloc` member brings no capability, while one of a `mem::Budget` member brings `mem::Budget`:
+
+```nan
+pub fn scratch(alloc: mem::Alloc, limit: usize) -> mem::Alloc {
+    return alloc.split(limit).alloc()
+} scratch
+```
+
+```text
+$ nan show example::scratch --api
+ok show example::scratch --api: records 1
+api example::scratch example/example.nan:2
+    pub fn scratch(alloc: mem::Alloc, limit: usize) -> mem::Alloc
+    digest: effects none | authority mem::Budget | may-trap yes | terminates
+ok show example::scratch --api: records 1
+```
+
 ### Reversibility
 
 The **class** of a digest bounds what its code does to state outside the program, such as files, devices and peers. The classes are, from least to greatest:

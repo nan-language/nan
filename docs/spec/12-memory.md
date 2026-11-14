@@ -131,7 +131,7 @@ pub fn Watch.close(take self)
 - `changed` is a waiting primitive whose cancellation the runtime acknowledges at once ([acknowledged cancellation](17-suspension-io.md#acknowledged-cancellation)): when a suspended `changed` becomes cancelled after the charge has left its band, it returns the new band instead of the cancellation.
 - At most one task waits on a cell's charge at a time: a `changed` that would suspend while another task waits in a `changed` of a watch of the same cell traps (`trap.duplicate-access`). The first wait on a cell takes a record of the support routines' memory, and traps when that memory is exhausted (`trap.exhausted`).
 - Once the cell is closed its charge no longer changes, so a `changed` waiting on it waits until it is cancelled.
-- `changed` has the wait fact, and `watch` and `set` the alloc fact. A watch holds an allocator naming its cell, through which `band` and `changed` read the charge, so their digests hold `mem::Alloc` among their capabilities and a watch is a [capability type](05-properties.md#capability-types).
+- `changed` has the wait fact, and `watch` and `set` the alloc fact. A watch holds an allocator naming its cell, through which `band` and `changed` read the charge, so a watch is a [capability type](05-properties.md#capability-types).
 
 ```nan
 pub fn scratch_level(alloc: mem::Alloc) -> usize

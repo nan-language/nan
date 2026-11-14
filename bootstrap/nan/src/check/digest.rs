@@ -1128,9 +1128,12 @@ impl Walk<'_, '_, '_> {
                     facts.class = facts.class.join(self.ck.served_class(served));
                 }
                 if self.ck.db.is_std(*item) && self.ck.is_primitive_capability_member(*item) {
-                    let mut capabilities = facts.capabilities.clone().unwrap_or_default();
-                    capabilities.insert(self.ck.owner_item(*item));
-                    facts.capabilities = Some(capabilities);
+                    let owner = self.ck.owner_item(*item);
+                    if self.ck.db.canonical(owner) != "mem::Alloc" {
+                        let mut capabilities = facts.capabilities.clone().unwrap_or_default();
+                        capabilities.insert(owner);
+                        facts.capabilities = Some(capabilities);
+                    }
                 }
                 if self.ck.is_validator(*item) {
                     let mut validators = facts.validators.clone().unwrap_or_default();

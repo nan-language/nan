@@ -1,0 +1,503 @@
+//! JSON values as the language server reads and writes them.
+
+/// A JSON value: an object keeps its members in order, a number its text.
+pkg enum Json {
+    Null
+    Bool(bool)
+    Number(text::String)
+    Text(text::String)
+    Array(mem::List[Json])
+    Object(mem::List[Member])
+} Json
+
+/// A member of an object.
+pkg struct Member {
+    pkg name: text::String
+    pkg value: Json
+} Member
+
+/// The deepest nesting of arrays and objects a message may hold.
+const DEEPEST: u32 = 64
+
+const HEX_DIGITS: Str = "0123456789abcdef"
+
+/// A member of that name.
+pkg fn Member.of(name: Str, take value: Json, alloc: mem::Alloc) -> Member {
+    return Member(name: text::String.of(name, alloc), value: take value)
+} Member.of
+
+pkg fn Json.text(written: Str, alloc: mem::Alloc) -> Json {
+    return Json.Text(text::String.of(written, alloc))
+} Json.text
+
+pkg fn Json.number(value: u64, alloc: mem::Alloc) -> Json {
+    var written = text::String.empty(alloc)
+    mut written.write(text::fmt("{value}", value), budget: 32)
+    return Json.Number(take written)
+} Json.number
+
+/// A copy of the value.
+pkg fn Json.copy(self, alloc: mem::Alloc) -> Json {
+    match self {
+        Json.Null => return Json.Null
+        Json.Bool(value) => return Json.Bool(value)
+        Json.Number(written) => return Json.Number(text::String.of(written.as_str(), alloc))
+        Json.Text(written) => return Json.Text(text::String.of(written.as_str(), alloc))
+        Json.Array(elements) => {
+            var copied = mem::List[Json].empty(alloc)
+            for element in elements {
+                mut copied.push(element.copy(alloc))
+            }
+            return Json.Array(take copied)
+        }
+        Json.Object(members) => {
+            var copied = mem::List[Member].empty(alloc)
+            for member in members {
+                mut copied.push(Member.of(member.name.as_str(), value: member.value.copy(alloc), alloc))
+            }
+            return Json.Object(take copied)
+        }
+    }
+} Json.copy
+
+/// An object's member of that name.
+pkg proj fn Json.get(self, name: Str) -> Option[Json] {
+    let Json.Object(members) = self else {
+        return None
+    }
+    for member in members {
+        if member.name.as_str() == name {
+            return Some(member.value)
+        }
+    }
+    return None
+} Json.get
+
+/// The value two names reach, each an object's member.
+pkg proj fn Json.at(self, outer: Str, inner: Str) -> Option[Json] {
+    let Some(held) = self.get(outer) else {
+        return None
+    }
+    return held.get(inner)
+} Json.at
+
+pkg proj fn Json.as_str(self) -> Option[Str] {
+    return match self {
+        Json.Text(written) => Some(written.as_str())
+        else => None
+    }
+} Json.as_str
+
+pkg fn Json.to_bool(self) -> Option[bool] {
+    return match self {
+        Json.Bool(value) => Some(value)
+        else => None
+    }
+} Json.to_bool
+
+/// A number without sign, fraction or exponent that fits in 32 bits.
+pkg fn Json.to_u32(self) -> Option[u32] {
+    let Json.Number(written) = self else {
+        return None
+    }
+    var value: u32 = 0
+    for c in written.as_str() {
+        if c < '0' or c > '9' {
+            return None
+        }
+        let Some(scaled) = value.checked_mul(10) else {
+            return None
+        }
+        let Some(next) = scaled.checked_add(c.to_bits() - '0'.to_bits()) else {
+            return None
+        }
+        value = next
+    }
+    return Some(value)
+} Json.to_u32
+
+/// An array's elements, none for another value.
+pkg proj fn Json.elements(self) -> Option[Slice[Json]] {
+    return match self {
+        Json.Array(elements) => Some(elements.view())
+        else => None
+    }
+} Json.elements
+
+/// The value written compactly, members in their order.
+pkg fn Json.written(self, alloc: mem::Alloc) -> text::String {
+    var out = text::String.empty(alloc)
+    self.write(mut out)
+    return out
+} Json.written
+
+fn Json.write(self, mut out: text::String) {
+    match self {
+        Json.Null => mut out.append("null")
+        Json.Bool(value) => {
+            match value {
+                true => mut out.append("true")
+                false => mut out.append("false")
+            }
+        }
+        Json.Number(written) => mut out.append(written.as_str())
+        Json.Text(written) => write_text(written.as_str(), mut out)
+        Json.Array(elements) => {
+            mut out.push('[')
+            for index in 0..<elements.len() {
+                if index > 0 {
+                    mut out.push(',')
+                }
+                elements[index].write(mut out)
+            }
+            mut out.push(']')
+        }
+        Json.Object(members) => {
+            mut out.push('{')
+            for index in 0..<members.len() {
+                if index > 0 {
+                    mut out.push(',')
+                }
+                write_text(members[index].name.as_str(), mut out)
+                mut out.push(':')
+                members[index].value.write(mut out)
+            }
+            mut out.push('}')
+        }
+    }
+} Json.write
+
+/// A string literal: `"` and `\` escaped, control characters by their escapes.
+fn write_text(written: Str, mut out: text::String) {
+    mut out.push('"')
+    for c in written {
+        match c {
+            '"' => mut out.append("\\\"")
+            '\\' => mut out.append("\\\\")
+            '\n' => mut out.append("\\n")
+            '\r' => mut out.append("\\r")
+            '\t' => mut out.append("\\t")
+            else => {
+                if c.to_bits() < 0x20 {
+                    mut out.append("\\u00")
+                    hex_digit(mut out, value: usize.widen(c.to_bits() >> 4))
+                    hex_digit(mut out, value: usize.widen(c.to_bits() & 0xF))
+                } else {
+                    mut out.push(c)
+                }
+            }
+        }
+    }
+    mut out.push('"')
+} write_text
+
+fn hex_digit(mut out: text::String, value: usize) {
+    let Some(digit) = HEX_DIGITS.slice_bytes(value, end: value + 1) else {
+        expect false
+        return
+    }
+    mut out.append(digit)
+} hex_digit
+
+/// The value a message's bytes hold, with whitespace around it; none when they hold no single
+/// valid value or nest deeper than `DEEPEST`.
+pkg fn parse(take bytes: Slice[u8], alloc: mem::Alloc) -> Option[Json] {
+    var reader = Reader(bytes: take bytes, at: 0)
+    let Some(value) = mut reader.value(0, alloc) else {
+        return None
+    }
+    mut reader.skip_space()
+    if reader.at != reader.bytes.len() {
+        return None
+    }
+    return Some(take value)
+} parse
+
+view struct Reader {
+    bytes: Slice[u8]
+    at: usize
+} Reader
+
+fn Reader.peek(self) -> Option[u8] {
+    if self.at >= self.bytes.len() {
+        return None
+    }
+    return Some(self.bytes[self.at])
+} Reader.peek
+
+fn Reader.skip_space(mut self) {
+    loop {
+        match self.peek() {
+            Some(b' ') or Some(b'\t') or Some(b'\n') or Some(b'\r') => {
+                self.at += 1
+            }
+            else => return
+        }
+    }
+} Reader.skip_space
+
+/// Takes `word` when the bytes continue with it.
+fn Reader.word(mut self, word: Slice[u8]) -> bool {
+    if self.at + word.len() > self.bytes.len() {
+        return false
+    }
+    for index in 0..<word.len() {
+        if self.bytes[self.at + index] != word[index] {
+            return false
+        }
+    }
+    self.at += word.len()
+    return true
+} Reader.word
+
+/// The bytes `start..<end` read.
+proj fn Reader.held(self, start: usize, end: usize) -> Slice[u8] {
+    let Some(upto) = self.bytes.prefix(end) else {
+        return self.bytes
+    }
+    let Some(parts) = upto.split_at(start) else {
+        return self.bytes
+    }
+    return parts.tail
+} Reader.held
+
+fn Reader.value(mut self, depth: u32, alloc: mem::Alloc) -> Option[Json] {
+    mut self.skip_space()
+    let Some(lead) = self.peek() else {
+        return None
+    }
+    if lead == b'n' and mut self.word(b"null") {
+        return Some(Json.Null)
+    }
+    if lead == b't' and mut self.word(b"true") {
+        return Some(Json.Bool(true))
+    }
+    if lead == b'f' and mut self.word(b"false") {
+        return Some(Json.Bool(false))
+    }
+    return match lead {
+        b'"' => match mut self.text(alloc) {
+            Some(written) => Some(Json.Text(take written))
+            None => None
+        }
+        b'[' => match depth < DEEPEST {
+            true => mut self.array(depth + 1, alloc)
+            false => None
+        }
+        b'{' => match depth < DEEPEST {
+            true => mut self.members(depth + 1, alloc)
+            false => None
+        }
+        b'-' or b'0'..=b'9' => mut self.number(alloc)
+        else => None
+    }
+} Reader.value
+
+fn Reader.array(mut self, depth: u32, alloc: mem::Alloc) -> Option[Json] {
+    self.at += 1
+    var elements = mem::List[Json].empty(alloc)
+    mut self.skip_space()
+    if mut self.word(b"]") {
+        return Some(Json.Array(take elements))
+    }
+    loop {
+        let Some(element) = mut self.value(depth, alloc) else {
+            return None
+        }
+        mut elements.push(take element)
+        mut self.skip_space()
+        if mut self.word(b"]") {
+            return Some(Json.Array(take elements))
+        }
+        if not mut self.word(b",") {
+            return None
+        }
+    }
+} Reader.array
+
+fn Reader.members(mut self, depth: u32, alloc: mem::Alloc) -> Option[Json] {
+    self.at += 1
+    var members = mem::List[Member].empty(alloc)
+    mut self.skip_space()
+    if mut self.word(b"}") {
+        return Some(Json.Object(take members))
+    }
+    loop {
+        mut self.skip_space()
+        if self.peek() != Some(b'"') {
+            return None
+        }
+        let Some(name) = mut self.text(alloc) else {
+            return None
+        }
+        mut self.skip_space()
+        if not mut self.word(b":") {
+            return None
+        }
+        let Some(value) = mut self.value(depth, alloc) else {
+            return None
+        }
+        mut members.push(Member(name: take name, value: take value))
+        mut self.skip_space()
+        if mut self.word(b"}") {
+            return Some(Json.Object(take members))
+        }
+        if not mut self.word(b",") {
+            return None
+        }
+    }
+} Reader.members
+
+fn Reader.number(mut self, alloc: mem::Alloc) -> Option[Json] {
+    let start = self.at
+    discard mut self.word(b"-")
+    match self.peek() {
+        Some(b'0') => {
+            self.at += 1
+        }
+        Some(b'1'..=b'9') => mut self.digits()
+        else => return None
+    }
+    if mut self.word(b".") and not mut self.required_digits() {
+        return None
+    }
+    if self.peek() == Some(b'e') or self.peek() == Some(b'E') {
+        self.at += 1
+        if self.peek() == Some(b'+') or self.peek() == Some(b'-') {
+            self.at += 1
+        }
+        if not mut self.required_digits() {
+            return None
+        }
+    }
+    let Ok(written) = attempt text::String.try_from_utf8(self.held(start, end: self.at), alloc) else {
+        return None
+    }
+    return Some(Json.Number(take written))
+} Reader.number
+
+fn Reader.digits(mut self) {
+    loop {
+        match self.peek() {
+            Some(b'0'..=b'9') => {
+                self.at += 1
+            }
+            else => return
+        }
+    }
+} Reader.digits
+
+fn Reader.required_digits(mut self) -> bool {
+    let start = self.at
+    mut self.digits()
+    return self.at > start
+} Reader.required_digits
+
+/// A string literal, its escapes decoded; a lone surrogate decodes as U+FFFD.
+fn Reader.text(mut self, alloc: mem::Alloc) -> Option[text::String] {
+    self.at += 1
+    var written = text::String.empty(alloc)
+    loop {
+        let start = self.at
+        loop {
+            match self.peek() {
+                None => return None
+                Some(b'"') or Some(b'\\') or Some(0..=0x1F) => break
+                else => {
+                    self.at += 1
+                }
+            }
+        }
+        let Ok(run) = attempt text::String.try_from_utf8(self.held(start, end: self.at), alloc) else {
+            return None
+        }
+        mut written.append(run.as_str())
+        match self.peek() {
+            Some(b'"') => {
+                self.at += 1
+                return Some(take written)
+            }
+            Some(b'\\') => {
+                self.at += 1
+                let Some(c) = mut self.escape() else {
+                    return None
+                }
+                mut written.push(c)
+            }
+            else => return None
+        }
+    }
+} Reader.text
+
+fn Reader.escape(mut self) -> Option[char] {
+    let Some(byte) = self.peek() else {
+        return None
+    }
+    self.at += 1
+    return match byte {
+        b'"' => Some('"')
+        b'\\' => Some('\\')
+        b'/' => Some('/')
+        b'b' => Some('\u{8}')
+        b'f' => Some('\u{C}')
+        b'n' => Some('\n')
+        b'r' => Some('\r')
+        b't' => Some('\t')
+        b'u' => mut self.unicode()
+        else => None
+    }
+} Reader.escape
+
+/// The character a `\u` escape writes, after its `\u`: a pair of surrogates joined, a lone one
+/// U+FFFD.
+fn Reader.unicode(mut self) -> Option[char] {
+    let Some(unit) = self.unit(self.at) else {
+        return None
+    }
+    self.at += 4
+    if unit < 0xD800 or unit >= 0xDC00 {
+        return match char.checked_from_bits(unit) {
+            Some(c) => Some(c)
+            None => Some('\u{FFFD}')
+        }
+    }
+    var low: Option[u32] = None
+    if mut self.continues_with_escape() {
+        low = self.unit(self.at + 2)
+    }
+    let Some(second) = low else {
+        return Some('\u{FFFD}')
+    }
+    if second < 0xDC00 or second >= 0xE000 {
+        return Some('\u{FFFD}')
+    }
+    self.at += 6
+    return char.checked_from_bits(0x10000 + ((unit - 0xD800) << 10) + (second - 0xDC00))
+} Reader.unicode
+
+/// Whether the bytes continue with `\u`, which this takes nothing of.
+fn Reader.continues_with_escape(mut self) -> bool {
+    let at = self.at
+    let continues = mut self.word(b"\\u")
+    self.at = at
+    return continues
+} Reader.continues_with_escape
+
+/// The four hexadecimal digits at `at`.
+fn Reader.unit(self, at: usize) -> Option[u32] {
+    if at + 4 > self.bytes.len() {
+        return None
+    }
+    var unit: u32 = 0
+    for index in 0..<4usize {
+        let byte = self.bytes[at + index]
+        let digit = match byte {
+            b'0'..=b'9' => byte - b'0'
+            b'a'..=b'f' => byte - b'a' + 10
+            b'A'..=b'F' => byte - b'A' + 10
+            else => return None
+        }
+        unit = unit * 16 + u32.widen(digit)
+    }
+    return Some(unit)
+} Reader.unit

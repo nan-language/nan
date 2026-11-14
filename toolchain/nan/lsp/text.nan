@@ -1,0 +1,273 @@
+//! Positions and files as the protocol writes them: a position as a line from 0 and the code units of its line before it, in the encoding the server and client agreed on; a file as a `file` URI.
+
+/// The code units positions count.
+pkg enum Encoding derives Copy, Eq {
+    Utf8
+    Utf16
+} Encoding
+
+/// A position's line, from 0, and its character.
+pkg struct LineCharacter derives Copy, Eq {
+    pkg line: u32
+    pkg character: u32
+} LineCharacter
+
+const HEX_UPPER: Slice[u8] = b"0123456789ABCDEF"
+
+pkg proj fn Encoding.name(self) -> Str {
+    return match self {
+        Encoding.Utf8 => "utf-8"
+        Encoding.Utf16 => "utf-16"
+    }
+} Encoding.name
+
+/// The code units of the character a byte starts: none for a byte continuing one.
+fn Encoding.units(self, byte: u8) -> u32 {
+    if self == Encoding.Utf8 {
+        return 1
+    }
+    if byte >= 0x80 and byte < 0xC0 {
+        return 0
+    }
+    if byte >= 0xF0 {
+        return 2
+    }
+    return 1
+} Encoding.units
+
+/// The bytes of the character a byte starts, by its lead byte.
+fn width(byte: u8) -> usize {
+    if byte >= 0xF0 {
+        return 4
+    }
+    if byte >= 0xE0 {
+        return 3
+    }
+    if byte >= 0xC0 {
+        return 2
+    }
+    return 1
+} width
+
+/// The position of a byte offset in a text, an offset past the text's end being its end.
+pkg fn position_json(source: Slice[u8], at: u32, encoding: Encoding, alloc: mem::Alloc) -> Json {
+    let found = line_character(source, at, encoding)
+    var members = mem::List[Member].empty(alloc)
+    mut members.push(Member.of("line", value: Json.number(u64.widen(found.line), alloc), alloc))
+    mut members.push(Member.of("character", value: Json.number(u64.widen(found.character), alloc), alloc))
+    return Json.Object(take members)
+} position_json
+
+/// The line, from 0, and character of a byte offset in a text.
+pkg fn line_character(source: Slice[u8], at: u32, encoding: Encoding) -> LineCharacter {
+    var end = usize.widen(at)
+    if end > source.len() {
+        end = source.len()
+    }
+    var line: u32 = 0
+    var start: usize = 0
+    for index in 0..<end {
+        if source[index] == b'\n' {
+            line += 1
+            start = index + 1
+        }
+    }
+    var character: u32 = 0
+    for index in start..<end {
+        character += encoding.units(source[index])
+    }
+    return LineCharacter(line: line, character: character)
+} line_character
+
+/// The range of the bytes from `start` to `end` of a text.
+pkg fn range_json(source: Slice[u8], start: u32, end: u32, encoding: Encoding, alloc: mem::Alloc) -> Json {
+    var members = mem::List[Member].empty(alloc)
+    mut members.push(Member.of("start", value: position_json(source, at: start, encoding, alloc), alloc))
+    mut members.push(Member.of("end", value: position_json(source, at: end, encoding, alloc), alloc))
+    return Json.Object(take members)
+} range_json
+
+/// The bytes of a text's line, from 1, without its line end.
+pkg fn line_bytes(source: Slice[u8], line: u32) -> diagnostic::Span {
+    let start = line_start(source, line: line - 1)
+    var end = start
+    while end < source.len() and source[end] != b'\n' {
+        end += 1
+    }
+    return diagnostic::Span(start: u32.fit(start), end: u32.fit(end))
+} line_bytes
+
+/// The offset of a line's start, lines counting from 0; the text's end for a line past its last.
+fn line_start(source: Slice[u8], line: u32) -> usize {
+    var start: usize = 0
+    var counted: u32 = 0
+    while counted < line {
+        while start < source.len() and source[start] != b'\n' {
+            start += 1
+        }
+        if start == source.len() {
+            return start
+        }
+        start += 1
+        counted += 1
+    }
+    return start
+} line_start
+
+/// The byte offset of a position given as JSON: its line's end for a character past it, the
+/// start of a character whose units it falls within, the text's end for a line past its last.
+pkg fn offset_of(source: Slice[u8], position: Json, encoding: Encoding) -> Option[u32] {
+    let Some(line_number) = position.get("line") else {
+        return None
+    }
+    let Some(line) = line_number.to_u32() else {
+        return None
+    }
+    let Some(character_number) = position.get("character") else {
+        return None
+    }
+    let Some(character) = character_number.to_u32() else {
+        return None
+    }
+    let start = line_start(source, line: line)
+    var end = start
+    while end < source.len() and source[end] != b'\n' {
+        end += 1
+    }
+    var at = start
+    var counted: u32 = 0
+    while at < end {
+        var next = at + width(source[at])
+        if next > end {
+            next = end
+        }
+        var units: u32 = 0
+        for index in at..<next {
+            units += encoding.units(source[index])
+        }
+        if counted + units > character {
+            break
+        }
+        counted += units
+        at = next
+    }
+    return Some(u32.fit(at))
+} offset_of
+
+/// The path a `file` URI names, its percent escapes decoded; none for another URI.
+pkg fn uri_path(uri: Str, alloc: mem::Alloc) -> Option[text::String] {
+    let Some(skipped) = uri_rest_start(uri) else {
+        return None
+    }
+    let Some(rest) = uri.slice_bytes(skipped, end: uri.byte_len()) else {
+        return None
+    }
+    if not rest.starts_with("/") {
+        return None
+    }
+    let bytes = rest.as_bytes()
+    var decoded = mem::Bytes.empty(alloc)
+    var index: usize = 0
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            mut decoded.push(bytes[index])
+            index += 1
+            continue
+        }
+        if index + 2 >= bytes.len() {
+            return None
+        }
+        let Some(high) = hex_value(bytes[index + 1]) else {
+            return None
+        }
+        let Some(low) = hex_value(bytes[index + 2]) else {
+            return None
+        }
+        mut decoded.push(high * 16 + low)
+        index += 3
+    }
+    let Ok(decoded_path) = attempt text::String.try_from_utf8(decoded.view(), alloc) else {
+        return None
+    }
+    let held = decoded.view()
+    let drive = held.len() >= 3 and is_letter(held[1]) and held[2] == b':'
+    if not drive {
+        return Some(take decoded_path)
+    }
+    let Some(without) = decoded_path.slice_bytes(1, end: decoded_path.byte_len()) else {
+        return None
+    }
+    return Some(text::String.of(without, alloc))
+} uri_path
+
+/// The offset in a `file` URI after its scheme and an empty or `localhost` authority.
+fn uri_rest_start(uri: Str) -> Option[usize] {
+    if not uri.starts_with("file://") {
+        return None
+    }
+    if uri.starts_with("file://localhost") {
+        return Some(16)
+    }
+    return Some(7)
+} uri_rest_start
+
+/// The value of a hexadecimal digit.
+fn hex_value(byte: u8) -> Option[u8] {
+    return match byte {
+        b'0'..=b'9' => Some(byte - b'0')
+        b'a'..=b'f' => Some(byte - b'a' + 10)
+        b'A'..=b'F' => Some(byte - b'A' + 10)
+        else => None
+    }
+} hex_value
+
+/// The `file` URI of an absolute path: its separators written `/`, each byte other than an
+/// unreserved character, `/` and a drive letter's `:` percent-encoded.
+pkg fn path_uri(path: Str, alloc: mem::Alloc) -> text::String {
+    var written = mem::Bytes.empty(alloc)
+    if not path.starts_with("/") and not path.starts_with("\\") {
+        mut written.push(b'/')
+    }
+    for byte in path.as_bytes() {
+        match byte {
+            b'\\' => mut written.push(b'/')
+            else => mut written.push(byte)
+        }
+    }
+    var uri = mem::Bytes.empty(alloc)
+    mut uri.append(b"file://")
+    let held = written.view()
+    for index in 0..<held.len() {
+        let byte = held[index]
+        let marked = byte == b'-' or byte == b'.' or byte == b'_' or byte == b'~' or byte == b'/'
+        if is_letter(byte) or (byte >= b'0' and byte <= b'9') or marked or (byte == b':' and index == 2) {
+            mut uri.push(byte)
+            continue
+        }
+        mut uri.push(b'%')
+        mut uri.push(HEX_UPPER[usize.widen(byte >> 4)])
+        mut uri.push(HEX_UPPER[usize.widen(byte & 0xF)])
+    }
+    let Ok(written_uri) = attempt text::String.try_from_utf8(uri.view(), alloc) else {
+        expect false
+        return text::String.empty(alloc)
+    }
+    return written_uri
+} path_uri
+
+/// Whether a byte is an ASCII letter.
+fn is_letter(byte: u8) -> bool {
+    return (byte >= b'a' and byte <= b'z') or (byte >= b'A' and byte <= b'Z')
+} is_letter
+
+/// A path below `root` as a workspace path; none for a path outside it, `root` itself, or one
+/// with a `..` component.
+pkg fn relative(root: Str, path: Str, alloc: mem::Alloc) -> Option[text::String] {
+    let Some(below) = platform::strip_prefix(path, base: root, alloc) else {
+        return None
+    }
+    if below.is_empty() or below.as_str() == ".." or below.starts_with("../") or below.find("/../").is_some() or below.ends_with("/..") {
+        return None
+    }
+    return Some(take below)
+} relative

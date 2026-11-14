@@ -226,13 +226,16 @@ impl Workspace {
     }
 
     /// The layout with the files of `changed` the workspace does not hold added to their
-    /// packages, source or machine.
+    /// packages, source or machine, their manifests aside.
     fn layout_with(&self, changed: &HashMap<String, Vec<u8>>) -> Vec<Found> {
         let mut layout = self.layout.clone();
         for path in changed.keys() {
             let Some(found) = holder(&self.layout, path).map(|index| &mut layout[index]) else {
                 continue;
             };
+            if *path == format!("{}/package.nan", found.dir) {
+                continue;
+            }
             let held = match path.starts_with(&format!("{}/.nan/", found.dir)) {
                 true => &mut found.machine,
                 false => &mut found.sources,

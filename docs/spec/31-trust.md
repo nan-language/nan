@@ -139,6 +139,13 @@ package ring {
 pub const CAPACITY: usize = 64
 ```
 
+```text
+$ nan fix monitor
+ok fix monitor: errors 0, incomplete 0
+wrote monitor/package.nan
+ok fix monitor: errors 0, incomplete 0
+```
+
 ## Release gate
 
 The **release gate** is `nan verify`. It accepts a package exactly when, for the package and for each package it reaches through a chain of `dep` directives with relative-path sources:

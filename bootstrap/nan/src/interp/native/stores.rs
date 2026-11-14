@@ -122,6 +122,10 @@ pub fn member(
             interp.memory.set(&count, next);
             shared
         }
+        ("mem::Shared", "is_unique") => {
+            let count = place(&interp.deref(&args[0]).fields()[COUNT]);
+            Val::Bool(interp.memory.get(&count).int() == 1)
+        }
         ("mem::Shared", "contents") => interp.deref(&args[0]).fields()[CONTENTS].clone(),
         ("mem::Shared", "make_mut") => return Some(make_mut(interp, args, &element, at, site)),
         ("mem::Arena", "empty") => {

@@ -230,6 +230,12 @@ fn shared(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             fx.store(record, sret, 0);
             supply.done(lo, fx);
         }
+        "is_unique" => {
+            let record = fx.load(PTR, supply.param(0).address(), 0);
+            let count = fx.b.ins().atomic_load(PTR, MemFlagsData::trusted(), record);
+            let unique = fx.b.ins().icmp_imm_s(IntCC::Equal, count, 1);
+            supply.ret(lo, fx, Held::Scalar(unique));
+        }
         "contents" => {
             let record = fx.load(PTR, supply.param(0).address(), 0);
             let contents = fx.offset(record, at);

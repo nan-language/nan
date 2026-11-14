@@ -471,14 +471,17 @@ pub fn Shared.try_of(take value: T, alloc: Alloc) -> Shared[T] fails OutOfMemory
 
 pub fn Shared.share(self) -> Shared[T] limits notrap, terminates, noalloc
 
+pub fn Shared.is_unique(self) -> bool limits notrap, terminates, noalloc
+
 pub proj fn Shared.contents(self) -> T limits pure, notrap, terminates
 
 pub proj fn Shared.make_mut(mut self, clone: fn(value: T, alloc: Alloc) -> T) -> T
 ```
 
 - `share` returns another `mem::Shared` of the same contents and adds 1 to the count. Releasing a `mem::Shared` subtracts 1; the one that brings the count to 0 releases the contents and the box.
-- The count is not part of the contents: `share` and release change it atomically and through no access to the contents. The contents are read only through `contents` and written only through `make_mut`.
-- Each release of a `mem::Shared` synchronises with the `make_mut` or release that later observes the count it left ([memory model](23-low-level.md#memory-model)).
+- `is_unique` returns whether the count is 1 when it reads it: whether no other `mem::Shared` shares the contents.
+- The count is not part of the contents: `share` and release change it, and `is_unique` reads it, atomically and through no access to the contents. The contents are read only through `contents` and written only through `make_mut`.
+- Each release of a `mem::Shared` synchronises with the `make_mut`, `is_unique` or release that later observes the count it left ([memory model](23-low-level.md#memory-model)).
 - `make_mut` yields a writable view of the contents. When the count is above 1 it first calls `clone` with a read of the contents and the stored allocator, moves the result into a new box drawn through that allocator, trapping on exhaustion (`trap.exhausted`), makes the receiver hold that box with a count of 1, and subtracts 1 from the old count, releasing the old contents and box when that brings it to 0. When the count is 1 it calls nothing.
 
 ```nan
@@ -498,6 +501,25 @@ pub fn add_track(mut shared: mem::Shared[Playlist], track: u32) {
     var playlist = mut shared.make_mut(clone: copy_playlist)
     mut playlist.tracks.push(track)
 } add_track
+```
+
+```nan
+pub fn evict_unviewed(mut pieces: mem::List[mem::Shared[mem::Bytes]]) {
+    mut pieces.retain(keep: fn(piece: mem::Shared[mem::Bytes]) => not piece.is_unique())
+} evict_unviewed
+
+pub fn pieces_kept(alloc: mem::Alloc) -> usize
+    example pieces_kept(testing::world().alloc) == 1
+{
+    var pieces = mem::List[mem::Shared[mem::Bytes]].empty(alloc)
+    let viewed = mem::Shared.of(mem::Bytes.zeroed(16, alloc), alloc)
+    let view = viewed.share()
+    mut pieces.push(take viewed)
+    mut pieces.push(mem::Shared.of(mem::Bytes.zeroed(16, alloc), alloc))
+    evict_unviewed(mut pieces)
+    discard view
+    return pieces.len()
+} pieces_kept
 ```
 
 ## Collections

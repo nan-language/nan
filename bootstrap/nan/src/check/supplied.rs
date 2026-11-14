@@ -125,10 +125,12 @@ const TRAPPING: [&str; 37] = [
     "hw::UserFrame.fetch_or",
 ];
 
-/// The supplied operations that change an atomic count without a type with interior mutability.
-const COUNTED: [&str; 4] = [
+/// The supplied operations that change or read an atomic count without a type with interior
+/// mutability.
+const COUNTED: [&str; 5] = [
     "mem::Shared.share",
     "mem::Shared.make_mut",
+    "mem::Shared.is_unique",
     "sys::load::Pin.of",
     "sys::load::Pin.share",
 ];

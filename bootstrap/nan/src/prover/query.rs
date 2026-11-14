@@ -1115,16 +1115,19 @@ impl<'w, 'a> Walk<'w, 'a> {
             let otherwise = self.tag_is(otherwise, index);
             return self.terms.ite(condition, then, otherwise);
         }
-        let tag = match self.terms.get(scrutinee).clone() {
+        let tag = self.tag(scrutinee);
+        let index = self.terms.int(i128::from(index), Scalar::U32);
+        self.terms.compare(BinaryOp::Eq, tag, index)
+    }
+
+    /// The tag of a term that is no ite: its variant's index for a `variant`.
+    fn tag(&mut self, term: TermId) -> TermId {
+        match self.terms.get(term).clone() {
             Term::App(Op::Variant(_, variant), _) => {
                 self.terms.int(i128::from(variant), Scalar::U32)
             }
-            _ => self
-                .terms
-                .intern(Term::Tag(scrutinee), Ty::Scalar(Scalar::U32)),
-        };
-        let index = self.terms.int(i128::from(index), Scalar::U32);
-        self.terms.compare(BinaryOp::Eq, tag, index)
+            _ => self.terms.intern(Term::Tag(term), Ty::Scalar(Scalar::U32)),
+        }
     }
 
     /// The term of a const or const parameter: its value for an integer, `bool` or `char`
@@ -1578,17 +1581,57 @@ impl<'w, 'a> Walk<'w, 'a> {
     }
 
     /// The term of a call the decidable fragment interprets: a widening or fitting conversion
-    /// between integer types, which is its argument.
+    /// between integer types, which is its argument, and the derived `eq` of an enum whose
+    /// variants have no payload, which is the atom that its operands' tags are equal.
     fn interpreted(&mut self, fn_ref: &FnRef, args: &[TermId]) -> Option<TermId> {
-        let Callable::Builtin(Builtin::Conversion(conversion, target)) = &fn_ref.callable else {
-            return None;
-        };
-        let source = self.terms.ty(*args.first()?).scalar()?;
-        let integers = target.is_integer() && source.is_integer();
-        match conversion {
-            Conversion::Widen | Conversion::Fit if integers => Some(args[0]),
+        match &fn_ref.callable {
+            Callable::Builtin(Builtin::Conversion(conversion, target)) => {
+                let source = self.terms.ty(*args.first()?).scalar()?;
+                let integers = target.is_integer() && source.is_integer();
+                match conversion {
+                    Conversion::Widen | Conversion::Fit if integers => Some(args[0]),
+                    _ => None,
+                }
+            }
+            Callable::Derived {
+                owner,
+                method: "eq",
+            } if self.payloadless(*owner) => Some(self.tags_equal(args[0], args[1])),
             _ => None,
         }
+    }
+
+    /// Whether an item is an enum none of whose variants has a payload, and that no other
+    /// package may extend.
+    fn payloadless(&self, item: ItemId) -> bool {
+        let foreign_open = self.ck.db.ast(item).is_open()
+            && self.ck.db.package_of(item) != self.ck.db.package_of(self.holder);
+        match &self.ck.sig(item).kind {
+            SigKind::Enum { variants } => {
+                !foreign_open
+                    && variants
+                        .iter()
+                        .all(|variant| matches!(variant.payload, PayloadSig::None))
+            }
+            _ => false,
+        }
+    }
+
+    /// The atom that the tags of two terms are equal, the ite of the arms' atoms for an ite.
+    fn tags_equal(&mut self, left: TermId, right: TermId) -> TermId {
+        if let Term::Ite(condition, then, otherwise) = self.terms.get(left).clone() {
+            let then = self.tags_equal(then, right);
+            let otherwise = self.tags_equal(otherwise, right);
+            return self.terms.ite(condition, then, otherwise);
+        }
+        if let Term::Ite(condition, then, otherwise) = self.terms.get(right).clone() {
+            let then = self.tags_equal(left, then);
+            let otherwise = self.tags_equal(left, otherwise);
+            return self.terms.ite(condition, then, otherwise);
+        }
+        let left = self.tag(left);
+        let right = self.tag(right);
+        self.terms.compare(BinaryOp::Eq, left, right)
     }
 
     /// The condition under which a built-in operation does not trap.

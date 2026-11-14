@@ -1581,18 +1581,18 @@ fn Walk.tag_is(self, mut terms: Terms, scrutinee: u32, index: u32) -> u32 {
         }
         else => {}
     }
-    var tag: u32 = 0
-    match terms.get(scrutinee) {
-        Term.App(op: Op.Variant(ty: _, index: variant), args: _) => {
-            tag = mut terms.integer(wide::Wide.of_u64(u64.widen(variant)), scalar: ty::Scalar.Unsigned32)
-        }
-        else => {
-            tag = mut terms.intern(Term.Tag(scrutinee), ty: ty::Ty.scalar(ty::Scalar.Unsigned32))
-        }
-    }
+    let tag = self.tag(mut terms, term: scrutinee)
     let wanted = mut terms.integer(wide::Wide.of_u64(u64.widen(index)), scalar: ty::Scalar.Unsigned32)
     return mut terms.compare(nir::BinaryOp.Eq, left: tag, right: wanted)
 } Walk.tag_is
+
+/// The tag of a term that is no ite: its variant's index for a `variant`.
+fn Walk.tag(self, mut terms: Terms, term: u32) -> u32 {
+    return match terms.get(term) {
+        Term.App(op: Op.Variant(ty: _, index: variant), args: _) => mut terms.integer(wide::Wide.of_u64(u64.widen(variant)), scalar: ty::Scalar.Unsigned32)
+        else => mut terms.intern(Term.Tag(term), ty: ty::Ty.scalar(ty::Scalar.Unsigned32))
+    }
+} Walk.tag
 
 /// The term of a const or const parameter: its value for an integer, `bool` or `char`
 /// const, its application otherwise.
@@ -1957,7 +1957,7 @@ fn Walk.known_call(
         }
         None => {}
     }
-    match self.interpreted(terms, fn_ref, args) {
+    match self.interpreted(mut terms, fn_ref, args) {
         Some(term) => return Some(term)
         None => {}
     }
@@ -2223,8 +2223,18 @@ fn Walk.subst_args(self) -> mem::List[ty::Arg] {
 } Walk.subst_args
 
 /// The term of a call the decidable fragment interprets: a widening or fitting conversion
-/// between integer types, which is its argument.
-fn Walk.interpreted(self, terms: Terms, fn_ref: nir::FnRef, args: Slice[u32]) -> Option[u32] {
+/// between integer types, which is its argument, and the derived `eq` of an enum whose
+/// variants have no payload, which is the atom that its operands' tags are equal.
+fn Walk.interpreted(self, mut terms: Terms, fn_ref: nir::FnRef, args: Slice[u32]) -> Option[u32] {
+    match fn_ref.callable {
+        nir::Callable.Derived(owner: owner, method: method) => {
+            if method.as_str() == "eq" and args.len() == 2 and self.payloadless(owner) {
+                return Some(self.tags_equal(mut terms, left: args[0], right: args[1]))
+            }
+            return None
+        }
+        else => {}
+    }
     let nir::Callable.Builtin(nir::Builtin.Conversion(conversion: conversion, scalar: target)) = fn_ref.callable else {
         return None
     }
@@ -2240,6 +2250,49 @@ fn Walk.interpreted(self, terms: Terms, fn_ref: nir::FnRef, args: Slice[u32]) ->
     }
     return None
 } Walk.interpreted
+
+/// Whether an item is an enum none of whose variants has a payload, and that no other
+/// package may extend.
+fn Walk.payloadless(self, item: ty::ItemId) -> bool {
+    let db = self.ck.db()
+    if db.ast(item).is_open() and db.package_of(item) != db.package_of(self.holder) {
+        return false
+    }
+    let sig = self.ck.sig(item)
+    let SigKind.Enum(variants: variants) = sig.contents().kind else {
+        return false
+    }
+    for variant in variants {
+        match variant.payload {
+            Payload.None => {}
+            else => return false
+        }
+    }
+    return true
+} Walk.payloadless
+
+/// The atom that the tags of two terms are equal, the ite of the arms' atoms for an ite.
+fn Walk.tags_equal(self, mut terms: Terms, left: u32, right: u32) -> u32 {
+    match terms.get(left) {
+        Term.Ite(condition: condition, then: then, otherwise: otherwise) => {
+            let then_equal = self.tags_equal(mut terms, left: then, right)
+            let otherwise_equal = self.tags_equal(mut terms, left: otherwise, right)
+            return mut terms.ite(condition, then: then_equal, otherwise: otherwise_equal)
+        }
+        else => {}
+    }
+    match terms.get(right) {
+        Term.Ite(condition: condition, then: then, otherwise: otherwise) => {
+            let then_equal = self.tags_equal(mut terms, left, right: then)
+            let otherwise_equal = self.tags_equal(mut terms, left, right: otherwise)
+            return mut terms.ite(condition, then: then_equal, otherwise: otherwise_equal)
+        }
+        else => {}
+    }
+    let left_tag = self.tag(mut terms, term: left)
+    let right_tag = self.tag(mut terms, term: right)
+    return mut terms.compare(nir::BinaryOp.Eq, left: left_tag, right: right_tag)
+} Walk.tags_equal
 
 /// The condition a built-in operation's obligation demands.
 fn Walk.builtin_goal(mut self, mut terms: Terms, fn_ref: nir::FnRef, args: Slice[u32], obligation: Obligation) -> u32 {

@@ -211,7 +211,7 @@ The prover interprets exactly these forms:
 - `inv`, which is MAX − a on an unsigned type with maximum MAX and −a − 1 on a signed type;
 - a call of the [named conversion](09-numbers.md#conversions) `widen` or `fit` whose source and target types are both integer types, whose term is its argument's;
 - on unsigned operands, with c a literal of at least 1: `div a, c` and `rem a, c`, the quotient q and remainder r, applications with their type's range, with the facts a = c × q + r and r ≤ c − 1; `shr a, k` for a literal k, which is `div a, 2^k`; and `band` of a and a literal 2^k − 1 in either order, which is `rem a, 2^k`;
-- `eq`, `ne`, `lt`, `le`, `gt` and `ge` on integers and `char`; `eq a, b` and `ne a, b` on `bool`, which are ite(a, b, `not b`) and its negation; `not`; `is P, E.V`, the atom that the tag of P's content equals V's index;
+- `eq`, `ne`, `lt`, `le`, `gt` and `ge` on integers and `char`; `eq a, b` and `ne a, b` on `bool`, which are ite(a, b, `not b`) and its negation; `not`; `is P, E.V`, the atom that the tag of P's content equals V's index; a call of the derived `eq` of an enum none of whose variants has a payload, other than an open enum of another package, the atom that its operands' tags are equal;
 - ite terms;
 - a field step of a term; the field of a `construct` or the payload field of a `variant`, which is its operand, and the tag of a `variant`, which is its variant's index; the field of a term with one field replaced, which is the new term at that field and the former field elsewhere;
 - bounded quantifiers `all x in a..<b: P` and `any x in a..<b: P`, and their `..=` forms.
@@ -241,6 +241,21 @@ pub fn one_below(values: Slice[i32], index: usize) -> i32 limits notrap
 {
     return values[index] - 1
 } one_below
+```
+
+```nan
+pub closed enum Class derives Copy, Eq {
+    Latency
+    Normal
+} Class
+
+pub closed struct Share derives Copy, Eq {
+    pub class: Class
+    pub period_us: u32
+    invariant class != Class.Latency or period_us >= 1_000
+} Share
+
+pub fn Share.normal() -> Share = Share(class: Class.Normal, period_us: 0)
 ```
 
 ## Procedure

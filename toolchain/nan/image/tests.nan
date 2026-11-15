@@ -131,10 +131,16 @@ fn macos_object(target: workspace::Target, instructions: Slice[u8], relocated: f
 fn load_command(image: Slice[u8], kind: u32) -> usize {
     var at: usize = 32
     for _ in 0..<image.u32_le(16) {
-        if image.u32_le(at) == kind {
+        let Some(parts) = image.split_at(at) else {
+            break
+        }
+        if parts.tail.u32_le(0) == kind {
             return at
         }
-        at += usize.widen(image.u32_le(at + 4))
+        let Some(next) = at.checked_add(usize.widen(parts.tail.u32_le(4))) else {
+            break
+        }
+        at = next
     }
     expect false
     return 0
@@ -145,12 +151,23 @@ fn segment_names(image: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
     var names = mem::Bytes.empty(alloc)
     var at: usize = 32
     for _ in 0..<image.u32_le(16) {
-        if image.u32_le(at) == LC_SEGMENT_64 {
-            for offset in 0..<16usize {
-                mut names.push(image[at + 8 + offset])
-            }
+        let Some(parts) = image.split_at(at) else {
+            break
         }
-        at += usize.widen(image.u32_le(at + 4))
+        let command = parts.tail
+        if command.u32_le(0) == LC_SEGMENT_64 {
+            let Some(named) = command.split_at(8) else {
+                break
+            }
+            let Some(name) = named.tail.prefix(16) else {
+                break
+            }
+            mut names.append(name)
+        }
+        let Some(next) = at.checked_add(usize.widen(command.u32_le(4))) else {
+            break
+        }
+        at = next
     }
     return names
 } segment_names
@@ -183,7 +200,7 @@ test a_macos_image_binds_its_imports_rebases_its_addresses_and_signs_its_pages f
     expect text.address == base and got.access == Access.Read
     expect linked.imports.len() == 1 and linked.imports[0].address == got.address and linked.imports[0].name.as_str() == "write"
     let displacement = i64.widen(i32.from_bits(text.bytes.view().u32_le(3)))
-    expect i64.from_bits(base) + 7 + displacement == i64.from_bits(got.address)
+    expect i64.from_bits(base).wrapping_add(7).wrapping_add(displacement) == i64.from_bits(got.address)
     expect linked.absolute.len() == 1 and linked.absolute[0] == data.address
     let image = macho_write(linked, entry: base, arch: workspace::Arch.Amd64, name: "probe", alloc)
     let bytes = image.view()
@@ -197,34 +214,56 @@ test a_macos_image_binds_its_imports_rebases_its_addresses_and_signs_its_pages f
     name16(mut names, name: "__LINKEDIT")
     let found = segment_names(bytes, alloc)
     expect found.view() == names.view()
-    expect bytes.u64_le(load_command(bytes, kind: LC_MAIN) + 8) == MACHO_PAGE
-    let info = load_command(bytes, kind: LC_DYLD_INFO_ONLY)
-    let rebase_at = usize.widen(bytes.u32_le(info + 8))
-    let bind_at = usize.widen(bytes.u32_le(info + 16))
-    for at in 0..<5usize {
-        expect bytes[rebase_at + at] == b"\x11\x23\x00\x51\x00"[at]
+    let Some(main) = bytes.split_at(load_command(bytes, kind: LC_MAIN)) else {
+        expect false
+        return
     }
+    expect main.tail.u64_le(8) == MACHO_PAGE
+    let Some(info) = bytes.split_at(load_command(bytes, kind: LC_DYLD_INFO_ONLY)) else {
+        expect false
+        return
+    }
+    let Some(rebase) = bytes.split_at(usize.widen(info.tail.u32_le(8))) else {
+        expect false
+        return
+    }
+    expect rebase.tail.prefix(5) == Some(b"\x11\x23\x00\x51\x00")
     let bind = b"\x11\x51\x40_write\x00\x72\x00\x90\x00"
-    expect usize.widen(bytes.u32_le(info + 20)) == bind.len()
-    for at in 0..<bind.len() {
-        expect bytes[bind_at + at] == bind[at]
+    expect usize.widen(info.tail.u32_le(20)) == bind.len()
+    let Some(bound) = bytes.split_at(usize.widen(info.tail.u32_le(16))) else {
+        expect false
+        return
     }
-    let sealed = load_command(bytes, kind: LC_CODE_SIGNATURE)
-    let code_end = usize.widen(bytes.u32_le(sealed + 8))
-    expect code_end + usize.widen(bytes.u32_le(sealed + 12)) == bytes.len()
+    let Some(binding) = bound.tail.prefix(bind.len()) else {
+        expect false
+        return
+    }
+    expect binding == bind
+    let Some(sealed) = bytes.split_at(load_command(bytes, kind: LC_CODE_SIGNATURE)) else {
+        expect false
+        return
+    }
+    let code_end = usize.widen(sealed.tail.u32_le(8))
+    expect code_end + usize.widen(sealed.tail.u32_le(12)) == bytes.len()
     let directory = code_end + usize.widen(bytes.u32_be(code_end + 16))
-    let hashes = directory + usize.widen(bytes.u32_be(directory + 16))
-    var hashed: usize = 0
-    while hashed * 4096 < code_end {
-        var end = (hashed + 1) * 4096
-        if end > code_end {
-            end = code_end
+    let Some(hashed) = bytes.split_at(directory + usize.widen(bytes.u32_be(directory + 16))) else {
+        expect false
+        return
+    }
+    var slot: usize = 0
+    var start: usize = 0
+    while start < code_end {
+        var end = code_end
+        if end - start > 4096 {
+            end = start + 4096
         }
-        let digest = sha256(bytes, start: hashed * 4096, end)
-        for at in 0..<32usize {
-            expect bytes[hashes + 32 * hashed + at] == digest[at]
+        let Some(slots) = hashed.tail.split_at(slot) else {
+            expect false
+            return
         }
-        hashed += 1
+        expect slots.tail.prefix(32) == Some(sha256(bytes, start, end).view())
+        slot += 32
+        start = end
     }
 } a_macos_image_binds_its_imports_rebases_its_addresses_and_signs_its_pages
 
@@ -248,7 +287,7 @@ test a_macos_image_patches_aarch64_loads_of_its_offset_tables_words for link {
     let text = linked.segments[0]
     let got = linked.segments[1]
     expect linked.imports.len() == 1 and linked.imports[0].address == got.address
-    let pages = u32.truncate(((got.address & ~0xFFFu64) - (base & ~0xFFFu64)) >> 12)
+    let pages = u32.truncate((got.address & ~0xFFFu64).wrapping_sub(base & ~0xFFFu64) >> 12)
     let paged = adrp | ((pages & 3) << 29) | ((pages >> 2) << 5)
     let offset = ldr | (u32.truncate((got.address & 0xFFF) >> 3) << 10)
     expect text.bytes.view().u32_le(0) == paged and text.bytes.view().u32_le(4) == offset

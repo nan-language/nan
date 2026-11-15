@@ -212,7 +212,7 @@ fn macho_write(linked: Linked, entry: u64, arch: workspace::Arch, name: Str, all
         segment_command(mut commands, segment)
     }
     let uuid_at = info_commands(mut commands, linkedit, entry, sealed: Placement(at: u32.truncate(signature_at), size: u32.truncate(signature_bytes)), alloc)
-    expect MACHO_HEADER_SIZE + u64.widen(commands.len()) <= MACHO_PAGE
+    expect u64.widen(commands.len()) <= MACHO_PAGE - MACHO_HEADER_SIZE
     var out = mem::Bytes.empty(alloc)
     macho_header(mut out, arch, commands: u32.truncate(u64.widen(laid.segments.len()) + 9), size: u32.truncate(u64.widen(commands.len())))
     mut out.append(commands.view())
@@ -398,27 +398,28 @@ fn info_commands(mut commands: mem::Bytes, linkedit: Linkedit, entry: u64, seale
     begin_command(mut commands, kind: LC_DYLD_INFO_ONLY, words: 10)
     append_placement(mut commands, part: linkedit.rebase)
     append_placement(mut commands, part: linkedit.bind)
-    object::resize(mut commands, length: commands.len() + 16)
+    append_zeros(mut commands, count: 16)
     append_placement(mut commands, part: linkedit.export)
     begin_command(mut commands, kind: LC_SYMTAB, words: 4)
     object::append_u32(mut commands, value: linkedit.symtab.at)
     object::append_u32(mut commands, value: 1)
     append_placement(mut commands, part: linkedit.strtab)
     begin_command(mut commands, kind: LC_DYSYMTAB, words: 18)
-    object::resize(mut commands, length: commands.len() + 12)
+    append_zeros(mut commands, count: 12)
     object::append_u32(mut commands, value: 1)
     object::append_u32(mut commands, value: 1)
-    object::resize(mut commands, length: commands.len() + 52)
+    append_zeros(mut commands, count: 52)
     path_command(mut commands, kind: LC_LOAD_DYLINKER, words: mem::List[u32].empty(alloc).view(), path: DYLINKER)
     let uuid_at = usize.widen(MACHO_HEADER_SIZE) + commands.len() + 8
     begin_command(mut commands, kind: LC_UUID, words: 4)
-    object::resize(mut commands, length: commands.len() + 16)
+    append_zeros(mut commands, count: 16)
     begin_command(mut commands, kind: LC_BUILD_VERSION, words: 4)
     object::append_u32(mut commands, value: PLATFORM_MACOS)
     object::append_u32(mut commands, value: MACOS_VERSION)
     object::append_u32(mut commands, value: MACOS_VERSION)
     object::append_u32(mut commands, value: 0)
     begin_command(mut commands, kind: LC_MAIN, words: 4)
+    expect entry >= MACHO_IMAGE_BASE
     object::append_u64(mut commands, value: entry - MACHO_IMAGE_BASE)
     object::append_u64(mut commands, value: 0)
     var dylib = mem::List[u32].empty(alloc)
@@ -441,38 +442,45 @@ fn append_placement(mut out: mem::Bytes, part: Placement) {
 fn pad(mut out: mem::Bytes, align: usize) {
     let rest = out.len() % align
     if rest != 0 {
-        object::resize(mut out, length: out.len() + (align - rest))
+        append_zeros(mut out, count: align - rest)
     }
 } pad
 
+/// Appends `count` zeros.
+fn append_zeros(mut out: mem::Bytes, count: usize) {
+    for _ in 0..<count {
+        mut out.push(0)
+    }
+} append_zeros
+
 /// Appends the kind and size of a load command of `words` 32-bit words, which follow.
-fn begin_command(mut out: mem::Bytes, kind: u32, words: u32) {
+fn begin_command(mut out: mem::Bytes, kind: u32, words: u8) {
     object::append_u32(mut out, value: kind)
-    object::append_u32(mut out, value: 8 + 4 * words)
+    object::append_u32(mut out, value: 8 + 4 * u32.widen(words))
 } begin_command
 
 /// Appends a load command of 32-bit words followed by a path, which the word after its size
 /// locates, padded to 8 bytes.
 fn path_command(mut out: mem::Bytes, kind: u32, words: Slice[u32], path: Str) {
+    expect words.len() <= 8 and path.byte_len() < 256
     let fixed = 12 + 4 * words.len()
     let size = fixed + path.byte_len() + 1
-    let padded = size + (8 - size % 8) % 8
+    let padding = (8 - size % 8) % 8
     object::append_u32(mut out, value: kind)
-    object::append_u32(mut out, value: u32.truncate(u64.widen(padded)))
+    object::append_u32(mut out, value: u32.truncate(u64.widen(size + padding)))
     object::append_u32(mut out, value: u32.truncate(u64.widen(fixed)))
     for word in words {
         object::append_u32(mut out, value: word)
     }
-    let start = out.len()
     mut out.append(path.as_bytes())
-    object::resize(mut out, length: start + padded - fixed)
+    append_zeros(mut out, count: 1 + padding)
 } path_command
 
-/// Appends a name of 16 bytes, padded with zeros.
+/// Appends a name of at most 16 bytes, padded with zeros to 16.
 fn name16(mut out: mem::Bytes, name: Str) {
-    let start = out.len()
+    expect name.byte_len() <= 16
     mut out.append(name.as_bytes())
-    object::resize(mut out, length: start + 16)
+    append_zeros(mut out, count: 16 - name.byte_len())
 } name16
 
 /// Appends the load command of a segment and its sections.
@@ -496,9 +504,9 @@ fn segment_command(mut out: mem::Bytes, segment: MachoSegment) {
         object::append_u64(mut out, value: section.size)
         object::append_u32(mut out, value: u32.truncate(section.offset))
         object::append_u32(mut out, value: section.align)
-        object::resize(mut out, length: out.len() + 8)
+        append_zeros(mut out, count: 8)
         object::append_u32(mut out, value: section.kind)
-        object::resize(mut out, length: out.len() + 12)
+        append_zeros(mut out, count: 12)
     }
 } segment_command
 
@@ -570,17 +578,29 @@ fn export_trie(alloc: mem::Alloc) -> mem::Bytes {
     mut out.push(1)
     mut out.append(HEADER_SYMBOL.as_bytes())
     mut out.push(0)
+    expect out.len() < 0x7F
     uleb(mut out, value: u64.widen(out.len()) + 1)
     mut out.push(2)
-    object::resize(mut out, length: out.len() + 3)
+    append_zeros(mut out, count: 3)
     return out
 } export_trie
 
 /// The size of the code signature of the `signed` bytes before it, identified by `name`.
 fn signature_size(signed: u64, name: Str) -> u64 {
-    let pages = (signed + SIGNATURE_PAGE - 1) / SIGNATURE_PAGE
-    return SUPER_BLOB + BLOB_INDEX + CODE_DIRECTORY + u64.widen(name.byte_len()) + 1 + 32 * pages
+    return SUPER_BLOB + BLOB_INDEX + CODE_DIRECTORY + u64.widen(name.byte_len()) + 1 + 32 * signature_pages(signed)
 } signature_size
+
+/// The number of pages the code signature hashes in the `signed` bytes before it, the last one
+/// partial.
+fn signature_pages(signed: u64) -> u64
+    ensures result <= signed / SIGNATURE_PAGE + 1
+{
+    var pages = signed / SIGNATURE_PAGE
+    if signed % SIGNATURE_PAGE != 0 {
+        pages += 1
+    }
+    return pages
+} signature_pages
 
 /// Appends a 32-bit word, most significant byte first.
 fn append_be32(mut out: mem::Bytes, value: u32) {
@@ -601,7 +621,7 @@ fn append_be64(mut out: mem::Bytes, value: u64) {
 fn macho_sign(signed: Slice[u8], name: Str, text: u64, text_size: u64, alloc: mem::Alloc) -> mem::Bytes {
     let size = signature_size(u64.widen(signed.len()), name)
     let directory = SUPER_BLOB + BLOB_INDEX
-    let pages = (u64.widen(signed.len()) + SIGNATURE_PAGE - 1) / SIGNATURE_PAGE
+    let pages = signature_pages(u64.widen(signed.len()))
     var out = mem::Bytes.empty(alloc)
     append_be32(mut out, value: CSMAGIC_EMBEDDED_SIGNATURE)
     append_be32(mut out, value: u32.truncate(size))
@@ -621,7 +641,7 @@ fn macho_sign(signed: Slice[u8], name: Str, text: u64, text_size: u64, alloc: me
     mut out.push(CS_HASHTYPE_SHA256)
     mut out.push(0)
     mut out.push(SIGNATURE_PAGE_BITS)
-    object::resize(mut out, length: out.len() + 16)
+    append_zeros(mut out, count: 16)
     append_be64(mut out, value: 0)
     append_be64(mut out, value: text)
     append_be64(mut out, value: text_size)
@@ -630,9 +650,9 @@ fn macho_sign(signed: Slice[u8], name: Str, text: u64, text_size: u64, alloc: me
     mut out.push(0)
     var start: usize = 0
     while start < signed.len() {
-        var end = start + usize.widen(SIGNATURE_PAGE)
-        if end > signed.len() {
-            end = signed.len()
+        var end = signed.len()
+        if end - start > usize.widen(SIGNATURE_PAGE) {
+            end = start + usize.widen(SIGNATURE_PAGE)
         }
         mut out.append(sha256(signed, start, end).view())
         start = end
@@ -645,15 +665,14 @@ fn sha256(bytes: Slice[u8], start: usize, end: usize) -> Array[u8, 32] {
     expect start <= end and end <= bytes.len()
     var state = sha256_initial()
     var block = Array[u8, 64].filled(0)
-    var filled: usize = 0
     for at in start..<end {
+        let filled = (at - start) % 64
         block[filled] = bytes[at]
-        filled += 1
-        if filled == 64 {
+        if filled == 63 {
             state = sha256_compressed(state, block)
-            filled = 0
         }
     }
+    var filled = (end - start) % 64
     block[filled] = 0x80
     filled += 1
     if filled > 56 {

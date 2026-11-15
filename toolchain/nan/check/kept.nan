@@ -268,12 +268,14 @@ struct Plan {
 } Plan
 
 /// A snapshot a check restores from: its key, the outcomes it restores, at the positions of the
-/// state checked, with their spans by item index, the reads it keeps, its files, and its bytes
-/// with the spans there of the green entries of the items it restores.
+/// state checked, with their spans by item index, the outcomes of the items outside the packages
+/// checked it gives once each is judged, the reads it keeps, its files, and its bytes with the
+/// spans there of the green entries of the items it restores.
 struct Restoring {
     key: hashing::HashValue
     bytes: mem::Bytes
     outcomes: mem::HashMap[u32, ByteSpan]
+    judged: mem::HashMap[u32, ByteSpan]
     reads: mem::List[TracedRead]
     names_reads: mem::List[TracedRead]
     files: mem::List[SnapshotFile]
@@ -1027,7 +1029,7 @@ fn Checker.seeded(self, item: ty::ItemId) -> bool {
     return state.digests.get(item).is_some() or state.body_dependencies.get(item).is_some() or state.unit_dependencies.get(item).is_some() or state.may_traps.get(item).is_some()
 } Checker.seeded
 
-/// The items whose outcomes a snapshot keeps: those of the packages the checker checks.
+/// The items of the packages the checker checks.
 fn Checker.outcome_items(self) -> mem::List[ty::ItemId] {
     let db = self.db()
     var items = mem::List[ty::ItemId].empty(self.alloc())
@@ -1040,6 +1042,48 @@ fn Checker.outcome_items(self) -> mem::List[ty::ItemId] {
     }
     return items
 } Checker.outcome_items
+
+/// The items whose outcomes a snapshot keeps: those of the packages checked, then each other
+/// item reported on that the check judged.
+fn Checker.kept_items(self) -> mem::List[ty::ItemId] {
+    let db = self.db()
+    let state = self.state.contents()
+    var items = self.outcome_items()
+    var checked = ItemMarks.empty(self.alloc())
+    for item in items {
+        discard mut checked.insert(item)
+    }
+    for index in 0..<db.items.len() {
+        let item = ty::ItemId(index: u32.fit(index))
+        if state.judged.get(item).is_some() and not checked.contains(item) and db.is_reported(item) {
+            mut items.push(item)
+        }
+    }
+    return items
+} Checker.kept_items
+
+/// Gives an item judged outside the packages checked the outcome the snapshot restoring the
+/// check holds of it, telling whether it held one.
+fn Checker.restore_judged(self, item: ty::ItemId) -> bool {
+    let alloc = self.alloc()
+    let Some(plan) = self.state.contents().kept.plan.get(0) else {
+        return false
+    }
+    let Some(restoring) = plan.contents().restored else {
+        return false
+    }
+    let Some(span) = restoring.judged.get(item.index) else {
+        return false
+    }
+    let Some(held) = copied_span(restoring.bytes.view(), span, alloc) else {
+        return false
+    }
+    let Some(outcome) = read_outcome(held.view(), item, alloc) else {
+        return false
+    }
+    self.restore_outcome(item, take outcome)
+    return true
+} Checker.restore_judged
 
 const SNAPSHOT_HEADER: Str = "nan kept 2"
 
@@ -1508,8 +1552,9 @@ fn Checker.check_restored(self, state: mem::Shared[CheckState], key: hashing::Ha
         return false
     }
     var facts = mem::HashMap[u32, OutcomeFacts].empty(seed: 0, alloc)
-    for item in items {
-        if not marked[usize.widen(item.index)] {
+    for index in 0..<self.db().items.len() {
+        let item = ty::ItemId(index: u32.fit(index))
+        if not marked[index] {
             continue
         }
         match snapshot.outcomes.get(item.index) {
@@ -1527,8 +1572,8 @@ fn Checker.check_restored(self, state: mem::Shared[CheckState], key: hashing::Ha
     }
     let reads = unmarked_reads(snapshot.reads.view(), marked: marked.view(), alloc)
     let names_reads = unmarked_reads(snapshot.names_reads.view(), marked: marked.view(), alloc)
-    let Restored(bytes: kept_bytes, outcomes: outcomes, greens: greens) = restored
-    discard self.state.contents().kept.plan.insert(0, value: mem::Shared.of(Plan(state: state.share(), restored: Some(Restoring(key: key, bytes: take kept_bytes, outcomes: take outcomes, reads: take reads, names_reads: take names_reads, files: copied_files(snapshot.files.view(), alloc), source: take bytes, greens: take greens))), alloc))
+    let Restored(bytes: kept_bytes, outcomes: outcomes, judged: judged, greens: greens) = restored
+    discard self.state.contents().kept.plan.insert(0, value: mem::Shared.of(Plan(state: state.share(), restored: Some(Restoring(key: key, bytes: take kept_bytes, outcomes: take outcomes, judged: take judged, reads: take reads, names_reads: take names_reads, files: copied_files(snapshot.files.view(), alloc), source: take bytes, greens: take greens))), alloc))
     self.check_all()
     return self.accepts(snapshot, facts, marked: marked.view(), old)
 } Checker.check_restored
@@ -1626,7 +1671,8 @@ fn Checker.accepts(self, snapshot: Snapshot, facts: mem::HashMap[u32, OutcomeFac
         return false
     }
     let state = self.state.contents()
-    for item in self.outcome_items() {
+    for index in 0..<self.db().items.len() {
+        let item = ty::ItemId(index: u32.fit(index))
         let Some(held) = facts.get(item.index) else {
             continue
         }
@@ -2054,13 +2100,13 @@ fn Checker.restored_green_bytes(self, item: ty::ItemId) -> Option[mem::Bytes] {
 
 /// The outcome of each item a snapshot keeps: the one it restored, or the one its work gave.
 fn Checker.put_outcomes(self, mut out: mem::Bytes, plan: Plan) {
-    let items = self.outcome_items()
+    let items = self.kept_items()
     let grouped = self.grouped()
     encoding::uvar(mut out, value: u64.widen(items.len()))
     for item in items {
         put_item(mut out, item)
         match plan.restored {
-            Some(restoring) => match restoring.outcomes.get(item.index) {
+            Some(restoring) => match self.restored_span(restoring, item) {
                 Some(span) => match copied_span(restoring.bytes.view(), span, alloc: self.alloc()) {
                     Some(kept) => {
                         encoding::bytes(mut out, value: kept.view())
@@ -2077,6 +2123,19 @@ fn Checker.put_outcomes(self, mut out: mem::Bytes, plan: Plan) {
         encoding::bytes(mut out, value: fresh.view())
     }
 } Checker.put_outcomes
+
+/// The span of the outcome a snapshot restored of an item: one of the packages checked, or another
+/// once the check judged it.
+fn Checker.restored_span(self, restoring: Restoring, item: ty::ItemId) -> Option[ByteSpan] {
+    match restoring.outcomes.get(item.index) {
+        Some(span) => return Some(span)
+        None => {}
+    }
+    if self.state.contents().kept.restored.get(item.index).is_none() {
+        return None
+    }
+    return restoring.judged.get(item.index)
+} Checker.restored_span
 
 /// Reads as `Checker.put_read_list` writes them.
 fn Cursor.reads(mut self, alloc: mem::Alloc) -> mem::List[TracedRead] {
@@ -2571,15 +2630,19 @@ fn Moves.move_span(self, path: Str, mut span: Option[diagnostic::Span]) -> bool 
 } Moves.move_span
 
 /// The outcomes a check restored, as the state checked holds them, and their spans there, with
-/// the spans of their green entries in the snapshot.
+/// those of the other items it gives once judged, and the spans of their green entries in the
+/// snapshot.
 struct Restored {
     bytes: mem::Bytes
     outcomes: mem::HashMap[u32, ByteSpan]
+    judged: mem::HashMap[u32, ByteSpan]
     greens: mem::HashMap[u32, ByteSpan]
 } Restored
 
 /// Seeds the checker with a snapshot's facts and gives it the outcomes and green entries of the
-/// items not checked again; none when one does not read or lies in a changed body.
+/// items of the packages checked not checked again, with the outcomes of the other items not
+/// checked again it gives once each is judged; none when one of the packages checked does not
+/// read or lies in a changed body.
 fn Checker.restore(self, snapshot: Snapshot, bytes: Slice[u8], marked: Slice[bool], moves: Moves) -> Option[Restored] {
     let alloc = self.alloc()
     let db = self.db()
@@ -2587,7 +2650,10 @@ fn Checker.restore(self, snapshot: Snapshot, bytes: Slice[u8], marked: Slice[boo
     var out = mem::Bytes.empty(alloc)
     var outcomes = mem::HashMap[u32, ByteSpan].empty(seed: 0, alloc)
     var greens = mem::HashMap[u32, ByteSpan].empty(seed: 0, alloc)
+    var judged = mem::HashMap[u32, ByteSpan].empty(seed: 0, alloc)
+    var checked = ItemMarks.empty(alloc)
     for item in self.outcome_items() {
+        discard mut checked.insert(item)
         if marked[usize.widen(item.index)] {
             continue
         }
@@ -2614,7 +2680,28 @@ fn Checker.restore(self, snapshot: Snapshot, bytes: Slice[u8], marked: Slice[boo
             None => {}
         }
     }
-    return Some(Restored(bytes: take out, outcomes: take outcomes, greens: take greens))
+    for index in 0..<db.items.len() {
+        let item = ty::ItemId(index: u32.fit(index))
+        if marked[index] or checked.contains(item) {
+            continue
+        }
+        let Some(span) = snapshot.outcomes.get(item.index) else {
+            continue
+        }
+        let Some(held) = copied_span(bytes, span, alloc) else {
+            continue
+        }
+        let Some(read) = read_outcome(held.view(), item, alloc) else {
+            continue
+        }
+        let Some(outcome) = take read.moved(path: db.item_file(item).path.as_str(), moves, alloc) else {
+            continue
+        }
+        let start = out.len()
+        put_outcome(mut out, outcome)
+        discard mut judged.insert(item.index, value: ByteSpan(start: start, end: out.len()))
+    }
+    return Some(Restored(bytes: take out, outcomes: take outcomes, judged: take judged, greens: take greens))
 } Checker.restore
 
 /// Whether nothing the check reports depends on when restored work ran: no `name.case` fix, no

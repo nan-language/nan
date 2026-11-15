@@ -107,10 +107,22 @@ struct Plan {
 struct Restoring {
     key: Hash,
     outcomes: HashMap<ItemId, Outcome>,
+    /// The outcomes of the items outside the packages checked, given each when the check judges
+    /// the item.
+    judged: HashMap<ItemId, Outcome>,
     reads: ReadsBy,
     names_reads: ReadsBy,
     greens: HashMap<ItemId, Greened>,
     files: Vec<SnapshotFile>,
+}
+
+/// What restoring a check from a snapshot gives: the outcomes and green entries of the items of
+/// the packages checked it restores, and the outcomes of the other items it gives once judged.
+#[derive(Default)]
+struct Restored {
+    outcomes: HashMap<ItemId, Outcome>,
+    judged: HashMap<ItemId, Outcome>,
+    greens: HashMap<ItemId, Greened>,
 }
 
 /// The positions `start..end` of one kind in a file.
@@ -1328,13 +1340,47 @@ impl Checker<'_> {
         }
     }
 
-    /// The items whose outcomes a snapshot keeps: those of the packages the checker checks.
+    /// The items of the packages the checker checks.
     fn outcome_items(&self) -> Vec<ItemId> {
         checked_packages(self)
             .into_iter()
             .flat_map(|(_, package)| &self.db.package(package).modules)
             .flat_map(|module| self.db.module(*module).items.iter().copied())
             .collect()
+    }
+
+    /// The items whose outcomes a snapshot holds: those of the packages checked, then each other
+    /// item reported on that the check judged.
+    fn kept_items(&self) -> Vec<ItemId> {
+        let mut items = self.outcome_items();
+        let checked: HashSet<ItemId> = items.iter().copied().collect();
+        let judged = self.judged.borrow();
+        items.extend(self.db_items().filter(|item| {
+            judged.contains(item) && !checked.contains(item) && self.db.is_reported(*item)
+        }));
+        items
+    }
+
+    /// The items of the database, in order.
+    fn db_items(&self) -> impl Iterator<Item = ItemId> {
+        (0..self.db.items.len()).map(|index| ItemId(index as u32))
+    }
+
+    /// Gives an item judged outside the packages checked the outcome the snapshot restoring the
+    /// check holds of it, telling whether it held one.
+    pub(super) fn restore_judged(&self, item: ItemId) -> bool {
+        let outcome = (self.kept.plan.borrow_mut().as_mut())
+            .and_then(|plan| plan.restored.as_mut())
+            .and_then(|restoring| {
+                let outcome = restoring.judged.remove(&item)?;
+                restoring.outcomes.insert(item, outcome.clone());
+                Some(outcome)
+            });
+        let Some(outcome) = outcome else {
+            return false;
+        };
+        self.restore_outcome(item, &outcome);
+        true
     }
 
     /// The interface hash of a const whose value is known, which holds that value.
@@ -1496,7 +1542,7 @@ impl Checker<'_> {
             put_item(&mut out, *item);
             put_green(&mut out, green);
         }
-        let items = self.outcome_items();
+        let items = self.kept_items();
         let held = |item: &ItemId| restored.and_then(|restoring| restoring.outcomes.get(item));
         let unheld: Vec<ItemId> = items
             .iter()
@@ -1637,30 +1683,37 @@ impl Checker<'_> {
     }
 
     /// Seeds the checker with a snapshot's facts and gives it the outcomes and green entries of
-    /// the items not checked again, at the positions of the state checked; none when one does
-    /// not lie outside the changed bodies.
-    fn restore(
-        &self,
-        snapshot: &Snapshot,
-        marked: &[bool],
-        moves: &Moves,
-    ) -> Option<(HashMap<ItemId, Outcome>, HashMap<ItemId, Greened>)> {
+    /// the items of the packages checked not checked again, at the positions of the state
+    /// checked, with the outcomes of the other items not checked again it gives once each is
+    /// judged; none when one of the packages checked does not lie outside the changed bodies.
+    fn restore(&self, snapshot: &Snapshot, marked: &[bool], moves: &Moves) -> Option<Restored> {
         self.seed(snapshot, marked);
-        let mut outcomes = HashMap::new();
-        let mut greens = HashMap::new();
-        for item in self.outcome_items() {
+        let mut restored = Restored::default();
+        let checked = self.outcome_items();
+        for &item in &checked {
             if marked[item.0 as usize] {
                 continue;
             }
             let outcome = snapshot.outcomes.get(&item)?.clone();
             let outcome = moves.outcome(&self.db.item(item).file.path, outcome)?;
             self.restore_outcome(item, &outcome);
-            outcomes.insert(item, outcome);
+            restored.outcomes.insert(item, outcome);
             if let Some(green) = snapshot.greens.get(&item) {
-                greens.insert(item, green.clone());
+                restored.greens.insert(item, green.clone());
             }
         }
-        Some((outcomes, greens))
+        let checked: HashSet<ItemId> = checked.into_iter().collect();
+        for item in self.db_items() {
+            if marked[item.0 as usize] || checked.contains(&item) {
+                continue;
+            }
+            let Some(outcome) = snapshot.outcomes.get(&item) else {
+                continue;
+            };
+            let moved = moves.outcome(&self.db.item(item).file.path, outcome.clone());
+            restored.judged.extend(moved.map(|outcome| (item, outcome)));
+        }
+        Some(restored)
     }
 
     /// Checks the state of a closure from the snapshot of an earlier state: restores the
@@ -1704,27 +1757,31 @@ impl Checker<'_> {
         let Some(marked) = rechecked(&snapshot, &changed, &old) else {
             return false;
         };
-        let Some((outcomes, greens)) = self.restore(&snapshot, &marked, &moves) else {
+        let Some(restored) = self.restore(&snapshot, &marked, &moves) else {
             return false;
         };
-        let facts: HashMap<ItemId, OutcomeFacts> = items
-            .iter()
-            .filter(|item| marked[item.0 as usize])
-            .filter_map(|item| {
-                let outcome = snapshot.outcomes.get(item)?;
+        let facts: HashMap<ItemId, OutcomeFacts> = (snapshot.outcomes.iter())
+            .filter(|(item, _)| marked[item.0 as usize])
+            .map(|(item, outcome)| {
                 let facts = OutcomeFacts {
                     alone: outcome.alone,
                     rejected: outcome.rejected,
                     value: outcome.value,
                 };
-                Some((*item, facts))
+                (*item, facts)
             })
             .collect();
+        let Restored {
+            outcomes,
+            judged,
+            greens,
+        } = restored;
         *self.kept.plan.borrow_mut() = Some(Plan {
             state,
             restored: Some(Restoring {
                 key,
                 outcomes,
+                judged,
                 reads: snapshot.reads.unmarked(&marked),
                 names_reads: snapshot.names_reads.unmarked(&marked),
                 greens,
@@ -1778,7 +1835,7 @@ impl Checker<'_> {
         if !self.reports_apart() {
             return false;
         }
-        for item in self.outcome_items() {
+        for item in self.db_items() {
             let Some(held) = facts.get(&item) else {
                 continue;
             };

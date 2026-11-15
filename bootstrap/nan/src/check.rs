@@ -741,9 +741,10 @@ impl Checker<'_> {
     }
 
     /// Checks an item unless it is checked, judging it alone: rejected when its syntax errors or
-    /// those its check reports lie on its lines.
+    /// those its check reports lie on its lines. A snapshot restoring the check may give the
+    /// item's outcome instead.
     pub(crate) fn judge_alone(&self, item: ItemId) {
-        if self.judged.borrow_mut().insert(item) {
+        if self.judged.borrow_mut().insert(item) && !self.restore_judged(item) {
             let reported = self.found.borrow().len();
             let quieted = self.quiet.borrow().len();
             let (muted, package) = (self.muted.replace(0), self.package.get());

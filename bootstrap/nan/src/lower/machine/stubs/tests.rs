@@ -109,6 +109,12 @@ fn aarch64_cache_stubs_maintain_lines_of_the_cache_type_register() {
 }
 
 #[test]
+fn dit_on_sets_dit_without_reading_the_feature_register() {
+    let dit = 0xD500_401F | 3 << 16 | 1 << 8 | 2 << 5;
+    assert_eq!(words(Stub::DitOn), [dit, RET]);
+}
+
+#[test]
 fn constant_time_sets_dit_and_doitm_where_enumerated() {
     let pfr0 = system_register(true, 3, 0, 0, 4, 0, 0);
     let dit = 0xD500_401F | 3 << 16 | 1 << 8 | 2 << 5;

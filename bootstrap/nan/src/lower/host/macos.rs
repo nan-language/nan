@@ -166,7 +166,7 @@ fn constant_time(lo: &mut Lowering, fx: &mut Fx) {
     let dit = lo.system_setting(fx, FEAT_DIT);
     let dit = fx.b.ins().icmp_imm_s(IntCC::NotEqual, dit, 0);
     fx.when(dit, |fx| {
-        lo.call_stub(fx, Stub::ConstantTime, &[]);
+        lo.call_stub(fx, Stub::DitOn, &[]);
     });
 }
 

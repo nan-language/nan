@@ -42,7 +42,8 @@ pub const RDMSR_FIXUP: i64 = 20;
 /// 1 GiB pages and 0 otherwise; and `ReadTsc`, which reads the time-stamp counter once every
 /// earlier instruction has completed. `ConstantTime` sets the running CPU's data-independent
 /// timing mode when it has one: on x86_64 DOITM, when `IA32_ARCH_CAPABILITIES` enumerates it,
-/// and on AArch64 `PSTATE.DIT`, when `ID_AA64PFR0_EL1` does. `CpuFeatures` records in the
+/// and on AArch64 `PSTATE.DIT`, when `ID_AA64PFR0_EL1` does; `DitOn` sets `PSTATE.DIT` alone, for
+/// a caller that knows the CPU has it. `CpuFeatures` records in the
 /// running CPU's record the features the other x86_64 stubs read, and makes the CPU's index,
 /// which it takes, its `TSC_AUX`. `Cpuid` writes the four registers a leaf and subleaf give at an address;
 /// `Rdtscp` gives the counter and writes the CPU's index at an address, reading both with
@@ -187,6 +188,7 @@ pub enum Stub {
     Smc,
     FiqOn,
     FiqOff,
+    DitOn,
     Syscall,
     Teb,
 }
@@ -621,7 +623,8 @@ impl Stub {
             | Stub::Hvc
             | Stub::Smc
             | Stub::FiqOn
-            | Stub::FiqOff => panic!("no x86_64 code for the AArch64 stub {self:?}"),
+            | Stub::FiqOff
+            | Stub::DitOn => panic!("no x86_64 code for the AArch64 stub {self:?}"),
         }
     }
 
@@ -1041,6 +1044,7 @@ impl Stub {
             ),
             Stub::FiqOn => (0, 0, &[0xff, 0x41, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6]),
             Stub::FiqOff => (0, 0, &[0xdf, 0x41, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6]),
+            Stub::DitOn => (0, 0, &[0x5f, 0x41, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6]),
             Stub::Out1
             | Stub::Out2
             | Stub::Out4

@@ -25,12 +25,12 @@ pub use bundle::{at_manifest, bundle};
 /// The entry landing fn each platform package holds.
 const LANDING: &str = "enter";
 
-/// What a final build reports and the image it writes, relative to the workspace root, with a
-/// kernel's interface file.
+/// What a final build reports and the image it writes, relative to the workspace root, with the
+/// file it writes beside the image: a kernel's interface file or a bundle's artefacts.
 pub struct Build {
     pub diagnostics: Vec<Diagnostic>,
     pub image: Option<String>,
-    pub interface: Option<String>,
+    pub companion: Option<String>,
 }
 
 impl Build {
@@ -38,7 +38,7 @@ impl Build {
         Build {
             diagnostics,
             image: None,
-            interface: None,
+            companion: None,
         }
     }
 }
@@ -112,7 +112,7 @@ pub fn build(
         diagnostics.push(diagnostic);
         return Ok(Build::failed(diagnostics));
     }
-    let interface = match interface {
+    let companion = match interface {
         Some(file) => {
             let path = format!(".nan/images/{}/{name}.nlif", target.name());
             write_file(&workspace.root.join(&path), &file)?;
@@ -123,7 +123,7 @@ pub fn build(
     Ok(Build {
         diagnostics,
         image: Some(image),
-        interface,
+        companion,
     })
 }
 

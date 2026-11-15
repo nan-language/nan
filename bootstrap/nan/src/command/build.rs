@@ -77,7 +77,7 @@ pub fn run(
     let compared = compared.map(|image| (current.join(image), image));
     let mut diagnostics = Vec::new();
     let mut images = Vec::new();
-    let mut interfaces = Vec::new();
+    let mut companions = Vec::new();
     for program in &programs {
         let compared = compared
             .as_ref()
@@ -85,7 +85,7 @@ pub fn run(
         let build = final_build::build(workspace, *program, compared)?;
         diagnostics.extend(build.diagnostics);
         images.extend(build.image);
-        interfaces.extend(build.interface);
+        companions.extend(build.companion);
     }
     if invocation.name == Name::Run && !errors(&diagnostics) {
         let image = images.pop().expect("a built image");
@@ -122,7 +122,7 @@ pub fn run(
         };
         return Ok(Outcome::Launch(launch));
     }
-    images.extend(interfaces);
+    images.extend(companions);
     Ok(Outcome::Output(report(
         invocation,
         workspace,
@@ -190,7 +190,7 @@ fn bundle(
         scope,
         written,
         build.diagnostics,
-        build.image.into_iter().collect(),
+        build.image.into_iter().chain(build.companion).collect(),
     )))
 }
 

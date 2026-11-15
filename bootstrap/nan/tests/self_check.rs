@@ -521,10 +521,28 @@ fn front_home() -> PathBuf {
     base().join("home")
 }
 
-/// Makes the NaN toolchain's workspace and local store copies of the bootstrap's.
+/// Makes the NaN toolchain's workspace and local store copies of the bootstrap's, but for the
+/// workspace's `.nan/images`, which holds what each toolchain built itself.
 fn resync(bootstrap: &Path, store: &Path) -> Result<(), String> {
+    let fault = |error: std::io::Error| error.to_string();
     let (front_dir, front_store) = fronts(bootstrap, store);
-    copy_state((bootstrap, store), (&front_dir, &front_store))
+    let images = front_dir.join(".nan/images");
+    let mut kept = front_dir.as_os_str().to_owned();
+    kept.push("-images");
+    let kept = PathBuf::from(kept);
+    drop(fs::remove_dir_all(&kept));
+    if images.exists() {
+        fs::rename(&images, &kept).map_err(fault)?;
+    }
+    copy_state((bootstrap, store), (&front_dir, &front_store))?;
+    if images.exists() {
+        fs::remove_dir_all(&images).map_err(fault)?;
+    }
+    if kept.exists() {
+        fs::create_dir_all(front_dir.join(".nan")).map_err(fault)?;
+        fs::rename(&kept, &images).map_err(fault)?;
+    }
+    Ok(())
 }
 
 /// Makes a workspace and local store copies of others.

@@ -217,6 +217,7 @@ A **bundle** is the `.nbun` file that `nan build <package> --against <interface 
 - A bundle build checks the package's dependency closure and release-checks its releases as a final build does. It is an error (`target.bundle-interface`), reported on the package's `package` line with a `note` reason, when the interface file cannot be read or does not decode, when it records another toolchain hash or a target the package does not declare, when a package of the closure has another code root than the interface file records under its name, when an interrupt fn of a package outside the kernel's final closure states a larger `stack N` than the file's part 5, when the bundle's code reaches a support routine or runtime data the kernel does not export, and when a nanos program's closure contributes to a loaded registry.
 - A `stack N` of the type of a loaded registry's function field demands `N` less 1 KiB of each function a contribution names for it, the rest left to its gate, reported at the contribution, and demands `N` of the gate in the kernel's final build, reported at the registry.
 - The [user-mode runtime](24-kernel.md#isolated-spaces) a kernel's final build holds is an unsigned bundle built against the kernel's own interface file, imports none, and whose job entry is the runtime's start, with the stack that start runs on.
+- A bundle build also writes `<package>.narts` beside the bundle: the artefacts of the bundle's final closure, std included, as the content of a [host section](#host-sections) `.nan` holds them.
 - `nan build --as <principal>` signs the bundle with the principal's secret key, as [publishing](29-identity-versioning.md#publishing) signs an artefact, failing as publishing does when the user directory lacks it.
 
 Its bytes, in the forms of the canonical NIR encoding, are the magic `4E 42 55 4E`, the format version 1 as a uvar, its **body** as bytes, then its **sections**: a record holding no field, or exactly field 1, the signature, a record of 1 the public key and 2 the [signature](31-trust.md#signatures), as bytes, of every byte of the bundle before its sections. The body is a record with these keys:
@@ -237,6 +238,56 @@ Its bytes, in the forms of the canonical NIR encoding, are the magic `4E 42 55 4
 | 12 | for a user-mode runtime, the bytes of the boot area it runs over, a uvar |
 
 - Words are 8 bytes, least significant byte first. The encoding of the image's code and line tables belongs to the kernel's ABI.
+
+```nan
+// file: kernel/package.nan
+//! A kernel exporting its load ABI.
+
+package kernel {
+    language 1
+    targets x86_64-bare
+    entry main
+} kernel
+
+// file: kernel/kernel.nan
+//! Entry of the kernel.
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    discard k.loader()
+    loop {
+    }
+} main
+
+// file: hello/package.nan
+//! A job.
+
+package hello {
+    language 1
+    targets x86_64-nanos
+    entry main
+} hello
+
+// file: hello/hello.nan
+//! Entry of the job.
+
+fn main(take world: nanos::World, take input: u32) -> u64 fails task::Cancelled uses wait {
+    world.log.info("hello", value: input)
+    return u64.widen(input) * 2
+} main
+```
+
+```text
+$ nan build kernel
+ok build kernel: files 2, errors 0, incomplete 0
+wrote .nan/images/x86_64-bare/kernel.elf
+wrote .nan/images/x86_64-bare/kernel.nlif
+ok build kernel: files 2, errors 0, incomplete 0
+$ nan build hello --against .nan/images/x86_64-bare/kernel.nlif
+ok build hello --against .nan/images/x86_64-bare/kernel.nlif: files 2, errors 0, incomplete 0
+wrote .nan/images/x86_64-nanos/hello.narts
+wrote .nan/images/x86_64-nanos/hello.nbun
+ok build hello --against .nan/images/x86_64-bare/kernel.nlif: files 2, errors 0, incomplete 0
+```
 
 ## Host symbol names
 

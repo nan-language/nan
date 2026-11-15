@@ -113,7 +113,7 @@ The **toolchain hash** identifies a toolchain's behaviour for one language versi
 | 1 | language version | a uvar |
 | 2 | toolchain source tree hash | the hash of the encoding of a list of pairs, in byte order of path, one per file of the toolchain source tree: its path relative to the tree's root, with `/` separators, as a text, and its content, as bytes |
 
-The **toolchain source tree** is the set of files the toolchain is built from: its source, the sources of the std packages it carries, the advisories it carries, and the files pinning the version of every library and compiler its build uses. A toolchain written in NaN is the image of a final build of its packages, whose code roots identify that source tree whichever toolchain built it ([reproducibility](#reproducibility)): its toolchain source tree hash is the hash of the encoding of the list of the code roots its image's `.nan` [host section](30-artefacts.md#host-sections) holds, in that section's order.
+The **toolchain source tree** is the set of files the toolchain is built from: its source, the sources of the std packages it carries, the advisories it carries, and the files pinning the version of every library and compiler its build uses. A toolchain written in NaN is the image of a final build of its packages, whose code roots identify that source tree whichever toolchain built it ([reproducibility](#reproducibility)): its toolchain source tree hash is the hash of the encoding of the list of the code roots its image's `.nan` [host section](30-artefacts.md#host-sections) holds, in that section's order; a toolchain built as a [bundle](30-artefacts.md#bundles) for NaN OS reads that list from its bundle's `.narts` file, which its job's file system holds as `image.narts`.
 
 - A toolchain has one toolchain hash per language version it implements, fixed when it is built, and applies to each package the one of that package's language version.
 - Two toolchains with equal toolchain hashes must produce equal outputs from equal build inputs.
@@ -121,7 +121,7 @@ The **toolchain source tree** is the set of files the toolchain is built from: i
 
 ## Cache
 
-The **user directory** is the directory `.nan` in the home directory of the user running the toolchain: on Linux the one the system's user database gives, on macOS the one `HOME` names, and on Windows the profile directory that `USERPROFILE` names. It holds the **build cache** in its subdirectory `cache`, the local store in its subdirectory `store`, and the [secret keys](31-trust.md#principals) of principals in its subdirectory `keys`. The toolchain creates each of the first three that is missing, and `keys` when it first writes a secret key, accessible to the running user alone; it writes each secret key's file readable and writable by that user alone.
+The **user directory** is the directory `.nan` in the home directory of the user running the toolchain: on Linux the one the system's user database gives, on macOS the one `HOME` names, on Windows the profile directory that `USERPROFILE` names, and on NaN OS the directory `home` of the job's file system. It holds the **build cache** in its subdirectory `cache`, the local store in its subdirectory `store`, and the [secret keys](31-trust.md#principals) of principals in its subdirectory `keys`. The toolchain creates each of the first three that is missing, and `keys` when it first writes a secret key, accessible to the running user alone; it writes each secret key's file readable and writable by that user alone.
 
 The build cache holds:
 

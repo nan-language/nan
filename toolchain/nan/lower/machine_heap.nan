@@ -1,10 +1,18 @@
 //! The boot heap, which starts a machine image's boot area and from which its runtime draws its records and the chunks of cells: a map of its 64 KiB chunks hands out runs of them, and a record is a block of a power-of-two size class behind a 16-byte header naming the class, carved from chunks the map hands out. A freed block smaller than a chunk joins its class's free list, from which a later record of the class takes it, and a freed run of chunks returns to the map. Every record and chunk is cleared once its lock is released. An isolated space's runtime draws each run of chunks the map hands out from its kernel and releases each run returning to the map.
 
-/// The bytes of the boot heap.
+/// The bytes of a kernel's boot heap, and of the boot heap an isolated space's runtime runs
+/// over, whose pages its kernel maps as the runtime draws them.
 const BOOT_HEAP: u64 = 16u64 * 1024 * 1024
 
-/// The chunks of the boot heap.
-const CHUNKS: u64 = BOOT_HEAP / MEMORY_CHUNK
+const SPACE_HEAP: u64 = 768u64 * 1024 * 1024
+
+/// The bytes of the boot heap the image runs over.
+fn heap_bytes(lo: Lowering) -> u64 {
+    if lo.user() {
+        return SPACE_HEAP
+    }
+    return BOOT_HEAP
+} heap_bytes
 
 /// The header before a block, holding its size class; it keeps usable bytes 16-aligned.
 const HEAP_HEADER: u64 = 16
@@ -22,8 +30,8 @@ const HEAP_CLASSES: u64 = 64
 /// The offsets of the allocators' state: their spin lock, the next free byte and the end of the
 /// chunk blocks are carved from, the bytes of the chunks the map hands out and the most it has
 /// handed out, the bytes of the live records, of the live task stacks among them, which change
-/// atomically without the lock, and of the runs of chunks handed out whole, the chunk map
-/// holding a bit per chunk set while it is handed out, and each size class's free-list head.
+/// atomically without the lock, and of the runs of chunks handed out whole, each size class's
+/// free-list head, and the chunk map holding a bit per chunk set while it is handed out.
 const ALLOCATORS_LOCK: u64 = 0
 
 const ALLOCATORS_CARVE: u64 = 8
@@ -40,11 +48,14 @@ const ALLOCATORS_STACKS: u64 = 48
 
 const ALLOCATORS_WHOLE: u64 = 56
 
-const ALLOCATORS_MAP: u64 = 64
+const ALLOCATORS_FREE: u64 = 64
 
-const ALLOCATORS_FREE: u64 = ALLOCATORS_MAP + CHUNKS / 8
+const ALLOCATORS_MAP: u64 = ALLOCATORS_FREE + 8 * HEAP_CLASSES
 
-const ALLOCATORS_SIZE: u64 = ALLOCATORS_FREE + 8 * HEAP_CLASSES
+/// The bytes of the allocators' state of a boot heap of `bytes`.
+fn heap_state_size(bytes: u64) -> u64 {
+    return ALLOCATORS_MAP + bytes / MEMORY_CHUNK / 8
+} heap_state_size
 
 /// A run of chunks handed out: its first chunk's address, its chunk count and a map holding a
 /// bit per chunk, set while the chunk is handed out.
@@ -315,14 +326,15 @@ fn heap_boot_heap(mut lo: Lowering, mut fx: Fx) -> clif::Value {
 /// The boot heap as a supply of chunks, its map in the allocators' state at `state`.
 fn boot_supply(mut lo: Lowering, mut fx: Fx, state: clif::Value) -> ChunkSupply {
     let base = heap_boot_heap(mut lo, mut fx)
-    let count = mut fx.ptr(CHUNKS)
+    let count = mut fx.ptr(heap_bytes(lo) / MEMORY_CHUNK)
     let map = mut fx.offset(state, offset: ALLOCATORS_MAP)
     return ChunkSupply(base: base, count: count, map: map)
 } boot_supply
 
 /// The address of the allocators' state.
 fn heap_state(mut lo: Lowering, mut fx: Fx) -> clif::Value {
-    return mut lo.reserved(mut fx, data_name: "_NSheap_state", size: ALLOCATORS_SIZE, align: 64)
+    let size = heap_state_size(heap_bytes(lo))
+    return mut lo.reserved(mut fx, data_name: "_NSheap_state", size, align: 64)
 } heap_state
 
 /// Takes the allocators' spin lock, which no interrupt fn takes. A kernel's holder disables

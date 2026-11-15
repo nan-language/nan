@@ -46,9 +46,11 @@ pub const BELL: Reserved = Reserved {
     align: 8,
 };
 
-/// The stack the start routine and the scheduler run on, and the boot area.
+/// The stack the start routine and the scheduler run on, and the boot area: the boot heap, then
+/// the runtime tables, to a whole page.
 pub const START_STACK: u64 = BOOT_STACK;
-pub const BOOT_AREA: u64 = super::super::machine::memory::BOOT_AREA;
+pub const BOOT_AREA: u64 = (super::super::machine::heap::SPACE_HEAP + super::system::TABLE_BYTES)
+    .next_multiple_of(super::super::machine::memory::TABLE);
 
 /// Makes a system call with up to six arguments, giving its result.
 pub fn call(lo: &mut Lowering, fx: &mut Fx, number: u64, args: &[Value]) -> Value {

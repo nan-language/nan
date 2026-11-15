@@ -25,7 +25,7 @@ pub const BOOT_AREA: u64 = (BOOT_HEAP + system::TABLE_BYTES).next_multiple_of(TA
 
 /// The bytes of a page table, the bytes an entry of its upper tables maps, a gigabyte, and the
 /// bytes a 2 MiB page or an AArch64 level-2 block maps.
-const TABLE: u64 = 4_096;
+pub const TABLE: u64 = 4_096;
 const GIGABYTE: u64 = 1 << 30;
 const BLOCK: u64 = 2 << 20;
 

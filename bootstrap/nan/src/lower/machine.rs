@@ -242,7 +242,11 @@ fn boot_stack_data(size: u64) -> Reserved {
 
 /// The data a kernel's runtime reserves that a bundle's code reaches, which a kernel exports.
 pub fn shared_data(arch: Arch) -> Vec<Reserved> {
-    let mut shared = vec![cpus::CPUS, bindings::IRQ_BINDINGS, heap::HEAP_STATE];
+    let mut shared = vec![
+        cpus::CPUS,
+        bindings::IRQ_BINDINGS,
+        heap::state_data(heap::BOOT_HEAP),
+    ];
     match arch {
         Arch::Amd64 => shared.push(interrupts::IDT),
         Arch::Aarch64 => shared.extend([its::IRQ_LPIS, its::ITS_DEVICES, discovery::MACHINE]),

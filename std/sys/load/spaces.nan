@@ -36,18 +36,20 @@ pub open struct Isolated {
 
 /// An isolated space: its root, its other tables, the pages it maps from the start of the user
 /// window up to the user frames it shares, laid out as `plan` gives, the pages of its boot area
-/// it has drawn, in order of their index from the window's start, and how many user frames it
-/// shares; the tables mapping the entry area follow those of the window.
+/// it has drawn and the tables of pages it took for them, each in order of index, and how many
+/// user frames it shares; the tables mapping the entry area follow those of the window.
 pub open linear struct Space {
     root: hw::PageTableRoot
     tables: mem::List[hw::PhysFrame[4_096]]
     pages: mem::List[hw::PhysFrame[4_096]]
     drawn: mem::List[Drawn]
+    boot_tables: mem::List[Drawn]
     shared: u64
     plan: Plan
 } Space
 
-/// A page of a space's boot area it has drawn: its index from the window's start, and its frame.
+/// A page of a space's boot area it has drawn, or a table of pages it took for them: its index
+/// from the window's start, or the table's from the first, and its frame.
 linear struct Drawn {
     index: u64
     frame: hw::PhysFrame[4_096]
@@ -147,27 +149,13 @@ pub fn Isolated.space(self, cpu: hw::Ring0, data: u64, mut frames: mem::List[hw:
         fail LoadError.Unplaceable
     }
     let image_base = image_window(self.runtime)
-    let runtime_copy = try relocated_copy(self.runtime_image.view(), parts: self.runtime, window: USER_WINDOW)
-    set_word(runtime_copy + self.runtime.lines + LINES_NEXT, value: image_base + self.parts.lines)
-    let image_copy = match attempt self.bound_copy(window: image_base) {
-        Ok(copy) => copy
-        Err(error) => {
-            release(runtime_copy)
-            fail error
-        }
-    }
-    var space = match attempt mapped(plan, reach, mut frames, alloc) {
-        Ok(space) => space
-        Err(error) => {
-            release(runtime_copy)
-            release(image_copy)
-            fail error
-        }
-    }
-    mut space.fill(at_page: 0, from: runtime_copy, len: self.runtime.size)
-    mut space.fill(at_page: plan.image, from: image_copy, len: self.parts.size)
-    release(runtime_copy)
-    release(image_copy)
+    var runtime_copy = try relocated_copy(self.runtime_image.view(), parts: self.runtime, window: USER_WINDOW, alloc)
+    let runtime_base = address_of(mut runtime_copy)
+    set_word(runtime_base + self.runtime.lines + LINES_NEXT, value: image_base + self.parts.lines)
+    var image_copy = try self.bound_copy(window: image_base, alloc)
+    var space = try mapped(plan, reach, mut frames, alloc)
+    mut space.fill(at_page: 0, from: runtime_base, len: self.runtime.size)
+    mut space.fill(at_page: plan.image, from: address_of(mut image_copy), len: self.parts.size)
     sync(space.pages[0].base(), len: plan.stack * PAGE)
     return space
 } Isolated.space
@@ -237,15 +225,21 @@ pub fn Space.write(mut self, address: u64, bytes: Slice[u8]) fails hw::UserAddrE
 pub fn Space.draw(mut self, address: u64, len: u64, mut frames: mem::List[hw::PhysFrame[4_096]]) -> u64 fails DrawError {
     let range = try self.boot_pages(address, len)
     var missing: u64 = 0
+    var tables: u64 = 0
     for index in range.low..<range.end {
         if self.frame_of(index).is_none() {
             missing += 1
         }
+        let table = index / TABLE_ENTRIES
+        if (index == range.low or index % TABLE_ENTRIES == 0) and not self.holds_table(table) {
+            tables += 1
+        }
     }
-    if u64.widen(frames.len()) < missing {
+    if u64.widen(frames.len()) < missing + tables {
         fail DrawError.Exhausted
     }
     for index in range.low..<range.end {
+        try mut self.table_for(index, mut frames)
         let at = self.drawn_from(index)
         if at == self.drawn.len() or self.drawn[at].index != index {
             let Some(frame) = mut frames.pop() else {
@@ -273,11 +267,15 @@ pub fn Space.give_back(mut self, address: u64, len: u64, mut frames: mem::List[h
 
 /// Gives back every frame the space took.
 pub fn Space.release(take self, mut frames: mem::List[hw::PhysFrame[4_096]]) {
-    let Space(root: root, tables: tables, pages: pages, drawn: drawn, shared: _, plan: _) = self
+    let Space(root: root, tables: tables, pages: pages, drawn: drawn, boot_tables: boot_tables, shared: _, plan: _) = self
     mut frames.push(take root.into_frame())
     given_back(take tables, mut frames)
     given_back(take pages, mut frames)
     for held in take drawn {
+        let Drawn(index: _, frame: frame) = held
+        mut frames.push(take frame)
+    }
+    for held in take boot_tables {
         let Drawn(index: _, frame: frame) = held
         mut frames.push(take frame)
     }
@@ -295,10 +293,55 @@ fn Space.boot_pages(self, address: u64, len: u64) -> Pages fails DrawError {
     return Pages(low: offset / PAGE, end: pages_of(offset + len))
 } Space.boot_pages
 
-/// The address of the entry of the table of pages mapping the page of an index.
+/// The address of the entry of the table of pages mapping the page of an index, which the space
+/// holds.
 fn Space.entry_of(self, index: u64) -> u64 {
-    return self.tables[usize.widen(index / TABLE_ENTRIES) + 2].base() + index % TABLE_ENTRIES * 8
+    let table = index / TABLE_ENTRIES
+    let offset = index % TABLE_ENTRIES * 8
+    if table < tables_of(self.plan) {
+        return self.tables[usize.widen(table) + 2].base() + offset
+    }
+    return self.boot_tables[self.table_from(table)].frame.base() + offset
 } Space.entry_of
+
+/// Whether the space holds the table of pages of an index.
+fn Space.holds_table(self, table: u64) -> bool {
+    if table < tables_of(self.plan) {
+        return true
+    }
+    let at = self.table_from(table)
+    return at < self.boot_tables.len() and self.boot_tables[at].index == table
+} Space.holds_table
+
+/// Takes from the end of `frames` the table of pages mapping the page of an index when the space
+/// holds none, cleared and entered in the table of 2 MiB entries.
+fn Space.table_for(mut self, index: u64, mut frames: mem::List[hw::PhysFrame[4_096]]) fails DrawError {
+    let table = index / TABLE_ENTRIES
+    if self.holds_table(table) {
+        return
+    }
+    let Some(frame) = mut frames.pop() else {
+        fail DrawError.Exhausted
+    }
+    clear(frame.base())
+    write_entry(self.tables[1].base() + table * 8, value: user_entry(frame.base(), kind: USER_TABLE))
+    mut self.boot_tables.insert(self.table_from(table), value: Drawn(index: table, frame: take frame))
+} Space.table_for
+
+/// The position in `boot_tables` of the first table whose index is not below `table`.
+fn Space.table_from(self, table: u64) -> usize {
+    var low: usize = 0
+    var high = self.boot_tables.len()
+    while low < high {
+        let middle = low + (high - low) / 2
+        if self.boot_tables[middle].index < table {
+            low = middle + 1
+        } else {
+            high = middle
+        }
+    }
+    return low
+} Space.table_from
 
 /// The physical address of the frame the space owns at the page of an index, none for a page
 /// it does not map or maps a user frame at.
@@ -348,18 +391,14 @@ fn runtime_export(image: Slice[u8], runtime: Parts, index: u64) -> u64 fails Loa
     return USER_WINDOW + offset - 1
 } runtime_export
 
-/// A copy in runtime memory of an image, its whole size, relocated for its address `window`;
-/// `release` frees it.
-fn relocated_copy(bundle: Slice[u8], parts: Parts, window: u64) -> u64 fails LoadError {
-    let copy = reserve(parts.size)
-    copy_in(bundle, from: parts.image, to: copy)
-    match attempt relocate(bundle, parts, base: copy, window) {
-        Ok(_) => return copy
-        Err(error) => {
-            release(copy)
-            fail error
-        }
-    }
+/// A copy of an image, its whole size, drawn through `alloc` and relocated for its address
+/// `window`.
+fn relocated_copy(bundle: Slice[u8], parts: Parts, window: u64, alloc: mem::Alloc) -> mem::Bytes fails LoadError {
+    var copy = mem::Bytes.zeroed(usize.widen(parts.size), alloc)
+    let base = address_of(mut copy)
+    copy_in(bundle, from: parts.image, to: base)
+    try relocate(bundle, parts, base, window)
+    return copy
 } relocated_copy
 
 /// The pages of `bytes` bytes.
@@ -381,26 +420,21 @@ fn sections_of(parts: Parts) -> Sections {
     return Sections(read_only: parts.read_only / PAGE, writable: parts.writable / PAGE)
 } sections_of
 
-/// The tables of pages a plan needs.
+/// The tables of the pages a plan maps before its boot area, those of whose pages a space takes
+/// as it draws them.
 fn tables_of(plan: Plan) -> u64 {
-    return (plan.end + TABLE_ENTRIES - 1) / TABLE_ENTRIES
+    return (plan.boot + TABLE_ENTRIES - 1) / TABLE_ENTRIES
 } tables_of
 
 /// A relocated copy of the bundle's image for its address `window`, its imports bound to the
-/// runtime's exports.
-fn Isolated.bound_copy(self, window: u64) -> u64 fails LoadError {
-    let copy = try relocated_copy(self.bundle.view(), parts: self.parts, window)
+/// runtime's exports, drawn through `alloc`.
+fn Isolated.bound_copy(self, window: u64, alloc: mem::Alloc) -> mem::Bytes fails LoadError {
+    var copy = try relocated_copy(self.bundle.view(), parts: self.parts, window, alloc)
     let image = self.runtime_image.view()
-    let bound = attempt bind(self.bundle.view(), parts: self.parts, base: copy, address: fn(index: u64) -> u64 fails LoadError {
+    try bind(self.bundle.view(), parts: self.parts, base: address_of(mut copy), address: fn(index: u64) -> u64 fails LoadError {
         return try runtime_export(image, runtime: self.runtime, index)
     })
-    match bound {
-        Ok(_) => return copy
-        Err(error) => {
-            release(copy)
-            fail error
-        }
-    }
+    return copy
 } Isolated.bound_copy
 
 /// The space of a plan, its frames taken from `frames` and cleared: a root mapping the window and
@@ -423,7 +457,7 @@ fn mapped(plan: Plan, reach: Reach, mut frames: mem::List[hw::PhysFrame[4_096]],
     for index in 0u64..<count {
         write_entry(tables[1].base() + index * 8, value: user_entry(tables[usize.widen(index) + 2].base(), kind: USER_TABLE))
     }
-    let space = Space(root: hw::PageTableRoot.of(take root), tables: take tables, pages: take pages, drawn: mem::List[Drawn].empty(alloc), shared: 0, plan: plan)
+    let space = Space(root: hw::PageTableRoot.of(take root), tables: take tables, pages: take pages, drawn: mem::List[Drawn].empty(alloc), boot_tables: mem::List[Drawn].empty(alloc), shared: 0, plan: plan)
     for index in 0u64..<plan.shared {
         write_entry(space.entry_of(index), value: user_entry(space.pages[usize.widen(index)].base(), kind: space.kind_of(index)))
     }
@@ -525,6 +559,11 @@ fn cleared_frames(mut frames: mem::List[hw::PhysFrame[4_096]], count: u64, alloc
     }
     return cleared
 } cleared_frames
+
+/// The address of the bytes a copy holds.
+fn address_of(mut copy: mem::Bytes) -> u64 {
+    return u64.widen(hw::Ptr.of_view_mut(mut copy.view_mut()).addr())
+} address_of
 
 /// Gives back the frames of a list.
 fn given_back(take from: mem::List[hw::PhysFrame[4_096]], mut frames: mem::List[hw::PhysFrame[4_096]]) {

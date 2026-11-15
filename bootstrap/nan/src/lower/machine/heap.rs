@@ -16,11 +16,18 @@ use super::super::runtime::memory::CHUNK;
 use super::super::runtime::{Routine, fetch_add, space, state};
 use super::stubs::Stub;
 
-/// The bytes of the boot heap.
+/// The bytes of a kernel's boot heap, and of the boot heap an isolated space's runtime runs
+/// over, whose pages its kernel maps as the runtime draws them.
 pub const BOOT_HEAP: u64 = 16 * 1024 * 1024;
+pub const SPACE_HEAP: u64 = 768 * 1024 * 1024;
 
-/// The chunks of the boot heap.
-const CHUNKS: u64 = BOOT_HEAP / CHUNK;
+/// The bytes of the boot heap the image runs over.
+pub fn heap_bytes(lo: &Lowering) -> u64 {
+    match lo.user() {
+        true => SPACE_HEAP,
+        false => BOOT_HEAP,
+    }
+}
 
 /// The header before a block, holding its size class; it keeps usable bytes 16-aligned.
 const HEADER: u64 = 16;
@@ -38,8 +45,8 @@ const CLASSES: u64 = 64;
 /// The offsets of the allocators' state: their spin lock, the next free byte and the end of the
 /// chunk blocks are carved from, the bytes of the chunks the map hands out and the most it has
 /// handed out, the bytes of the live records, of the live task stacks among them, which change
-/// atomically without the lock, and of the runs of chunks handed out whole, the chunk map
-/// holding a bit per chunk set while it is handed out, and each size class's free-list head.
+/// atomically without the lock, and of the runs of chunks handed out whole, each size class's
+/// free-list head, and the chunk map holding a bit per chunk set while it is handed out.
 mod allocators {
     pub const LOCK: u64 = 0;
     pub const CARVE: u64 = 8;
@@ -49,17 +56,18 @@ mod allocators {
     pub const RECORDS: u64 = 40;
     pub const STACKS: u64 = 48;
     pub const WHOLE: u64 = 56;
-    pub const MAP: u64 = 64;
-    pub const FREE: u64 = MAP + super::CHUNKS / 8;
-    pub const SIZE: u64 = FREE + 8 * super::CLASSES;
+    pub const FREE: u64 = 64;
+    pub const MAP: u64 = FREE + 8 * super::CLASSES;
 }
 
-/// The allocators' state.
-pub const HEAP_STATE: Reserved = Reserved {
-    name: "_NSheap_state",
-    size: allocators::SIZE,
-    align: 64,
-};
+/// The allocators' state of a boot heap of `bytes`.
+pub fn state_data(bytes: u64) -> Reserved {
+    Reserved {
+        name: "_NSheap_state",
+        size: allocators::MAP + bytes / CHUNK / 8,
+        align: 64,
+    }
+}
 
 /// A run of chunks handed out: its first chunk's address, its chunk count and a map holding a
 /// bit per chunk, set while the chunk is handed out.
@@ -294,14 +302,15 @@ fn boot_heap(lo: &mut Lowering, fx: &mut Fx) -> Value {
 fn boot_supply(lo: &mut Lowering, fx: &mut Fx, state: Value) -> ChunkSupply {
     ChunkSupply {
         base: boot_heap(lo, fx),
-        count: fx.ptr(CHUNKS),
+        count: fx.ptr(heap_bytes(lo) / CHUNK),
         map: fx.offset(state, allocators::MAP),
     }
 }
 
 /// The address of the allocators' state.
 fn heap_state(lo: &mut Lowering, fx: &mut Fx) -> Value {
-    lo.reserved(fx, HEAP_STATE)
+    let data = state_data(heap_bytes(lo));
+    lo.reserved(fx, data)
 }
 
 /// Takes the allocators' spin lock, which no interrupt fn takes. A kernel's holder disables

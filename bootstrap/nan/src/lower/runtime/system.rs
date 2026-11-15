@@ -71,7 +71,7 @@ fn init(lo: &mut Lowering, fx: &mut Fx) {
         true => fx.load(PTR, state_address, state::BOOT_AREA),
         false => lo.boot_area(fx),
     });
-    let mut offset = heap::BOOT_HEAP;
+    let mut offset = heap::heap_bytes(lo);
     for (field, size) in TABLES {
         let address = match area {
             Some(area) => fx.offset(area, offset),

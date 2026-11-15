@@ -208,18 +208,6 @@ struct LogLine derives Encode {
     value: text::String
 } LogLine
 
-/// The arguments of a write to a file a space opened.
-struct Writing derives Encode {
-    file: u64
-    data: mem::Bytes
-} Writing
-
-/// The arguments of a rename.
-struct Renaming derives Encode {
-    from: text::String
-    to: text::String
-} Renaming
-
 /// An entry of a directory a space lists: its name, and its kind's number.
 struct Listed derives Encode {
     name: text::String
@@ -532,6 +520,9 @@ fn copied(space: sys::load::Space, state: hw::UserState, at: usize, alloc: mem::
     if len > MOST_BYTES {
         fail hw::UserAddrError.OutsideUser
     }
+    if len == 0 {
+        return Untrusted.of(mem::Bytes.empty(alloc))
+    }
     return try space.read(user_word(state.regs[register(u64.widen(at))]), len, alloc)
 } copied
 
@@ -676,9 +667,7 @@ fn streamed(mut space: sys::load::Space, stdio: sys::Stdio, operation: u64, args
         return written_back(mut space, address: target, bytes: bytes_of(read, alloc), count: u64.widen(count))
     }
     if operation == WRITE_OUT or operation == WRITE_ERR {
-        let Ok(data) = attempt mem::wire::Codec[mem::Bytes].decode(args.view(), alloc) else {
-            return INVALID
-        }
+        let data = bytes_of(args.view(), alloc)
         let sent = match operation == WRITE_OUT {
             true => attempt await stdio.write_out(data.view())
             false => attempt await stdio.write_err(data.view())
@@ -704,13 +693,22 @@ fn filed(mut space: sys::load::Space, fs: sys::Fs, operation: u64, args: Untrust
         return try await file_served(mut space, operation, args, target, capacity, mut files, alloc)
     }
     if operation == FS_RENAME {
-        let Ok(renaming) = attempt mem::wire::Codec[Renaming].decode(args.view(), alloc) else {
+        let Some(paths) = numbered(args, alloc) else {
             return INVALID
         }
-        return completed(attempt await fs.rename(renaming.from.as_str(), to: renaming.to.as_str()))
+        let Some(parts) = paths.rest.view().split_at(usize.widen(paths.number)) else {
+            return INVALID
+        }
+        let Ok(from) = attempt text::String.try_from_utf8(parts.head, alloc) else {
+            return BAD_PATH
+        }
+        let Ok(to) = attempt text::String.try_from_utf8(parts.tail, alloc) else {
+            return BAD_PATH
+        }
+        return completed(attempt await fs.rename(from.as_str(), to: to.as_str()))
     }
-    let Ok(path) = attempt mem::wire::Codec[text::String].decode(args.view(), alloc) else {
-        return INVALID
+    let Ok(path) = attempt text::String.try_from_utf8(bytes_of(args.view(), alloc).view(), alloc) else {
+        return BAD_PATH
     }
     if operation == FS_OPEN or operation == FS_CREATE {
         let made = match operation == FS_OPEN {
@@ -747,21 +745,19 @@ fn filed(mut space: sys::load::Space, fs: sys::Fs, operation: u64, args: Untrust
 
 /// Serves a read, write, length or release of a file a space opened, by its number in `files`.
 fn file_served(mut space: sys::load::Space, operation: u64, args: Untrusted[mem::Bytes], target: u64, capacity: u64, mut files: Files, alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    let Some(given) = numbered(args, alloc) else {
+        return INVALID
+    }
+    let number = given.number
     if operation == FS_WRITE {
-        let Ok(writing) = attempt mem::wire::Codec[Writing].decode(args.view(), alloc) else {
-            return INVALID
-        }
-        let Some(found) = mut files.open.get_mut(writing.file) else {
+        let Some(found) = mut files.open.get_mut(number) else {
             return STALE
         }
         var file = found
-        return match attempt await mut file.write(writing.data.view()) {
+        return match attempt await mut file.write(given.rest.view()) {
             Ok(count) => u64.widen(count)
             Err(error) => file_failure(error)
         }
-    }
-    let Ok(number) = attempt mem::wire::Codec[u64].decode(args.view(), alloc) else {
-        return INVALID
     }
     if operation == FS_RELEASE {
         discard mut files.open.remove(number)
@@ -837,6 +833,26 @@ fn file_failure(error: sys::fs::FsError) -> u64 {
         else => REFUSAL
     }
 } file_failure
+
+/// A space's arguments that start with a word: the word, least significant byte first, and the
+/// bytes after it.
+struct Numbered {
+    number: u64
+    rest: mem::Bytes
+} Numbered
+
+/// A space's arguments split after the word they start with; none for fewer than 8 bytes.
+fn numbered(args: Untrusted[mem::Bytes], alloc: mem::Alloc) -> Option[Numbered] {
+    let Some(parts) = args.view().split_at(8) else {
+        return None
+    }
+    return Some(Numbered(number: leading_word(parts.head), rest: bytes_of(parts.tail, alloc)))
+} numbered
+
+/// The word of 8 bytes a space gives, least significant byte first.
+validator fn leading_word(raw: Untrusted[Slice[u8]]) -> u64 {
+    return raw.inspect().u64_le(0)
+} leading_word
 
 /// Logs a line whose arguments a call encodes, giving 0, or `INVALID` for arguments that do not
 /// decode.
@@ -1141,7 +1157,7 @@ fn wrote(remote: Remote, operation: u64, data: Slice[u8]) fails sys::StdioError 
     let Some(reach) = reached(remote) else {
         fail sys::StdioError.Closed
     }
-    try streamed_out(reach.handle, operation, data, alloc: reach.alloc)
+    try streamed_out(reach.handle, operation, data)
 } wrote
 
 /// Reads from the standard input of the standard streams at `handle`.
@@ -1154,13 +1170,21 @@ fn streamed_in(handle: u64, mut buf: SliceMut[u8]) -> usize fails sys::StdioErro
 } streamed_in
 
 /// Writes bytes to the standard output or error, as `operation` names, of the standard streams
-/// at `handle`.
-fn streamed_out(handle: u64, operation: u64, data: Slice[u8], alloc: mem::Alloc) fails sys::StdioError {
-    var bytes = mem::Bytes.empty(alloc)
-    mut bytes.append(data)
-    var nothing = mem::Bytes.empty(alloc)
-    if invoke(handle, operation, args: encoded(bytes, alloc).view(), result: mut nothing.view_mut()) >= FAILURES {
-        fail sys::StdioError.Closed
+/// at `handle`, at most a call's chunk at a time.
+fn streamed_out(handle: u64, operation: u64, data: Slice[u8]) fails sys::StdioError {
+    var done: usize = 0
+    while done < data.len() {
+        let Some(parts) = data.split_at(done) else {
+            return
+        }
+        let Some(chunk) = parts.tail.prefix(parts.tail.len().min(FILE_CHUNK)) else {
+            return
+        }
+        var nothing = Array[u8, 1].filled(0)
+        if invoke(handle, operation, args: chunk, result: mut nothing.view_mut()) >= FAILURES {
+            fail sys::StdioError.Closed
+        }
+        done += chunk.len()
     }
 } streamed_out
 
@@ -1170,39 +1194,45 @@ const STDIO_HANDLE: u64 = 1
 const FS_HANDLE: u64 = 3
 
 pub open struct SpaceCalls derives Copy {
-    alloc: mem::Alloc
 } SpaceCalls
 
-pub fn SpaceCalls.of_space(alloc: mem::Alloc) -> SpaceCalls {
-    return SpaceCalls(alloc: alloc)
+pub fn SpaceCalls.of_space() -> SpaceCalls {
+    return SpaceCalls()
 } SpaceCalls.of_space
 
 pub fn SpaceCalls.read_all(self, path: Str, alloc: mem::Alloc) -> mem::Bytes fails sys::fs::FsError {
-    return try space_read_all(FS_HANDLE, path, alloc)
+    var scratch = Array[u8, SCRATCH_BYTES].filled(0)
+    return try space_read_all(FS_HANDLE, path, alloc, scratch: mut scratch.view_mut())
 } SpaceCalls.read_all
 
 pub fn SpaceCalls.write_all(self, path: Str, data: Slice[u8]) fails sys::fs::FsError {
-    try space_write_all(FS_HANDLE, path, data, alloc: self.alloc)
+    var scratch = Array[u8, SCRATCH_BYTES].filled(0)
+    try space_write_all(FS_HANDLE, path, data, scratch: mut scratch.view_mut())
 } SpaceCalls.write_all
 
 pub fn SpaceCalls.remove(self, path: Str) fails sys::fs::FsError {
-    discard try space_path_call(FS_HANDLE, operation: FS_REMOVE, path, alloc: self.alloc)
+    var scratch = Array[u8, SCRATCH_BYTES].filled(0)
+    discard try space_path_call(FS_HANDLE, operation: FS_REMOVE, path, scratch: mut scratch.view_mut())
 } SpaceCalls.remove
 
 pub fn SpaceCalls.create_dir(self, path: Str) fails sys::fs::FsError {
-    discard try space_path_call(FS_HANDLE, operation: FS_CREATE_DIR, path, alloc: self.alloc)
+    var scratch = Array[u8, SCRATCH_BYTES].filled(0)
+    discard try space_path_call(FS_HANDLE, operation: FS_CREATE_DIR, path, scratch: mut scratch.view_mut())
 } SpaceCalls.create_dir
 
 pub fn SpaceCalls.rename(self, from: Str, to: Str) fails sys::fs::FsError {
-    try space_rename(FS_HANDLE, from, to, alloc: self.alloc)
+    var scratch = Array[u8, SCRATCH_BYTES].filled(0)
+    try space_rename(FS_HANDLE, from, to, scratch: mut scratch.view_mut())
 } SpaceCalls.rename
 
 pub fn SpaceCalls.kind(self, path: Str) -> sys::fs::Kind fails sys::fs::FsError {
-    return try space_kind(FS_HANDLE, path, alloc: self.alloc)
+    var scratch = Array[u8, SCRATCH_BYTES].filled(0)
+    return kind_of(try space_path_call(FS_HANDLE, operation: FS_KIND, path, scratch: mut scratch.view_mut()))
 } SpaceCalls.kind
 
 pub fn SpaceCalls.list(self, path: Str, alloc: mem::Alloc) -> mem::List[sys::fs::Entry] fails sys::fs::FsError {
-    return try space_list(FS_HANDLE, path, alloc)
+    var scratch = Array[u8, SCRATCH_BYTES].filled(0)
+    return try space_list(FS_HANDLE, path, alloc, scratch: mut scratch.view_mut())
 } SpaceCalls.list
 
 pub fn SpaceCalls.read_in(self, mut buf: SliceMut[u8]) -> usize fails sys::StdioError {
@@ -1210,78 +1240,91 @@ pub fn SpaceCalls.read_in(self, mut buf: SliceMut[u8]) -> usize fails sys::Stdio
 } SpaceCalls.read_in
 
 pub fn SpaceCalls.write_out(self, data: Slice[u8]) fails sys::StdioError {
-    try streamed_out(STDIO_HANDLE, operation: WRITE_OUT, data, alloc: self.alloc)
+    try streamed_out(STDIO_HANDLE, operation: WRITE_OUT, data)
 } SpaceCalls.write_out
 
 pub fn SpaceCalls.write_err(self, data: Slice[u8]) fails sys::StdioError {
-    try streamed_out(STDIO_HANDLE, operation: WRITE_ERR, data, alloc: self.alloc)
+    try streamed_out(STDIO_HANDLE, operation: WRITE_ERR, data)
 } SpaceCalls.write_err
 
 fn Remote.open(self, path: Str) -> u64 fails sys::fs::FsError limits stack 4_096 {
     let reach = try file_reach(self)
-    return try space_open(reach.handle, operation: FS_OPEN, path, alloc: reach.alloc)
+    var scratch = mem::Bytes.zeroed(path.byte_len(), alloc: reach.alloc)
+    return try space_path_call(reach.handle, operation: FS_OPEN, path, scratch: mut scratch.view_mut())
 } Remote.open
 
 fn Remote.create(self, path: Str) -> u64 fails sys::fs::FsError limits stack 4_096 {
     let reach = try file_reach(self)
-    return try space_open(reach.handle, operation: FS_CREATE, path, alloc: reach.alloc)
+    var scratch = mem::Bytes.zeroed(path.byte_len(), alloc: reach.alloc)
+    return try space_path_call(reach.handle, operation: FS_CREATE, path, scratch: mut scratch.view_mut())
 } Remote.create
 
 fn Remote.read_all(self, path: Str, alloc: mem::Alloc) -> mem::Bytes fails sys::fs::FsError limits stack 4_096 {
     let reach = try file_reach(self)
-    return try space_read_all(reach.handle, path, alloc)
+    var scratch = mem::Bytes.zeroed(path.byte_len().max(8), alloc: reach.alloc)
+    return try space_read_all(reach.handle, path, alloc, scratch: mut scratch.view_mut())
 } Remote.read_all
 
 fn Remote.write_all(self, path: Str, data: Slice[u8]) fails sys::fs::FsError limits stack 4_096 {
     let reach = try file_reach(self)
-    try space_write_all(reach.handle, path, data, alloc: reach.alloc)
+    var scratch = mem::Bytes.zeroed(path.byte_len().max(data.len().min(FILE_CHUNK) + 8), alloc: reach.alloc)
+    try space_write_all(reach.handle, path, data, scratch: mut scratch.view_mut())
 } Remote.write_all
 
 fn Remote.remove(self, path: Str) fails sys::fs::FsError limits stack 4_096 {
     let reach = try file_reach(self)
-    discard try space_path_call(reach.handle, operation: FS_REMOVE, path, alloc: reach.alloc)
+    var scratch = mem::Bytes.zeroed(path.byte_len(), alloc: reach.alloc)
+    discard try space_path_call(reach.handle, operation: FS_REMOVE, path, scratch: mut scratch.view_mut())
 } Remote.remove
 
 fn Remote.read(self, file: u64, mut buf: SliceMut[u8]) -> usize fails sys::fs::FsError limits stack 4_096 {
     let reach = try file_reach(self)
-    return try space_read(reach.handle, file, mut buf, alloc: reach.alloc)
+    var scratch = mem::Bytes.zeroed(8, alloc: reach.alloc)
+    return try space_read(reach.handle, file, mut buf, scratch: mut scratch.view_mut())
 } Remote.read
 
 fn Remote.write(self, file: u64, data: Slice[u8]) -> usize fails sys::fs::FsError limits stack 4_096 {
     let reach = try file_reach(self)
-    return try space_write(reach.handle, file, data, alloc: reach.alloc)
+    var scratch = mem::Bytes.zeroed(data.len().min(FILE_CHUNK) + 8, alloc: reach.alloc)
+    return try space_write(reach.handle, file, data, scratch: mut scratch.view_mut())
 } Remote.write
 
 fn Remote.byte_len(self, file: u64) -> u64 fails sys::fs::FsError limits stack 4_096 {
     let reach = try file_reach(self)
-    return try space_byte_len(reach.handle, file, alloc: reach.alloc)
+    var scratch = mem::Bytes.zeroed(8, alloc: reach.alloc)
+    return try space_numbered_call(reach.handle, operation: FS_BYTE_LEN, file, scratch: mut scratch.view_mut())
 } Remote.byte_len
 
 fn Remote.release(self, file: u64) limits stack 4_096 {
     let Some(reach) = reached(self) else {
         return
     }
-    space_release(reach.handle, file, alloc: reach.alloc)
+    var scratch = mem::Bytes.zeroed(8, alloc: reach.alloc)
+    discard attempt space_numbered_call(reach.handle, operation: FS_RELEASE, file, scratch: mut scratch.view_mut())
 } Remote.release
 
 fn Remote.create_dir(self, path: Str) fails sys::fs::FsError limits stack 4_096 {
     let reach = try file_reach(self)
-    discard try space_path_call(reach.handle, operation: FS_CREATE_DIR, path, alloc: reach.alloc)
+    var scratch = mem::Bytes.zeroed(path.byte_len(), alloc: reach.alloc)
+    discard try space_path_call(reach.handle, operation: FS_CREATE_DIR, path, scratch: mut scratch.view_mut())
 } Remote.create_dir
 
 fn Remote.rename(self, from: Str, to: Str) fails sys::fs::FsError limits stack 4_096 {
     let reach = try file_reach(self)
-    try space_rename(reach.handle, from, to, alloc: reach.alloc)
+    var scratch = mem::Bytes.zeroed(8 + from.byte_len() + to.byte_len(), alloc: reach.alloc)
+    try space_rename(reach.handle, from, to, scratch: mut scratch.view_mut())
 } Remote.rename
 
 fn Remote.kind(self, path: Str) -> sys::fs::Kind fails sys::fs::FsError limits stack 4_096 {
     let reach = try file_reach(self)
-    return try space_kind(reach.handle, path, alloc: reach.alloc)
+    var scratch = mem::Bytes.zeroed(path.byte_len(), alloc: reach.alloc)
+    return kind_of(try space_path_call(reach.handle, operation: FS_KIND, path, scratch: mut scratch.view_mut()))
 } Remote.kind
 
 fn Remote.list(self, path: Str, alloc: mem::Alloc) -> mem::List[sys::fs::Entry] fails sys::fs::FsError limits stack 4_096 {
     let reach = try file_reach(self)
-    return try space_list(reach.handle, path, alloc)
+    var scratch = mem::Bytes.zeroed(path.byte_len(), alloc: reach.alloc)
+    return try space_list(reach.handle, path, alloc, scratch: mut scratch.view_mut())
 } Remote.list
 
 /// What reaching a remote file system gives, failing as a revoked one when it is stale.
@@ -1292,8 +1335,11 @@ fn file_reach(remote: Remote) -> Reach fails sys::fs::FsError {
     return reach
 } file_reach
 
-/// The bytes a file system call carries at most: its arguments' encoding, or its result.
+/// The bytes a call carries at most: its arguments, or its result.
 const FILE_CHUNK: usize = 524_288
+
+/// The bytes of the buffer a space's own calls write their arguments into.
+const SCRATCH_BYTES: usize = 65_536
 
 /// Makes a file operation's call on the file system at `handle`, giving its result or failing
 /// with the failure it names.
@@ -1311,61 +1357,90 @@ fn space_call(handle: u64, operation: u64, args: Slice[u8], mut result: SliceMut
     }
 } space_call
 
-/// Makes a file operation's call taking a path and giving nothing but a number.
-fn space_path_call(handle: u64, operation: u64, path: Str, alloc: mem::Alloc) -> u64 fails sys::fs::FsError {
-    var nothing = mem::Bytes.empty(alloc)
-    return try space_call(handle, operation, args: encoded(text::String.of(path, alloc), alloc).view(), result: mut nothing.view_mut())
+/// Writes `bytes` into `scratch` after its first `skip` bytes, giving where they end; fails with
+/// `InvalidPath` when they do not fit.
+fn staged(bytes: Slice[u8], skip: usize, mut scratch: SliceMut[u8]) -> usize fails sys::fs::FsError {
+    let stop = skip + bytes.len()
+    let Some(held) = mut scratch.prefix_mut(stop) else {
+        fail sys::fs::FsError.InvalidPath
+    }
+    var head = held
+    let Some(parts) = mut head.split_at_mut(skip) else {
+        fail sys::fs::FsError.InvalidPath
+    }
+    var tail = parts.tail
+    mut tail.copy_from(bytes)
+    return stop
+} staged
+
+/// Makes a file operation's call whose arguments are the first `stop` bytes of `scratch` and
+/// whose result is a number.
+fn staged_call(handle: u64, operation: u64, stop: usize, scratch: Slice[u8]) -> u64 fails sys::fs::FsError {
+    let Some(args) = scratch.prefix(stop) else {
+        fail sys::fs::FsError.InvalidPath
+    }
+    var nothing = Array[u8, 1].filled(0)
+    return try space_call(handle, operation, args, result: mut nothing.view_mut())
+} staged_call
+
+/// Makes a file operation's call whose arguments are a path.
+fn space_path_call(handle: u64, operation: u64, path: Str, mut scratch: SliceMut[u8]) -> u64 fails sys::fs::FsError {
+    let stop = try staged(path.as_bytes(), skip: 0, mut scratch)
+    return try staged_call(handle, operation, stop, scratch: scratch.view())
 } space_path_call
 
-/// The number of a file the file system at `handle` opens for reading, or creates for writing.
-fn space_open(handle: u64, operation: u64, path: Str, alloc: mem::Alloc) -> u64 fails sys::fs::FsError {
-    return try space_path_call(handle, operation, path, alloc)
-} space_open
+/// Makes a file operation's call whose arguments are the number of an open file.
+fn space_numbered_call(handle: u64, operation: u64, file: u64, mut scratch: SliceMut[u8]) -> u64 fails sys::fs::FsError {
+    mut scratch.write_u64_le(0, value: file)
+    return try staged_call(handle, operation, stop: 8, scratch: scratch.view())
+} space_numbered_call
 
 /// Reads into `buf` from an open file of the file system at `handle`, at most a call's chunk.
-fn space_read(handle: u64, file: u64, mut buf: SliceMut[u8], alloc: mem::Alloc) -> usize fails sys::fs::FsError {
+fn space_read(handle: u64, file: u64, mut buf: SliceMut[u8], mut scratch: SliceMut[u8]) -> usize fails sys::fs::FsError {
+    mut scratch.write_u64_le(0, value: file)
+    let Some(args) = scratch.view().prefix(8) else {
+        fail sys::fs::FsError.Denied
+    }
     let room = buf.len().min(FILE_CHUNK)
     let Some(parts) = mut buf.split_at_mut(room) else {
         fail sys::fs::FsError.Denied
     }
     var head = parts.head
-    let count = try space_call(handle, operation: FS_READ, args: encoded(file, alloc).view(), result: mut head)
+    let count = try space_call(handle, operation: FS_READ, args, result: mut head)
     return usize.widen(count.min(u64.widen(room)))
 } space_read
 
-/// Writes a prefix of `data`, at most a call's chunk, to an open file of the file system at
-/// `handle`, giving its length.
-fn space_write(handle: u64, file: u64, data: Slice[u8], alloc: mem::Alloc) -> usize fails sys::fs::FsError {
-    let Some(parts) = data.split_at(data.len().min(FILE_CHUNK)) else {
+/// Writes a prefix of `data` to an open file of the file system at `handle`, as much as a call
+/// and `scratch` carry, giving its length.
+fn space_write(handle: u64, file: u64, data: Slice[u8], mut scratch: SliceMut[u8]) -> usize fails sys::fs::FsError {
+    mut scratch.write_u64_le(0, value: file)
+    let room = data.len().min(FILE_CHUNK).min(scratch.len() - 8)
+    let Some(parts) = data.split_at(room) else {
         fail sys::fs::FsError.Denied
     }
-    var bytes = mem::Bytes.empty(alloc)
-    mut bytes.append(parts.head)
-    var nothing = mem::Bytes.empty(alloc)
-    let count = try space_call(handle, operation: FS_WRITE, args: encoded(Writing(file: file, data: take bytes), alloc).view(), result: mut nothing.view_mut())
-    return usize.widen(count.min(u64.widen(parts.head.len())))
+    let stop = try staged(parts.head, skip: 8, mut scratch)
+    let count = try staged_call(handle, operation: FS_WRITE, stop, scratch: scratch.view())
+    return usize.widen(count.min(u64.widen(room)))
 } space_write
 
-/// The length of an open file of the file system at `handle`.
-fn space_byte_len(handle: u64, file: u64, alloc: mem::Alloc) -> u64 fails sys::fs::FsError {
-    var nothing = mem::Bytes.empty(alloc)
-    return try space_call(handle, operation: FS_BYTE_LEN, args: encoded(file, alloc).view(), result: mut nothing.view_mut())
-} space_byte_len
-
-/// Releases an open file of the file system at `handle`.
-fn space_release(handle: u64, file: u64, alloc: mem::Alloc) {
-    var nothing = mem::Bytes.empty(alloc)
-    discard invoke(handle, operation: FS_RELEASE, args: encoded(file, alloc).view(), result: mut nothing.view_mut())
-} space_release
-
 /// The contents of a file of the file system at `handle`, drawn through `alloc`.
-fn space_read_all(handle: u64, path: Str, alloc: mem::Alloc) -> mem::Bytes fails sys::fs::FsError {
-    let file = try space_open(handle, operation: FS_OPEN, path, alloc)
-    defer space_release(handle, file, alloc)
+fn space_read_all(handle: u64, path: Str, alloc: mem::Alloc, mut scratch: SliceMut[u8]) -> mem::Bytes fails sys::fs::FsError {
+    let file = try space_path_call(handle, operation: FS_OPEN, path, mut scratch)
+    let read = attempt space_contents(handle, file, alloc, mut scratch)
+    discard attempt space_numbered_call(handle, operation: FS_RELEASE, file, mut scratch)
+    return match read {
+        Ok(contents) => contents
+        Err(error) => fail error
+    }
+} space_read_all
+
+/// The rest of an open file of the file system at `handle`, drawn through `alloc`.
+fn space_contents(handle: u64, file: u64, alloc: mem::Alloc, mut scratch: SliceMut[u8]) -> mem::Bytes fails sys::fs::FsError {
+    let len = try space_numbered_call(handle, operation: FS_BYTE_LEN, file, mut scratch)
     var contents = mem::Bytes.empty(alloc)
-    var chunk = mem::Bytes.zeroed(FILE_CHUNK, alloc)
+    var chunk = mem::Bytes.zeroed(usize.widen(len).min(FILE_CHUNK).max(4_096), alloc)
     loop {
-        let count = try space_read(handle, file, buf: mut chunk.view_mut(), alloc)
+        let count = try space_read(handle, file, buf: mut chunk.view_mut(), mut scratch)
         if count == 0 {
             return contents
         }
@@ -1374,36 +1449,40 @@ fn space_read_all(handle: u64, path: Str, alloc: mem::Alloc) -> mem::Bytes fails
         }
         mut contents.append(read)
     }
-} space_read_all
+} space_contents
 
 /// Replaces the contents of a file of the file system at `handle` with `data`.
-fn space_write_all(handle: u64, path: Str, data: Slice[u8], alloc: mem::Alloc) fails sys::fs::FsError {
-    let file = try space_open(handle, operation: FS_CREATE, path, alloc)
-    defer space_release(handle, file, alloc)
+fn space_write_all(handle: u64, path: Str, data: Slice[u8], mut scratch: SliceMut[u8]) fails sys::fs::FsError {
+    let file = try space_path_call(handle, operation: FS_CREATE, path, mut scratch)
     var done: usize = 0
     while done < data.len() {
         let Some(parts) = data.split_at(done) else {
-            return
+            break
         }
-        let count = try space_write(handle, file, data: parts.tail, alloc)
+        let written = attempt space_write(handle, file, data: parts.tail, mut scratch)
+        let Ok(count) = written else {
+            discard attempt space_numbered_call(handle, operation: FS_RELEASE, file, mut scratch)
+            match written {
+                Ok(_) => return
+                Err(error) => fail error
+            }
+        }
         if count == 0 {
+            discard attempt space_numbered_call(handle, operation: FS_RELEASE, file, mut scratch)
             fail sys::fs::FsError.NoSpace
         }
         done += count
     }
+    discard attempt space_numbered_call(handle, operation: FS_RELEASE, file, mut scratch)
 } space_write_all
 
-/// Moves an entry of the file system at `handle`.
-fn space_rename(handle: u64, from: Str, to: Str, alloc: mem::Alloc) fails sys::fs::FsError {
-    var nothing = mem::Bytes.empty(alloc)
-    let renaming = Renaming(from: text::String.of(from, alloc), to: text::String.of(to, alloc))
-    discard try space_call(handle, operation: FS_RENAME, args: encoded(renaming, alloc).view(), result: mut nothing.view_mut())
+/// Moves an entry of the file system at `handle`: the length of `from`, then `from` and `to`.
+fn space_rename(handle: u64, from: Str, to: Str, mut scratch: SliceMut[u8]) fails sys::fs::FsError {
+    mut scratch.write_u64_le(0, value: u64.widen(from.byte_len()))
+    let middle = try staged(from.as_bytes(), skip: 8, mut scratch)
+    let stop = try staged(to.as_bytes(), skip: middle, mut scratch)
+    discard try staged_call(handle, operation: FS_RENAME, stop, scratch: scratch.view())
 } space_rename
-
-/// What a path of the file system at `handle` names.
-fn space_kind(handle: u64, path: Str, alloc: mem::Alloc) -> sys::fs::Kind fails sys::fs::FsError {
-    return kind_of(try space_path_call(handle, operation: FS_KIND, path, alloc))
-} space_kind
 
 /// The kind a number names.
 fn kind_of(number: u64) -> sys::fs::Kind {
@@ -1415,12 +1494,15 @@ fn kind_of(number: u64) -> sys::fs::Kind {
 } kind_of
 
 /// The entries of a directory of the file system at `handle`, drawn through `alloc`.
-fn space_list(handle: u64, path: Str, alloc: mem::Alloc) -> mem::List[sys::fs::Entry] fails sys::fs::FsError {
-    let args = encoded(text::String.of(path, alloc), alloc)
+fn space_list(handle: u64, path: Str, alloc: mem::Alloc, mut scratch: SliceMut[u8]) -> mem::List[sys::fs::Entry] fails sys::fs::FsError {
+    let stop = try staged(path.as_bytes(), skip: 0, mut scratch)
+    let Some(args) = scratch.view().prefix(stop) else {
+        fail sys::fs::FsError.InvalidPath
+    }
     var capacity: usize = 4_096
     loop {
         var buffer = mem::Bytes.zeroed(capacity, alloc)
-        let needed = usize.widen(try space_call(handle, operation: FS_LIST, args: args.view(), result: mut buffer.view_mut()))
+        let needed = usize.widen(try space_call(handle, operation: FS_LIST, args, result: mut buffer.view_mut()))
         if needed > capacity {
             if needed > FILE_CHUNK * 2 {
                 fail sys::fs::FsError.Denied

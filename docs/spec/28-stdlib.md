@@ -106,7 +106,7 @@ The table names every pub std type, interface, free function and registry with t
 | `sys` | `sys::Port`, `sys::CapabilityId`, `sys::Resource`, `sys::Held`, `sys::ResourceId`, `sys::Resources` | [Runner capabilities](26-components.md#runner-capabilities) |
 | `sys` | `sys::Resume`, `sys::ResumeReason`, `sys::Pressure`, `sys::Health`, `sys::HealthReply`, `sys::Suspend` | [System interfaces](26-components.md#system-interfaces) |
 | `sys` | `sys::sim::fs`, `sys::sim::net`, `sys::sim::random`, `sys::sim::stdio` | [Sim constructors](22-testing.md#sim-constructors) |
-| `sys` | `sys::load::Loader`, `sys::load::Prepared`, `sys::load::Bundle`, `sys::load::Load`, `sys::load::Job`, `sys::load::LoadError` | [Loading](24-kernel.md#loading) |
+| `sys` | `sys::load::Loader`, `sys::load::InterfaceHash`, `sys::load::Prepared`, `sys::load::Bundle`, `sys::load::Load`, `sys::load::Job`, `sys::load::LoadError` | [Loading](24-kernel.md#loading) |
 | `sys` | `sys::load::Isolated`, `sys::load::Space`, `sys::load::DrawError` | [Isolated spaces](24-kernel.md#isolated-spaces) |
 | `sys` | `sys::load::Table` | [Loaded registries](25-registries.md#loaded-registries) |
 | `hw` | `hw::Ptr` | [Pointers](23-low-level.md#pointers); atomic members in [Trusted atomics](23-low-level.md#trusted-atomics) |

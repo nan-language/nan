@@ -1739,6 +1739,12 @@ pub fn Kernel.loader(self) -> Option[sys::load::Loader]
 pub open struct Loader {
 } Loader
 
+pub closed struct InterfaceHash derives Copy, Eq, Ord, Hash, Encode {
+    pub bytes: Array[u8, 33]
+} InterfaceHash
+
+pub fn Loader.interface_hash(self) -> InterfaceHash
+
 pub fn Loader.prepare(self, bundle: Slice[u8], keys: Slice[core::crypto::PublicKey], alloc: mem::Alloc) -> Prepared fails LoadError
 
 pub fn Loader.prepare_unverified(self, bundle: Slice[u8], alloc: mem::Alloc) -> Prepared fails LoadError
@@ -1787,6 +1793,7 @@ pub closed enum LoadError derives Copy, Eq, Render {
 
 - `k.loader()` returns `Some` of a loader when the image exports its load ABI, and `None` otherwise. `sys::load::Loader` is a primitive capability.
 - A kernel exporting its load ABI has a **load window**, a range of 512 GiB of addresses outside the [entry root](#physical-memory)'s identity map, from `0xFFFF_8000_0000_0000` on x86_64, which the entry root's top-level entry 256 maps, and from `0xFFFF_0000_0000_0000` on AArch64, which `TTBR1_EL1` maps on each CPU with non-global pages.
+- `loader.interface_hash()` gives the kernel's [interface hash](30-artefacts.md#interface-files), which part 1 of each bundle built against its interface file holds.
 - `loader.prepare(bundle, keys, alloc)` places a bundle's image without publishing its entries. It fails with `Malformed` when `bundle` is not a bundle's encoding, with `Signature` when its sections hold no signature that one of `keys` verifies, and with `Interface` when it was built against another interface than the kernel's. It then copies the image into runtime memory, applies its relocations for the image's address in the load window, binds each import to the kernel's export, maps the image's pages into the window, its code readable and executable, its read-only data readable and its writable data readable and writable, never executable, makes the code visible to every CPU's instruction fetch and adds its line tables to those the trap routine reads; it traps (`trap.exhausted`) when runtime memory cannot hold the image. The prepared bundle's bookkeeping is drawn through `alloc`. A store through a mapped page of a bundle's code or read-only data raises a page fault ([interrupt functions](#interrupt-functions)).
 - `loader.prepare_unverified(bundle, alloc)` is `prepare` without the signature check. It is a trusted primitive whose soundness condition is that `bundle` is a bundle the toolchain built against the kernel's interface file.
 - `take prepared.load()` publishes the bundle's entries: for each loaded registry it contributes to, a new version holding the current version's entries and the bundle's, each of these inserted, in the bundle's order, before the first entry whose key is greater ([loaded registries](25-registries.md#loaded-registries)). It fails with `DuplicateKey` when two entries of a new version have equal keys and with `DuplicateUnique` when they have equal values of a unique field, publishing nothing and retiring the placement.

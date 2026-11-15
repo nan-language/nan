@@ -26,11 +26,12 @@ pub use bundle::{at_manifest, bundle};
 const LANDING: &str = "enter";
 
 /// What a final build reports and the image it writes, relative to the workspace root, with the
-/// file it writes beside the image: a kernel's interface file or a bundle's artefacts.
+/// files it writes beside the image: a kernel's interface file, or a bundle's artefacts and the
+/// hash of their code roots.
 pub struct Build {
     pub diagnostics: Vec<Diagnostic>,
     pub image: Option<String>,
-    pub companion: Option<String>,
+    pub companions: Vec<String>,
 }
 
 impl Build {
@@ -38,7 +39,7 @@ impl Build {
         Build {
             diagnostics,
             image: None,
-            companion: None,
+            companions: Vec::new(),
         }
     }
 }
@@ -112,18 +113,16 @@ pub fn build(
         diagnostics.push(diagnostic);
         return Ok(Build::failed(diagnostics));
     }
-    let companion = match interface {
-        Some(file) => {
-            let path = format!(".nan/images/{}/{name}.nlif", target.name());
-            write_file(&workspace.root.join(&path), &file)?;
-            Some(path)
-        }
-        None => None,
-    };
+    let mut companions = Vec::new();
+    if let Some(file) = interface {
+        let path = format!(".nan/images/{}/{name}.nlif", target.name());
+        write_file(&workspace.root.join(&path), &file)?;
+        companions.push(path);
+    }
     Ok(Build {
         diagnostics,
         image: Some(image),
-        companion,
+        companions,
     })
 }
 
@@ -278,7 +277,8 @@ fn kernel_interface(
         file,
         interface: Rc::new(interface),
         loaded: loaded.into_iter().map(|(_, item)| item).collect(),
-        isolates: calls("sys::load::Loader.isolate"),
+        isolates: calls("sys::load::Loader.isolate")
+            || calls("sys::load::Loader.isolate_unverified"),
     })
 }
 

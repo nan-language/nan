@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use super::{
     Build, artefacts, collisions, errors, final_closure, items, package_id, prefixes, roots,
-    section, write_file,
+    section, tree, write_file,
 };
 use crate::artefact::{read_bytes, read_uvar};
 use crate::check::db::{ItemId, PackageId};
@@ -261,12 +261,15 @@ pub fn bundle(
     let name = &checker.db.package(root).name;
     let path = format!(".nan/images/{}/{name}.nbun", target.name());
     write_file(&workspace.root.join(&path), &written)?;
-    let companion = format!(".nan/images/{}/{name}.narts", target.name());
-    write_file(&workspace.root.join(&companion), &section(&artefacts))?;
+    let images = format!(".nan/images/{}/{name}", target.name());
+    let artefacts_path = format!("{images}.narts");
+    write_file(&workspace.root.join(&artefacts_path), &section(&artefacts))?;
+    let tree_path = format!("{images}.ntree");
+    write_file(&workspace.root.join(&tree_path), &tree(&artefacts).0)?;
     Ok(Build {
         diagnostics,
         image: Some(path),
-        companion: Some(companion),
+        companions: vec![artefacts_path, tree_path],
     })
 }
 

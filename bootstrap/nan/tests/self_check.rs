@@ -14,10 +14,11 @@
 //! double-compiling: the toolchain the bootstrap built builds the toolchain, which builds it again
 //! into the same bytes, and the bootstrap's stage comparison accepts it. The signing test compares
 //! both on the key commands, signed seals and a signed release, with the same secret keys in the
-//! user directories of both. The NaN toolchain runs
-//! beside the bootstrap on a copy of the workspace and local store the bootstrap runs in, on one
-//! processor, or on every one when it builds itself, under an address-space cap, with a user
-//! directory of its own.
+//! user directories of both. The NaN OS test builds the toolchain for `x86_64-nanos` and compares
+//! its `check` and `build` commands, `build --against` included, in a kernel's isolated spaces
+//! under the emulator with the bootstrap's. The NaN toolchain runs beside the bootstrap on a copy
+//! of the workspace and local store the bootstrap runs in, on one processor, or on every one when
+//! it builds itself, under an address-space cap, with a user directory of its own.
 
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -46,6 +47,7 @@ datatest_stable::harness! {
     { test = internal_error, root = "../../toolchain", pattern = r"^nan/nan\.nan$" },
     { test = signing, root = "../../docs/spec", pattern = r"^31-trust\.md$" },
     { test = language_server, root = "../../docs/spec", pattern = r"^33-toolchain\.md$" },
+    { test = nanos_toolchain, root = "tests/nanos_toolchain", pattern = r"^space_host/package\.nan$" },
 }
 
 /// The root file the toolchain is built with: the command line with the user directory and local
@@ -1870,5 +1872,108 @@ fn language_server(_: &Utf8Path, _: String) -> datatest_stable::Result<()> {
         (&ran.stdout, ran.status.flatten()),
     )?;
     fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+/// The commands the toolchain's job runs in turn in the kernel `space_host`.
+const NANOS_COMMANDS: [&str; 3] = [
+    "check hello",
+    "build space_host",
+    "build hello --against .nan/images/x86_64-bare/space_host.nlif",
+];
+
+/// Builds the NaN toolchain for `x86_64-nanos` against the kernel `space_host`, boots the kernel
+/// with a boot module holding the toolchain's bundle, its tree file, its commands and the packages
+/// `hello` and `space_host`, and compares what the toolchain's commands write and exit with in the
+/// kernel's isolated spaces with what the bootstrap's do.
+fn nanos_toolchain(path: &Utf8Path, _: String) -> datatest_stable::Result<()> {
+    if std::env::consts::ARCH != "x86_64" {
+        return Ok(());
+    }
+    fresh_store("self-check-nanos-toolchain")?;
+    let source = path
+        .parent()
+        .and_then(Utf8Path::parent)
+        .expect("the kernel's test directory")
+        .as_std_path();
+    let dir = base().join("nanos");
+    copy_tree(&repository().join("toolchain"), &dir, false)?;
+    rewrite_manifest(&dir, DECLARED_TARGET, "targets x86_64-nanos\n")?;
+    copy_tree(&source.join("space_host"), &dir.join("space_host"), false)?;
+    let interface = ".nan/images/x86_64-bare/space_host.nlif";
+    for args in [
+        &["build", "space_host"][..],
+        &["dep", "approve", "nan"],
+        &["build", "nan", "--against", interface],
+    ] {
+        let (output, status) = nan(&dir, args)?;
+        if status != Some(0) {
+            return Err(format!("nan {} reports\n{output}", args.join(" ")).into());
+        }
+    }
+    let images = dir.join(".nan/images/x86_64-nanos");
+    let mut files = vec![
+        ("nan.nbun".to_owned(), fs::read(images.join("nan.nbun"))?),
+        (
+            "image.ntree".to_owned(),
+            fs::read(images.join("nan.ntree"))?,
+        ),
+        (
+            "commands".to_owned(),
+            format!("{}\n", NANOS_COMMANDS.join("\n")).into_bytes(),
+        ),
+    ];
+    for package in ["hello", "space_host"] {
+        tree(&source.join(package), &format!("{package}/"), &mut files)?;
+    }
+    let mut module = Vec::new();
+    for (name, contents) in &files {
+        module.extend((name.len() as u32).to_le_bytes());
+        module.extend(name.as_bytes());
+        module.extend((contents.len() as u64).to_le_bytes());
+        module.extend(contents);
+    }
+    let module_path = dir.join("module");
+    fs::write(&module_path, module)?;
+    let checked = base().join("nanos-checked");
+    for package in ["hello", "space_host"] {
+        copy_tree(&source.join(package), &checked.join(package), false)?;
+    }
+    let mut expected = String::new();
+    let mut status = Some(0);
+    for command in NANOS_COMMANDS {
+        let args: Vec<&str> = command.split(' ').collect();
+        let (output, ended) = nan(&checked, &args)?;
+        expected.push_str(&output);
+        status = ended;
+        if status != Some(0) {
+            break;
+        }
+    }
+    let run = nan::run(&["run".to_owned(), "space_host".to_owned()], &dir);
+    let launch = run
+        .launch
+        .ok_or_else(|| format!("nan run space_host reports\n{}", run.output))?;
+    // QEMU's firmware stalls loading a boot module this large while a TPM is attached.
+    let mut args = Vec::new();
+    let mut given = launch.args.iter();
+    while let Some(arg) = given.next() {
+        match given.as_slice().first() {
+            Some(value) if arg.starts_with('-') && value.contains("tpm") => drop(given.next()),
+            _ => args.push(arg.clone()),
+        }
+    }
+    args.extend(["-initrd", &module_path.display().to_string(), "-m", "2G"].map(str::to_owned));
+    let launch = nan::Launch { args, ..launch };
+    let booted = machine::boot(&launch, Vec::new())?;
+    if (Some(booted.status), booted.written.as_str()) != (status, expected.as_str()) {
+        return Err(format!(
+            "the NaN toolchain in an isolated space writes\n{}exiting with {}\nthe bootstrap\n{expected}exiting with {status:?}",
+            booted.written, booted.status
+        )
+        .into());
+    }
+    fs::remove_dir_all(dir)?;
+    fs::remove_dir_all(checked)?;
     Ok(())
 }

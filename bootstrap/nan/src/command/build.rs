@@ -85,7 +85,7 @@ pub fn run(
         let build = final_build::build(workspace, *program, compared)?;
         diagnostics.extend(build.diagnostics);
         images.extend(build.image);
-        companions.extend(build.companion);
+        companions.extend(build.companions);
     }
     if invocation.name == Name::Run && !errors(&diagnostics) {
         let image = images.pop().expect("a built image");
@@ -190,7 +190,7 @@ fn bundle(
         scope,
         written,
         build.diagnostics,
-        build.image.into_iter().chain(build.companion).collect(),
+        build.image.into_iter().chain(build.companions).collect(),
     )))
 }
 

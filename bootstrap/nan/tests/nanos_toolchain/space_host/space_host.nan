@@ -1,0 +1,723 @@
+//! Runs the job of the NaN toolchain's bundle in isolated spaces, once for each command its boot module gives while each exits with status 0, over a file system in memory holding the module's other files, writing the job's standard output and error to the serial port, then ends the run with the status the last command exits with.
+
+registers Uart {
+    data: u8 at 0x0 write
+} Uart
+
+registers Exit {
+    code: u8 at 0x0 write
+} Exit
+
+/// The bytes of the largest region of usable memory the kernel's file system and the job's image
+/// draw from; the space draws its pages from the rest of usable memory.
+const STORE_BYTES: u64 = 805_306_368
+
+/// The boot module's files holding the toolchain's bundle and the commands it runs, one per line,
+/// its arguments separated by spaces.
+const BUNDLE_FILE: Str = "nan.nbun"
+
+const COMMANDS_FILE: Str = "commands"
+
+/// The status the run ends with when the job ends without an exit status.
+const UNENDED: u8 = 100
+
+fn say(text: Str) {
+    say_bytes(text.as_bytes())
+} say
+
+fn say_bytes(bytes: Slice[u8]) {
+    var uart = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
+    for byte in bytes {
+        mut uart.write(Uart.data, value: byte)
+    }
+    take uart.unmap()
+} say_bytes
+
+/// Ends the run with `code`, the CPU's privileges and the frame holding them given up.
+fn finish(take cpu: hw::Ring0, take frame: hw::PhysFrame[4_096], code: u8) -> Never {
+    let base = frame.base()
+    trusted "the frame holds the privileges, and no value owns them from now on" { hw::Ptr[hw::Ring0].of_addr(usize.widen(base + 8)).write(take cpu) }
+    trusted "the frame holds itself, and no value owns it from now on" { hw::Ptr[hw::PhysFrame[4_096]].of_addr(usize.widen(base)).write(take frame) }
+    var exit = trusted "the emulator decodes port 0xF4 to its exit port and nothing else maps it" { hw::Ports[Exit].map(0xF4) }
+    mut exit.write(Exit.code, value: code)
+    loop {
+    }
+} finish
+
+fn stop(text: Str) -> Never {
+    say(text)
+    loop {
+    }
+} stop
+
+/// The kernel's policy, which keeps every task on CPU 0 with slices of a millisecond.
+struct OneCpu {
+} OneCpu
+
+impl OneCpu: hw::Policy
+
+fn OneCpu.place(self, t: hw::IrqsDisabled, task: hw::TaskView) -> hw::Placement limits notrap, terminates, noalloc, stack 4_096 {
+    return hw::Placement(cpu: 0, key: 0, bound: false)
+} OneCpu.place
+
+fn OneCpu.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Option[hw::Steal] limits notrap, terminates, noalloc, stack 4_096 {
+    return None
+} OneCpu.steal
+
+fn OneCpu.slice(self, t: hw::IrqsDisabled, cpu: u32, task: hw::TaskView) -> u64 limits notrap, terminates, noalloc, stack 4_096 {
+    return 1_000_000
+} OneCpu.slice
+
+fn OneCpu.idle(self, t: hw::IrqsDisabled, cpu: u32, until_ns: Option[u64]) -> hw::Idle limits notrap, terminates, noalloc, stack 4_096 {
+    return hw::Idle.Halt
+} OneCpu.idle
+
+/// The serial port serving the job's log and standard streams.
+struct Console {
+} Console
+
+impl Console: sys::Kind[core::atomic::AtomicU64, u64]
+
+impl Console: sys::LogService
+
+impl Console: sys::StdioService
+
+fn Console.log(self, level: sys::LogLevel, message: Str, value: Str) limits stack 4_096 {
+    say(text: "log ")
+    say(text: message)
+    say(text: ": ")
+    say(text: value)
+    say(text: "\n")
+} Console.log
+
+fn Console.read_in(self, mut buf: SliceMut[u8]) -> usize limits stack 4_096 {
+    return 0
+} Console.read_in
+
+fn Console.write_out(self, data: Slice[u8]) limits stack 4_096 {
+    say_bytes(data)
+} Console.write_out
+
+fn Console.write_err(self, data: Slice[u8]) limits stack 4_096 {
+    say_bytes(data)
+} Console.write_err
+
+/// A random source serving the bytes of a counter.
+struct Counter {
+} Counter
+
+impl Counter: sys::Kind[core::atomic::AtomicU64, u64]
+
+impl Counter: sys::RandomService
+
+fn Counter.fill(self, mut buf: SliceMut[u8]) limits stack 4_096 {
+    let given = sys::reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => state.fetch_add(u64.widen(buf.len())))
+    let start = given.value_or(None).value_or(0)
+    for index in 0..<buf.len() {
+        buf[index] = u8.truncate(start + u64.widen(index))
+    }
+} Counter.fill
+
+/// A file or directory of the kernel's file system.
+enum Node {
+    File(mem::Bytes)
+    Directory
+} Node
+
+/// A file the job opened: its path, how many of its bytes it has read, and whether it opened it
+/// for writing.
+struct Opened {
+    path: text::String
+    at: usize
+    writing: bool
+} Opened
+
+/// The kernel's file system: each file and directory by path, and the files open by number.
+struct Tree {
+    nodes: mem::Map[text::String, Node]
+    open: mem::Map[u64, Opened]
+    next: u64
+    alloc: mem::Alloc
+} Tree
+
+/// The file system the kernel serves the job, its state the tree.
+struct Files {
+} Files
+
+impl Files: sys::Kind[task::Cown[Tree], u64]
+
+impl Files: sys::FsService
+
+/// The tree the file system serves.
+fn Files.tree(self) -> task::Cown[Tree] fails sys::fs::FsError {
+    let Some(tree) = sys::reach(self, body: fn(state: task::Cown[Tree], record: u64) => state.share()) else {
+        fail sys::fs::FsError.Denied
+    }
+    return tree
+} Files.tree
+
+fn Files.open(self, path: Str) -> u64 fails sys::fs::FsError uses wait limits stack 4_096 {
+    let tree = try self.tree()
+    return await when mut tree => try mut tree.opened(path)
+} Files.open
+
+fn Files.create(self, path: Str) -> u64 fails sys::fs::FsError uses wait limits stack 4_096 {
+    let tree = try self.tree()
+    return await when mut tree => try mut tree.created(path)
+} Files.create
+
+fn Files.read_all(self, path: Str, alloc: mem::Alloc) -> mem::Bytes fails sys::fs::FsError uses wait limits stack 4_096 {
+    let tree = try self.tree()
+    return await when tree => try tree.contents(path, alloc)
+} Files.read_all
+
+fn Files.write_all(self, path: Str, data: Slice[u8]) fails sys::fs::FsError uses wait limits stack 4_096 {
+    let tree = try self.tree()
+    await when mut tree {
+        try mut tree.written(path, data)
+    }
+} Files.write_all
+
+fn Files.remove(self, path: Str) fails sys::fs::FsError uses wait limits stack 4_096 {
+    let tree = try self.tree()
+    await when mut tree {
+        try mut tree.removed(path)
+    }
+} Files.remove
+
+fn Files.read(self, file: u64, mut buf: SliceMut[u8]) -> usize fails sys::fs::FsError uses wait limits stack 4_096 {
+    let tree = try self.tree()
+    return await when mut tree => try mut tree.read(file, mut buf)
+} Files.read
+
+fn Files.write(self, file: u64, data: Slice[u8]) -> usize fails sys::fs::FsError uses wait limits stack 4_096 {
+    let tree = try self.tree()
+    return await when mut tree => try mut tree.write(file, data)
+} Files.write
+
+fn Files.byte_len(self, file: u64) -> u64 fails sys::fs::FsError uses wait limits stack 4_096 {
+    let tree = try self.tree()
+    return await when tree => try tree.byte_len(file)
+} Files.byte_len
+
+/// Keeps the file's number: the tree holds each file the job opened until the run ends.
+fn Files.release(self, file: u64) limits stack 4_096 {
+} Files.release
+
+fn Files.create_dir(self, path: Str) fails sys::fs::FsError uses wait limits stack 4_096 {
+    let tree = try self.tree()
+    await when mut tree {
+        try mut tree.made_dir(path)
+    }
+} Files.create_dir
+
+fn Files.rename(self, from: Str, to: Str) fails sys::fs::FsError uses wait limits stack 4_096 {
+    let tree = try self.tree()
+    await when mut tree {
+        try mut tree.renamed(from, to)
+    }
+} Files.rename
+
+fn Files.kind(self, path: Str) -> sys::fs::Kind fails sys::fs::FsError uses wait limits stack 4_096 {
+    let tree = try self.tree()
+    return await when tree => try tree.kind_of(path)
+} Files.kind
+
+fn Files.list(self, path: Str, alloc: mem::Alloc) -> mem::List[sys::fs::Entry] fails sys::fs::FsError uses wait limits stack 4_096 {
+    let tree = try self.tree()
+    return await when tree => try tree.listed(path, alloc)
+} Files.list
+
+/// Opens the file `path` names for reading.
+fn Tree.opened(mut self, path: Str) -> u64 fails sys::fs::FsError {
+    match self.nodes.get_by(fn(key: text::String) => key.as_str().cmp(path)) {
+        Some(Node.File(_)) => {}
+        Some(Node.Directory) => fail sys::fs::FsError.Denied
+        None => fail sys::fs::FsError.NotFound
+    }
+    return mut self.numbered(path, writing: false)
+} Tree.opened
+
+/// Creates or empties the file `path` names, and its missing directories, and opens it for
+/// writing.
+fn Tree.created(mut self, path: Str) -> u64 fails sys::fs::FsError {
+    try mut self.written(path, data: b"")
+    return mut self.numbered(path, writing: true)
+} Tree.created
+
+fn Tree.numbered(mut self, path: Str, writing: bool) -> u64 {
+    self.next += 1
+    discard mut self.open.insert(self.next, value: Opened(path: text::String.of(path, alloc: self.alloc), at: 0, writing: writing))
+    return self.next
+} Tree.numbered
+
+fn Tree.contents(self, path: Str, alloc: mem::Alloc) -> mem::Bytes fails sys::fs::FsError {
+    return match self.nodes.get_by(fn(key: text::String) => key.as_str().cmp(path)) {
+        Some(Node.File(bytes)) => copied(bytes.view(), alloc)
+        Some(Node.Directory) => fail sys::fs::FsError.Denied
+        None => fail sys::fs::FsError.NotFound
+    }
+} Tree.contents
+
+/// Replaces the contents of the file `path` names with `data`, creating it and its missing
+/// directories.
+fn Tree.written(mut self, path: Str, data: Slice[u8]) fails sys::fs::FsError {
+    if self.is_dir(path) {
+        fail sys::fs::FsError.Denied
+    }
+    try mut self.made_parents(path)
+    discard mut self.nodes.insert(text::String.of(path, alloc: self.alloc), value: Node.File(copied(data, alloc: self.alloc)))
+} Tree.written
+
+fn Tree.is_dir(self, path: Str) -> bool {
+    return match self.nodes.get_by(fn(key: text::String) => key.as_str().cmp(path)) {
+        Some(Node.Directory) => true
+        else => false
+    }
+} Tree.is_dir
+
+/// Creates each missing directory of `path`, failing where a file is.
+fn Tree.made_parents(mut self, path: Str) fails sys::fs::FsError {
+    let bytes = path.as_bytes()
+    for at in 0..<bytes.len() {
+        if bytes[at] != b'/' {
+            continue
+        }
+        let Some(dir) = path.slice_bytes(0, end: at) else {
+            fail sys::fs::FsError.InvalidPath
+        }
+        match self.nodes.get_by(fn(key: text::String) => key.as_str().cmp(dir)) {
+            Some(Node.Directory) => {}
+            Some(Node.File(_)) => fail sys::fs::FsError.Denied
+            None => {
+                discard mut self.nodes.insert(text::String.of(dir, alloc: self.alloc), value: Node.Directory)
+            }
+        }
+    }
+} Tree.made_parents
+
+/// Creates the directory `path` names and its missing directories, doing nothing where one is.
+fn Tree.made_dir(mut self, path: Str) fails sys::fs::FsError {
+    match self.nodes.get_by(fn(key: text::String) => key.as_str().cmp(path)) {
+        Some(Node.Directory) => return
+        Some(Node.File(_)) => fail sys::fs::FsError.Denied
+        None => {}
+    }
+    try mut self.made_parents(path)
+    discard mut self.nodes.insert(text::String.of(path, alloc: self.alloc), value: Node.Directory)
+} Tree.made_dir
+
+/// Removes the file or empty directory `path` names.
+fn Tree.removed(mut self, path: Str) fails sys::fs::FsError {
+    match self.nodes.get_by(fn(key: text::String) => key.as_str().cmp(path)) {
+        Some(Node.File(_)) => {}
+        Some(Node.Directory) => {
+            if self.children(path) > 0 {
+                fail sys::fs::FsError.Denied
+            }
+        }
+        None => fail sys::fs::FsError.NotFound
+    }
+    discard mut self.nodes.remove(text::String.of(path, alloc: self.alloc))
+} Tree.removed
+
+/// The number of entries directly in the directory `path` names, the root for the empty path.
+fn Tree.children(self, path: Str) -> usize {
+    var count: usize = 0
+    for entry in self.nodes {
+        if within(entry.key().as_str(), dir: path) {
+            count += 1
+        }
+    }
+    return count
+} Tree.children
+
+fn Tree.read(mut self, file: u64, mut buf: SliceMut[u8]) -> usize fails sys::fs::FsError {
+    let Some(found) = mut self.open.get_mut(file) else {
+        fail sys::fs::FsError.Denied
+    }
+    var opened = found
+    if opened.writing {
+        fail sys::fs::FsError.Denied
+    }
+    let path = opened.path.as_str()
+    let Some(Node.File(bytes)) = self.nodes.get_by(fn(key: text::String) => key.as_str().cmp(path)) else {
+        fail sys::fs::FsError.NotFound
+    }
+    let Some(parts) = bytes.view().split_at(opened.at.min(bytes.len())) else {
+        fail sys::fs::FsError.Denied
+    }
+    let count = parts.tail.len().min(buf.len())
+    let Some(given) = parts.tail.prefix(count) else {
+        fail sys::fs::FsError.Denied
+    }
+    let Some(into) = mut buf.prefix_mut(count) else {
+        fail sys::fs::FsError.Denied
+    }
+    var target = into
+    mut target.copy_from(given)
+    opened.at += count
+    return count
+} Tree.read
+
+fn Tree.write(mut self, file: u64, data: Slice[u8]) -> usize fails sys::fs::FsError {
+    let Some(opened) = self.open.get(file) else {
+        fail sys::fs::FsError.Denied
+    }
+    if not opened.writing {
+        fail sys::fs::FsError.Denied
+    }
+    let path = opened.path.as_str()
+    let Some(Node.File(found)) = mut self.nodes.get_by_mut(fn(key: text::String) => key.as_str().cmp(path)) else {
+        fail sys::fs::FsError.NotFound
+    }
+    var bytes = found
+    mut bytes.append(data)
+    return data.len()
+} Tree.write
+
+fn Tree.byte_len(self, file: u64) -> u64 fails sys::fs::FsError {
+    let Some(opened) = self.open.get(file) else {
+        fail sys::fs::FsError.Denied
+    }
+    let path = opened.path.as_str()
+    let Some(Node.File(bytes)) = self.nodes.get_by(fn(key: text::String) => key.as_str().cmp(path)) else {
+        fail sys::fs::FsError.NotFound
+    }
+    return u64.widen(bytes.len())
+} Tree.byte_len
+
+/// Moves the file or directory `from` names, with what a directory holds, to `to`, replacing a
+/// file there and creating the missing directories of `to`.
+fn Tree.renamed(mut self, from: Str, to: Str) fails sys::fs::FsError {
+    let moving = self.is_dir(from)
+    match self.nodes.get_by(fn(key: text::String) => key.as_str().cmp(from)) {
+        Some(_) => {}
+        None => fail sys::fs::FsError.NotFound
+    }
+    if self.is_dir(to) {
+        fail sys::fs::FsError.Denied
+    }
+    try mut self.made_parents(to)
+    var moved = mem::List[text::String].empty(self.alloc)
+    for entry in self.nodes {
+        let key = entry.key().as_str()
+        if key == from or (moving and below(key, dir: from)) {
+            mut moved.push(text::String.of(key, alloc: self.alloc))
+        }
+    }
+    for key in moved {
+        let Some(node) = mut self.nodes.remove(text::String.of(key.as_str(), alloc: self.alloc)) else {
+            continue
+        }
+        var target = text::String.of(to, alloc: self.alloc)
+        let Some(rest) = key.as_str().slice_bytes(from.byte_len(), end: key.as_str().byte_len()) else {
+            continue
+        }
+        mut target.append(rest)
+        discard mut self.nodes.insert(take target, value: take node)
+    }
+} Tree.renamed
+
+fn Tree.kind_of(self, path: Str) -> sys::fs::Kind fails sys::fs::FsError {
+    if path.is_empty() {
+        return sys::fs::Kind.Directory
+    }
+    return match self.nodes.get_by(fn(key: text::String) => key.as_str().cmp(path)) {
+        Some(Node.File(_)) => sys::fs::Kind.File
+        Some(Node.Directory) => sys::fs::Kind.Directory
+        None => fail sys::fs::FsError.NotFound
+    }
+} Tree.kind_of
+
+/// The entries directly in the directory `path` names, in byte order of name.
+fn Tree.listed(self, path: Str, alloc: mem::Alloc) -> mem::List[sys::fs::Entry] fails sys::fs::FsError {
+    if try self.kind_of(path) != sys::fs::Kind.Directory {
+        fail sys::fs::FsError.Denied
+    }
+    var entries = mem::List[sys::fs::Entry].empty(alloc)
+    for entry in self.nodes {
+        let key = entry.key().as_str()
+        if not within(key, dir: path) {
+            continue
+        }
+        var start: usize = 0
+        if not path.is_empty() {
+            start = path.byte_len() + 1
+        }
+        let Some(name) = key.slice_bytes(start, end: key.byte_len()) else {
+            continue
+        }
+        let kind = match entry.value() {
+            Node.File(_) => sys::fs::Kind.File
+            Node.Directory => sys::fs::Kind.Directory
+        }
+        mut entries.push(sys::fs::Entry(name: text::String.of(name, alloc), kind: kind))
+    }
+    return entries
+} Tree.listed
+
+/// Whether `key` lies somewhere below the directory `dir`.
+fn below(key: Str, dir: Str) -> bool {
+    return key.byte_len() > dir.byte_len() and key.starts_with(dir) and key.as_bytes()[dir.byte_len()] == b'/'
+} below
+
+/// Whether `key` names an entry directly in the directory `dir`, the root for the empty path.
+fn within(key: Str, dir: Str) -> bool {
+    var start: usize = 0
+    if not dir.is_empty() {
+        if not below(key, dir) {
+            return false
+        }
+        start = dir.byte_len() + 1
+    }
+    let bytes = key.as_bytes()
+    for at in start..<bytes.len() {
+        if bytes[at] == b'/' {
+            return false
+        }
+    }
+    return true
+} within
+
+fn copied(data: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(data)
+    return bytes
+} copied
+
+/// A file of the boot module: its path and its contents.
+struct Stored {
+    path: text::String
+    contents: mem::Bytes
+} Stored
+
+/// The files the boot module holds, each a little-endian u32 length and the UTF-8 of its path,
+/// then a little-endian u64 length and its contents; none when it holds anything else.
+validator fn stored(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Option[mem::List[Stored]] {
+    let bytes = raw.inspect()
+    var files = mem::List[Stored].empty(alloc)
+    var at: usize = 0
+    while at < bytes.len() {
+        let Some(name_len) = number_at(bytes, at, width: 4) else {
+            return None
+        }
+        let name_at = at + 4
+        if not holds(bytes, at: name_at, length: name_len) {
+            return None
+        }
+        let name = copied_at(bytes, at: name_at, length: name_len, alloc)
+        let Ok(path) = attempt text::String.try_from_utf8(name.view(), alloc) else {
+            return None
+        }
+        let Some(length) = number_at(bytes, at: name_at + name_len, width: 8) else {
+            return None
+        }
+        let contents_at = name_at + name_len + 8
+        if not holds(bytes, at: contents_at, length) {
+            return None
+        }
+        mut files.push(Stored(path: take path, contents: copied_at(bytes, at: contents_at, length, alloc)))
+        at = contents_at + length
+    }
+    return Some(take files)
+} stored
+
+/// The little-endian number of `width` bytes at `at`.
+fn number_at(bytes: Slice[u8], at: usize, width: usize) -> Option[usize] {
+    if not holds(bytes, at, length: width) {
+        return None
+    }
+    var value: u64 = 0
+    for index in 0..<width {
+        value |= u64.widen(bytes[at + index]) << u32.fit(8 * index)
+    }
+    return Some(usize.widen(value))
+} number_at
+
+/// Whether `bytes` holds `length` bytes at `at`.
+fn holds(bytes: Slice[u8], at: usize, length: usize) -> bool {
+    return at <= bytes.len() and length <= bytes.len() - at
+} holds
+
+/// The `length` bytes at `at`, `holds` saying `bytes` holds them.
+fn copied_at(bytes: Slice[u8], at: usize, length: usize, alloc: mem::Alloc) -> mem::Bytes {
+    var out = mem::Bytes.empty(alloc)
+    let Some(parts) = bytes.split_at(at) else {
+        return out
+    }
+    let Some(field) = parts.tail.prefix(length) else {
+        return out
+    }
+    mut out.append(field)
+    return out
+} copied_at
+
+/// The parts of `text` that `separator` ends.
+fn split(text: Slice[u8], separator: u8, alloc: mem::Alloc) -> mem::List[mem::Bytes] {
+    var parts = mem::List[mem::Bytes].empty(alloc)
+    var start: usize = 0
+    for at in 0..<text.len() {
+        if text[at] != separator {
+            continue
+        }
+        mut parts.push(copied_at(text, at: start, length: at - start, alloc))
+        start = at + 1
+    }
+    return parts
+} split
+
+/// The job's input for a command: its arguments, separated by spaces.
+fn host_input(command: Slice[u8], alloc: mem::Alloc) -> mem::Bytes {
+    var line = copied(command, alloc)
+    mut line.push(b' ')
+    let args = split(line.view(), separator: b' ', alloc)
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[nanos::HostInput].encode(nanos::HostInput(args: take args, environment: mem::Map[mem::Bytes, mem::Bytes].empty(alloc)), out: mut bytes)
+    return bytes
+} host_input
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let clock = k.clock()
+    let Some(loader) = k.loader() else {
+        stop(text: "no loader\n")
+    }
+    let Some(cpu) = mut k.ring0() else {
+        stop(text: "no ring0\n")
+    }
+    var modules = mut k.modules()
+    let Some(module) = mut modules.pop() else {
+        stop(text: "no boot module\n")
+    }
+    var regions = mut k.regions()
+    if regions.len() == 0 {
+        stop(text: "no usable memory\n")
+    }
+    var largest: usize = 0
+    for index in 0..<regions.len() {
+        if regions[index].byte_len() > regions[largest].byte_len() {
+            largest = index
+        }
+    }
+    var space_memory = mut regions.remove(largest)
+    let Some(store_region) = mut space_memory.split(at: space_memory.base() + STORE_BYTES) else {
+        stop(text: "too little memory\n")
+    }
+    let store = mem::Heap.over(take space_memory)
+    let big = store.alloc()
+    let Some(files) = stored(module.contents(), alloc: big) else {
+        stop(text: "undecodable boot module\n")
+    }
+    var frames = mem::List[hw::PhysFrame[4_096]].empty(big)
+    let returned = take module.into_region()
+    take returned.frames(mut frames)
+    take store_region.frames(mut frames)
+    for region in take regions {
+        take region.frames(mut frames)
+    }
+    mut k.policy(OneCpu())
+    take k.anchor(store, run: fn[take loader, take cpu, take files, take frames](exec: task::Executor) fails task::Cancelled uses wait limits stack 262_144 {
+        let code = match attempt await served(cpu, loader, take files, clock, mut frames, alloc: big) {
+            Ok(code) => code
+            Err(_) => UNENDED
+        }
+        let Some(last) = mut frames.pop() else {
+            stop(text: "out of frames\n")
+        }
+        finish(take cpu, frame: take last, code)
+    })
+} main
+
+/// Runs the toolchain's job for each command of the boot module over its files while each exits
+/// with status 0, giving the status the last one exits with.
+fn served(cpu: hw::Ring0, loader: sys::load::Loader, take files: mem::List[Stored], clock: sys::Clock, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> u8 fails task::Cancelled uses wait {
+    var tree = Tree(nodes: mem::Map[text::String, Node].empty(alloc), open: mem::Map[u64, Opened].empty(alloc), next: 0, alloc: alloc)
+    var bundle = mem::Bytes.empty(alloc)
+    var commands = mem::Bytes.empty(alloc)
+    for file in take files {
+        let Stored(path: path, contents: contents) = file
+        if path.as_str() == BUNDLE_FILE {
+            bundle = contents
+        } else if path.as_str() == COMMANDS_FILE {
+            commands = contents
+        } else {
+            let Ok(_) = attempt mut tree.made_parents(path.as_str()) else {
+                stop(text: "unplaceable file\n")
+            }
+            discard mut tree.nodes.insert(take path, value: Node.File(take contents))
+        }
+    }
+    let job = match trusted "the harness builds the bundle against this kernel's interface" { attempt loader.isolate_unverified(bundle.view(), alloc) } {
+        Ok(placed) => placed
+        Err(error) => {
+            var shown = text::String.empty(alloc)
+            mut shown.write(Dyn[Render].view(error), budget: 64)
+            say(text: shown.as_str())
+            stop(text: " bundle\n")
+        }
+    }
+    let consoles = sys::Minter[Console, core::atomic::AtomicU64, u64].of(core::atomic::AtomicU64.of(0), alloc)
+    let counters = sys::Minter[Counter, core::atomic::AtomicU64, u64].of(core::atomic::AtomicU64.of(0), alloc)
+    let disks = sys::Minter[Files, task::Cown[Tree], u64].of(task::Cown.of(take tree, alloc), alloc)
+    let Ok(log) = attempt sys::Log.served(consoles.mint(0)) else {
+        stop(text: "no log\n")
+    }
+    let Ok(stdio) = attempt sys::Stdio.served(consoles.mint(0)) else {
+        stop(text: "no stdio\n")
+    }
+    let Ok(random) = attempt sys::Random.served(counters.mint(0)) else {
+        stop(text: "no random\n")
+    }
+    let Ok(fs) = attempt sys::Fs.served(disks.mint(0)) else {
+        stop(text: "no fs\n")
+    }
+    let services = nanos::Services(clock: clock, log: log, stdio: stdio, random: random, fs: fs)
+    let Some(bell) = mut frames.pop() else {
+        stop(text: "out of frames\n")
+    }
+    let link = nanos::Link.of(take bell, alloc)
+    let Some(state) = mut frames.pop() else {
+        stop(text: "out of frames\n")
+    }
+    var extended = Some(hw::ExtendedState.of(take state))
+    var code: u8 = 0
+    for command in split(commands.view(), separator: b'\n', alloc) {
+        let outcome = attempt await nanos::run_isolated(cpu, job, services, link, input: host_input(command.view(), alloc), mut frames, mut extended, alloc)
+        code = status_of(take outcome, alloc)
+        if code != 0 {
+            break
+        }
+    }
+    take link.release(mut frames)
+    match extended {
+        Some(owned) => mut frames.push(take owned.into_frame())
+        None => {}
+    }
+    take consoles.close()
+    take counters.close()
+    take disks.close()
+    return code
+} served
+
+/// The status a run of the job exits with, writing how it ended otherwise.
+fn status_of(take outcome: Result[nanos::Ended, nanos::IsolatedError], alloc: mem::Alloc) -> u8 {
+    match outcome {
+        Ok(nanos::Ended.Returned(bytes)) => {
+            let Ok(code) = attempt mem::wire::Codec[u8].decode(Untrusted.of(bytes.view()), alloc) else {
+                say(text: "undecodable status\n")
+                return UNENDED
+            }
+            return code
+        }
+        Ok(nanos::Ended.Failed(message)) => say(text: message.as_str())
+        Ok(nanos::Ended.Trapped(trap)) => {
+            var shown = text::String.empty(alloc)
+            mut shown.write(Dyn[Render].view(trap), budget: 4_096)
+            say(text: shown.as_str())
+        }
+        Err(_) => say(text: "unplaced")
+        else => say(text: "ended")
+    }
+    say(text: "\n")
+    return UNENDED
+} status_of

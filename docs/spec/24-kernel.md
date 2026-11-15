@@ -1811,7 +1811,7 @@ pub closed enum LoadError derives Copy, Eq, Render {
 
 ### Isolated spaces
 
-A kernel runs the job of a nanos bundle in an **isolated space** when it runs it in user mode, under a root of its own, on the kernel's **user-mode runtime**: the support routines and runtime data a bundle imports, lowered for user mode, which the kernel's final build holds when a function of a package outside std calls `sys::load::Loader.isolate` ([bundles](30-artefacts.md#bundles)).
+A kernel runs the job of a nanos bundle in an **isolated space** when it runs it in user mode, under a root of its own, on the kernel's **user-mode runtime**: the support routines and runtime data a bundle imports, lowered for user mode, which the kernel's final build holds when a function of a package outside std calls `sys::load::Loader.isolate` or `sys::load::Loader.isolate_unverified` ([bundles](30-artefacts.md#bundles)).
 
 ```nan-api
 // module: sys::load

@@ -51,7 +51,7 @@ fn kernel_interface(checker: check::Checker, root: ty::PackageId, artefacts: mem
         for callee in called.contents() {
             let path = checker.db().canonical(callee)
             takes_loader = takes_loader or path.as_str() == "boot::Kernel.loader"
-            isolates = isolates or path.as_str() == "sys::load::Loader.isolate"
+            isolates = isolates or path.as_str() == "sys::load::Loader.isolate" or path.as_str() == "sys::load::Loader.isolate_unverified"
         }
     }
     if loaded.len() == 0 and not takes_loader {
@@ -330,7 +330,7 @@ pkg fn bundle(session: check::Session, package_index: usize, against: Str, signe
     let held = session.workspace.contents()
     let Some(source) = held.package_at(package_index) else {
         expect false
-        return Build.failed(mem::List[diagnostic::Diagnostic].empty(alloc))
+        return Build.failed(mem::List[diagnostic::Diagnostic].empty(alloc), alloc)
     }
     let Ok(file) = attempt platform::os::read_all(against, alloc) else {
         return unusable(source, reason: "the interface file cannot be read", alloc)
@@ -343,7 +343,7 @@ pkg fn bundle(session: check::Session, package_index: usize, against: Str, signe
     }
     let Some(manifest) = source.manifest else {
         expect false
-        return Build.failed(mem::List[diagnostic::Diagnostic].empty(alloc))
+        return Build.failed(mem::List[diagnostic::Diagnostic].empty(alloc), alloc)
     }
     let program = manifest.entry.is_some()
     var target = read.target
@@ -363,7 +363,7 @@ pkg fn bundle(session: check::Session, package_index: usize, against: Str, signe
     let closures = session.check_closures_coding(package_index)
     var diagnostics = session.reported_by(closures, scope: scope::Scope.Workspace)
     let Some(checked) = held.closure_of(package_index) else {
-        return Build.failed(take diagnostics)
+        return Build.failed(take diagnostics, alloc)
     }
     let program_checker = session.checker_in(take closures, package_index: package_index, target: target)
     let coding = program_checker.is_some() and session.codes_in_check(checked, package_index: package_index, target: target)
@@ -411,7 +411,7 @@ pkg fn bundle(session: check::Session, package_index: usize, against: Str, signe
         mut diagnostics.push(interface_error(source, reason: "a nanos program adds no entry to a loaded registry", alloc))
     }
     if errors(diagnostics.view()) {
-        return Build.failed(take diagnostics)
+        return Build.failed(take diagnostics, alloc)
     }
     let kernel = lower::Interface(hash: copied_bytes(hashing::HashValue.of(file.view()).bytes.view(), alloc), exports: take read.exports, interrupt_stack: read.interrupt_stack)
     let entries = bundle_entries(checker, root, manifest, alloc)
@@ -424,7 +424,7 @@ pkg fn bundle(session: check::Session, package_index: usize, against: Str, signe
         mut diagnostics.push(take reported)
     }
     if errors(diagnostics.view()) {
-        return Build.failed(take diagnostics)
+        return Build.failed(take diagnostics, alloc)
     }
     let written = match image::write_bundle(lowered.object.view(), contributed: lowered.contributed.view(), job: lowered.job, components: lowered.components.view(), hash: kernel.hash.view(), exports: kernel.exports.view(), signer, alloc) {
         Ok(bytes) => bytes
@@ -437,15 +437,21 @@ pkg fn bundle(session: check::Session, package_index: usize, against: Str, signe
                 mut reason.append(missing[index].as_str())
             }
             mut diagnostics.push(interface_error(source, reason: reason.as_str(), alloc))
-            return Build.failed(take diagnostics)
+            return Build.failed(take diagnostics, alloc)
         }
     }
     let name = checker.db().package_data(root).name.as_str()
     var path = image_path(target, name, suffix: ".nbun", alloc)
     try write_file(platform::join(held.root.as_str(), name: path.as_str(), alloc).as_str(), contents: written.view(), alloc)
+    var companions = mem::List[text::String].empty(alloc)
     var artefacts_path = image_path(target, name, suffix: ".narts", alloc)
     try write_file(platform::join(held.root.as_str(), name: artefacts_path.as_str(), alloc).as_str(), contents: section(artefacts, alloc).view(), alloc)
-    return Build(diagnostics: take diagnostics, image: Some(take path), companion: Some(take artefacts_path))
+    mut companions.push(take artefacts_path)
+    var tree_path = image_path(target, name, suffix: ".ntree", alloc)
+    let tree = tree_of(code_roots(artefacts, alloc).view(), alloc)
+    try write_file(platform::join(held.root.as_str(), name: tree_path.as_str(), alloc).as_str(), contents: tree.bytes.view(), alloc)
+    mut companions.push(take tree_path)
+    return Build(diagnostics: take diagnostics, image: Some(take path), companions: take companions)
 } bundle
 
 /// The final-link roots of a bundle: its package.
@@ -459,7 +465,7 @@ fn single_root(root: ty::PackageId, alloc: mem::Alloc) -> mem::List[ty::PackageI
 fn unusable(source: workspace::Package, reason: Str, alloc: mem::Alloc) -> Build {
     var diagnostics = mem::List[diagnostic::Diagnostic].empty(alloc)
     mut diagnostics.push(interface_error(source, reason, alloc))
-    return Build.failed(take diagnostics)
+    return Build.failed(take diagnostics, alloc)
 } unusable
 
 /// Whether package roots name a package.

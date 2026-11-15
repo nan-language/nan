@@ -361,6 +361,42 @@ pkg fn default_stack() -> usize {
 } default_stack
 ```
 
+A variant's head may keep a `fails` clause that only another variant's body needs ([heads](02-items.md#heads)):
+
+```nan
+// file: probe/package.nan
+//! Memory reserves for host and bare builds.
+
+package probe {
+    language 1
+    targets x86_64-bare, x86_64-linux
+} probe
+
+// file: probe/probe.nan
+//! Reserves memory on the target.
+
+pub fn reserve(bytes: u64) -> u64 fails mem::OutOfMemory {
+    return try memory::reserve(bytes)
+} reserve
+
+// file: probe/memory@bare/memory.nan
+//! Memory reserves per machine.
+
+pkg fn reserve(bytes: u64) -> u64 fails mem::OutOfMemory {
+    return bytes
+} reserve
+
+// file: probe/memory@linux/memory.nan
+//! Memory reserves per machine.
+
+pkg fn reserve(bytes: u64) -> u64 fails mem::OutOfMemory {
+    if bytes > 1_048_576 {
+        fail mem::OutOfMemory.Exhausted
+    }
+    return bytes
+} reserve
+```
+
 ```nan
 // file: probe/package.nan
 //! Stack reserves for host and bare builds.

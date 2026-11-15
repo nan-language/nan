@@ -52,6 +52,8 @@ pub struct ModuleData<'a> {
     pub package: PackageId,
     pub name: String,
     pub root: bool,
+    /// Whether it is a set of target variants.
+    pub variants: bool,
     /// Its items in byte order of file path, then position.
     pub items: Vec<ItemId>,
     /// The items each name declares, functions named after a type excepted.
@@ -243,6 +245,7 @@ impl<'a> Db<'a> {
                 package: id,
                 name: module.name.clone(),
                 root: is_root,
+                variants,
                 items: Vec::new(),
                 names: HashMap::new(),
                 abandoned: false,

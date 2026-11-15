@@ -22,7 +22,7 @@ use super::tir::{
 use super::ty::{Param, Scalar, Ty};
 use super::unused::{Binding, Usage};
 use crate::diagnostic::{Code, Diagnostic, Fix, Offer, Role};
-use crate::syntax::ast::{self, ItemKind, Mode, Tok};
+use crate::syntax::ast::{self, ItemKind, Mode, Tok, Visibility};
 
 /// The function, closure or other body whose `return`, `fail` and `try` statements act on.
 #[derive(Clone, Debug)]
@@ -1202,7 +1202,9 @@ impl Checker<'_> {
             let entry = self.names_entry(item);
             let fixable = !entry || self.db.target.is_host();
             let clauses = Clauses::of(&function.head, fixable);
-            let exempt = entry || root.as_ref().is_some_and(TExpr::holds_failure);
+            let shared = self.db.module(self.db.module_of(item)).variants
+                && self.db.ast(item).visibility != Visibility::Private;
+            let exempt = entry || shared || root.as_ref().is_some_and(TExpr::holds_failure);
             body.check_effects(token, &frame, &sig.fn_ty(), &clauses, exempt);
         }
         body.finish(root)

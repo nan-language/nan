@@ -12,7 +12,7 @@ use super::sig::FnSig;
 use super::ty::Ty;
 
 /// The supplied operations that draw memory although no `try_` form names them.
-const DRAWING: [&str; 54] = [
+const DRAWING: [&str; 55] = [
     "mem::Shared.make_mut",
     "mem::wire::Codec.decode",
     "mem::wire::Codec.decode_from",
@@ -44,6 +44,7 @@ const DRAWING: [&str; 54] = [
     "sys::Stepper.wake",
     "sys::Wire.schema",
     "sys::Wire.serve",
+    "sys::Wire.step_encoded",
     "sys::Reply.decode",
     "sys::load::pin",
     "sys::load::reserve",
@@ -139,7 +140,7 @@ const COUNTED: [&str; 5] = [
 /// The supplied operations calling a component's handlers or a job's entry on the calling task,
 /// whose digests hold the declared digest of a call through `sys::Component`, a system interface
 /// or a function type.
-const HANDLING: [&str; 9] = [
+const HANDLING: [&str; 10] = [
     "nanos::call",
     "sys::Stepper.start",
     "sys::Stepper.deliver",
@@ -149,6 +150,7 @@ const HANDLING: [&str; 9] = [
     "sys::Stepper.health",
     "sys::Stepper.suspend",
     "sys::Stepper.wake",
+    "sys::Wire.step_encoded",
 ];
 
 /// The std types storing their contents inline, which never draw memory.

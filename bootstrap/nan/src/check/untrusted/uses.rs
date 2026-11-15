@@ -287,8 +287,8 @@ impl Walk<'_, '_> {
 
     /// The uses of naming an instantiation of a function: those of the conformances of its type
     /// arguments to their bounds, of the decoders and encoders its codec uses substitute, and for
-    /// `sys::Wire.encode_message`, `encode_any` and `decode_any` of the encoders or decoders of
-    /// the parameters of the protocol's `pub` operations, or of all its operations.
+    /// `sys::Wire.encode_message`, `encode_any`, `step_encoded` and `decode_any` of the encoders
+    /// or decoders of the parameters of the protocol's `pub` operations, or of all its operations.
     fn named(&mut self, token: Tok, function: ItemId, args: &[Arg]) {
         let Some(head) = self.ck.fn_sig(function) else {
             return;
@@ -303,7 +303,7 @@ impl Walk<'_, '_> {
         }
         let messages = match self.ck.db.canonical(function).as_str() {
             "sys::Wire.encode_message" => Some((Codec::Encode, false)),
-            "sys::Wire.encode_any" => Some((Codec::Encode, true)),
+            "sys::Wire.encode_any" | "sys::Wire.step_encoded" => Some((Codec::Encode, true)),
             "sys::Wire.decode_any" => Some((Codec::Decode, true)),
             _ => None,
         };

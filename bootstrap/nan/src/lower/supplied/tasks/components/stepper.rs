@@ -13,9 +13,10 @@ use super::super::super::super::runtime::regions::WAITING;
 use super::super::super::super::runtime::{Routine, holdings, seeded, settle, tasks};
 use super::super::super::super::{Glue, Lowering};
 use super::super::super::Supply;
+use super::super::super::codecs::protocols::append_any;
 use super::{
-    HEADER_BYTES, call_handler, draw_record, entry, handle, handle_oldest, handler, intake, keyed,
-    oldest_sent, release_env, runner, shape, status, take_sent, unreference, wait_for,
+    HEADER_BYTES, call_handler, draw_record, entry, handle, handler, intake, keyed, oldest_sent,
+    release_env, runner, shape, status, take_oldest, take_sent, unreference, wait_for,
 };
 use crate::check::ty::{Arg, Bound, Ty};
 
@@ -58,27 +59,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         }
         "step" => {
             let record = record(fx);
-            let (state, env, message) = types_of(supply);
-            let option = supply.abi.result.clone();
-            let handled = lo.std_ty("sys", "Handled", Vec::new());
-            let layout = lo.layout(&option);
-            let result = supply
-                .sret
-                .unwrap_or_else(|| fx.slot(layout.size, layout.align));
-            let lock = fx.offset(record, runner::LOCK);
-            lo.call_routine(fx, Routine::Lock, &[lock]);
-            let oldest = fx.load(PTR, record, runner::OLDEST);
-            let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, oldest, 0);
-            lo.write_option_with(fx, &option, result, present, |lo, fx, at| {
-                let handled = Some((&handled, at));
-                handle_oldest(lo, fx, record, oldest, &state, &env, &message, handled);
-            });
-            let empty = fx.b.ins().bxor_imm_s(present, 1);
-            fx.when(empty, |fx| {
-                lo.call_routine(fx, Routine::Unlock, &[lock]);
-            });
-            let held = lo.held_at(fx, &option, result);
-            supply.ret(lo, fx, held);
+            step(lo, fx, supply, record, types_of(supply), None);
         }
         "take_sent" => {
             let record = record(fx);
@@ -237,6 +218,44 @@ fn held_task(lo: &mut Lowering, fx: &mut Fx, node: Value, at: Value) {
 }
 
 /// The state, Env and message types of a stepper.
+/// `mut s.step()`, its stepper's record at `record` and its state, Env and message types given:
+/// the oldest message of the intake handled, and `Some` of what it handled, `None` when the
+/// intake is empty. With `out`, the address of a `sys::Encoded` and the message a protocol's,
+/// the encoding of the call the message makes is appended to `out` before its handler runs.
+pub fn step(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    record: Value,
+    (state, env, message): (Ty, Ty, Ty),
+    out: Option<Value>,
+) {
+    let option = supply.abi.result.clone();
+    let handled = lo.std_ty("sys", "Handled", Vec::new());
+    let layout = lo.layout(&option);
+    let result = supply
+        .sret
+        .unwrap_or_else(|| fx.slot(layout.size, layout.align));
+    let lock = fx.offset(record, runner::LOCK);
+    lo.call_routine(fx, Routine::Lock, &[lock]);
+    let oldest = fx.load(PTR, record, runner::OLDEST);
+    let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, oldest, 0);
+    lo.write_option_with(fx, &option, result, present, |lo, fx, at| {
+        let handled = Some((&handled, at));
+        let taken = take_oldest(lo, fx, record, oldest, &message, handled);
+        if let (Some(out), Ty::Item(protocol, _)) = (out, &message) {
+            append_any(lo, fx, supply, *protocol, taken.0, out);
+        }
+        handle(lo, fx, record, &state, &env, &message, taken, Some(oldest));
+    });
+    let empty = fx.b.ins().bxor_imm_s(present, 1);
+    fx.when(empty, |fx| {
+        lo.call_routine(fx, Routine::Unlock, &[lock]);
+    });
+    let held = lo.held_at(fx, &option, result);
+    supply.ret(lo, fx, held);
+}
+
 fn types_of(supply: &Supply) -> (Ty, Ty, Ty) {
     (supply.type_arg(0), supply.type_arg(1), supply.type_arg(2))
 }

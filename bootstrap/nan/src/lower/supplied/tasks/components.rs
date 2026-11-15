@@ -26,7 +26,7 @@ mod intake;
 mod keyed;
 mod keys;
 mod run;
-mod stepper;
+pub mod stepper;
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC, types};
 
@@ -354,21 +354,19 @@ fn draw_record(
     record
 }
 
-/// Removes the oldest entry of a runner's intake and handles its message on the running task:
-/// a one-way post completes, a request's entry awaits its handler's reply, and the entry of a
-/// message the component sent is freed. The caller holds the lock, which this releases. With a
-/// `sys::Handled` type and an address, it writes there what it handles.
-#[allow(clippy::too_many_arguments)]
-fn handle_oldest(
+/// Removes the oldest entry of a runner's intake, giving the slot its message is moved to and
+/// the block holding its header, for `handle` to handle it with that entry: a one-way post
+/// completes, and the entry of a message the component sent is freed. The caller holds the
+/// lock, which this releases. With a `sys::Handled` type and an address, it writes there what
+/// it takes.
+fn take_oldest(
     lo: &mut Lowering,
     fx: &mut Fx,
     record: Value,
     oldest: Value,
-    state: &Ty,
-    env: &Ty,
     message: &Ty,
     handled: Option<(&Ty, Value)>,
-) {
+) -> (Value, Value) {
     let layout = lo.layout(message);
     let slot = fx.slot(layout.size, layout.align);
     intake::unlink(fx, record, oldest);
@@ -400,16 +398,7 @@ fn handle_oldest(
     fx.when(sent, |fx| {
         lo.call_routine(fx, Routine::Free, &[oldest]);
     });
-    handle(
-        lo,
-        fx,
-        record,
-        state,
-        env,
-        message,
-        (slot, header),
-        Some(oldest),
-    );
+    (slot, header)
 }
 
 /// Writes the `sys::Handled` of a message in a slot handled under the header of a block: that

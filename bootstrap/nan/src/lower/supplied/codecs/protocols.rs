@@ -1,7 +1,7 @@
 //! The wire encoding of protocols: the encodings of calls of operations as members of
 //! `sys::Wire`, `sys::Wire.hash`, `sys::Wire.schema`, `sys::Wire.serve`,
-//! `sys::Wire.encode_message`, `sys::Reply.decode`, and the handles `sys::Handle.of` makes and
-//! capability ids read.
+//! `sys::Wire.encode_message`, `sys::Wire.encode_any`, `sys::Wire.step_encoded`,
+//! `sys::Reply.decode`, and the handles `sys::Handle.of` makes and capability ids read.
 
 use cranelift_codegen::ir::{InstBuilder, TrapCode, Value, condcodes::IntCC, types};
 
@@ -11,6 +11,7 @@ use super::super::super::call::Invoked;
 use super::super::super::fx::{Fx, PTR};
 use super::super::super::{Instance, Lowering};
 use super::super::mem::vector;
+use super::super::tasks::components::stepper;
 use super::super::tasks::protocols::{Answer, await_reply};
 use super::super::{Supply, entry as supplied_entry, tasks::address_of};
 use super::{
@@ -38,6 +39,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         }
         "sys::Wire.serve" => serve(lo, fx, supply),
         "sys::Wire.encode_message" => encode_message(lo, fx, supply),
+        "sys::Wire.step_encoded" => step_encoded(lo, fx, supply),
         "sys::Wire.operations" => {
             let schemas = lo.ck.operation_schemas(protocol_of(supply));
             constant(lo, fx, supply, &schemas);
@@ -243,9 +245,25 @@ fn encode_any(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let protocol = protocol_of(supply);
     let message = Ty::item(protocol, Vec::new());
     let value = address_of(lo, fx, &message, supply.param(0));
+    let index = append_any(lo, fx, supply, protocol, value, supply.param(1).address());
+    let number = fx.b.ins().ireduce(types::I16, index);
+    supply.ret(lo, fx, Held::Scalar(number));
+}
+
+/// Appends to the encoded call at `out` the encoding of the call the message of `protocol` at
+/// `value` makes, of any operation, giving the index of that operation.
+pub fn append_any(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    protocol: ItemId,
+    value: Value,
+    out: Value,
+) -> Value {
+    let message = Ty::item(protocol, Vec::new());
     let cases = every_case(lo, protocol);
     let index = lo.variant_index(fx, &message, value);
-    let parts = encoded_parts(lo, fx, supply.param(1).address());
+    let parts = encoded_parts(lo, fx, out);
     for case in &cases {
         let this =
             fx.b.ins()
@@ -254,11 +272,18 @@ fn encode_any(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             append(lo, fx, supply, parts, |lo, fx, state| {
                 encode_case(lo, fx, Format::Wire, &message, case, value, state)
             });
-            let number = fx.int(types::I16, case.index as i64);
-            supply.ret(lo, fx, Held::Scalar(number));
         });
     }
-    fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
+    index
+}
+
+/// `Wire[P].step_encoded(mut stepper, mut out)`: a step of the stepper, which appends to `out`
+/// the encoding of the call its message makes before its handler runs.
+fn step_encoded(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let record = fx.load(PTR, supply.param(0).address(), 0);
+    let types = (supply.type_arg(1), supply.type_arg(2), supply.type_arg(0));
+    let out = supply.param(1).address();
+    stepper::step(lo, fx, supply, record, types, Some(out));
 }
 
 /// `Wire[P].decode_any(raw, handles, alloc)`: the message of any operation whose call `raw`

@@ -12,8 +12,8 @@ use super::super::super::super::{Glue, Lowering};
 use super::super::super::Supply;
 use super::super::super::mem::lists::fn_param;
 use super::{
-    call_handler, draw_record, handle_oldest, handler, intake, keyed, release_env, runner, shape,
-    unreference, wait_for, wake_waiter, withdraw,
+    call_handler, draw_record, handle, handler, intake, keyed, release_env, runner, shape,
+    take_oldest, unreference, wait_for, wake_waiter, withdraw,
 };
 use crate::check::ty::Ty;
 
@@ -153,7 +153,8 @@ fn component_glue(lo: &mut Lowering, state: &Ty, env: &Ty, message: &Ty) -> Func
                 present,
                 &[types::I8],
                 |lo, fx| {
-                    handle_oldest(lo, fx, record, oldest, &state, &env, &message, None);
+                    let taken = take_oldest(lo, fx, record, oldest, &message, None);
+                    handle(lo, fx, record, &state, &env, &message, taken, Some(oldest));
                     vec![fx.int(types::I8, 1)]
                 },
                 |lo, fx| {

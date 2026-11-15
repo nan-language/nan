@@ -29,7 +29,10 @@ fn stepper_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) {
         }
         "deliver" => stepper_deliver(mut lo, mut fx, supply, headed: false)
         "deliver_headed" => stepper_deliver(mut lo, mut fx, supply, headed: true)
-        "step" => stepper_step(mut lo, mut fx, supply)
+        "step" => {
+            let record = stepper_record(mut fx, supply)
+            stepper_step(mut lo, mut fx, supply, record, types: stepper_types(lo, supply), out: None)
+        }
         "incoming" => {
             let record = stepper_record(mut fx, supply)
             stepper_wait(mut lo, mut fx, supply, record, until_idle: false)
@@ -96,11 +99,11 @@ fn stepper_deliver(mut lo: Lowering, mut fx: Fx, supply: Supply, headed: bool) {
     supply.done(mut lo, mut fx)
 } stepper_deliver
 
-/// `mut s.step()`: handles the oldest message of the intake, giving what it handled, none when
-/// there was none.
-fn stepper_step(mut lo: Lowering, mut fx: Fx, supply: Supply) {
-    let record = stepper_record(mut fx, supply)
-    let types = stepper_types(lo, supply)
+/// `mut s.step()`, its stepper's record at `record` and its state, Env and message types given:
+/// the oldest message of the intake handled, and `Some` of what it handled, `None` when the
+/// intake is empty. With `out`, the address of a `sys::Encoded` and the message a protocol's,
+/// the encoding of the call the message makes is appended to `out` before its handler runs.
+fn stepper_step(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Value, types: StepperTypes, out: Option[clif::Value]) {
     let option = supply.abi.result
     let handled = lo.std_ty("sys", type_name: "Handled", args: mem::List[ty::Ty].empty(lo.alloc))
     let laid = mut lo.layout_of(option)
@@ -113,7 +116,19 @@ fn stepper_step(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let oldest = mut fx.load(PTR, addr: record, offset: RUNNER_OLDEST)
     let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: oldest, y: 0)
     mut lo.write_option_with(mut fx, layout_ty: option, address: result, presence: present, write_payload: fn(mut lo1: Lowering, mut fx1: Fx, at: clif::Value) {
-        handle_oldest(mut lo1, fx: mut fx1, record, oldest, state: types.state, env: types.env, message: types.message, handled: Some(HandledAt(handled: handled, at: at)))
+        let taken = components_take_oldest(mut lo1, fx: mut fx1, record, oldest, message: types.message, handled: Some(HandledAt(handled: handled, at: at)))
+        match out {
+            Some(encoded) => {
+                match lo1.ck.types().kind(types.message) {
+                    ty::TyKind.Item(item: protocol, args: _) => {
+                        discard protocols_append_any(mut lo1, fx: mut fx1, supply, protocol, value: taken.slot, out: encoded)
+                    }
+                    else => {}
+                }
+            }
+            None => {}
+        }
+        components_handle(mut lo1, fx: mut fx1, record, state: types.state, env: types.env, message: types.message, slot: taken.slot, header: taken.header, node: Some(oldest))
     })
     let empty = mut fx.b.bxor_imm_s(present, y: 1)
     mut fx.if_true(empty, then: fn[mut lo](mut fx1: Fx) {

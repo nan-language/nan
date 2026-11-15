@@ -646,6 +646,7 @@ pub closed struct Services derives Copy {
     pub log: sys::Log
     pub stdio: sys::Stdio
     pub random: sys::Random
+    pub fs: sys::Fs
 } Services
 
 pub closed enum IsolatedError derives Render {
@@ -676,14 +677,40 @@ pub fn Link.receive(self, channel: usize, alloc: mem::Alloc) -> Untrusted[mem::B
 pub fn Link.release(take self, mut frames: mem::List[hw::PhysFrame[4_096]])
 
 pub fn run_isolated(cpu: hw::Ring0, job: sys::load::Isolated, services: Services, link: Link, take input: mem::Bytes, mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState], alloc: mem::Alloc) -> Ended fails IsolatedError uses wait
+
+pub open struct SpaceCalls derives Copy {
+} SpaceCalls
+
+pub fn SpaceCalls.of_space(alloc: mem::Alloc) -> SpaceCalls
+
+pub fn SpaceCalls.read_all(self, path: Str, alloc: mem::Alloc) -> mem::Bytes fails sys::fs::FsError
+
+pub fn SpaceCalls.write_all(self, path: Str, data: Slice[u8]) fails sys::fs::FsError
+
+pub fn SpaceCalls.remove(self, path: Str) fails sys::fs::FsError
+
+pub fn SpaceCalls.create_dir(self, path: Str) fails sys::fs::FsError
+
+pub fn SpaceCalls.rename(self, from: Str, to: Str) fails sys::fs::FsError
+
+pub fn SpaceCalls.kind(self, path: Str) -> sys::fs::Kind fails sys::fs::FsError
+
+pub fn SpaceCalls.list(self, path: Str, alloc: mem::Alloc) -> mem::List[sys::fs::Entry] fails sys::fs::FsError
+
+pub fn SpaceCalls.read_in(self, mut buf: SliceMut[u8]) -> usize fails sys::StdioError
+
+pub fn SpaceCalls.write_out(self, data: Slice[u8]) fails sys::StdioError
+
+pub fn SpaceCalls.write_err(self, data: Slice[u8]) fails sys::StdioError
 ```
 
 - `nanos::run_isolated(cpu, job, services, link, input, mut frames, mut extended, alloc)` makes a space of `job` from `frames`, shares `link`'s frames with it, copies `input` into it and runs the space's thread on `cpu` with the extended state `extended` holds, serving its system calls, until the job ends; it then gives the space's frames back to `frames` and returns how the job ended, as `nanos::run` does. It fails with `IsolatedError.NoJob` when the bundle holds no job and with `Unplaced` when the space cannot be made.
 - A **link** is the [user frames](24-kernel.md#user-frames) a kernel shares with the spaces it runs with it, one after another: a doorbell, and channels. `nanos::Link.of(take bell, alloc)` makes a link of no channel whose doorbell is `bell`, and `link.open(key, take inbound, take outbound)` adds a channel under `key`, the space reading what the kernel writes in `inbound` and writing what the kernel reads in `outbound`, and gives its index; each frame is cleared. `link.ring(bits)` sets `bits` in the doorbell's first word and wakes the space if its runtime waits. A channel frame is a ring: the count of bytes its writer has written, the count its reader has read, each a word read with acquire and written with release ordering, then its bytes from offset 64. `link.send(channel, data)` writes as many bytes of `data` as the channel's inbound ring has room for and rings the doorbell's bit of the channel, the last bit for a channel past 63, giving their count, and `link.receive(channel, alloc)` waits until the space has written bytes the kernel has not read in the channel's outbound ring, then gives them, drawn through `alloc`, and rings the channel's bit; both fail with `LinkError.NoChannel` for an index that names no channel, and they read the space's counts as untrusted, a ring whose counts no reader and writer could leave having no room and no bytes. A task waiting in `receive` while another waits there on the same channel traps (`trap.duplicate-access`). `take link.release(mut frames)` gives the link's frames back to `frames`.
-- The space holds the capabilities it reaches through `invoke` in a **table of handles**, a handle being the index of its entry: the log, standard streams and random source of `services`, then each channel of `link`, then the runner capability of an instance's space ([component instances](#component-instances)), then each capability that crosses into the space, up to 256 entries. A call naming a handle the table does not hold fails as one naming a stale capability.
+- The space holds the capabilities it reaches through `invoke` in a **table of handles**, a handle being the index of its entry: the log, standard streams, random source and file system of `services`, by the handles 0 to 3, then each channel of `link`, then the runner capability of an instance's space ([component instances](#component-instances)), then each capability that crosses into the space, up to 256 entries. A call naming a handle the table does not hold fails as one naming a stale capability.
 - The space's runtime holds each channel of `link` in the job's `world.caps` as a `sys::Stdio` under the channel's key, whose `read_in` reads from its inbound ring, waiting on the doorbell while it is empty, whose `write_out` writes to its outbound ring, waiting on the doorbell while it is full, and whose `write_err` fails with `StdioError.Closed`; each read or write that moves bytes tells the kernel through the channel's handle, which wakes a task waiting in `link.receive`. A runtime waiting on the doorbell looks at its ring again at least every second.
 - The space grows within `frames`: it starts mapping none of its boot area, and `run_isolated` serves each draw and release of its runtime through `space.draw` and `space.give_back` on `frames`, and draws the page of the boot area its thread faults on when the space does not map it. A draw for which `frames` holds too few frames fails, and the allocation needing it with it, as on an exhausted heap; a fault for which `frames` holds no frame ends the job `Trapped` with a trap of `trap.exhausted`.
-- The job runs as the first task of a domain run of the space's runtime, on a world of that runtime's allocator, executor and clock, whose log, standard streams and random source reach `services` through system calls, whose file system and network are denied, and whose table holds `link`'s channels alone. A host-compatible entry so receives a denied wall clock.
+- The job runs as the first task of a domain run of the space's runtime, on a world of that runtime's allocator, executor and clock, whose log, standard streams, random source and file system reach `services` through system calls, whose network is denied, and whose table holds `link`'s channels alone. A file the job opens is open in `run_isolated` until the job releases it or ends, and each call moves at most 512 KiB of a file's bytes. A host-compatible entry so receives a denied wall clock.
+- `nanos::SpaceCalls.of_space(alloc)` gives the calls of the code running in an isolated space, which reach what the space's table holds by its handles without waiting: the space's thread runs nothing else until its kernel answers. `read_all`, `write_all`, `remove`, `create_dir`, `rename`, `kind` and `list` act as the `sys::Fs` operations of their names on the file system of `services`, and `read_in`, `write_out` and `write_err` as the `sys::Stdio` operations of their names on its standard streams, each drawing what it encodes through `alloc`. It is a trusted primitive whose soundness condition is that the calling code runs in an isolated space.
 - The kernel reads every register and byte the space gives as untrusted: the arguments of a log line or of a write reach `services` only when they are the `mem::wire` encodings the runtime writes, and a call naming bytes the space does not map fails. A trap of the job's domain ends it `Trapped` with a trap of the same kind, another exception of its thread with a trap of `trap.exception`, and a space waiting with no timer armed, which nothing can wake, with a trap of `trap.abandoned`, each located at the call of `run_isolated`.
 
 ### Component instances

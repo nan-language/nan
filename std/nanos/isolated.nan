@@ -21,12 +21,21 @@ const ROLE_NUMBER: u64 = 6
 
 const ROLE_RESULT: u64 = 7
 
-/// A call's results from `FAILURES` up are failures: an invalid call, and a stale capability.
+/// A call's results from `FAILURES` up are failures: an invalid call, a stale capability, and a
+/// file operation failing with a missing entry, a refusal, an invalid path or a full device.
 const FAILURES: u64 = 0xFFFF_FFFF_FFFF_F000
 
 const INVALID: u64 = 0xFFFF_FFFF_FFFF_FFFF
 
 const STALE: u64 = 0xFFFF_FFFF_FFFF_FFFE
+
+const MISSING_FILE: u64 = 0xFFFF_FFFF_FFFF_FFFD
+
+const REFUSAL: u64 = 0xFFFF_FFFF_FFFF_FFFC
+
+const BAD_PATH: u64 = 0xFFFF_FFFF_FFFF_FFFB
+
+const FULL_DEVICE: u64 = 0xFFFF_FFFF_FFFF_FFFA
 
 /// The operations of the capabilities the kernel serves a job's space.
 const LOG_LINE: u64 = 0
@@ -38,6 +47,30 @@ const WRITE_OUT: u64 = 1
 const WRITE_ERR: u64 = 2
 
 const FILL: u64 = 0
+
+/// The operations of the file system the kernel serves a job's space: those of `sys::FsService`
+/// but `read_all` and `write_all`, which the space makes of the others.
+const FS_OPEN: u64 = 0
+
+const FS_CREATE: u64 = 1
+
+const FS_READ: u64 = 2
+
+const FS_WRITE: u64 = 3
+
+const FS_BYTE_LEN: u64 = 4
+
+const FS_RELEASE: u64 = 5
+
+const FS_REMOVE: u64 = 6
+
+const FS_CREATE_DIR: u64 = 7
+
+const FS_RENAME: u64 = 8
+
+const FS_KIND: u64 = 9
+
+const FS_LIST: u64 = 10
 
 /// The operations of the runner capability the kernel serves an instance's space; a call through a
 /// port, which waits for its reply, crosses the link instead.
@@ -79,7 +112,7 @@ const ABANDONED: u64 = 16
 const MOST_BYTES: u64 = 1_048_576
 
 /// The bytes of a start record and of the record of a port.
-const START_BYTES: usize = 96
+const START_BYTES: usize = 104
 
 const PORT_BYTES: usize = 40
 
@@ -94,19 +127,20 @@ pub closed enum IsolatedError derives Render {
 } IsolatedError
 
 /// What the kernel serves a job in an isolated space: the clock of its waits, and the capabilities
-/// its world's log, standard streams and random source reach.
+/// its world's log, standard streams, random source and file system reach.
 pub closed struct Services derives Copy {
     pub clock: sys::Clock
     pub log: sys::Log
     pub stdio: sys::Stdio
     pub random: sys::Random
+    pub fs: sys::Fs
 } Services
 
 /// The record from which a space's runtime starts: the entry, where its input lies and its
-/// length, the address of the doorbell, the handles of the log, standard streams and random
-/// source, where the records of the link's channels lie and their count, 1 when the entry is a
-/// component entry whose instance the link's first channel carries, 0 for a job, and the handle of
-/// the runner capability.
+/// length, the address of the doorbell, the handles of the log, standard streams, random source
+/// and file system, where the records of the link's channels lie and their count, 1 when the
+/// entry is a component entry whose instance the link's first channel carries, 0 for a job, and
+/// the handle of the runner capability.
 struct Start derives Copy {
     job: sys::load::Job
     input: u64
@@ -115,6 +149,7 @@ struct Start derives Copy {
     log: u64
     stdio: u64
     random: u64
+    fs: u64
     ports: u64
     port_count: u64
     held: u64
@@ -126,6 +161,7 @@ enum Holding derives Copy {
     Log(sys::Log)
     Stdio(sys::Stdio)
     Random(sys::Random)
+    Fs(sys::Fs)
     Channel(usize)
     Runner(sys::Runner)
 } Holding
@@ -163,12 +199,32 @@ impl Remote: sys::StdioService
 
 impl Remote: sys::RandomService
 
+impl Remote: sys::FsService
+
 /// The arguments of a log line.
 struct LogLine derives Encode {
     level: u8
     message: text::String
     value: text::String
 } LogLine
+
+/// The arguments of a write to a file a space opened.
+struct Writing derives Encode {
+    file: u64
+    data: mem::Bytes
+} Writing
+
+/// The arguments of a rename.
+struct Renaming derives Encode {
+    from: text::String
+    to: text::String
+} Renaming
+
+/// An entry of a directory a space lists: its name, and its kind's number.
+struct Listed derives Encode {
+    name: text::String
+    kind: u8
+} Listed
 
 /// The arguments of a call handed to the runner capability through a port.
 struct Sending derives Encode {
@@ -219,6 +275,7 @@ fn placed(cpu: hw::Ring0, job: sys::load::Isolated, entry: sys::load::Job, servi
     let log = held_by(table, holding: Holding.Log(services.log))
     let stdio = held_by(table, holding: Holding.Stdio(services.stdio))
     let random = held_by(table, holding: Holding.Random(services.random))
+    let fs = held_by(table, holding: Holding.Fs(services.fs))
     let channels = table.count.load()
     for index in 0..<link.channels.len() {
         discard held_by(table, holding: Holding.Channel(index))
@@ -233,7 +290,7 @@ fn placed(cpu: hw::Ring0, job: sys::load::Isolated, entry: sys::load::Job, servi
                 true => 1
                 false => 0
             }
-            let record = Start(job: entry, input: input_at, input_len: u64.widen(input.len()), bell: ports.bell, log: log, stdio: stdio, random: random, ports: start + u64.widen(START_BYTES), port_count: u64.widen(link.channels.len()), held: instance, runner: acting)
+            let record = Start(job: entry, input: input_at, input_len: u64.widen(input.len()), bell: ports.bell, log: log, stdio: stdio, random: random, fs: fs, ports: start + u64.widen(START_BYTES), port_count: u64.widen(link.channels.len()), held: instance, runner: acting)
             discard attempt mut space.write(start, bytes: record_bytes(record, count: START_BYTES, alloc).view())
             discard attempt mut space.write(record.ports, bytes: ports.records.view())
             discard attempt mut space.write(input_at, bytes: input.view())
@@ -376,6 +433,7 @@ fn record_bytes[T: Copy](record: T, count: usize, alloc: mem::Alloc) -> mem::Byt
 fn run_space(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserState, mut extended: Option[hw::ExtendedState], served: Serving, link: Link, halted: fn() -> bool, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
     let services = served.services
     var ids = mem::Map[u64, Carried].empty(alloc)
+    var files = Files(open: mem::Map[u64, sys::fs::File].empty(alloc), next: 0)
     loop {
         if halted() {
             return Ended.Abandoned
@@ -417,7 +475,7 @@ fn run_space(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserSta
                         Err(_) => INVALID
                     }
                 } else if number == CALL_INVOKE {
-                    answer = try await invoked(mut space, state, served, link, mut ids, alloc)
+                    answer = try await invoked(mut space, state, served, link, mut ids, mut files, alloc)
                 }
                 state.regs[register(ROLE_RESULT)] = Untrusted.of(answer)
             }
@@ -479,8 +537,9 @@ fn copied(space: sys::load::Space, state: hw::UserState, at: usize, alloc: mem::
 
 /// Serves an `CALL_INVOKE` call: the handle of an entry of the space's table, the operation, the
 /// address and length of its arguments and the address and capacity of its result; `ids` keeps
-/// what crossed into the table for each capability the runner capability holds by number.
-fn invoked(mut space: sys::load::Space, state: hw::UserState, served: Serving, link: Link, mut ids: mem::Map[u64, Carried], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+/// what crossed into the table for each capability the runner capability holds by number, and
+/// `files` the files the space opened.
+fn invoked(mut space: sys::load::Space, state: hw::UserState, served: Serving, link: Link, mut ids: mem::Map[u64, Carried], mut files: Files, alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
     let handle = user_word(state.regs[register(0)])
     let operation = user_word(state.regs[register(1)])
     let target = user_word(state.regs[register(4)])
@@ -510,6 +569,7 @@ fn invoked(mut space: sys::load::Space, state: hw::UserState, served: Serving, l
                 return written_back(mut space, address: target, bytes: bytes, count: capacity)
             }
         }
+        Holding.Fs(fs) => return try await filed(mut space, fs, operation, args, target, capacity, mut files, alloc)
         Holding.Channel(index) => {
             if operation == NOTIFY {
                 link.heard_from(index)
@@ -631,6 +691,153 @@ fn streamed(mut space: sys::load::Space, stdio: sys::Stdio, operation: u64, args
     return INVALID
 } streamed
 
+/// The files a space opened, by number, and the number of the next one.
+struct Files {
+    open: mem::Map[u64, sys::fs::File]
+    next: u64
+} Files
+
+/// Serves an operation of the file system a space holds, opening and releasing its files in
+/// `files`: its result's address and capacity are `target` and `capacity`.
+fn filed(mut space: sys::load::Space, fs: sys::Fs, operation: u64, args: Untrusted[mem::Bytes], target: u64, capacity: u64, mut files: Files, alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    if operation == FS_READ or operation == FS_WRITE or operation == FS_BYTE_LEN or operation == FS_RELEASE {
+        return try await file_served(mut space, operation, args, target, capacity, mut files, alloc)
+    }
+    if operation == FS_RENAME {
+        let Ok(renaming) = attempt mem::wire::Codec[Renaming].decode(args.view(), alloc) else {
+            return INVALID
+        }
+        return completed(attempt await fs.rename(renaming.from.as_str(), to: renaming.to.as_str()))
+    }
+    let Ok(path) = attempt mem::wire::Codec[text::String].decode(args.view(), alloc) else {
+        return INVALID
+    }
+    if operation == FS_OPEN or operation == FS_CREATE {
+        let made = match operation == FS_OPEN {
+            true => attempt await fs.open(path.as_str())
+            false => attempt await fs.create(path.as_str())
+        }
+        let Ok(file) = made else {
+            return failed_with(made)
+        }
+        let number = files.next
+        files.next += 1
+        discard mut files.open.insert(number, value: take file)
+        return number
+    }
+    if operation == FS_REMOVE {
+        return completed(attempt await fs.remove(path.as_str()))
+    }
+    if operation == FS_CREATE_DIR {
+        return completed(attempt await fs.create_dir(path.as_str()))
+    }
+    if operation == FS_KIND {
+        return match attempt await fs.kind(path.as_str()) {
+            Ok(sys::fs::Kind.File) => 0
+            Ok(sys::fs::Kind.Directory) => 1
+            Ok(sys::fs::Kind.Other) => 2
+            Err(error) => file_failure(error)
+        }
+    }
+    if operation == FS_LIST {
+        return try await listed_back(mut space, fs, path: path.as_str(), target, capacity, alloc)
+    }
+    return INVALID
+} filed
+
+/// Serves a read, write, length or release of a file a space opened, by its number in `files`.
+fn file_served(mut space: sys::load::Space, operation: u64, args: Untrusted[mem::Bytes], target: u64, capacity: u64, mut files: Files, alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    if operation == FS_WRITE {
+        let Ok(writing) = attempt mem::wire::Codec[Writing].decode(args.view(), alloc) else {
+            return INVALID
+        }
+        let Some(found) = mut files.open.get_mut(writing.file) else {
+            return STALE
+        }
+        var file = found
+        return match attempt await mut file.write(writing.data.view()) {
+            Ok(count) => u64.widen(count)
+            Err(error) => file_failure(error)
+        }
+    }
+    let Ok(number) = attempt mem::wire::Codec[u64].decode(args.view(), alloc) else {
+        return INVALID
+    }
+    if operation == FS_RELEASE {
+        discard mut files.open.remove(number)
+        return 0
+    }
+    let Some(found) = mut files.open.get_mut(number) else {
+        return STALE
+    }
+    var file = found
+    if operation == FS_BYTE_LEN {
+        return match attempt await file.byte_len() {
+            Ok(len) => len
+            Err(error) => file_failure(error)
+        }
+    }
+    var buffer = Untrusted.of(mem::Bytes.zeroed(usize.widen(capacity), alloc))
+    return match attempt await mut file.read(mut buffer.view_mut()) {
+        Ok(count) => match buffer.view().prefix(count) {
+            Some(read) => written_back(mut space, address: target, bytes: bytes_of(read, alloc), count: u64.widen(count))
+            None => INVALID
+        }
+        Err(error) => file_failure(error)
+    }
+} file_served
+
+/// Serves a listing: the encoding of the entries of the directory at `path` written back when
+/// it fits `capacity`, giving its length either way.
+fn listed_back(mut space: sys::load::Space, fs: sys::Fs, path: Str, target: u64, capacity: u64, alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    let found = attempt await fs.list(path, alloc)
+    let Ok(entries) = found else {
+        return failed_with(found)
+    }
+    var listed = mem::List[Listed].empty(alloc)
+    for entry in take entries {
+        let kind: u8 = match entry.kind {
+            sys::fs::Kind.File => 0
+            sys::fs::Kind.Directory => 1
+            sys::fs::Kind.Other => 2
+        }
+        mut listed.push(Listed(name: take entry.name, kind: kind))
+    }
+    let bytes = encoded(listed, alloc)
+    let len = u64.widen(bytes.len())
+    if len > capacity {
+        return len
+    }
+    return written_back(mut space, address: target, bytes: bytes, count: len)
+} listed_back
+
+/// The result naming the failure of an outcome that failed, `INVALID` for one that did not.
+fn failed_with[T](outcome: Result[T, sys::fs::FsError]) -> u64 {
+    return match outcome {
+        Ok(_) => INVALID
+        Err(error) => file_failure(error)
+    }
+} failed_with
+
+/// The result of a file operation's outcome: 0, or the failure it gives.
+fn completed(outcome: Result[Unit, sys::fs::FsError]) -> u64 {
+    return match outcome {
+        Ok(_) => 0
+        Err(error) => file_failure(error)
+    }
+} completed
+
+/// The result naming a file operation's failure.
+fn file_failure(error: sys::fs::FsError) -> u64 {
+    return match error {
+        sys::fs::FsError.NotFound => MISSING_FILE
+        sys::fs::FsError.InvalidPath => BAD_PATH
+        sys::fs::FsError.NoSpace => FULL_DEVICE
+        sys::fs::FsError.Revoked(_) => STALE
+        else => REFUSAL
+    }
+} file_failure
+
 /// Logs a line whose arguments a call encodes, giving 0, or `INVALID` for arguments that do not
 /// decode.
 fn logged(log: sys::Log, args: Untrusted[mem::Bytes], alloc: mem::Alloc) -> u64 {
@@ -682,9 +889,9 @@ fn trap_of(kind: u64, alloc: mem::Alloc) -> sys::Trap
 
 /// The first task of a space's runtime: runs the job its start record names, or holds the
 /// instance of the component entry it names for the kernel over its link's first channel, on a
-/// world whose log, standard streams and random source the kernel serves, with its link's other
-/// channels in its table, its file system and network denied, and ends the space with how the job
-/// or instance ended.
+/// world whose log, standard streams, random source and file system the kernel serves, with its
+/// link's other channels in its table, its network denied, and ends the space with how the job or
+/// instance ended.
 pkg fn isolated(start: u64) fails task::Cancelled uses wait limits stack 16_384 {
     let record = trusted "the kernel writes the start record at `start` before the space starts" { hw::Ptr[Start].of_addr(usize.widen(start)).read() }
     let granted = space_base()
@@ -726,14 +933,15 @@ pkg fn isolated(start: u64) fails task::Cancelled uses wait limits stack 16_384 
     }
 } isolated
 
-/// The world of a space: its runtime's allocator, executor and clock, its log, standard streams
-/// and random source served by the kernel by the handles its start record gives, its file system
-/// and network denied, and its table holding each channel of its link from the index
+/// The world of a space: its runtime's allocator, executor and clock, its log, standard streams,
+/// random source and file system served by the kernel by the handles its start record gives, its
+/// network denied, and its table holding each channel of its link from the index
 /// `channels_from` as a standard stream under the channel's key.
 fn remote_world(granted: Base, record: Start, base: Remote, ports: sys::Minter[Port, Ports, u64], channels_from: u64) -> World fails sys::Revoked {
     let logs = try Cap[sys::Log].held(base, handle: record.log, serve: served_log)
     let streams = try Cap[sys::Stdio].held(base, handle: record.stdio, serve: served_stdio)
     let source = try Cap[sys::Random].held(base, handle: record.random, serve: served_random)
+    let files = try Cap[sys::Fs].held(base, handle: record.fs, serve: served_fs)
     var caps = Caps.empty(granted.alloc)
     for index in channels_from..<record.port_count {
         let port = port_at(record, index)
@@ -748,7 +956,7 @@ fn remote_world(granted: Base, record: Start, base: Remote, ports: sys::Minter[P
         }
         Cap[sys::Stdio].put(mut caps, key: named.as_str(), capability: channel)
     }
-    return World(alloc: granted.alloc, exec: granted.exec, clock: granted.clock, random: source, log: logs, stdio: streams, fs: sys::Fs.denied(), net: sys::Net.denied(), caps: take caps)
+    return World(alloc: granted.alloc, exec: granted.exec, clock: granted.clock, random: source, log: logs, stdio: streams, fs: files, net: sys::Net.denied(), caps: take caps)
 } remote_world
 
 /// The record of a channel of the space's link, by its index.
@@ -832,6 +1040,10 @@ fn served_random(remote: Remote) -> sys::Random fails sys::Revoked {
     return try sys::Random.served(remote)
 } served_random
 
+fn served_fs(remote: Remote) -> sys::Fs fails sys::Revoked {
+    return try sys::Fs.served(remote)
+} served_fs
+
 /// The handle of the capability the runtime holds for what the kernel carried into the space's
 /// table, none once `base` is stale.
 fn minted_for(base: Remote, crossed: Carried) -> Option[sys::Handle] {
@@ -913,11 +1125,7 @@ fn Remote.read_in(self, mut buf: SliceMut[u8]) -> usize fails sys::StdioError li
     let Some(reach) = reached(self) else {
         fail sys::StdioError.Closed
     }
-    let read = invoke(reach.handle, operation: READ_IN, args: b"", result: mut buf)
-    if read >= FAILURES {
-        fail sys::StdioError.Closed
-    }
-    return usize.widen(read)
+    return try streamed_in(reach.handle, mut buf)
 } Remote.read_in
 
 fn Remote.write_out(self, data: Slice[u8]) fails sys::StdioError limits stack 4_096 {
@@ -933,13 +1141,306 @@ fn wrote(remote: Remote, operation: u64, data: Slice[u8]) fails sys::StdioError 
     let Some(reach) = reached(remote) else {
         fail sys::StdioError.Closed
     }
-    var bytes = mem::Bytes.empty(reach.alloc)
-    mut bytes.append(data)
-    var nothing = mem::Bytes.empty(reach.alloc)
-    if invoke(reach.handle, operation, args: encoded(bytes, alloc: reach.alloc).view(), result: mut nothing.view_mut()) >= FAILURES {
+    try streamed_out(reach.handle, operation, data, alloc: reach.alloc)
+} wrote
+
+/// Reads from the standard input of the standard streams at `handle`.
+fn streamed_in(handle: u64, mut buf: SliceMut[u8]) -> usize fails sys::StdioError {
+    let read = invoke(handle, operation: READ_IN, args: b"", result: mut buf)
+    if read >= FAILURES {
         fail sys::StdioError.Closed
     }
-} wrote
+    return usize.widen(read)
+} streamed_in
+
+/// Writes bytes to the standard output or error, as `operation` names, of the standard streams
+/// at `handle`.
+fn streamed_out(handle: u64, operation: u64, data: Slice[u8], alloc: mem::Alloc) fails sys::StdioError {
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(data)
+    var nothing = mem::Bytes.empty(alloc)
+    if invoke(handle, operation, args: encoded(bytes, alloc).view(), result: mut nothing.view_mut()) >= FAILURES {
+        fail sys::StdioError.Closed
+    }
+} streamed_out
+
+/// The handles a space's table holds its standard streams and its file system by.
+const STDIO_HANDLE: u64 = 1
+
+const FS_HANDLE: u64 = 3
+
+pub open struct SpaceCalls derives Copy {
+    alloc: mem::Alloc
+} SpaceCalls
+
+pub fn SpaceCalls.of_space(alloc: mem::Alloc) -> SpaceCalls {
+    return SpaceCalls(alloc: alloc)
+} SpaceCalls.of_space
+
+pub fn SpaceCalls.read_all(self, path: Str, alloc: mem::Alloc) -> mem::Bytes fails sys::fs::FsError {
+    return try space_read_all(FS_HANDLE, path, alloc)
+} SpaceCalls.read_all
+
+pub fn SpaceCalls.write_all(self, path: Str, data: Slice[u8]) fails sys::fs::FsError {
+    try space_write_all(FS_HANDLE, path, data, alloc: self.alloc)
+} SpaceCalls.write_all
+
+pub fn SpaceCalls.remove(self, path: Str) fails sys::fs::FsError {
+    discard try space_path_call(FS_HANDLE, operation: FS_REMOVE, path, alloc: self.alloc)
+} SpaceCalls.remove
+
+pub fn SpaceCalls.create_dir(self, path: Str) fails sys::fs::FsError {
+    discard try space_path_call(FS_HANDLE, operation: FS_CREATE_DIR, path, alloc: self.alloc)
+} SpaceCalls.create_dir
+
+pub fn SpaceCalls.rename(self, from: Str, to: Str) fails sys::fs::FsError {
+    try space_rename(FS_HANDLE, from, to, alloc: self.alloc)
+} SpaceCalls.rename
+
+pub fn SpaceCalls.kind(self, path: Str) -> sys::fs::Kind fails sys::fs::FsError {
+    return try space_kind(FS_HANDLE, path, alloc: self.alloc)
+} SpaceCalls.kind
+
+pub fn SpaceCalls.list(self, path: Str, alloc: mem::Alloc) -> mem::List[sys::fs::Entry] fails sys::fs::FsError {
+    return try space_list(FS_HANDLE, path, alloc)
+} SpaceCalls.list
+
+pub fn SpaceCalls.read_in(self, mut buf: SliceMut[u8]) -> usize fails sys::StdioError {
+    return try streamed_in(STDIO_HANDLE, mut buf)
+} SpaceCalls.read_in
+
+pub fn SpaceCalls.write_out(self, data: Slice[u8]) fails sys::StdioError {
+    try streamed_out(STDIO_HANDLE, operation: WRITE_OUT, data, alloc: self.alloc)
+} SpaceCalls.write_out
+
+pub fn SpaceCalls.write_err(self, data: Slice[u8]) fails sys::StdioError {
+    try streamed_out(STDIO_HANDLE, operation: WRITE_ERR, data, alloc: self.alloc)
+} SpaceCalls.write_err
+
+fn Remote.open(self, path: Str) -> u64 fails sys::fs::FsError limits stack 4_096 {
+    let reach = try file_reach(self)
+    return try space_open(reach.handle, operation: FS_OPEN, path, alloc: reach.alloc)
+} Remote.open
+
+fn Remote.create(self, path: Str) -> u64 fails sys::fs::FsError limits stack 4_096 {
+    let reach = try file_reach(self)
+    return try space_open(reach.handle, operation: FS_CREATE, path, alloc: reach.alloc)
+} Remote.create
+
+fn Remote.read_all(self, path: Str, alloc: mem::Alloc) -> mem::Bytes fails sys::fs::FsError limits stack 4_096 {
+    let reach = try file_reach(self)
+    return try space_read_all(reach.handle, path, alloc)
+} Remote.read_all
+
+fn Remote.write_all(self, path: Str, data: Slice[u8]) fails sys::fs::FsError limits stack 4_096 {
+    let reach = try file_reach(self)
+    try space_write_all(reach.handle, path, data, alloc: reach.alloc)
+} Remote.write_all
+
+fn Remote.remove(self, path: Str) fails sys::fs::FsError limits stack 4_096 {
+    let reach = try file_reach(self)
+    discard try space_path_call(reach.handle, operation: FS_REMOVE, path, alloc: reach.alloc)
+} Remote.remove
+
+fn Remote.read(self, file: u64, mut buf: SliceMut[u8]) -> usize fails sys::fs::FsError limits stack 4_096 {
+    let reach = try file_reach(self)
+    return try space_read(reach.handle, file, mut buf, alloc: reach.alloc)
+} Remote.read
+
+fn Remote.write(self, file: u64, data: Slice[u8]) -> usize fails sys::fs::FsError limits stack 4_096 {
+    let reach = try file_reach(self)
+    return try space_write(reach.handle, file, data, alloc: reach.alloc)
+} Remote.write
+
+fn Remote.byte_len(self, file: u64) -> u64 fails sys::fs::FsError limits stack 4_096 {
+    let reach = try file_reach(self)
+    return try space_byte_len(reach.handle, file, alloc: reach.alloc)
+} Remote.byte_len
+
+fn Remote.release(self, file: u64) limits stack 4_096 {
+    let Some(reach) = reached(self) else {
+        return
+    }
+    space_release(reach.handle, file, alloc: reach.alloc)
+} Remote.release
+
+fn Remote.create_dir(self, path: Str) fails sys::fs::FsError limits stack 4_096 {
+    let reach = try file_reach(self)
+    discard try space_path_call(reach.handle, operation: FS_CREATE_DIR, path, alloc: reach.alloc)
+} Remote.create_dir
+
+fn Remote.rename(self, from: Str, to: Str) fails sys::fs::FsError limits stack 4_096 {
+    let reach = try file_reach(self)
+    try space_rename(reach.handle, from, to, alloc: reach.alloc)
+} Remote.rename
+
+fn Remote.kind(self, path: Str) -> sys::fs::Kind fails sys::fs::FsError limits stack 4_096 {
+    let reach = try file_reach(self)
+    return try space_kind(reach.handle, path, alloc: reach.alloc)
+} Remote.kind
+
+fn Remote.list(self, path: Str, alloc: mem::Alloc) -> mem::List[sys::fs::Entry] fails sys::fs::FsError limits stack 4_096 {
+    let reach = try file_reach(self)
+    return try space_list(reach.handle, path, alloc)
+} Remote.list
+
+/// What reaching a remote file system gives, failing as a revoked one when it is stale.
+fn file_reach(remote: Remote) -> Reach fails sys::fs::FsError {
+    let Some(reach) = reached(remote) else {
+        fail sys::fs::FsError.Revoked(sys::Revoked.Stale)
+    }
+    return reach
+} file_reach
+
+/// The bytes a file system call carries at most: its arguments' encoding, or its result.
+const FILE_CHUNK: usize = 524_288
+
+/// Makes a file operation's call on the file system at `handle`, giving its result or failing
+/// with the failure it names.
+fn space_call(handle: u64, operation: u64, args: Slice[u8], mut result: SliceMut[u8]) -> u64 fails sys::fs::FsError {
+    let answer = invoke(handle, operation, args, mut result)
+    if answer < FAILURES {
+        return answer
+    }
+    fail match answer {
+        MISSING_FILE => sys::fs::FsError.NotFound
+        BAD_PATH => sys::fs::FsError.InvalidPath
+        FULL_DEVICE => sys::fs::FsError.NoSpace
+        STALE => sys::fs::FsError.Revoked(sys::Revoked.Stale)
+        else => sys::fs::FsError.Denied
+    }
+} space_call
+
+/// Makes a file operation's call taking a path and giving nothing but a number.
+fn space_path_call(handle: u64, operation: u64, path: Str, alloc: mem::Alloc) -> u64 fails sys::fs::FsError {
+    var nothing = mem::Bytes.empty(alloc)
+    return try space_call(handle, operation, args: encoded(text::String.of(path, alloc), alloc).view(), result: mut nothing.view_mut())
+} space_path_call
+
+/// The number of a file the file system at `handle` opens for reading, or creates for writing.
+fn space_open(handle: u64, operation: u64, path: Str, alloc: mem::Alloc) -> u64 fails sys::fs::FsError {
+    return try space_path_call(handle, operation, path, alloc)
+} space_open
+
+/// Reads into `buf` from an open file of the file system at `handle`, at most a call's chunk.
+fn space_read(handle: u64, file: u64, mut buf: SliceMut[u8], alloc: mem::Alloc) -> usize fails sys::fs::FsError {
+    let room = buf.len().min(FILE_CHUNK)
+    let Some(parts) = mut buf.split_at_mut(room) else {
+        fail sys::fs::FsError.Denied
+    }
+    var head = parts.head
+    let count = try space_call(handle, operation: FS_READ, args: encoded(file, alloc).view(), result: mut head)
+    return usize.widen(count.min(u64.widen(room)))
+} space_read
+
+/// Writes a prefix of `data`, at most a call's chunk, to an open file of the file system at
+/// `handle`, giving its length.
+fn space_write(handle: u64, file: u64, data: Slice[u8], alloc: mem::Alloc) -> usize fails sys::fs::FsError {
+    let Some(parts) = data.split_at(data.len().min(FILE_CHUNK)) else {
+        fail sys::fs::FsError.Denied
+    }
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(parts.head)
+    var nothing = mem::Bytes.empty(alloc)
+    let count = try space_call(handle, operation: FS_WRITE, args: encoded(Writing(file: file, data: take bytes), alloc).view(), result: mut nothing.view_mut())
+    return usize.widen(count.min(u64.widen(parts.head.len())))
+} space_write
+
+/// The length of an open file of the file system at `handle`.
+fn space_byte_len(handle: u64, file: u64, alloc: mem::Alloc) -> u64 fails sys::fs::FsError {
+    var nothing = mem::Bytes.empty(alloc)
+    return try space_call(handle, operation: FS_BYTE_LEN, args: encoded(file, alloc).view(), result: mut nothing.view_mut())
+} space_byte_len
+
+/// Releases an open file of the file system at `handle`.
+fn space_release(handle: u64, file: u64, alloc: mem::Alloc) {
+    var nothing = mem::Bytes.empty(alloc)
+    discard invoke(handle, operation: FS_RELEASE, args: encoded(file, alloc).view(), result: mut nothing.view_mut())
+} space_release
+
+/// The contents of a file of the file system at `handle`, drawn through `alloc`.
+fn space_read_all(handle: u64, path: Str, alloc: mem::Alloc) -> mem::Bytes fails sys::fs::FsError {
+    let file = try space_open(handle, operation: FS_OPEN, path, alloc)
+    defer space_release(handle, file, alloc)
+    var contents = mem::Bytes.empty(alloc)
+    var chunk = mem::Bytes.zeroed(FILE_CHUNK, alloc)
+    loop {
+        let count = try space_read(handle, file, buf: mut chunk.view_mut(), alloc)
+        if count == 0 {
+            return contents
+        }
+        let Some(read) = chunk.view().prefix(count) else {
+            return contents
+        }
+        mut contents.append(read)
+    }
+} space_read_all
+
+/// Replaces the contents of a file of the file system at `handle` with `data`.
+fn space_write_all(handle: u64, path: Str, data: Slice[u8], alloc: mem::Alloc) fails sys::fs::FsError {
+    let file = try space_open(handle, operation: FS_CREATE, path, alloc)
+    defer space_release(handle, file, alloc)
+    var done: usize = 0
+    while done < data.len() {
+        let Some(parts) = data.split_at(done) else {
+            return
+        }
+        let count = try space_write(handle, file, data: parts.tail, alloc)
+        if count == 0 {
+            fail sys::fs::FsError.NoSpace
+        }
+        done += count
+    }
+} space_write_all
+
+/// Moves an entry of the file system at `handle`.
+fn space_rename(handle: u64, from: Str, to: Str, alloc: mem::Alloc) fails sys::fs::FsError {
+    var nothing = mem::Bytes.empty(alloc)
+    let renaming = Renaming(from: text::String.of(from, alloc), to: text::String.of(to, alloc))
+    discard try space_call(handle, operation: FS_RENAME, args: encoded(renaming, alloc).view(), result: mut nothing.view_mut())
+} space_rename
+
+/// What a path of the file system at `handle` names.
+fn space_kind(handle: u64, path: Str, alloc: mem::Alloc) -> sys::fs::Kind fails sys::fs::FsError {
+    return kind_of(try space_path_call(handle, operation: FS_KIND, path, alloc))
+} space_kind
+
+/// The kind a number names.
+fn kind_of(number: u64) -> sys::fs::Kind {
+    return match number {
+        0 => sys::fs::Kind.File
+        1 => sys::fs::Kind.Directory
+        else => sys::fs::Kind.Other
+    }
+} kind_of
+
+/// The entries of a directory of the file system at `handle`, drawn through `alloc`.
+fn space_list(handle: u64, path: Str, alloc: mem::Alloc) -> mem::List[sys::fs::Entry] fails sys::fs::FsError {
+    let args = encoded(text::String.of(path, alloc), alloc)
+    var capacity: usize = 4_096
+    loop {
+        var buffer = mem::Bytes.zeroed(capacity, alloc)
+        let needed = usize.widen(try space_call(handle, operation: FS_LIST, args: args.view(), result: mut buffer.view_mut()))
+        if needed > capacity {
+            if needed > FILE_CHUNK * 2 {
+                fail sys::fs::FsError.Denied
+            }
+            capacity = needed
+            continue
+        }
+        let Some(written) = buffer.view().prefix(needed) else {
+            fail sys::fs::FsError.Denied
+        }
+        let Ok(listed) = attempt mem::wire::Codec[mem::List[Listed]].decode(Untrusted.of(take written), alloc) else {
+            fail sys::fs::FsError.Denied
+        }
+        var entries = mem::List[sys::fs::Entry].empty(alloc)
+        for entry in take listed {
+            mut entries.push(sys::fs::Entry(name: take entry.name, kind: kind_of(u64.widen(entry.kind))))
+        }
+        return entries
+    }
+} space_list
 
 fn Remote.fill(self, mut buf: SliceMut[u8]) limits stack 4_096 {
     let Some(reach) = reached(self) else {

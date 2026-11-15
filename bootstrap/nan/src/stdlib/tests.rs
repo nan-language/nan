@@ -21,7 +21,7 @@ fn std_checks_without_diagnostics() {
 }
 
 /// The types of the values only machine targets give.
-const MACHINE_VALUES: [&str; 28] = [
+const MACHINE_VALUES: [&str; 29] = [
     "boot::Machine",
     "boot::Kernel",
     "boot::HeapMeter",
@@ -35,6 +35,7 @@ const MACHINE_VALUES: [&str; 28] = [
     "nanos::Instance",
     "nanos::Inbox",
     "nanos::Link",
+    "nanos::SpaceCalls",
     "sys::load::Isolated",
     "sys::load::Space",
     "hw::Ring0",

@@ -1,4 +1,4 @@
-//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port and their random source from a counter through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, a job reading kernel memory, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, instances of a component whose calls, a postponed one included, keyed tasks and checkpoints run in their spaces, with logs crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, a space's runtime probing kernel memory and a bundle the load window holds, and a job spinning on floats while a job of the shared space does.
+//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port and their random source from a counter and their file system from a disk writing each call it serves through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, a job reading kernel memory, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, instances of a component whose calls, a postponed one included, keyed tasks and checkpoints run in their spaces, with logs crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, a space's runtime probing kernel memory and a bundle the load window holds, and a job spinning on floats while a job of the shared space does.
 
 registers Pl011 {
     data: u8 at 0x0 write
@@ -129,6 +129,103 @@ fn Counter.fill(self, mut buf: SliceMut[u8]) limits stack 4_096 {
         buf[index] = u8.truncate(start + u64.widen(index))
     }
 } Counter.fill
+
+/// A file system writing each call it serves to the serial port: every file it opens holds
+/// `hello`, its root lists a directory and a file, and its state counts the reads it served.
+struct Disk {
+} Disk
+
+impl Disk: sys::Kind[core::atomic::AtomicU64, u64]
+
+impl Disk: sys::FsService
+
+fn Disk.open(self, path: Str) -> u64 limits stack 4_096 {
+    said(text: "disk open ", path)
+    return 7
+} Disk.open
+
+fn Disk.create(self, path: Str) -> u64 limits stack 4_096 {
+    said(text: "disk create ", path)
+    return 8
+} Disk.create
+
+fn Disk.read_all(self, path: Str, alloc: mem::Alloc) -> mem::Bytes limits stack 4_096 {
+    said(text: "disk read all ", path)
+    var bytes = mem::Bytes.empty(alloc)
+    mut bytes.append(b"hello")
+    return bytes
+} Disk.read_all
+
+fn Disk.write_all(self, path: Str, data: Slice[u8]) limits stack 4_096 {
+    said(text: "disk write all ", path)
+} Disk.write_all
+
+fn Disk.remove(self, path: Str) fails sys::fs::FsError limits stack 4_096 {
+    said(text: "disk remove ", path)
+    fail sys::fs::FsError.NotFound
+} Disk.remove
+
+/// `hello` on every other read, the end of the file on the others.
+fn Disk.read(self, file: u64, mut buf: SliceMut[u8]) -> usize limits stack 4_096 {
+    let served = sys::reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => state.fetch_add(1))
+    if served.value_or(None).value_or(1) % 2 == 1 {
+        return 0
+    }
+    let contents = b"hello"
+    var count: usize = 0
+    while count < buf.len() and count < contents.len() {
+        buf[count] = contents[count]
+        count += 1
+    }
+    return count
+} Disk.read
+
+fn Disk.write(self, file: u64, data: Slice[u8]) -> usize limits stack 4_096 {
+    say(text: "disk write ")
+    say_bytes(data)
+    say(text: "\n")
+    return data.len()
+} Disk.write
+
+fn Disk.byte_len(self, file: u64) -> u64 limits stack 4_096 {
+    return 5
+} Disk.byte_len
+
+fn Disk.release(self, file: u64) limits stack 4_096 {
+    say(text: "disk release\n")
+} Disk.release
+
+fn Disk.create_dir(self, path: Str) limits stack 4_096 {
+    said(text: "disk create dir ", path)
+} Disk.create_dir
+
+fn Disk.rename(self, from: Str, to: Str) limits stack 4_096 {
+    say(text: "disk rename ")
+    say(text: from)
+    said(text: " ", path: to)
+} Disk.rename
+
+/// A directory for the empty path, a file for every other.
+fn Disk.kind(self, path: Str) -> sys::fs::Kind limits stack 4_096 {
+    if path.byte_len() == 0 {
+        return sys::fs::Kind.Directory
+    }
+    return sys::fs::Kind.File
+} Disk.kind
+
+fn Disk.list(self, path: Str, alloc: mem::Alloc) -> mem::List[sys::fs::Entry] limits stack 4_096 {
+    var entries = mem::List[sys::fs::Entry].empty(alloc)
+    mut entries.push(sys::fs::Entry(name: text::String.of("logs", alloc), kind: sys::fs::Kind.Directory))
+    mut entries.push(sys::fs::Entry(name: text::String.of("notes", alloc), kind: sys::fs::Kind.File))
+    return entries
+} Disk.list
+
+/// Writes a text and a path, then a line feed.
+fn said(text: Str, path: Str) {
+    say(text)
+    say(text: path)
+    say(text: "\n")
+} said
 
 fn say(text: Str) {
     say_bytes(text.as_bytes())
@@ -373,12 +470,13 @@ struct Grants derives Copy {
     console: Console
     noter: Console
     counter: Counter
+    disk: Disk
     exec: task::Executor
     alloc: mem::Alloc
 } Grants
 
 /// The services of an isolated job: its log and standard streams on the console, its random
-/// source the counter.
+/// source the counter and its file system the disk.
 fn services(grants: Grants) -> nanos::Services {
     let Ok(log) = attempt sys::Log.served(grants.console) else {
         stop(text: "no log\n")
@@ -389,7 +487,10 @@ fn services(grants: Grants) -> nanos::Services {
     let Ok(random) = attempt sys::Random.served(grants.counter) else {
         stop(text: "no random\n")
     }
-    return nanos::Services(clock: grants.clock, log: log, stdio: stdio, random: random)
+    let Ok(fs) = attempt sys::Fs.served(grants.disk) else {
+        stop(text: "no fs\n")
+    }
+    return nanos::Services(clock: grants.clock, log: log, stdio: stdio, random: random, fs: fs)
 } services
 
 /// The frames a space takes, from the end of `frames`.
@@ -488,11 +589,13 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     take k.anchor(0u8, run: fn[take loader, take cpu, take frames](exec: task::Executor) fails task::Cancelled uses wait limits stack 262_144 {
         let consoles = sys::Minter[Console, core::atomic::AtomicU64, u64].of(core::atomic::AtomicU64.of(0), alloc)
         let counters = sys::Minter[Counter, core::atomic::AtomicU64, u64].of(core::atomic::AtomicU64.of(0), alloc)
-        let grants = Grants(clock: clock, console: consoles.mint(0), noter: consoles.mint(1), counter: counters.mint(0), exec: exec, alloc: alloc)
+        let disks = sys::Minter[Disk, core::atomic::AtomicU64, u64].of(core::atomic::AtomicU64.of(0), alloc)
+        let grants = Grants(clock: clock, console: consoles.mint(0), noter: consoles.mint(1), counter: counters.mint(0), disk: disks.mint(0), exec: exec, alloc: alloc)
         var pool = frames
         let served = attempt await serve(cpu, loader, grants, frames: mut pool)
         take consoles.close()
         take counters.close()
+        take disks.close()
         let Some(last) = mut pool.pop() else {
             stop(text: "out of frames\n")
         }

@@ -17,8 +17,9 @@
 //! use the harnesses' home directory.
 
 use std::fs;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 
 use datatest_stable::Utf8Path;
 
@@ -73,6 +74,13 @@ fn build(root: &Path, name: &str) -> datatest_stable::Result<()> {
     Ok(())
 }
 
+/// The status a run ends with: its exit code, or the negated number of the signal ending it.
+fn status_of(status: ExitStatus) -> i32 {
+    status
+        .code()
+        .unwrap_or_else(|| -status.signal().unwrap_or(0))
+}
+
 /// Runs a host program's image, giving its exit status and what it writes.
 fn run_host(root: &Path, target: &str, name: &str) -> std::io::Result<(i32, String)> {
     let run = Command::new(root.join(".nan/images").join(target).join(name))
@@ -80,7 +88,7 @@ fn run_host(root: &Path, target: &str, name: &str) -> std::io::Result<(i32, Stri
         .output()?;
     let mut written = String::from_utf8_lossy(&run.stdout).into_owned();
     written.push_str(&String::from_utf8_lossy(&run.stderr));
-    Ok((run.status.code().unwrap_or(-1), written))
+    Ok((status_of(run.status), written))
 }
 
 /// Runs a Windows program's image as `nan run` launches it, under Wine in a prefix of its own
@@ -108,7 +116,7 @@ fn run_windows(
         .output()?;
     let mut written = String::from_utf8_lossy(&run.stdout).into_owned();
     written.push_str(&String::from_utf8_lossy(&run.stderr));
-    Ok(Some((run.status.code().unwrap_or(-1), written)))
+    Ok(Some((status_of(run.status), written)))
 }
 
 /// Whether this machine has the extensions of a codegen level.

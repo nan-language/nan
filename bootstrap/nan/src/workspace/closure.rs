@@ -33,16 +33,16 @@ pub struct Closure {
 }
 
 impl Closure {
-    /// The part of the closure that checking one workspace package it checks reads: that
-    /// package, the members named like std packages, and each member their `dep` aliases reach.
-    pub fn reached_from(&self, workspace: &super::Workspace, package: usize) -> Closure {
+    /// The part of the closure that checking one of its members reads: that member, the members
+    /// named like std packages, and each member their `dep` aliases reach.
+    pub fn reached_from(&self, workspace: &super::Workspace, member: Member) -> Closure {
         let mut reached: Vec<Member> = self
             .members
             .iter()
             .filter(|(name, _)| crate::stdlib::is_std(name))
             .map(|(_, member)| *member)
             .collect();
-        reached.push(Member::Source(package));
+        reached.push(member);
         let mut at = 0;
         while let Some(&member) = reached.get(at) {
             at += 1;
@@ -96,12 +96,13 @@ pub trait Store {
 }
 
 /// What reading the closures of the workspace packages gives: the closures, the releases they
-/// read from the store, the store entries confirming the current states of path sources, the
-/// path sources read without one, and the diagnostics of their locks.
+/// read from the store, the store entries confirming the current states of path sources, each
+/// once with its code root, the path sources read without one, and the diagnostics of their
+/// locks.
 pub struct Read {
     pub closures: Vec<Closure>,
     pub releases: Vec<Release>,
-    pub confirmed: Vec<Entry>,
+    pub confirmed: Vec<(Hash, Entry)>,
     pub unconfirmed: Vec<Unconfirmed>,
     pub found: Vec<Diagnostic>,
 }
@@ -185,7 +186,7 @@ struct Reader<'a> {
     packages: &'a [Arc<Package>],
     store: &'a mut dyn Store,
     releases: Vec<Release>,
-    confirmed: Vec<Entry>,
+    confirmed: Vec<(Hash, Entry)>,
     unconfirmed: Vec<Unconfirmed>,
     found: Vec<Diagnostic>,
     /// The defect of the NIR stream of each release's artefact decoded, by its code root.
@@ -312,7 +313,11 @@ impl Reader<'_> {
                 match (named, entry) {
                     (Some(at), entry) => {
                         match entry.filter(|entry| holds_sources(entry, &self.packages[at])) {
-                            Some(entry) => self.confirmed.push(entry),
+                            Some(entry) => {
+                                if !self.confirmed.iter().any(|(root, _)| *root == line.root) {
+                                    self.confirmed.push((line.root, entry));
+                                }
+                            }
                             None => self.unconfirmed.push(Unconfirmed {
                                 package: index,
                                 line: reaching,

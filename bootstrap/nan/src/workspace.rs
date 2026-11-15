@@ -38,8 +38,8 @@ pub struct Workspace {
     /// The releases of the local store that the packages' locks read.
     pub releases: Vec<Release>,
     /// The store entries confirming that path sources' current states are the releases their
-    /// locks name.
-    confirmed: Vec<crate::store::Entry>,
+    /// locks name, by code root.
+    confirmed: Vec<(crate::hash::Hash, crate::store::Entry)>,
     /// The path sources whose current states no store entry confirms as their locked releases.
     pub unconfirmed: Vec<Unconfirmed>,
     /// The dependency closures the packages share, each checking some of them.
@@ -607,14 +607,22 @@ impl closure::Store for UserStore {
 }
 
 /// The releases a workspace already read, read again for a changed workspace.
-struct HeldReleases<'a>(&'a [Release], &'a [crate::store::Entry]);
+struct HeldReleases<'a>(
+    &'a [Release],
+    &'a [(crate::hash::Hash, crate::store::Entry)],
+);
 
 impl closure::Store for HeldReleases<'_> {
     fn entry(&mut self, root: &crate::hash::Hash) -> io::Result<Option<crate::store::Entry>> {
         let release = self.0.iter().find(|release| release.root == *root);
         Ok(release
             .map(|release| &release.entry)
-            .or_else(|| self.1.iter().find(|entry| entry.root() == *root))
+            .or_else(|| {
+                self.1
+                    .iter()
+                    .find(|(held, _)| held == root)
+                    .map(|(_, entry)| entry)
+            })
             .cloned())
     }
 

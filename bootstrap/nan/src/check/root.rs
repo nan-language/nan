@@ -31,19 +31,9 @@ struct Coded {
 }
 
 /// The artefact of the current state of a closure's member. Its code root and seals are kept in
-/// the build cache, under the toolchain, the member's name and the states of the closure's
-/// members.
+/// the build cache under its `coded_key`.
 pub fn build(workspace: &Workspace, closure: &Closure, member: Member) -> Built {
-    let name = workspace.member(member).name().unwrap_or_default();
-    let mut key = format!("coded\n{}\n{name}\n", crate::toolchain::hash(1).full());
-    for (name, held) in &closure.members {
-        let state = match held {
-            Member::Source(at) => coded_state(&workspace.packages[*at]),
-            Member::Release(at) => workspace.releases[*at].root,
-        };
-        key.push_str(&format!("{name} {}\n", state.full()));
-    }
-    let key = Hash::of(key.as_bytes());
+    let key = coded_key(workspace, closure, member);
     let cache = Cache::open().ok().and_then(Result::ok);
     let held = cache
         .as_ref()
@@ -60,6 +50,21 @@ pub fn build(workspace: &Workspace, closure: &Closure, member: Member) -> Built 
         }
     };
     assemble(workspace.member(member), &coded)
+}
+
+/// The build cache key of a closure member's code root and seals: the toolchain, the member's
+/// name and the states of the members it reaches.
+fn coded_key(workspace: &Workspace, closure: &Closure, member: Member) -> Hash {
+    let name = workspace.member(member).name().unwrap_or_default();
+    let mut key = format!("coded\n{}\n{name}\n", crate::toolchain::hash(1).full());
+    for (name, held) in &closure.reached_from(workspace, member).members {
+        let state = match held {
+            Member::Source(at) => coded_state(&workspace.packages[*at]),
+            Member::Release(at) => workspace.releases[*at].root,
+        };
+        key.push_str(&format!("{name} {}\n", state.full()));
+    }
+    Hash::of(key.as_bytes())
 }
 
 /// The `dep.sync-pending` diagnostics a scope holds of the path sources whose current states no
@@ -429,3 +434,6 @@ impl Checker<'_> {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -26,25 +26,25 @@ pkg fn Closure.empty(alloc: mem::Alloc) -> Closure {
     return Closure(members: mem::Map[text::String, Member].empty(alloc), checked: mem::List[usize].empty(alloc), aliases: mem::Map[AliasKey, Member].empty(alloc))
 } Closure.empty
 
-/// The part of the closure that checking one workspace package it checks reads: that package,
-/// the members named like std packages, and each member their `dep` aliases reach.
-pkg fn Closure.reached_from(self, held: Workspace, package_index: usize, alloc: mem::Alloc) -> Closure {
+/// The part of the closure that checking one of its members reads: that member, the members
+/// named like std packages, and each member their `dep` aliases reach.
+pkg fn Closure.reached_from(self, held: Workspace, member: Member, alloc: mem::Alloc) -> Closure {
     var reached = mem::List[Member].empty(alloc)
     for entry in self.members {
         if stdlib::is_std(entry.key().as_str()) {
             mut reached.push(entry.value())
         }
     }
-    mut reached.push(Member.Source(package_index))
+    mut reached.push(member)
     var at: usize = 0
     while at < reached.len() {
-        let member = reached[at]
+        let current = reached[at]
         at += 1
-        let Some(manifest) = held.member(member).manifest else {
+        let Some(manifest) = held.member(current).manifest else {
             continue
         }
         for dep in manifest.deps {
-            let Some(next) = self.alias(member, alias: dep.alias.as_str()) else {
+            let Some(next) = self.alias(current, alias: dep.alias.as_str()) else {
                 continue
             }
             if not holds_member(reached.view(), wanted: next) {
@@ -122,13 +122,20 @@ pkg struct Release {
     pkg pack: mem::Shared[Package]
 } Release
 
+/// A store entry confirming that a path source's current state is its release, by the
+/// release's code root.
+pkg struct Confirmed {
+    pkg root: hashing::HashValue
+    pkg entry: mem::Shared[store::Entry]
+} Confirmed
+
 /// What reading the closures of the workspace packages gives: the closures, the releases they
-/// read from the store, the store entries confirming the current states of path sources, the
-/// path sources read without one, and the diagnostics of their locks.
+/// read from the store, the store entries confirming the current states of path sources, each
+/// once, the path sources read without one, and the diagnostics of their locks.
 struct Read {
     pkg closures: mem::List[Closure]
     pkg releases: mem::List[Release]
-    pkg confirmed: mem::List[mem::Shared[store::Entry]]
+    pkg confirmed: mem::List[Confirmed]
     pkg unconfirmed: mem::List[Unconfirmed]
     pkg found: mem::List[diagnostic::Diagnostic]
 } Read
@@ -155,7 +162,7 @@ fn read_closures(
     grammar: syntax::Grammar,
     alloc: mem::Alloc,
     ) -> Read fails platform::IoError {
-    var reader = ClosureReader(releases: mem::List[Release].empty(alloc), confirmed: mem::List[mem::Shared[store::Entry]].empty(alloc), unconfirmed: mem::List[Unconfirmed].empty(alloc), found: mem::List[diagnostic::Diagnostic].empty(alloc), streams: mem::List[StreamDefect].empty(alloc), alloc: alloc)
+    var reader = ClosureReader(releases: mem::List[Release].empty(alloc), confirmed: mem::List[Confirmed].empty(alloc), unconfirmed: mem::List[Unconfirmed].empty(alloc), found: mem::List[diagnostic::Diagnostic].empty(alloc), streams: mem::List[StreamDefect].empty(alloc), alloc: alloc)
     var closures = mem::List[Closure].empty(alloc)
     var index: usize = 0
     for held in packages {
@@ -240,7 +247,7 @@ struct Own {
 
 struct ClosureReader {
     releases: mem::List[Release]
-    confirmed: mem::List[mem::Shared[store::Entry]]
+    confirmed: mem::List[Confirmed]
     unconfirmed: mem::List[Unconfirmed]
     found: mem::List[diagnostic::Diagnostic]
     /// The defect of the NIR stream of each release's artefact decoded, by its code root.
@@ -253,6 +260,16 @@ struct StreamDefect {
     root: hashing::HashValue
     defect: Option[diagnostic::Code]
 } StreamDefect
+
+/// Keeps a store entry confirming a path source, unless one of its code root is kept.
+fn ClosureReader.confirm(mut self, root: hashing::HashValue, take entry: mem::Shared[store::Entry]) {
+    for held in self.confirmed {
+        if held.root == root {
+            return
+        }
+    }
+    mut self.confirmed.push(Confirmed(root: root, entry: take entry))
+} ClosureReader.confirm
 
 fn ClosureReader.report(mut self, code: diagnostic::Code, pack: Package, line: u32) {
     var path = text::String.of(pack.dir.as_str(), alloc: self.alloc)
@@ -478,7 +495,7 @@ fn ClosureReader.locked_member(
             if located.name() == Some(line.package_name.as_str()) {
                 if entry_holds(entry, pack: located, alloc) {
                     match entry {
-                        Some(confirming) => mut self.confirmed.push(take confirming)
+                        Some(confirming) => mut self.confirm(line.root, entry: take confirming)
                         None => {}
                     }
                 } else {

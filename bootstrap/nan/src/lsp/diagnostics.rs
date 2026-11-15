@@ -13,9 +13,14 @@ use crate::syntax::file::parse;
 use crate::workspace::Workspace;
 
 /// The diagnostics `nan check` reports on the workspace package at `index`, each with the fixes
-/// it offers.
+/// it offers, keeping the snapshot of its check in the build cache as `nan check` does.
 pub fn of_package(workspace: &Workspace, index: usize) -> Vec<Diagnostic> {
-    let mut diagnostics = check::reported(workspace, &Scope::Package(index));
+    let scope = Scope::Package(index);
+    let checkers = check::checked_scope(workspace, &scope);
+    let mut diagnostics = check::reported_by(workspace, &checkers, &scope);
+    for (_, checker) in &checkers {
+        checker.keep();
+    }
     let current = workspace.root.join(&workspace.packages[index].dir);
     fix::offer(workspace, &current, None, &mut diagnostics);
     diagnostics

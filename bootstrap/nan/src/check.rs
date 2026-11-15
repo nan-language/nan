@@ -983,7 +983,7 @@ fn scope_closures<'w>(
     let Some(closure) = workspace.closure_of(package) else {
         return Vec::new();
     };
-    let reached = closure.reached_from(workspace, index);
+    let reached = closure.reached_from(workspace, crate::workspace::Member::Source(index));
     let declared = check_targets(package);
     closure_targets(workspace, closure)
         .into_iter()

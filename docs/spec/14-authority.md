@@ -683,6 +683,20 @@ pub open struct SpaceCalls derives Copy {
 
 pub fn SpaceCalls.of_space() -> SpaceCalls
 
+pub fn SpaceCalls.open(self, path: Str) -> u64 fails sys::fs::FsError
+
+pub fn SpaceCalls.create(self, path: Str) -> u64 fails sys::fs::FsError
+
+pub fn SpaceCalls.read(self, file: u64, mut buf: SliceMut[u8]) -> usize fails sys::fs::FsError
+
+pub fn SpaceCalls.write(self, file: u64, data: Slice[u8]) -> usize fails sys::fs::FsError
+
+pub fn SpaceCalls.byte_len(self, file: u64) -> u64 fails sys::fs::FsError
+
+pub fn SpaceCalls.release(self, file: u64)
+
+pub fn SpaceCalls.now_ns(self) -> u64
+
 pub fn SpaceCalls.read_all(self, path: Str, alloc: mem::Alloc) -> mem::Bytes fails sys::fs::FsError
 
 pub fn SpaceCalls.write_all(self, path: Str, data: Slice[u8]) fails sys::fs::FsError
@@ -710,7 +724,7 @@ pub fn SpaceCalls.write_err(self, data: Slice[u8]) fails sys::StdioError
 - The space's runtime holds each channel of `link` in the job's `world.caps` as a `sys::Stdio` under the channel's key, whose `read_in` reads from its inbound ring, waiting on the doorbell while it is empty, whose `write_out` writes to its outbound ring, waiting on the doorbell while it is full, and whose `write_err` fails with `StdioError.Closed`; each read or write that moves bytes tells the kernel through the channel's handle, which wakes a task waiting in `link.receive`. A runtime waiting on the doorbell looks at its ring again at least every second.
 - The space grows within `frames`: it starts mapping none of its boot area, and `run_isolated` serves each draw and release of its runtime through `space.draw` and `space.give_back` on `frames`, and draws the page of the boot area its thread faults on when the space does not map it. A draw for which `frames` holds too few frames fails, and the allocation needing it with it, as on an exhausted heap; a fault for which `frames` holds no frame ends the job `Trapped` with a trap of `trap.exhausted`.
 - The job runs as the first task of a domain run of the space's runtime, on a world of that runtime's allocator, executor and clock, whose log, standard streams, random source and file system reach `services` through system calls, whose network is denied, and whose table holds `link`'s channels alone. A file the job opens is open in `run_isolated` until the job releases it or ends, and each call moves at most 512 KiB of a file's bytes. A host-compatible entry so receives a denied wall clock.
-- `nanos::SpaceCalls.of_space()` gives the calls of the code running in an isolated space, which reach what the space's table holds by its handles without waiting: the space's thread runs nothing else until its kernel answers. `read_all`, `write_all`, `remove`, `create_dir`, `rename`, `kind` and `list` act as the `sys::Fs` operations of their names on the file system of `services`, and `read_in`, `write_out` and `write_err` as the `sys::Stdio` operations of their names on its standard streams; only `read_all` and `list` draw memory, their results through `alloc`. It is a trusted primitive whose soundness condition is that the calling code runs in an isolated space.
+- `nanos::SpaceCalls.of_space()` gives the calls of the code running in an isolated space, which reach what the space's table holds by its handles without waiting: the space's thread runs nothing else until its kernel answers. `read_all`, `write_all`, `remove`, `create_dir`, `rename`, `kind` and `list` act as the `sys::Fs` operations of their names on the file system of `services`, and `read_in`, `write_out` and `write_err` as the `sys::Stdio` operations of their names on its standard streams. `open` and `create` open a file of that file system as those operations do and give its number, which `read`, `write` and `byte_len` act on as the operations of their names on a `sys::fs::File`, each read or write moving a prefix of its bytes and giving its length, and which `release` releases; `now_ns` reads the kernel's clock in nanoseconds. Only `read_all` and `list` draw memory, their results through `alloc`. It is a trusted primitive whose soundness condition is that the calling code runs in an isolated space.
 - The kernel reads every register and byte the space gives as untrusted: the arguments of a log line or of a write reach `services` only when they are the `mem::wire` encodings the runtime writes, and a call naming bytes the space does not map fails. A trap of the job's domain ends it `Trapped` with a trap of the same kind, another exception of its thread with a trap of `trap.exception`, and a space waiting with no timer armed, which nothing can wake, with a trap of `trap.abandoned`, each located at the call of `run_isolated`.
 
 ### Component instances

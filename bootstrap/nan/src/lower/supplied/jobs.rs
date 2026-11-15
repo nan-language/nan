@@ -73,6 +73,10 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
             let given = space::call(lo, fx, space::INVOKE, &call);
             supply.ret(lo, fx, Held::Scalar(given));
         }
+        "nanos::now" => {
+            let ns = space::call(lo, fx, space::NOW, &[]);
+            supply.ret(lo, fx, Held::Scalar(ns));
+        }
         "nanos::end" => {
             let (bytes, len) = view(fx, supply.param(2));
             let call = [

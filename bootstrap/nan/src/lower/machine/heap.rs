@@ -13,7 +13,7 @@ use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, 
 use super::super::Lowering;
 use super::super::fx::{Fx, PTR};
 use super::super::runtime::memory::CHUNK;
-use super::super::runtime::{Routine, space, state};
+use super::super::runtime::{Routine, fetch_add, space, state};
 use super::stubs::Stub;
 
 /// The bytes of the boot heap.
@@ -37,9 +37,9 @@ const CLASSES: u64 = 64;
 
 /// The offsets of the allocators' state: their spin lock, the next free byte and the end of the
 /// chunk blocks are carved from, the bytes of the chunks the map hands out and the most it has
-/// handed out, the bytes of the live records other than task stacks, of the live task stacks
-/// and of the runs of chunks handed out whole, the chunk map holding a bit per chunk set while
-/// it is handed out, and each size class's free-list head.
+/// handed out, the bytes of the live records, of the live task stacks among them, which change
+/// atomically without the lock, and of the runs of chunks handed out whole, the chunk map
+/// holding a bit per chunk set while it is handed out, and each size class's free-list head.
 mod allocators {
     pub const LOCK: u64 = 0;
     pub const CARVE: u64 = 8;
@@ -114,29 +114,32 @@ pub fn unmap_chunks(lo: &mut Lowering, fx: &mut Fx, base: Value, count: Value) {
     unlock(lo, fx, state, flags);
 }
 
-/// Counts a task stack `RecordAlloc` gave, when it is not zero, among the live task stacks
-/// rather than the other records, or the other way round when `drawn` is false.
+/// Adds a task stack `RecordAlloc` gave, when it is not zero, to the live task stacks, or takes
+/// it from them when `drawn` is false.
 pub fn count_stack(lo: &mut Lowering, fx: &mut Fx, stack: Value, drawn: bool) {
     let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, stack, 0);
     fx.when(present, |fx| {
         let block = fx.b.ins().iadd_imm_s(stack, -(HEADER as i64));
         let class = fx.load(PTR, block, 0);
         let bytes = block_bytes(fx, class);
+        let bytes = match drawn {
+            true => bytes,
+            false => fx.b.ins().ineg(bytes),
+        };
         let state = heap_state(lo, fx);
-        let flags = lock(lo, fx, state);
-        tally(fx, state, allocators::STACKS, bytes, drawn);
-        tally(fx, state, allocators::RECORDS, bytes, !drawn);
-        unlock(lo, fx, state, flags);
+        let stacks = fx.offset(state, allocators::STACKS);
+        fetch_add(fx, stacks, bytes);
     });
 }
 
 /// The bytes of the chunks the map hands out, the most it has handed out, and those of the live
 /// records other than task stacks, of the live task stacks and of the runs of chunks handed out
-/// whole, read together.
+/// whole, read together. A stack counts among the records from its draw until it counts among
+/// the stacks, and from when it no longer does until it is freed.
 pub fn reading(lo: &mut Lowering, fx: &mut Fx) -> [Value; 5] {
     let state = heap_state(lo, fx);
     let flags = lock(lo, fx, state);
-    let counts = [
+    let [drawn, peak, records, stacks, whole] = [
         allocators::DRAWN,
         allocators::PEAK,
         allocators::RECORDS,
@@ -145,7 +148,8 @@ pub fn reading(lo: &mut Lowering, fx: &mut Fx) -> [Value; 5] {
     ]
     .map(|at| fx.load(PTR, state, at));
     unlock(lo, fx, state, flags);
-    counts
+    let records = fx.b.ins().isub(records, stacks);
+    [drawn, peak, records, stacks, whole]
 }
 
 /// Adds `bytes` to the count at `at` of the allocators' state, or subtracts them when `adding`

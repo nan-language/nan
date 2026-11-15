@@ -21,9 +21,9 @@ const HEAP_CLASSES: u64 = 64
 
 /// The offsets of the allocators' state: their spin lock, the next free byte and the end of the
 /// chunk blocks are carved from, the bytes of the chunks the map hands out and the most it has
-/// handed out, the bytes of the live records other than task stacks, of the live task stacks
-/// and of the runs of chunks handed out whole, the chunk map holding a bit per chunk set while
-/// it is handed out, and each size class's free-list head.
+/// handed out, the bytes of the live records, of the live task stacks among them, which change
+/// atomically without the lock, and of the runs of chunks handed out whole, the chunk map
+/// holding a bit per chunk set while it is handed out, and each size class's free-list head.
 const ALLOCATORS_LOCK: u64 = 0
 
 const ALLOCATORS_CARVE: u64 = 8
@@ -108,25 +108,27 @@ fn heap_unmap_chunks(mut lo: Lowering, mut fx: Fx, base: clif::Value, count: cli
     unlock(mut lo, mut fx, state, flags)
 } heap_unmap_chunks
 
-/// Counts a task stack `RecordAlloc` gave, when it is not zero, among the live task stacks
-/// rather than the other records, or the other way round when `drawn` is false.
+/// Adds a task stack `RecordAlloc` gave, when it is not zero, to the live task stacks, or takes
+/// it from them when `drawn` is false.
 fn heap_count_stack(mut lo: Lowering, mut fx: Fx, stack: clif::Value, drawn: bool) {
     let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: stack, y: 0)
     mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
         let block = mut fx1.b.iadd_imm_s(stack, y: -i64.fit(HEAP_HEADER))
         let class = mut fx1.load(PTR, addr: block, offset: 0)
-        let block_size = block_bytes(mut fx1, class)
+        var block_size = block_bytes(mut fx1, class)
+        if not drawn {
+            block_size = mut fx1.b.ineg(block_size)
+        }
         let state = heap_state(mut lo, fx: mut fx1)
-        let flags = heap_lock(mut lo, fx: mut fx1, state)
-        discard tally(mut fx1, state, at: ALLOCATORS_STACKS, bytes: block_size, adding: drawn)
-        discard tally(mut fx1, state, at: ALLOCATORS_RECORDS, bytes: block_size, adding: not drawn)
-        unlock(mut lo, fx: mut fx1, state, flags)
+        let stacks = mut fx1.offset(state, offset: ALLOCATORS_STACKS)
+        discard fetch_add(mut fx1, address: stacks, amount: block_size)
     })
 } heap_count_stack
 
 /// The bytes of the chunks the map hands out, the most it has handed out, and those of the live
 /// records other than task stacks, of the live task stacks and of the runs of chunks handed out
-/// whole, read together.
+/// whole, read together. A stack counts among the records from its draw until it counts among
+/// the stacks, and from when it no longer does until it is freed.
 fn heap_reading(mut lo: Lowering, mut fx: Fx) -> Array[clif::Value, 5] {
     let state = heap_state(mut lo, mut fx)
     let flags = heap_lock(mut lo, mut fx, state)
@@ -140,6 +142,7 @@ fn heap_reading(mut lo: Lowering, mut fx: Fx) -> Array[clif::Value, 5] {
         counts[index] = mut fx.load(PTR, addr: state, offset: offsets[index])
     }
     unlock(mut lo, mut fx, state, flags)
+    counts[2] = mut fx.b.isub(counts[2], y: counts[3])
     return counts
 } heap_reading
 

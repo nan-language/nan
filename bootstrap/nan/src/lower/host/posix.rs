@@ -10,7 +10,7 @@ use cranelift_module::{FuncId, Linkage, Module};
 
 use super::super::fx::{Fx, PTR};
 use super::super::runtime::system::{self, unavailable_unless};
-use super::super::runtime::tasks::{self, thread};
+use super::super::runtime::tasks::thread;
 use super::super::runtime::{Routine, memory, state};
 use super::super::{CALL_CONV, Lowering, Program, lines};
 use super::Context;
@@ -26,6 +26,8 @@ pub struct Posix {
     /// The `mmap` flags of private anonymous memory, and of a task stack.
     pub map_anonymous: i64,
     pub map_stack: i64,
+    /// The size of the guard region below each task stack: whole pages of the system.
+    pub guard: u64,
     /// The signal asking a thread to stop the task it runs, the signals of a fault in a stack's
     /// guard region, and that of an exceeded processor time limit.
     pub stop: i32,
@@ -57,6 +59,11 @@ fn posix(lo: &Lowering) -> &'static Posix {
 /// The signal asking a thread of the target's system to stop the task it runs.
 pub fn stop_signal(lo: &Lowering) -> i32 {
     posix(lo).stop
+}
+
+/// The size of the guard region below each task stack on the target's system.
+pub fn guard(lo: &Lowering) -> u64 {
+    posix(lo).guard
 }
 
 const MAP_FAILED: i64 = -1;
@@ -396,7 +403,7 @@ pub fn map_stack(lo: &mut Lowering, fx: &mut Fx, len: Value, guarded: bool) -> V
 
 /// Makes the guard region at the base of a stack inaccessible, or accessible again.
 pub fn protect_guard(lo: &mut Lowering, fx: &mut Fx, base: Value, accessible: bool) {
-    let guard = fx.ptr(tasks::GUARD);
+    let guard = fx.ptr(posix(lo).guard);
     let protection = match accessible {
         true => PROTECT_READ_WRITE,
         false => PROTECT_NONE,

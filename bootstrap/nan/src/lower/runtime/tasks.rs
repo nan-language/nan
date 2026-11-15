@@ -263,11 +263,9 @@ pub mod trap_record {
     pub const BYTES: u64 = 16;
 }
 
-/// The default size of a task's stack, of the entry task's stack on a host target, and of a
-/// Linux target's guard region.
+/// The default size of a task's stack, and of the entry task's stack on a host target.
 pub const STACK: u64 = 65_536;
 pub const ENTRY_STACK: u64 = 67_108_864;
-pub const GUARD: u64 = 4_096;
 
 /// The bytes a task's stack holds beyond its usable size for the support routines and C library
 /// functions that its calls of support routines run, whose use past the stub call bound the
@@ -286,7 +284,7 @@ fn guard(lo: &Lowering) -> u64 {
     match (lo.machine(), lo.windows()) {
         (true, _) => 0,
         (false, true) => host::windows::GUARD,
-        (false, false) => GUARD,
+        (false, false) => host::posix::guard(lo),
     }
 }
 

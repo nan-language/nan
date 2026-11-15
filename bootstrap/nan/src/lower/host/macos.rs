@@ -32,6 +32,7 @@ const SIGSEGV: i32 = 11;
 pub const POSIX: Posix = Posix {
     map_anonymous: 0x1002,
     map_stack: 0x1002,
+    guard: 16_384,
     stop: 16,
     faults: &[SIGBUS, SIGSEGV],
     cpu_limit: 24,

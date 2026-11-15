@@ -76,6 +76,9 @@ pub enum Routine {
     /// `(thunk, record, need)`: calls a grown call's thunk with its record, on a new segment of
     /// the running task's stack when the running one lacks `need` bytes above its limit.
     Grow,
+    /// `(thunk, record, need)`: calls a grown call's thunk with its record on a new segment of
+    /// the running task's stack, returned once the thunk returns.
+    GrowSegment,
     /// `(record)`: the first code a segment runs: the thunk and record of the grown call that
     /// `Grow` keeps in its frame, then back to `Grow`.
     GrownStart,
@@ -272,6 +275,7 @@ impl Routine {
             Routine::Park => "_NSstack_switch_park",
             Routine::TaskStart => "_NSstack_switch_task_start",
             Routine::Grow => "_NSstack_switch_grow",
+            Routine::GrowSegment => "_NSstack_switch_grow_segment",
             Routine::GrownStart => "_NSstack_switch_grown_start",
             Routine::Nested => "_NSstack_switch_nested",
             Routine::IoSubmit => "_NSstack_switch_io_submit",
@@ -308,7 +312,9 @@ impl Routine {
     ) {
         const P: cranelift_codegen::ir::Type = types::I64;
         match self {
-            Routine::Copy | Routine::Fill | Routine::Grow => (&[P, P, P], &[]),
+            Routine::Copy | Routine::Fill | Routine::Grow | Routine::GrowSegment => {
+                (&[P, P, P], &[])
+            }
             Routine::OutboxMint | Routine::KindMint | Routine::KindDerive => (&[P, P, P], &[P]),
             Routine::Compare => (&[P, P, P], &[types::I32]),
             Routine::Alloc => (&[P, P, P], &[P]),
@@ -776,6 +782,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         Routine::CownRelease => super::supplied::tasks::cowns::release_routine(lo, fx),
         Routine::Yield | Routine::Stream => seeded::define(lo, fx, routine),
         Routine::Grow => segments::grow(lo, fx),
+        Routine::GrowSegment => segments::grow_segment(lo, fx),
         Routine::GrownStart => segments::grown_start(lo, fx),
         Routine::Nested => segments::nested(lo, fx),
         Routine::Turn => serial::define_turn(lo, fx),

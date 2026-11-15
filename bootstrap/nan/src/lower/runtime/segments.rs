@@ -128,10 +128,8 @@ pub fn release(lo: &mut Lowering, fx: &mut Fx, record: Value) {
 
 /// `Grow(thunk, record, need)`: calls the thunk with the record on the stack it runs on, unless
 /// that is the running task's and holds less than `need` bytes and the stub call bound above
-/// its limit below `Grow`'s frame. Then the thunk runs on a new segment drawn through the
-/// task's stack cell, of the default task stack or the room it needs if more, which is returned
-/// once the thunk returns; when the segment cannot be drawn, the task traps
-/// (`trap.exhausted`).
+/// its limit below `Grow`'s frame. Then `GrowSegment` runs the thunk on a new segment, so that
+/// `Grow`'s frame, which every grown call holds, keeps none of the segment's work.
 pub fn grow(lo: &mut Lowering, fx: &mut Fx) {
     let params = fx.entry();
     let (thunk, record, need) = (params[0], params[1], params[2]);
@@ -161,7 +159,7 @@ pub fn grow(lo: &mut Lowering, fx: &mut Fx) {
         short,
         &[],
         |lo, fx| {
-            on_segment(lo, fx, task, thunk, record, need);
+            lo.call_routine(fx, Routine::GrowSegment, &[thunk, record, need]);
             Vec::new()
         },
         |_, fx| {
@@ -174,16 +172,14 @@ pub fn grow(lo: &mut Lowering, fx: &mut Fx) {
     fx.b.ins().return_(&[]);
 }
 
-/// Runs a thunk with its record on a new segment of a task's stack, then returns the segment;
-/// when the segment cannot be drawn, the task traps (`trap.exhausted`).
-fn on_segment(
-    lo: &mut Lowering,
-    fx: &mut Fx,
-    task: Value,
-    thunk: Value,
-    record: Value,
-    need: Value,
-) {
+/// `GrowSegment(thunk, record, need)`: runs the thunk with its record on a new segment drawn
+/// through the running task's stack cell, of the default task stack or the room the thunk needs
+/// if more, returned once the thunk returns; when the segment cannot be drawn, the task traps
+/// (`trap.exhausted`).
+pub fn grow_segment(lo: &mut Lowering, fx: &mut Fx) {
+    let params = fx.entry();
+    let (thunk, record, need) = (params[0], params[1], params[2]);
+    let task = tasks::current_task(lo, fx);
     let cell = fx.load(PTR, task, task::STACK_CELL);
     let domain = fx.load(PTR, task, task::DOMAIN);
     let length = segment_length(lo, fx, need);
@@ -193,6 +189,7 @@ fn on_segment(
     let mapped = fx.b.ins().icmp_imm_s(IntCC::Equal, cell, 0);
     let mapped = fx.b.ins().uextend(PTR, mapped);
     run_on_segment(lo, fx, task, (segment, length, mapped), thunk, record);
+    fx.b.ins().return_(&[]);
 }
 
 /// Returns a segment: unmapped when `mapped`, freed otherwise.

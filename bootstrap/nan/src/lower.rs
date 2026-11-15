@@ -708,6 +708,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
                     let flags = match routine {
                         Routine::TaskStart
                         | Routine::Grow
+                        | Routine::GrowSegment
                         | Routine::GrownStart
                         | Routine::Nested => lines::HIDDEN,
                         _ => lines::HIDDEN | lines::CRITICAL,

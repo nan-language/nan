@@ -1,4 +1,4 @@
-//! The simulated file system: its files by joined path, each holding bytes drawn through the file system's allocator and counted against its size limit, and its open files, each the file it reads or writes and its position. Directories are implicit.
+//! The simulated file system: its files and directories in byte order of joined path, each file holding bytes drawn through the file system's allocator and counted against its size limit, and its open files, each the file it reads or writes and its position.
 
 /// The offsets of a file system's fields: its size limit, its files' total size, the cell it
 /// draws through and its first file.
@@ -12,7 +12,8 @@ const SYSTEM_FILES: u64 = 32
 
 const SYSTEM_SIZE: u64 = 40
 
-/// The offsets of a file's fields: the next file, its joined path and its bytes.
+/// The offsets of a file's fields: the next file, its joined path, its bytes and whether it is
+/// a directory, which holds no bytes.
 const FS_FILE_NEXT: u64 = 0
 
 const FS_FILE_PATH: u64 = 8
@@ -23,7 +24,9 @@ const FS_FILE_DATA: u64 = 24
 
 const FS_FILE_LEN: u64 = 32
 
-const FS_FILE_SIZE: u64 = 40
+const FS_FILE_DIRECTORY: u64 = 40
+
+const FS_FILE_SIZE: u64 = 48
 
 /// The offsets of an open file's fields: its file system, its file, its position and whether
 /// it was opened for writing.
@@ -67,12 +70,14 @@ fn fs_resolved(mut lo: Lowering, mut fx: Fx, supply: Supply, index: clif::Value)
     return ResolvedPath(system: system, path: path)
 } fs_resolved
 
-/// The joined path of a prefix and a path in runtime memory: the prefix, `/` when it is not
+/// The joined path of a prefix and a path in runtime memory: the prefix, `/` when neither is
 /// empty, and the path.
 fn fs_joined(mut lo: Lowering, mut fx: Fx, prefix: Stretch, path: Held) -> Stretch {
     let tail_path = sys_view(mut fx, held: path)
     let has_prefix = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: prefix.len, y: 0)
-    let separator = mut fx.b.uextend(PTR, x: has_prefix)
+    let has_path = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: tail_path.len, y: 0)
+    let separated = mut fx.b.band(has_prefix, y: has_path)
+    let separator = mut fx.b.uextend(PTR, x: separated)
     let with_separator = mut fx.b.iadd(prefix.len, y: separator)
     let len = mut fx.b.iadd(with_separator, y: tail_path.len)
     let size = mut fx.b.iadd_imm_s(len, y: 1)
@@ -80,7 +85,7 @@ fn fs_joined(mut lo: Lowering, mut fx: Fx, prefix: Stretch, path: Held) -> Stret
     exhausted_unless(mut lo, mut fx, address: text)
     let prefix_args = fx.list3(text, b: prefix.start, c: prefix.len)
     discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: prefix_args.view())
-    mut fx.if_true(has_prefix, then: fn(mut fx1: Fx) {
+    mut fx.if_true(separated, then: fn(mut fx1: Fx) {
         let at = mut fx1.b.iadd(text, y: prefix.len)
         let slash = mut fx1.int(clif::Type.Int8, value: i64.widen(b'/'))
         mut fx1.store(slash, addr: at, offset: 0)
@@ -153,14 +158,8 @@ fn find_or_create(mut lo: Lowering, mut fx: Fx, system: clif::Value, path: Stret
     let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: found.file, y: 0)
     let results = fx.types1(PTR)
     let target = mut fx.choose_in(mut lo, condition: missing, results: results.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
-        let size = mut fx1.ptr(FS_FILE_SIZE)
-        let created = mut lo1.record_alloc(mut fx1, size)
-        exhausted_unless(mut lo1, fx: mut fx1, address: created)
-        mut fx1.store(path.start, addr: created, offset: FS_FILE_PATH)
-        mut fx1.store(path.len, addr: created, offset: FS_FILE_PATH_LEN)
-        let first_file = mut fx1.load(PTR, addr: system, offset: SYSTEM_FILES)
-        mut fx1.store(first_file, addr: created, offset: FS_FILE_NEXT)
-        mut fx1.store(created, addr: system, offset: SYSTEM_FILES)
+        let file = mut fx1.ptr(0)
+        let created = fs_new_entry(mut lo1, fx: mut fx1, system, path, directory: file)
         return fx1.list1(created)
     }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         mut lo1.record_free(mut fx1, address: path.start)
@@ -169,6 +168,220 @@ fn find_or_create(mut lo: Lowering, mut fx: Fx, system: clif::Value, path: Stret
     expect target.len() == 1
     return target[0]
 } find_or_create
+
+/// A new empty file, or a directory when `directory` is 1, of a joined path, linked among its
+/// file system's files in byte order of path; the joined path's memory passes to it.
+fn fs_new_entry(mut lo: Lowering, mut fx: Fx, system: clif::Value, path: Stretch, directory: clif::Value) -> clif::Value {
+    let size = mut fx.ptr(FS_FILE_SIZE)
+    let created = mut lo.record_alloc(mut fx, size)
+    exhausted_unless(mut lo, mut fx, address: created)
+    mut fx.store(path.start, addr: created, offset: FS_FILE_PATH)
+    mut fx.store(path.len, addr: created, offset: FS_FILE_PATH_LEN)
+    mut fx.store(directory, addr: created, offset: FS_FILE_DIRECTORY)
+    fs_insert(mut lo, mut fx, system, record: created)
+    return created
+} fs_new_entry
+
+/// Links a file before the first of its file system's files whose path comes after its own.
+fn fs_insert(mut lo: Lowering, mut fx: Fx, system: clif::Value, record: clif::Value) {
+    let path = fs_path_of(mut fx, record)
+    let link = mut fx.offset(system, offset: SYSTEM_FILES)
+    let first_file = mut fx.load(PTR, addr: link, offset: 0)
+    let initial = fx.list2(link, b: first_file)
+    let found = mut fx.repeat(initial.view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 2
+        let pointing = current[0]
+        let file = current[1]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: file, y: 0)
+        let results = fx1.types1(clif::Type.Int8)
+        let later = mut fx1.choose_in(mut lo, condition: present, results: results.view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let other = fs_path_of(mut fx2, record: file)
+            let after = fs_comes_after(mut lo2, fx: mut fx2, a: other, b: path)
+            return fx2.list1(after)
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let none = mut fx2.int(clif::Type.Int8, value: 0)
+            return fx2.list1(none)
+        })
+        expect later.len() == 1
+        let absent = mut fx1.b.bxor_imm_s(present, y: 1)
+        let stop = mut fx1.b.bor(later[0], y: absent)
+        let pair = fx1.types2(PTR, b: PTR)
+        let next = mut fx1.choose(stop, results: pair.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list2(pointing, b: file)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let next_link = mut fx2.offset(file, offset: FS_FILE_NEXT)
+            let next_file = mut fx2.load(PTR, addr: file, offset: FS_FILE_NEXT)
+            return fx2.list2(next_link, b: next_file)
+        })
+        let again = mut fx1.b.bxor_imm_s(stop, y: 1)
+        return Pass(again: again, next: take next)
+    })
+    expect found.len() == 2
+    mut fx.store(found[1], addr: record, offset: FS_FILE_NEXT)
+    mut fx.store(record, addr: found[0], offset: 0)
+} fs_insert
+
+/// The joined path of a file.
+fn fs_path_of(mut fx: Fx, record: clif::Value) -> Stretch {
+    let start = mut fx.load(PTR, addr: record, offset: FS_FILE_PATH)
+    let len = mut fx.load(PTR, addr: record, offset: FS_FILE_PATH_LEN)
+    return Stretch(start: start, len: len)
+} fs_path_of
+
+/// Whether the path `a` comes after the path `b` in byte order.
+fn fs_comes_after(mut lo: Lowering, mut fx: Fx, a: Stretch, b: Stretch) -> clif::Value {
+    let shorter = mut fx.b.umin(a.len, y: b.len)
+    let compare_args = fx.list3(a.start, b: b.start, c: shorter)
+    let order = mut lo.call_routine(mut fx, routine: Routine.Compare, args: compare_args.view())
+    expect order.len() == 1
+    let greater = mut fx.b.icmp_imm_s(clif::IntCC.SignedGreaterThan, x: order[0], y: 0)
+    let equal = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: order[0], y: 0)
+    let longer = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThan, x: a.len, y: b.len)
+    let tie = mut fx.b.band(equal, y: longer)
+    return mut fx.b.bor(greater, y: tie)
+} fs_comes_after
+
+/// Whether the path `own` is `path` or lies below it.
+fn fs_under(mut lo: Lowering, mut fx: Fx, own: Stretch, path: Stretch) -> clif::Value {
+    let long = mut fx.b.icmp(clif::IntCC.UnsignedGreaterThanOrEqual, x: own.len, y: path.len)
+    let results = fx.types1(clif::Type.Int8)
+    let inside = mut fx.choose_in(mut lo, condition: long, results: results.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let compare_args = fx1.list3(own.start, b: path.start, c: path.len)
+        let order = mut lo1.call_routine(mut fx1, routine: Routine.Compare, args: compare_args.view())
+        expect order.len() == 1
+        let prefixed = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: order[0], y: 0)
+        let exact = mut fx1.b.icmp(clif::IntCC.Equal, x: own.len, y: path.len)
+        let flag = fx1.types1(clif::Type.Int8)
+        let parted = mut fx1.choose(exact, results: flag.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let none = mut fx2.int(clif::Type.Int8, value: 0)
+            return fx2.list1(none)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let at = mut fx2.b.iadd(own.start, y: path.len)
+            let byte = mut fx2.load(clif::Type.Int8, addr: at, offset: 0)
+            let slash = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: byte, y: i64.widen(b'/'))
+            return fx2.list1(slash)
+        })
+        expect parted.len() == 1
+        let below = mut fx1.b.bor(exact, y: parted[0])
+        let both = mut fx1.b.band(prefixed, y: below)
+        return fx1.list1(both)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let none = mut fx1.int(clif::Type.Int8, value: 0)
+        return fx1.list1(none)
+    })
+    expect inside.len() == 1
+    return inside[0]
+} fs_under
+
+/// Whether the path `own` lies below `path`.
+fn fs_strictly_under(mut lo: Lowering, mut fx: Fx, own: Stretch, path: Stretch) -> clif::Value {
+    let under = fs_under(mut lo, mut fx, own, path)
+    let other = mut fx.b.icmp(clif::IntCC.NotEqual, x: own.len, y: path.len)
+    return mut fx.b.band(under, y: other)
+} fs_strictly_under
+
+/// Whether `len` bytes from `start` hold a `/`.
+fn fs_holds_slash(mut fx: Fx, text: Stretch) -> clif::Value {
+    let zero = mut fx.ptr(0)
+    let none = mut fx.int(clif::Type.Int8, value: 0)
+    let initial = fx.list2(zero, b: none)
+    let found = mut fx.repeat(initial.view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 2
+        let index = current[0]
+        let seen = current[1]
+        let inside = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: index, y: text.len)
+        let flag = fx1.types1(clif::Type.Int8)
+        let slash = mut fx1.choose(inside, results: flag.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let at = mut fx2.b.iadd(text.start, y: index)
+            let byte = mut fx2.load(clif::Type.Int8, addr: at, offset: 0)
+            let separator = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: byte, y: i64.widen(b'/'))
+            return fx2.list1(separator)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list1(seen)
+        })
+        expect slash.len() == 1
+        let absent = mut fx1.b.bxor_imm_s(slash[0], y: 1)
+        let going = mut fx1.b.band(inside, y: absent)
+        let next = mut fx1.b.iadd_imm_s(index, y: 1)
+        return Pass(again: going, next: fx1.list2(next, b: slash[0]))
+    })
+    expect found.len() == 2
+    return found[1]
+} fs_holds_slash
+
+/// The directories a joined path passes through, and the path itself when `through`, made
+/// where missing; a file on the way fails the operation with `Denied`.
+fn fs_make_directories(mut lo: Lowering, mut fx: Fx, supply: Supply, system: clif::Value, path: Stretch, through: bool) {
+    let zero = mut fx.ptr(0)
+    let initial = fx.list1(zero)
+    discard mut fx.repeat(initial.view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 1
+        let index = current[0]
+        let inside = mut fx1.b.icmp(clif::IntCC.UnsignedLessThan, x: index, y: path.len)
+        mut fx1.if_true(inside, then: fn[mut lo](mut fx2: Fx) {
+            let at = mut fx2.b.iadd(path.start, y: index)
+            let byte = mut fx2.load(clif::Type.Int8, addr: at, offset: 0)
+            let slash = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: byte, y: i64.widen(b'/'))
+            mut fx2.if_true(slash, then: fn[mut lo](mut fx3: Fx) {
+                fs_directory_at(mut lo, fx: mut fx3, supply, system, path: Stretch(start: path.start, len: index))
+            })
+        })
+        let next = mut fx1.b.iadd_imm_s(index, y: 1)
+        return Pass(again: inside, next: fx1.list1(next))
+    })
+    if through {
+        fs_directory_at(mut lo, mut fx, supply, system, path)
+    }
+} fs_make_directories
+
+/// The directory of the joined path of `len` bytes from `start`, made of a copy of them when
+/// missing; a file there fails the operation with `Denied`.
+fn fs_directory_at(mut lo: Lowering, mut fx: Fx, supply: Supply, system: clif::Value, path: Stretch) {
+    let found = fs_find(mut lo, mut fx, system, path)
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: found.file, y: 0)
+    let none = mem::List[clif::Type].empty(fx.alloc)
+    discard mut fx.choose_in(mut lo, condition: missing, results: none.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let size = mut fx1.b.iadd_imm_s(path.len, y: 1)
+        let text = mut lo1.record_alloc(mut fx1, size)
+        exhausted_unless(mut lo1, fx: mut fx1, address: text)
+        let copy_args = fx1.list3(text, b: path.start, c: path.len)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Copy, args: copy_args.view())
+        let directory = mut fx1.ptr(1)
+        discard fs_new_entry(mut lo1, fx: mut fx1, system, path: Stretch(start: text, len: path.len), directory)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        fs_refuse_unless_directory(mut lo1, fx: mut fx1, supply, record: found.file)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+} fs_directory_at
+
+/// Fails the operation with `Denied` when a file of the file system is a directory.
+fn fs_refuse_directory(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Value) {
+    let directory = mut fx.load(PTR, addr: record, offset: FS_FILE_DIRECTORY)
+    let refused = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: directory, y: 0)
+    mut fx.if_true(refused, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Denied")
+    })
+} fs_refuse_directory
+
+/// Fails the operation with `Denied` when a file of the file system is not a directory.
+fn fs_refuse_unless_directory(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Value) {
+    let directory = mut fx.load(PTR, addr: record, offset: FS_FILE_DIRECTORY)
+    let refused = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: directory, y: 0)
+    mut fx.if_true(refused, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Denied")
+    })
+} fs_refuse_unless_directory
+
+/// Unlinks a file from its file system, its bytes no longer counted against its size limit.
+fn fs_unlink(mut fx: Fx, system: clif::Value, record: clif::Value, link: clif::Value) {
+    let next = mut fx.load(PTR, addr: record, offset: FS_FILE_NEXT)
+    mut fx.store(next, addr: link, offset: 0)
+    let len = mut fx.load(PTR, addr: record, offset: FS_FILE_LEN)
+    let total = mut fx.load(PTR, addr: system, offset: SYSTEM_TOTAL)
+    let remaining = mut fx.b.isub(total, y: len)
+    mut fx.store(remaining, addr: system, offset: SYSTEM_TOTAL)
+} fs_unlink
 
 /// Replaces a file's bytes with `len` bytes, the first `kept` of them its own, then those at
 /// `data`; fails with `NoSpace`, changing nothing, when its file system's total size would pass
@@ -229,9 +442,12 @@ fn fs_open(mut lo: Lowering, mut fx: Fx, supply: Supply, index: clif::Value, cre
     ret_resource(mut lo, mut fx, supply, handle, descriptor: opened.index)
 } fs_open
 
-/// The file `open` gives for writing: created when missing, then emptied.
+/// The file `open` gives for writing, below directories made where missing: created when
+/// missing, then emptied.
 fn fs_writing_target(mut lo: Lowering, mut fx: Fx, supply: Supply, system: clif::Value, path: Stretch) -> clif::Value {
+    fs_make_directories(mut lo, mut fx, supply, system, path, through: false)
     let target = find_or_create(mut lo, mut fx, system, path)
+    fs_refuse_directory(mut lo, mut fx, supply, record: target)
     let none = mut fx.ptr(0)
     let empty = Stretch(start: none, len: none)
     fs_resize(mut lo, mut fx, supply, system, target, kept: none, data: empty)
@@ -246,6 +462,7 @@ fn fs_reading_target(mut lo: Lowering, mut fx: Fx, supply: Supply, system: clif:
     mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
         fail_with(mut lo, fx: mut fx1, supply, variant: "NotFound")
     })
+    fs_refuse_directory(mut lo, mut fx, supply, record: found.file)
     return found.file
 } fs_reading_target
 
@@ -260,6 +477,7 @@ fn read_all(mut lo: Lowering, mut fx: Fx, supply: Supply, index: clif::Value) {
     mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
         fail_with(mut lo, fx: mut fx1, supply, variant: "NotFound")
     })
+    fs_refuse_directory(mut lo, mut fx, supply, record: found.file)
     let alloc = mut fx.load(PTR, addr: supply.param(2).address_value(), offset: 0)
     let len = mut fx.load(PTR, addr: found.file, offset: FS_FILE_LEN)
     let Some(bytes) = supply.sret else {
@@ -291,33 +509,354 @@ fn fs_write_all(mut lo: Lowering, mut fx: Fx, supply: Supply, index: clif::Value
     cancellation_point(mut lo, mut fx, supply)
     let named = fs_resolved(mut lo, mut fx, supply, index)
     let path = named.path
+    fs_make_directories(mut lo, mut fx, supply, system: named.system, path, through: false)
     let target = find_or_create(mut lo, mut fx, system: named.system, path)
+    fs_refuse_directory(mut lo, mut fx, supply, record: target)
     let data = sys_view(mut fx, held: supply.param(2))
     let none = mut fx.ptr(0)
     fs_resize(mut lo, mut fx, supply, system: named.system, target, kept: none, data)
     supply.done(mut lo, mut fx)
 } fs_write_all
 
-/// `sys::Fs.remove`: the file leaves its file system, its bytes freed once no open file reads
-/// them.
+/// `sys::Fs.remove`: the file or empty directory leaves its file system, a file's bytes freed
+/// once no open file reads them.
 fn fs_remove(mut lo: Lowering, mut fx: Fx, supply: Supply, index: clif::Value) {
     cancellation_point(mut lo, mut fx, supply)
     let named = fs_resolved(mut lo, mut fx, supply, index)
     let path = named.path
     let found = fs_find(mut lo, mut fx, system: named.system, path)
-    mut lo.record_free(mut fx, address: path.start)
     let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: found.file, y: 0)
     mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
+        mut lo.record_free(mut fx1, address: path.start)
         fail_with(mut lo, fx: mut fx1, supply, variant: "NotFound")
     })
-    let next = mut fx.load(PTR, addr: found.file, offset: FS_FILE_NEXT)
-    mut fx.store(next, addr: found.link, offset: 0)
-    let len = mut fx.load(PTR, addr: found.file, offset: FS_FILE_LEN)
-    let total = mut fx.load(PTR, addr: named.system, offset: SYSTEM_TOTAL)
-    let remaining = mut fx.b.isub(total, y: len)
-    mut fx.store(remaining, addr: named.system, offset: SYSTEM_TOTAL)
+    let occupied = fs_holds_below(mut lo, mut fx, system: named.system, path)
+    mut lo.record_free(mut fx, address: path.start)
+    mut fx.if_true(occupied, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Denied")
+    })
+    fs_unlink(mut fx, system: named.system, record: found.file, link: found.link)
     supply.done(mut lo, mut fx)
 } fs_remove
+
+/// Whether a file of the file system lies below a joined path.
+fn fs_holds_below(mut lo: Lowering, mut fx: Fx, system: clif::Value, path: Stretch) -> clif::Value {
+    let first_file = mut fx.load(PTR, addr: system, offset: SYSTEM_FILES)
+    let none = mut fx.int(clif::Type.Int8, value: 0)
+    let initial = fx.list2(first_file, b: none)
+    let found = mut fx.repeat(initial.view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 2
+        let file = current[0]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: file, y: 0)
+        let flag = fx1.types1(clif::Type.Int8)
+        let below = mut fx1.choose_in(mut lo, condition: present, results: flag.view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let own = fs_path_of(mut fx2, record: file)
+            let inside = fs_strictly_under(mut lo2, fx: mut fx2, own, path)
+            return fx2.list1(inside)
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let outside = mut fx2.int(clif::Type.Int8, value: 0)
+            return fx2.list1(outside)
+        })
+        expect below.len() == 1
+        let pointer = fx1.types1(PTR)
+        let next = mut fx1.choose(present, results: pointer.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let next_file = mut fx2.load(PTR, addr: file, offset: FS_FILE_NEXT)
+            return fx2.list1(next_file)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let end = mut fx2.ptr(0)
+            return fx2.list1(end)
+        })
+        expect next.len() == 1
+        let absent = mut fx1.b.bxor_imm_s(below[0], y: 1)
+        let going = mut fx1.b.band(present, y: absent)
+        return Pass(again: going, next: fx1.list2(next[0], b: below[0]))
+    })
+    expect found.len() == 2
+    return found[1]
+} fs_holds_below
+
+/// `sys::Fs.create_dir`: the directory and those its path passes through, made where missing.
+fn fs_create_dir(mut lo: Lowering, mut fx: Fx, supply: Supply, index: clif::Value) {
+    cancellation_point(mut lo, mut fx, supply)
+    let named = fs_resolved(mut lo, mut fx, supply, index)
+    fs_make_directories(mut lo, mut fx, supply, system: named.system, path: named.path, through: true)
+    mut lo.record_free(mut fx, address: named.path.start)
+    supply.done(mut lo, mut fx)
+} fs_create_dir
+
+/// `sys::Fs.rename`: the file or directory `from` names, with every file below it, moved to
+/// `to`, replacing a file there.
+fn fs_rename(mut lo: Lowering, mut fx: Fx, supply: Supply, index: clif::Value) {
+    cancellation_point(mut lo, mut fx, supply)
+    let system = object_at(mut lo, mut fx, index)
+    let prefix = sys_checked_text(mut lo, mut fx, supply, capability: supply.param(0).address_value())
+    let from = fs_joined(mut lo, mut fx, prefix, path: supply.param(1))
+    let to = fs_joined(mut lo, mut fx, prefix, path: supply.param(2))
+    mut lo.record_free(mut fx, address: prefix.start)
+    let moved = fs_find(mut lo, mut fx, system, path: from)
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: moved.file, y: 0)
+    let inside = fs_strictly_under(mut lo, mut fx, own: to, path: from)
+    let refused = mut fx.b.bor(missing, y: inside)
+    mut fx.if_true(refused, then: fn[mut lo](mut fx1: Fx) {
+        mut lo.record_free(mut fx1, address: from.start)
+        mut lo.record_free(mut fx1, address: to.start)
+        mut fx1.if_true(missing, then: fn[mut lo](mut fx2: Fx) {
+            fail_with(mut lo, fx: mut fx2, supply, variant: "NotFound")
+        })
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Denied")
+    })
+    let same = fs_under(mut lo, mut fx, own: to, path: from)
+    let distinct = mut fx.b.bxor_imm_s(same, y: 1)
+    mut fx.if_true(distinct, then: fn[mut lo](mut fx1: Fx) {
+        fs_move(mut lo, fx: mut fx1, supply, system, moved: moved.file, from, to)
+    })
+    mut lo.record_free(mut fx, address: from.start)
+    mut lo.record_free(mut fx, address: to.start)
+    supply.done(mut lo, mut fx)
+} fs_rename
+
+/// Moves the file `moved` of the joined path `from`, and every file below it, to `to`, below
+/// directories made where missing, replacing a file there.
+fn fs_move(mut lo: Lowering, mut fx: Fx, supply: Supply, system: clif::Value, moved: clif::Value, from: Stretch, to: Stretch) {
+    fs_make_directories(mut lo, mut fx, supply, system, path: to, through: false)
+    let target = fs_find(mut lo, mut fx, system, path: to)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: target.file, y: 0)
+    mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+        fs_refuse_directory(mut lo, fx: mut fx1, supply, record: target.file)
+        fs_refuse_directory(mut lo, fx: mut fx1, supply, record: moved)
+        fs_unlink(mut fx1, system, record: target.file, link: target.link)
+    })
+    let chain = fs_gather(mut lo, mut fx, system, path: from)
+    let initial = fx.list1(chain)
+    discard mut fx.repeat(initial.view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 1
+        let file = current[0]
+        let present_file = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: file, y: 0)
+        let pointer = fx1.types1(PTR)
+        let next = mut fx1.choose(present_file, results: pointer.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let next_file = mut fx2.load(PTR, addr: file, offset: FS_FILE_NEXT)
+            return fx2.list1(next_file)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let end = mut fx2.ptr(0)
+            return fx2.list1(end)
+        })
+        expect next.len() == 1
+        mut fx1.if_true(present_file, then: fn[mut lo](mut fx2: Fx) {
+            let old = fs_path_of(mut fx2, record: file)
+            let tail = mut fx2.b.isub(old.len, y: from.len)
+            let len = mut fx2.b.iadd(to.len, y: tail)
+            let size = mut fx2.b.iadd_imm_s(len, y: 1)
+            let text = mut lo.record_alloc(mut fx2, size)
+            exhausted_unless(mut lo, fx: mut fx2, address: text)
+            let head_args = fx2.list3(text, b: to.start, c: to.len)
+            discard mut lo.call_routine(mut fx2, routine: Routine.Copy, args: head_args.view())
+            let at = mut fx2.b.iadd(text, y: to.len)
+            let rest = mut fx2.b.iadd(old.start, y: from.len)
+            let tail_args = fx2.list3(at, b: rest, c: tail)
+            discard mut lo.call_routine(mut fx2, routine: Routine.Copy, args: tail_args.view())
+            mut lo.record_free(mut fx2, address: old.start)
+            mut fx2.store(text, addr: file, offset: FS_FILE_PATH)
+            mut fx2.store(len, addr: file, offset: FS_FILE_PATH_LEN)
+            fs_insert(mut lo, fx: mut fx2, system, record: file)
+        })
+        return Pass(again: present_file, next: fx1.list1(next[0]))
+    })
+} fs_move
+
+/// Unlinks from a file system the file of a joined path and every file below it, giving them
+/// as a chain through their links.
+fn fs_gather(mut lo: Lowering, mut fx: Fx, system: clif::Value, path: Stretch) -> clif::Value {
+    let link = mut fx.offset(system, offset: SYSTEM_FILES)
+    let zero = mut fx.ptr(0)
+    let initial = fx.list2(link, b: zero)
+    let found = mut fx.repeat(initial.view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 2
+        let pointing = current[0]
+        let chain = current[1]
+        let file = mut fx1.load(PTR, addr: pointing, offset: 0)
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: file, y: 0)
+        let pair = fx1.types2(PTR, b: PTR)
+        let next = mut fx1.choose_in(mut lo, condition: present, results: pair.view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let own = fs_path_of(mut fx2, record: file)
+            let caught = fs_under(mut lo2, fx: mut fx2, own, path)
+            let both = fx2.types2(PTR, b: PTR)
+            return mut fx2.choose(caught, results: both.view(), then: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let after = mut fx3.load(PTR, addr: file, offset: FS_FILE_NEXT)
+                mut fx3.store(after, addr: pointing, offset: 0)
+                mut fx3.store(chain, addr: file, offset: FS_FILE_NEXT)
+                return fx3.list2(pointing, b: file)
+            }, otherwise: fn(mut fx3: Fx) -> mem::List[clif::Value] {
+                let next_link = mut fx3.offset(file, offset: FS_FILE_NEXT)
+                return fx3.list2(next_link, b: chain)
+            })
+        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list2(pointing, b: chain)
+        })
+        return Pass(again: present, next: take next)
+    })
+    expect found.len() == 2
+    return found[1]
+} fs_gather
+
+/// `sys::Fs.kind`: a directory for the empty path or a directory, a file for a file.
+fn fs_kind(mut lo: Lowering, mut fx: Fx, supply: Supply, index: clif::Value) {
+    cancellation_point(mut lo, mut fx, supply)
+    let named = fs_resolved(mut lo, mut fx, supply, index)
+    let path = named.path
+    let found = fs_find(mut lo, mut fx, system: named.system, path)
+    mut lo.record_free(mut fx, address: path.start)
+    let root = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: path.len, y: 0)
+    let missing = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: found.file, y: 0)
+    let given = mut fx.b.bxor_imm_s(root, y: 1)
+    let absent = mut fx.b.band(missing, y: given)
+    mut fx.if_true(absent, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "NotFound")
+    })
+    let flag = fx.types1(clif::Type.Int8)
+    let directory = mut fx.choose(root, results: flag.view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let yes = mut fx1.int(clif::Type.Int8, value: 1)
+        return fx1.list1(yes)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let held = mut fx1.load(PTR, addr: found.file, offset: FS_FILE_DIRECTORY)
+        let is = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: held, y: 0)
+        return fx1.list1(is)
+    })
+    expect directory.len() == 1
+    let kind = supply.abi.result
+    let laid = mut lo.layout_of(kind)
+    let slot = mut fx.slot(laid.contents().size, align: laid.contents().align)
+    fs_write_kind(mut lo, mut fx, kind, at: slot, directory: directory[0])
+    let held = mut lo.held_at(mut fx, ty: kind, address: slot)
+    supply.ret(mut lo, mut fx, held)
+} fs_kind
+
+/// Writes at `at` the `sys::fs::Kind` of a file or, when `directory` holds, a directory.
+fn fs_write_kind(mut lo: Lowering, mut fx: Fx, kind: ty::Ty, at: clif::Value, directory: clif::Value) {
+    let none = mem::List[clif::Type].empty(fx.alloc)
+    discard mut fx.choose_in(mut lo, condition: directory, results: none.view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let folder = mut lo1.variant_value(mut fx1, ty: kind, variant: "Directory", payload_values: mem::List[Held].empty(fx1.alloc).view(), wrapped: None)
+        mut lo1.store_held(mut fx1, address: at, held: folder, ty: kind)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        let file = mut lo1.variant_value(mut fx1, ty: kind, variant: "File", payload_values: mem::List[Held].empty(fx1.alloc).view(), wrapped: None)
+        mut lo1.store_held(mut fx1, address: at, held: file, ty: kind)
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
+} fs_write_kind
+
+/// `sys::Fs.list`: the entries of the directory, the root for the empty path, in byte order of
+/// name, drawn through `alloc`.
+fn fs_list(mut lo: Lowering, mut fx: Fx, supply: Supply, index: clif::Value) {
+    cancellation_point(mut lo, mut fx, supply)
+    let named = fs_resolved(mut lo, mut fx, supply, index)
+    let system = named.system
+    let path = named.path
+    let root = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: path.len, y: 0)
+    let given = mut fx.b.bxor_imm_s(root, y: 1)
+    mut fx.if_true(given, then: fn[mut lo](mut fx1: Fx) {
+        let found = fs_find(mut lo, fx: mut fx1, system, path)
+        let missing = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: found.file, y: 0)
+        mut fx1.if_true(missing, then: fn[mut lo](mut fx2: Fx) {
+            mut lo.record_free(mut fx2, address: path.start)
+            fail_with(mut lo, fx: mut fx2, supply, variant: "NotFound")
+        })
+        let directory = mut fx1.load(PTR, addr: found.file, offset: FS_FILE_DIRECTORY)
+        let file = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: directory, y: 0)
+        mut fx1.if_true(file, then: fn[mut lo](mut fx2: Fx) {
+            mut lo.record_free(mut fx2, address: path.start)
+            fail_with(mut lo, fx: mut fx2, supply, variant: "Denied")
+        })
+    })
+    let alloc = mut fx.load(PTR, addr: supply.param(2).address_value(), offset: 0)
+    let Some(entries) = supply.sret else {
+        expect false
+        return
+    }
+    let Some(entry) = lo.ck.types().type_arg(supply.abi.result, index: 0) else {
+        expect false
+        return
+    }
+    let element = Element.of(mut lo, ty: entry)
+    vector_empty(mut fx, address: entries, alloc, element)
+    let after = mut fx.b.iadd_imm_s(path.len, y: 1)
+    let zero = mut fx.ptr(0)
+    let start = mut fx.b.select(root, x: zero, y: after)
+    let first_file = mut fx.load(PTR, addr: system, offset: SYSTEM_FILES)
+    let initial = fx.list1(first_file)
+    discard mut fx.repeat(initial.view(), body: fn[mut lo](mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
+        expect current.len() == 1
+        let file = current[0]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: file, y: 0)
+        let pointer = fx1.types1(PTR)
+        let next = mut fx1.choose(present, results: pointer.view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let next_file = mut fx2.load(PTR, addr: file, offset: FS_FILE_NEXT)
+            return fx2.list1(next_file)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let end = mut fx2.ptr(0)
+            return fx2.list1(end)
+        })
+        expect next.len() == 1
+        mut fx1.if_true(present, then: fn[mut lo](mut fx2: Fx) {
+            let own = fs_path_of(mut fx2, record: file)
+            let flag = fx2.types1(clif::Type.Int8)
+            let below = mut fx2.choose_in(mut lo, condition: root, results: flag.view(), then: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                let yes = mut fx3.int(clif::Type.Int8, value: 1)
+                return fx3.list1(yes)
+            }, otherwise: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                let inside = fs_strictly_under(mut lo3, fx: mut fx3, own, path)
+                return fx3.list1(inside)
+            })
+            expect below.len() == 1
+            mut fx2.if_true(below[0], then: fn[mut lo](mut fx3: Fx) {
+                let name = mut fx3.b.iadd(own.start, y: start)
+                let len = mut fx3.b.isub(own.len, y: start)
+                let nested = fs_holds_slash(mut fx3, text: Stretch(start: name, len: len))
+                let child = mut fx3.b.bxor_imm_s(nested, y: 1)
+                mut fx3.if_true(child, then: fn[mut lo](mut fx4: Fx) {
+                    fs_push_entry(mut lo, fx: mut fx4, entries, alloc, entry, record: file, name: Stretch(start: name, len: len))
+                })
+            })
+        })
+        return Pass(again: present, next: fx1.list1(next[0]))
+    })
+    mut lo.record_free(mut fx, address: path.start)
+    supply.ret(mut lo, mut fx, held: Held.Address(entries))
+} fs_list
+
+/// Appends to the list at `entries` drawing through `alloc` the entry of a file named by `len`
+/// bytes from `name`: a copy of them and the file's kind.
+fn fs_push_entry(mut lo: Lowering, mut fx: Fx, entries: clif::Value, alloc: clif::Value, entry: ty::Ty, record: clif::Value, name: Stretch) {
+    let one = mut fx.ptr(1)
+    let alloc_args = fx.list3(alloc, b: name.len, c: one)
+    let drawn = mut lo.call_routine(mut fx, routine: Routine.Alloc, args: alloc_args.view())
+    expect drawn.len() == 1
+    let text = drawn[0]
+    exhausted_unless(mut lo, mut fx, address: text)
+    let copy_args = fx.list3(text, b: name.start, c: name.len)
+    discard mut lo.call_routine(mut fx, routine: Routine.Copy, args: copy_args.view())
+    let element = Element.of(mut lo, ty: entry)
+    let count = mut fx.load(PTR, addr: entries, offset: VECTOR_LEN)
+    let needed = mut fx.b.iadd_imm_s(count, y: 1)
+    let room = vector_reserve(mut lo, mut fx, address: entries, needed, element)
+    let short = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: room, y: 0)
+    mut fx.if_true(short, then: fn[mut lo](mut fx1: Fx) {
+        raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
+    })
+    let data = mut fx.load(PTR, addr: entries, offset: VECTOR_DATA)
+    let at = element.at(mut fx, data, index: count)
+    let name_field = mut lo.layouts.field(lo.ck, ty: entry, variant: None, label: "name")
+    let kind_field = mut lo.layouts.field(lo.ck, ty: entry, variant: None, label: "kind")
+    let string = mut fx.offset(at, offset: name_field.offset)
+    mut fx.store(text, addr: string, offset: VECTOR_DATA)
+    mut fx.store(name.len, addr: string, offset: VECTOR_LEN)
+    mut fx.store(name.len, addr: string, offset: VECTOR_CAPACITY)
+    mut fx.store(alloc, addr: string, offset: VECTOR_ALLOC)
+    let held = mut fx.load(PTR, addr: record, offset: FS_FILE_DIRECTORY)
+    let directory = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: held, y: 0)
+    let kind_at = mut fx.offset(at, offset: kind_field.offset)
+    fs_write_kind(mut lo, mut fx, kind: kind_field.ty, at: kind_at, directory)
+    mut fx.store(needed, addr: entries, offset: VECTOR_LEN)
+} fs_push_entry
 
 /// The open file a resource at an address names.
 fn fs_opened(mut lo: Lowering, mut fx: Fx, address: clif::Value) -> clif::Value {

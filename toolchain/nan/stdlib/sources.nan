@@ -13044,10 +13044,37 @@ const TEXT_LINUX_PLATFORM_FILES: Str =
     \\    resolve: u64 at 16
     \\} OpenHow
     \\
-    \\/// The open flags of a file read from, written to after truncation, or created.
+    \\/// The open flags of a file read from, written to after truncation, or created, of a directory
+    \\/// read from, and of a path whose entry's kind is read.
     \\const READ_ONLY: u64 = 0x8_0000
     \\
     \\const WRITE_CREATE: u64 = 0x8_0241
+    \\
+    \\const DIRECTORY_ONLY: u64 = 0x9_0000
+    \\
+    \\const PATH_ONLY: u64 = 0x28_0000
+    \\
+    \\/// The errors of a directory where a file is expected and of a file where a directory is.
+    \\const EISDIR: i32 = 21
+    \\
+    \\/// The `unlinkat` flag removing a directory.
+    \\const AT_REMOVEDIR: u32 = 0x200
+    \\
+    \\/// The `statx` flag reading the descriptor's own entry, and the file type bits of its mode.
+    \\const AT_EMPTY_PATH: u32 = 0x1000
+    \\
+    \\const MODE_TYPE: u16 = 0xF000
+    \\
+    \\const MODE_FILE: u16 = 0x8000
+    \\
+    \\const MODE_DIRECTORY: u16 = 0x4000
+    \\
+    \\/// The types `getdents64` gives a regular file and a directory.
+    \\const DT_FILE: u8 = 8
+    \\
+    \\const DT_DIRECTORY: u8 = 4
+    \\
+    \\foreign fn getdents64(fd: i32, buffer: hw::Ptr[u8], len: usize) -> isize convention "sysv"
     \\
     \\/// Resolution staying beneath the directory and following no magic links.
     \\const BENEATH: u64 = 0x0A
@@ -13055,12 +13082,18 @@ const TEXT_LINUX_PLATFORM_FILES: Str =
     \\/// The longest path the platform functions join, in bytes, its NUL excluded.
     \\const PATH_LIMIT: usize = 4_095
     \\
-    \\/// `prefix`, `/` when it is not empty, `path` and a NUL, in a buffer; false when it is too long.
+    \\/// `prefix`, `/` when neither is empty, `path` and a NUL, in a buffer, `.` for two empty texts;
+    \\/// false when it is too long.
     \\fn joined(prefix: Str, path: Str, mut buffer: Array[u8, 4_096]) -> bool {
     \\    let head = prefix.as_bytes()
     \\    let tail = path.as_bytes()
+    \\    if head.len() == 0 and tail.len() == 0 {
+    \\        buffer[0] = b'.'
+    \\        buffer[1] = 0
+    \\        return true
+    \\    }
     \\    var separator: usize = 0
-    \\    if head.len() > 0 {
+    \\    if head.len() > 0 and tail.len() > 0 {
     \\        separator = 1
     \\    }
     \\    if head.len() + separator + tail.len() > PATH_LIMIT {
@@ -13182,11 +13215,126 @@ const TEXT_LINUX_PLATFORM_FILES: Str =
     \\        fail sys::fs::FsError.InvalidPath
     \\    }
     \\    let address = u64.widen(hw::Ptr.of_view(buffer.view()).addr())
-    \\    let result = try await submit(operation(OP_UNLINKAT, fd: dir, address, len: 0, offset: 0))
+    \\    var result = try await submit(operation(OP_UNLINKAT, fd: dir, address, len: 0, offset: 0))
+    \\    if result == -EISDIR {
+    \\        var request = operation(OP_UNLINKAT, fd: dir, address, len: 0, offset: 0)
+    \\        request.op_flags = AT_REMOVEDIR
+    \\        result = try await submit(request)
+    \\    }
     \\    if result < 0 {
     \\        fail failure(result)
     \\    }
     \\} fs_remove
+    \\
+    \\pkg fn fs_create_dir(dir: i32, prefix: Str, path: Str) fails sys::fs::FsError uses wait {
+    \\    var buffer = Array[u8, 4_096].filled(0)
+    \\    if not joined(prefix, path, mut buffer) {
+    \\        fail sys::fs::FsError.InvalidPath
+    \\    }
+    \\    try await make_parents(dir, path: buffer)
+    \\    let address = u64.widen(hw::Ptr.of_view(buffer.view()).addr())
+    \\    let result = try await submit(operation(OP_MKDIRAT, fd: dir, address, len: 0x1ED, offset: 0))
+    \\    if result == -EEXIST {
+    \\        if try await fs_kind(dir, prefix, path) != sys::fs::Kind.Directory {
+    \\            fail sys::fs::FsError.Denied
+    \\        }
+    \\        return
+    \\    }
+    \\    if result < 0 {
+    \\        fail failure(result)
+    \\    }
+    \\} fs_create_dir
+    \\
+    \\pkg fn fs_rename(dir: i32, prefix: Str, from: Str, to: Str) fails sys::fs::FsError uses wait {
+    \\    var source = Array[u8, 4_096].filled(0)
+    \\    var target = Array[u8, 4_096].filled(0)
+    \\    if not joined(prefix, path: from, buffer: mut source) or not joined(prefix, path: to, buffer: mut target) {
+    \\        fail sys::fs::FsError.InvalidPath
+    \\    }
+    \\    try await make_parents(dir, path: target)
+    \\    let source_address = u64.widen(hw::Ptr.of_view(source.view()).addr())
+    \\    let target_address = u64.widen(hw::Ptr.of_view(target.view()).addr())
+    \\    let result = try await submit(operation(OP_RENAMEAT, fd: dir, address: source_address, len: u32.truncate(dir), offset: target_address))
+    \\    if result < 0 {
+    \\        fail failure(result)
+    \\    }
+    \\} fs_rename
+    \\
+    \\pkg fn fs_kind(dir: i32, prefix: Str, path: Str) -> sys::fs::Kind fails sys::fs::FsError uses wait {
+    \\    let fd = try await open_beneath(dir, prefix, path, flags: PATH_ONLY)
+    \\    defer release(fd)
+    \\    var status = Array[u8, 256].filled(0)
+    \\    let empty = Array[u8, 1].filled(0)
+    \\    let path_address = u64.widen(hw::Ptr.of_view(empty.view()).addr())
+    \\    let status_address = u64.widen(hw::Ptr.of_view_mut(mut status.view_mut()).addr())
+    \\    var request = operation(OP_STATX, fd, address: path_address, len: 1, offset: status_address)
+    \\    request.op_flags = AT_EMPTY_PATH
+    \\    let result = try await submit(request)
+    \\    if result < 0 {
+    \\        fail failure(result)
+    \\    }
+    \\    let kind = status.view().u16_le(28) & MODE_TYPE
+    \\    if kind == MODE_FILE {
+    \\        return sys::fs::Kind.File
+    \\    }
+    \\    if kind == MODE_DIRECTORY {
+    \\        return sys::fs::Kind.Directory
+    \\    }
+    \\    return sys::fs::Kind.Other
+    \\} fs_kind
+    \\
+    \\pkg fn fs_list(dir: i32, prefix: Str, path: Str, alloc: mem::Alloc) -> mem::List[sys::fs::Entry] fails sys::fs::FsError uses wait {
+    \\    let fd = try await open_beneath(dir, prefix, path, flags: DIRECTORY_ONLY)
+    \\    defer release(fd)
+    \\    var entries = mem::List[sys::fs::Entry].empty(alloc)
+    \\    var records = Array[u8, 4_096].filled(0)
+    \\    loop {
+    \\        let count = getdents64(fd, buffer: hw::Ptr.of_view_mut(mut records.view_mut()), len: 4_096)
+    \\        if count < 0 {
+    \\            fail sys::fs::FsError.Denied
+    \\        }
+    \\        if count == 0 {
+    \\            break
+    \\        }
+    \\        var at: usize = 0
+    \\        while at + 19 < usize.fit(count) {
+    \\            let length = usize.widen(records.view().u16_le(at + 16))
+    \\            let stop = name_end(records.view(), at: at + 19, end: at + length)
+    \\            let Some(parts) = records.view().split_at(stop) else {
+    \\                fail sys::fs::FsError.Denied
+    \\            }
+    \\            let Some(named) = parts.head.split_at(at + 19) else {
+    \\                fail sys::fs::FsError.Denied
+    \\            }
+    \\            if named.tail != b"." and named.tail != b".." {
+    \\                let Ok(text) = attempt text::String.try_from_utf8(named.tail, alloc) else {
+    \\                    fail sys::fs::FsError.Denied
+    \\                }
+    \\                let kind = match records[at + 18] {
+    \\                    DT_FILE => sys::fs::Kind.File
+    \\                    DT_DIRECTORY => sys::fs::Kind.Directory
+    \\                    else => sys::fs::Kind.Other
+    \\                }
+    \\                mut entries.push(sys::fs::Entry(name: take text, kind: kind))
+    \\            }
+    \\            if length == 0 {
+    \\                break
+    \\            }
+    \\            at += length
+    \\        }
+    \\    }
+    \\    mut entries.sort_by(fn(left: sys::fs::Entry, right: sys::fs::Entry) => left.name.as_str().cmp(right.name.as_str()))
+    \\    return entries
+    \\} fs_list
+    \\
+    \\/// Where the name of a directory record from `at` ends: its NUL, or `end`.
+    \\fn name_end(records: Slice[u8], at: usize, end: usize) -> usize {
+    \\    var stop = at
+    \\    while stop < end and stop < records.len() and records[stop] != 0 {
+    \\        stop += 1
+    \\    }
+    \\    return stop
+    \\} name_end
     \\
     \\pkg fn file_read(fd: i32, address: u64, len: usize) -> usize fails sys::fs::FsError uses wait {
     \\    let count = try await read_at(fd, address, len)
@@ -13265,6 +13413,8 @@ const TEXT_LINUX_PLATFORM_LINUX_PLATFORM: Str =
     \\pkg const OP_OPENAT2: u8 = 28
     \\
     \\pkg const OP_SHUTDOWN: u8 = 34
+    \\
+    \\pkg const OP_RENAMEAT: u8 = 35
     \\
     \\pkg const OP_UNLINKAT: u8 = 36
     \\
@@ -13773,6 +13923,12 @@ const TEXT_MACOS_PLATFORM_FILES: Str =
     \\
     \\foreign fn unlinkat(dir: i32, path: hw::Ptr[u8], flags: i32) -> i32 convention "darwin"
     \\
+    \\foreign fn renameat(from_dir: i32, from: hw::Ptr[u8], to_dir: i32, to: hw::Ptr[u8]) -> i32 convention "darwin"
+    \\
+    \\foreign fn getattrlistat(dir: i32, path: hw::Ptr[u8], attributes: hw::Ptr[AttrList], buffer: u64, size: usize, options: u64) -> i32 convention "darwin"
+    \\
+    \\foreign fn getattrlistbulk(dir: i32, attributes: hw::Ptr[AttrList], buffer: u64, size: usize, options: u64) -> i32 convention "darwin"
+    \\
     \\/// The open flags of a file read from, written to after truncation or created, and of a
     \\/// directory, each closed on exec and resolved beneath the directory it opens from.
     \\const READ_ONLY: i32 = 0x0100_1000
@@ -13785,6 +13941,45 @@ const TEXT_MACOS_PLATFORM_FILES: Str =
     \\const FILE_MODE: u64 = 0x1A4
     \\
     \\const DIRECTORY_MODE: u16 = 0x1ED
+    \\
+    \\/// The `unlinkat` flag removing a directory.
+    \\const REMOVE_DIRECTORY: i32 = 0x80
+    \\
+    \\/// The common attributes `getattrlistat` and `getattrlistbulk` are asked for: which were returned,
+    \\/// an entry's name and its type.
+    \\const RETURNED_ATTRIBUTES: u32 = 0x8000_0000
+    \\
+    \\const NAME_ATTRIBUTE: u32 = 0x1
+    \\
+    \\const TYPE_ATTRIBUTE: u32 = 0x8
+    \\
+    \\/// The options of `getattrlistat` not following a final symbolic link, and of `getattrlistbulk`
+    \\/// giving every attribute asked for its place.
+    \\const NO_FOLLOW: u64 = 0x1
+    \\
+    \\const PACK_INVALID: u64 = 0x8
+    \\
+    \\/// The types of a regular file and of a directory the type attribute gives.
+    \\const REGULAR_TYPE: u32 = 1
+    \\
+    \\const DIRECTORY_TYPE: u32 = 2
+    \\
+    \\/// The offsets in an entry `getattrlistbulk` gives of the reference to its name and of its type,
+    \\/// after its length and the attributes returned.
+    \\const BULK_NAME: usize = 24
+    \\
+    \\const BULK_TYPE: usize = 32
+    \\
+    \\/// `struct attrlist`: the five groups of attributes asked for.
+    \\layout AttrList: bytes 24 le {
+    \\    count: u16 at 0
+    \\    reserved: u16 at 2
+    \\    common: u32 at 4
+    \\    volume: u32 at 8
+    \\    directory: u32 at 12
+    \\    file: u32 at 16
+    \\    fork: u32 at 20
+    \\} AttrList
     \\
     \\/// The longest path the platform functions join, in bytes, its NUL excluded.
     \\const PATH_LIMIT: usize = 4_095
@@ -13824,6 +14019,18 @@ const TEXT_MACOS_PLATFORM_FILES: Str =
     \\    buffer[at] = 0
     \\    return true
     \\} joined
+    \\
+    \\/// `joined` for an operation on a directory, where the empty path names `prefix` itself, and `.`
+    \\/// the tree's root when `prefix` is empty too.
+    \\fn joined_directory(prefix: Str, path: Str, mut buffer: Array[u8, 4_096]) -> bool {
+    \\    if not path.is_empty() {
+    \\        return joined(prefix, path, mut buffer)
+    \\    }
+    \\    if prefix.is_empty() {
+    \\        return joined(prefix, path: ".", mut buffer)
+    \\    }
+    \\    return joined(prefix: "", path: prefix, mut buffer)
+    \\} joined_directory
     \\
     \\/// The failure of an error number of a file operation.
     \\fn failure(code: i32) -> sys::fs::FsError {
@@ -13911,6 +14118,75 @@ const TEXT_MACOS_PLATFORM_FILES: Str =
     \\    return fd
     \\} open_beneath
     \\
+    \\/// The type the type attribute gives of the entry `name` of the directory open as `fd`, a final
+    \\/// symbolic link not followed.
+    \\fn entry_type(fd: i32, name: Slice[u8]) -> u32 fails sys::fs::FsError {
+    \\    var asked = AttrList(count: 5, reserved: 0, common: TYPE_ATTRIBUTE, volume: 0, directory: 0, file: 0, fork: 0)
+    \\    var attributes = Array[u8, 8].filled(0)
+    \\    let address = u64.widen(hw::Ptr.of_view_mut(mut attributes.view_mut()).addr())
+    \\    if getattrlistat(fd, path: hw::Ptr.of_view(name), attributes: hw::Ptr.of_mut(mut asked), buffer: address, size: 8, options: NO_FOLLOW) != 0 {
+    \\        fail failure(last_error())
+    \\    }
+    \\    return attributes.view().u32_le(4)
+    \\} entry_type
+    \\
+    \\/// The kind of an entry of a type the type attribute gives.
+    \\fn kind_of(type: u32) -> sys::fs::Kind {
+    \\    return match type {
+    \\        REGULAR_TYPE => sys::fs::Kind.File
+    \\        DIRECTORY_TYPE => sys::fs::Kind.Directory
+    \\        else => sys::fs::Kind.Other
+    \\    }
+    \\} kind_of
+    \\
+    \\/// Appends the `count` entries `getattrlistbulk` wrote to `buffer`: each its length, the
+    \\/// attributes returned, the reference to its NUL-terminated name and its type.
+    \\fn bulk_entries(buffer: Slice[u8], count: usize, mut into: mem::List[sys::fs::Entry], alloc: mem::Alloc) fails sys::fs::FsError {
+    \\    var at: usize = 0
+    \\    for _ in 0..<count {
+    \\        if at > buffer.len() or buffer.len() - at < BULK_TYPE + 4 {
+    \\            fail sys::fs::FsError.Denied
+    \\        }
+    \\        let length = usize.widen(buffer.u32_le(at))
+    \\        let named_at = at + BULK_NAME
+    \\        let name_length = usize.widen(buffer.u32_le(named_at + 4))
+    \\        let Some(from_reference) = buffer.split_at(named_at) else {
+    \\            fail sys::fs::FsError.Denied
+    \\        }
+    \\        let Some(from_name) = from_reference.tail.split_at(usize.widen(buffer.u32_le(named_at))) else {
+    \\            fail sys::fs::FsError.Denied
+    \\        }
+    \\        if name_length == 0 {
+    \\            fail sys::fs::FsError.Denied
+    \\        }
+    \\        let Some(spelt) = from_name.tail.prefix(name_length - 1) else {
+    \\            fail sys::fs::FsError.Denied
+    \\        }
+    \\        let Ok(name) = attempt text::String.try_from_utf8(spelt, alloc) else {
+    \\            fail sys::fs::FsError.Denied
+    \\        }
+    \\        mut into.push(sys::fs::Entry(name: take name, kind: kind_of(buffer.u32_le(at + BULK_TYPE))))
+    \\        if length == 0 or length > buffer.len() - at {
+    \\            fail sys::fs::FsError.Denied
+    \\        }
+    \\        at += length
+    \\    }
+    \\} bulk_entries
+    \\
+    \\/// The order of two names byte by byte, a name before each longer one it starts.
+    \\fn byte_order(left: Slice[u8], right: Slice[u8]) -> core::Ordering {
+    \\    for at in 0..<left.len() {
+    \\        if at == right.len() {
+    \\            return core::Ordering.Greater
+    \\        }
+    \\        let ordered = left[at].cmp(right[at])
+    \\        if ordered != core::Ordering.Equal {
+    \\            return ordered
+    \\        }
+    \\    }
+    \\    return left.len().cmp(right.len())
+    \\} byte_order
+    \\
     \\/// Reads at most `len` bytes at `address` from a file at its position: the count, 0 at its end.
     \\fn read_file(fd: i32, address: u64, len: usize) -> usize fails sys::fs::FsError {
     \\    loop {
@@ -13988,17 +14264,108 @@ const TEXT_MACOS_PLATFORM_FILES: Str =
     \\        fail sys::fs::FsError.InvalidPath
     \\    }
     \\    let parent = try open_parent(dir, path: buffer)
+    \\    defer close_parent(dir, parent)
     \\    let Some(parts) = buffer.view().split_at(parent.name) else {
-    \\        close_parent(dir, parent)
     \\        fail sys::fs::FsError.InvalidPath
     \\    }
-    \\    let removed = unlinkat(parent.fd, path: hw::Ptr.of_view(parts.tail), flags: 0)
-    \\    let code = last_error()
-    \\    close_parent(dir, parent)
-    \\    if removed != 0 {
-    \\        fail failure(code)
+    \\    var flags: i32 = 0
+    \\    if try entry_type(parent.fd, name: parts.tail) == DIRECTORY_TYPE {
+    \\        flags = REMOVE_DIRECTORY
+    \\    }
+    \\    if unlinkat(parent.fd, path: hw::Ptr.of_view(parts.tail), flags) != 0 {
+    \\        fail failure(last_error())
     \\    }
     \\} fs_remove
+    \\
+    \\pkg fn fs_create_dir(dir: i32, prefix: Str, path: Str) fails sys::fs::FsError {
+    \\    var buffer = Array[u8, 4_096].filled(0)
+    \\    if not joined(prefix, path, mut buffer) {
+    \\        fail sys::fs::FsError.InvalidPath
+    \\    }
+    \\    try make_parents(dir, path: buffer)
+    \\    let parent = try open_parent(dir, path: buffer)
+    \\    defer close_parent(dir, parent)
+    \\    let Some(parts) = buffer.view().split_at(parent.name) else {
+    \\        fail sys::fs::FsError.InvalidPath
+    \\    }
+    \\    if mkdirat(parent.fd, path: hw::Ptr.of_view(parts.tail), mode: DIRECTORY_MODE) == 0 {
+    \\        return
+    \\    }
+    \\    let code = last_error()
+    \\    if code != EEXIST {
+    \\        fail failure(code)
+    \\    }
+    \\    if try entry_type(parent.fd, name: parts.tail) != DIRECTORY_TYPE {
+    \\        fail sys::fs::FsError.Denied
+    \\    }
+    \\} fs_create_dir
+    \\
+    \\pkg fn fs_rename(dir: i32, prefix: Str, from: Str, to: Str) fails sys::fs::FsError {
+    \\    var source = Array[u8, 4_096].filled(0)
+    \\    var target = Array[u8, 4_096].filled(0)
+    \\    if not joined(prefix, path: from, buffer: mut source) or not joined(prefix, path: to, buffer: mut target) {
+    \\        fail sys::fs::FsError.InvalidPath
+    \\    }
+    \\    let source_parent = try open_parent(dir, path: source)
+    \\    defer close_parent(dir, parent: source_parent)
+    \\    try make_parents(dir, path: target)
+    \\    let target_parent = try open_parent(dir, path: target)
+    \\    defer close_parent(dir, parent: target_parent)
+    \\    let Some(source_parts) = source.view().split_at(source_parent.name) else {
+    \\        fail sys::fs::FsError.InvalidPath
+    \\    }
+    \\    let Some(target_parts) = target.view().split_at(target_parent.name) else {
+    \\        fail sys::fs::FsError.InvalidPath
+    \\    }
+    \\    if renameat(source_parent.fd, from: hw::Ptr.of_view(source_parts.tail), to_dir: target_parent.fd, to: hw::Ptr.of_view(target_parts.tail)) != 0 {
+    \\        fail failure(last_error())
+    \\    }
+    \\} fs_rename
+    \\
+    \\pkg fn fs_kind(dir: i32, prefix: Str, path: Str) -> sys::fs::Kind fails sys::fs::FsError {
+    \\    var buffer = Array[u8, 4_096].filled(0)
+    \\    if not joined_directory(prefix, path, mut buffer) {
+    \\        fail sys::fs::FsError.InvalidPath
+    \\    }
+    \\    let parent = try open_parent(dir, path: buffer)
+    \\    defer close_parent(dir, parent)
+    \\    let Some(parts) = buffer.view().split_at(parent.name) else {
+    \\        fail sys::fs::FsError.InvalidPath
+    \\    }
+    \\    return kind_of(try entry_type(parent.fd, name: parts.tail))
+    \\} fs_kind
+    \\
+    \\pkg fn fs_list(dir: i32, prefix: Str, path: Str, alloc: mem::Alloc) -> mem::List[sys::fs::Entry] fails sys::fs::FsError {
+    \\    var buffer = Array[u8, 4_096].filled(0)
+    \\    if not joined_directory(prefix, path, mut buffer) {
+    \\        fail sys::fs::FsError.InvalidPath
+    \\    }
+    \\    let fd = open_path(dir, path: buffer.view(), flags: DIRECTORY, mode: 0)
+    \\    if fd < 0 {
+    \\        fail failure(last_error())
+    \\    }
+    \\    defer release(fd)
+    \\    var asked = AttrList(count: 5, reserved: 0, common: RETURNED_ATTRIBUTES | NAME_ATTRIBUTE | TYPE_ATTRIBUTE, volume: 0, directory: 0, file: 0, fork: 0)
+    \\    var entries = mem::List[sys::fs::Entry].empty(alloc)
+    \\    var chunk = Array[u8, 4_096].filled(0)
+    \\    loop {
+    \\        let address = u64.widen(hw::Ptr.of_view_mut(mut chunk.view_mut()).addr())
+    \\        let count = getattrlistbulk(fd, attributes: hw::Ptr.of_mut(mut asked), buffer: address, size: 4_096, options: PACK_INVALID)
+    \\        if count == 0 {
+    \\            break
+    \\        }
+    \\        if count > 0 {
+    \\            try bulk_entries(chunk.view(), count: usize.fit(count), into: mut entries, alloc)
+    \\            continue
+    \\        }
+    \\        let code = last_error()
+    \\        if code != EINTR {
+    \\            fail failure(code)
+    \\        }
+    \\    }
+    \\    mut entries.sort_by(fn(left: sys::fs::Entry, right: sys::fs::Entry) => byte_order(left.name.as_bytes(), right: right.name.as_bytes()))
+    \\    return entries
+    \\} fs_list
     \\
     \\pkg fn file_read(fd: i32, address: u64, len: usize) -> usize fails sys::fs::FsError {
     \\    return try read_file(fd, address, len)
@@ -20817,6 +21184,17 @@ const TEXT_SYS_FS_FS: Str =
     \\pub open struct File {
     \\} File
     \\
+    \\pub closed enum Kind derives Copy, Eq, Render {
+    \\    File
+    \\    Directory
+    \\    Other
+    \\} Kind
+    \\
+    \\pub closed struct Entry {
+    \\    pub name: text::String
+    \\    pub kind: Kind
+    \\} Entry
+    \\
     \\pub fn File.read(mut self, mut buf: Untrusted[SliceMut[u8]]) -> usize fails FsError uses wait
     \\    ensures result <= buf.byte_len()
     \\
@@ -23243,6 +23621,14 @@ const TEXT_SYS_SYS: Str =
     \\
     \\pub fn Fs.remove(self, path: Str) fails fs::FsError uses wait
     \\
+    \\pub fn Fs.create_dir(self, path: Str) fails fs::FsError uses wait
+    \\
+    \\pub fn Fs.rename(self, from: Str, to: Str) fails fs::FsError uses wait
+    \\
+    \\pub fn Fs.kind(self, path: Str) -> fs::Kind fails fs::FsError uses wait
+    \\
+    \\pub fn Fs.list(self, path: Str, alloc: mem::Alloc) -> mem::List[fs::Entry] fails fs::FsError uses wait
+    \\
     \\pub open struct Net {
     \\} Net
     \\
@@ -23366,6 +23752,10 @@ const TEXT_SYS_SYS: Str =
     \\    fn write(self, file: u64, data: Slice[u8]) -> usize fails fs::FsError uses wait limits stack 4_096
     \\    fn byte_len(self, file: u64) -> u64 fails fs::FsError uses wait limits stack 4_096
     \\    fn release(self, file: u64) limits stack 4_096
+    \\    fn create_dir(self, path: Str) fails fs::FsError uses wait limits stack 4_096
+    \\    fn rename(self, from: Str, to: Str) fails fs::FsError uses wait limits stack 4_096
+    \\    fn kind(self, path: Str) -> fs::Kind fails fs::FsError uses wait limits stack 4_096
+    \\    fn list(self, path: Str, alloc: mem::Alloc) -> mem::List[fs::Entry] fails fs::FsError uses wait limits stack 4_096
     \\} FsService
     \\
     \\pub interface NetService {
@@ -24157,6 +24547,30 @@ const TEXT_SYS_SYS: Str =
     \\    discard reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => state.fetch_add(1))
     \\} Shelf.release
     \\
+    \\fn Shelf.create_dir(self, path: Str) limits stack 4_096 {
+    \\} Shelf.create_dir
+    \\
+    \\fn Shelf.rename(self, from: Str, to: Str) fails fs::FsError limits stack 4_096 {
+    \\    if from.byte_len() == to.byte_len() {
+    \\        fail fs::FsError.Denied
+    \\    }
+    \\} Shelf.rename
+    \\
+    \\/// A directory for the empty path, a file for any other.
+    \\fn Shelf.kind(self, path: Str) -> fs::Kind limits stack 4_096 {
+    \\    if path.byte_len() == 0 {
+    \\        return fs::Kind.Directory
+    \\    }
+    \\    return fs::Kind.File
+    \\} Shelf.kind
+    \\
+    \\/// One file, named by the path.
+    \\fn Shelf.list(self, path: Str, alloc: mem::Alloc) -> mem::List[fs::Entry] limits stack 4_096 {
+    \\    var entries = mem::List[fs::Entry].empty(alloc)
+    \\    mut entries.push(fs::Entry(name: text::String.of(path, alloc), kind: fs::Kind.File))
+    \\    return entries
+    \\} Shelf.list
+    \\
     \\/// Connections named by the length of their host or by their port, a line counting every call.
     \\struct Line {
     \\} Line
@@ -24754,6 +25168,23 @@ const TEXT_SYS_SYS: Str =
     \\    expect denied
     \\} read_only_fs_refuses_writes
     \\
+    \\test read_only_fs_refuses_directory_changes for Fs.read_only {
+    \\    let world = testing::world()
+    \\    try await world.fs.write_all("note", data: b"x")
+    \\    let reader = try world.fs.read_only()
+    \\    let made = attempt await reader.create_dir("logs")
+    \\    let moved = attempt await reader.rename("note", to: "kept")
+    \\    expect denied_by(made) and denied_by(moved)
+    \\} read_only_fs_refuses_directory_changes
+    \\
+    \\/// Whether an outcome is a refusal with `Denied`.
+    \\fn denied_by(outcome: Result[Unit, fs::FsError]) -> bool {
+    \\    return match outcome {
+    \\        Err(fs::FsError.Denied) => true
+    \\        else => false
+    \\    }
+    \\} denied_by
+    \\
     \\test open_of_a_missing_file_fails for Fs.open {
     \\    let world = testing::world()
     \\    let outcome = attempt await world.fs.open("missing")
@@ -24798,6 +25229,89 @@ const TEXT_SYS_SYS: Str =
     \\    }
     \\    expect missing
     \\} removed_file_cannot_be_opened
+    \\
+    \\test removed_empty_directories_leave_their_parent for Fs.remove {
+    \\    let world = testing::world()
+    \\    try await world.fs.create_dir("logs/old")
+    \\    try await world.fs.remove("logs/old")
+    \\    let left = try await world.fs.list("logs", alloc: world.alloc)
+    \\    try await world.fs.write_all("logs/day", data: b"x")
+    \\    let outcome = attempt await world.fs.remove("logs")
+    \\    let refused = match outcome {
+    \\        Err(fs::FsError.Denied) => true
+    \\        else => false
+    \\    }
+    \\    expect left.len() == 0 and refused
+    \\} removed_empty_directories_leave_their_parent
+    \\
+    \\test created_directories_hold_no_entries for Fs.create_dir {
+    \\    let world = testing::world()
+    \\    try await world.fs.create_dir("logs/old")
+    \\    try await world.fs.create_dir("logs/old")
+    \\    let logs = try await world.fs.list("logs", alloc: world.alloc)
+    \\    let old = try await world.fs.list("logs/old", alloc: world.alloc)
+    \\    try await world.fs.write_all("note", data: b"x")
+    \\    let outcome = attempt await world.fs.create_dir("note")
+    \\    let refused = match outcome {
+    \\        Err(fs::FsError.Denied) => true
+    \\        else => false
+    \\    }
+    \\    expect logs.len() == 1 and logs[0].name.as_str() == "old" and logs[0].kind == fs::Kind.Directory
+    \\    expect old.len() == 0 and refused
+    \\} created_directories_hold_no_entries
+    \\
+    \\test renamed_entries_move_below_new_directories for Fs.rename {
+    \\    let world = testing::world()
+    \\    try await world.fs.write_all("draft", data: b"new")
+    \\    try await world.fs.write_all("final/note", data: b"old")
+    \\    try await world.fs.rename("draft", to: "final/note")
+    \\    let replaced = try await world.fs.read_all("final/note", alloc: world.alloc)
+    \\    try await world.fs.rename("final", to: "kept/final")
+    \\    let moved = try await world.fs.read_all("kept/final/note", alloc: world.alloc)
+    \\    let outcome = attempt await world.fs.kind("draft")
+    \\    let missing = match outcome {
+    \\        Err(fs::FsError.NotFound) => true
+    \\        else => false
+    \\    }
+    \\    let root = try await world.fs.list("", alloc: world.alloc)
+    \\    expect testing::same(replaced.view(), expected: Untrusted.of(b"new")) and testing::same(moved.view(), expected: Untrusted.of(b"new"))
+    \\    expect missing and root.len() == 1 and root[0].name.as_str() == "kept"
+    \\} renamed_entries_move_below_new_directories
+    \\
+    \\test kinds_tell_files_from_directories for Fs.kind {
+    \\    let world = testing::world()
+    \\    try await world.fs.write_all("notes/day", data: b"x")
+    \\    let root = try await world.fs.kind("")
+    \\    let notes = try await world.fs.kind("notes")
+    \\    let day = try await world.fs.kind("notes/day")
+    \\    let outcome = attempt await world.fs.kind("notes/night")
+    \\    let missing = match outcome {
+    \\        Err(fs::FsError.NotFound) => true
+    \\        else => false
+    \\    }
+    \\    expect root == fs::Kind.Directory and notes == fs::Kind.Directory and day == fs::Kind.File and missing
+    \\} kinds_tell_files_from_directories
+    \\
+    \\test listed_entries_come_in_byte_order_of_name for Fs.list {
+    \\    let world = testing::world()
+    \\    try await world.fs.write_all("b", data: b"x")
+    \\    try await world.fs.write_all("a/c", data: b"x")
+    \\    try await world.fs.create_dir("c")
+    \\    let root = try await world.fs.list("", alloc: world.alloc)
+    \\    let file = attempt await world.fs.list("b", alloc: world.alloc)
+    \\    let refused = match file {
+    \\        Err(fs::FsError.Denied) => true
+    \\        else => false
+    \\    }
+    \\    let absent = attempt await world.fs.list("d", alloc: world.alloc)
+    \\    let missing = match absent {
+    \\        Err(fs::FsError.NotFound) => true
+    \\        else => false
+    \\    }
+    \\    expect root.len() == 3 and root[0].name.as_str() == "a" and root[1].name.as_str() == "b" and root[2].name.as_str() == "c"
+    \\    expect root[0].kind == fs::Kind.Directory and root[1].kind == fs::Kind.File and root[2].kind == fs::Kind.Directory
+    \\    expect refused and missing
+    \\} listed_entries_come_in_byte_order_of_name
     \\
     \\test narrowed_net_cannot_listen for Net.only_host {
     \\    let world = testing::world()
@@ -26167,6 +26681,9 @@ const TEXT_SYS_SYS: Str =
     \\    let read = try await reads_back(reader, path: "notes")
     \\    let written = attempt await reader.write_all("notes", data: b"x")
     \\    let removed = attempt await docs.remove("notes")
+    \\    let renamed = attempt await docs.rename("a", to: "b")
+    \\    let kind = try await fs.kind("")
+    \\    let listed = try await docs.list("notes", alloc: world.alloc)
     \\    let released = reach(counter, body: tally_count)
     \\    minter.revoke(shelf)
     \\    let opened = attempt await docs.open("notes")
@@ -26182,7 +26699,12 @@ const TEXT_SYS_SYS: Str =
     \\        Err(fs::FsError.Revoked(Revoked.Stale)) => true
     \\        else => false
     \\    }
+    \\    let joined = match renamed {
+    \\        Err(fs::FsError.Denied) => true
+    \\        else => false
+    \\    }
     \\    expect path.byte_len() == 10 and read and refused and missing and revoked and released == Some(1)
+    \\    expect joined and kind == fs::Kind.Directory and listed.len() == 1 and listed[0].name.as_str() == "docs/notes"
     \\} served_files_call_their_kind
     \\
     \\/// Whether `net` denies a connection to `host`, abandoning one it opens.
@@ -30594,8 +31116,16 @@ const TEXT_WINDOWS_PLATFORM_FILES: Str =
     \\
     \\foreign fn SetFileInformationByHandle(handle: u64, class: u32, information: hw::Ptr[u32], len: u32) -> i32 convention "win64"
     \\
+    \\foreign fn GetFileInformationByHandle(handle: u64, information: hw::Ptr[u32]) -> i32 convention "win64"
+    \\
+    \\foreign fn FindFirstFileW(name: hw::Ptr[u16], data: hw::Ptr[u32]) -> u64 convention "win64"
+    \\
+    \\foreign fn FindNextFileW(search: u64, data: hw::Ptr[u32]) -> i32 convention "win64"
+    \\
+    \\foreign fn FindClose(search: u64) -> i32 convention "win64"
+    \\
     \\/// The access rights of a file read from, of one written to and removed when it was created
-    \\/// outside, and of one removed.
+    \\/// outside, and of one removed or renamed.
     \\const READ_ACCESS: u32 = 0x8000_0000
     \\
     \\const WRITE_ACCESS: u32 = 0x4001_0000
@@ -30623,11 +31153,25 @@ const TEXT_WINDOWS_PLATFORM_FILES: Str =
     \\/// The handle `CreateFileW` gives on failure.
     \\const INVALID: u64 = 0xFFFF_FFFF_FFFF_FFFF
     \\
-    \\/// The error code of a file or directory that already exists, and the information class
-    \\/// marking a file for removal once its handles close.
+    \\/// The error code of a file or directory that already exists, and the information classes
+    \\/// marking a file for removal once its handles close and renaming it.
     \\const ALREADY_EXISTS: u32 = 183
     \\
     \\const REMOVAL_CLASS: u32 = 4
+    \\
+    \\const RENAME_CLASS: u32 = 3
+    \\
+    \\/// The negated error codes of a search finding no entry and of one finding no more.
+    \\const NO_ENTRY: i64 = -2
+    \\
+    \\const NO_MORE_ENTRIES: i64 = -18
+    \\
+    \\/// The attributes of a directory, a device and a reparse point such as a symbolic link.
+    \\const DIRECTORY: u32 = 0x10
+    \\
+    \\const DEVICE: u32 = 0x40
+    \\
+    \\const REPARSE_POINT: u32 = 0x400
     \\
     \\/// The UTF-16 units a path buffer holds, and the most a full path has, its NUL excluded.
     \\const PATH_UNITS: usize = 2_048
@@ -30740,8 +31284,8 @@ const TEXT_WINDOWS_PLATFORM_FILES: Str =
     \\    }
     \\} final_path
     \\
-    \\/// Whether an open handle's final path lies beneath the final path of the working directory,
-    \\/// which `.` opens.
+    \\/// Whether an open handle's final path is or lies beneath the final path of the working
+    \\/// directory, which `.` opens.
     \\fn inside(handle: u64) -> bool fails sys::fs::FsError {
     \\    var working = Array[u16, 2].filled(0)
     \\    working[0] = 0x2E
@@ -30754,7 +31298,7 @@ const TEXT_WINDOWS_PLATFORM_FILES: Str =
     \\    discard CloseHandle(root)
     \\    var reached = Path(units: Array[u16, 2_048].filled(0), len: 0, base: 0)
     \\    final_path(handle, buffer: mut reached)
-    \\    if tree.len == 0 or reached.len <= tree.len {
+    \\    if tree.len == 0 or reached.len < tree.len {
     \\        return false
     \\    }
     \\    for at in 0..<tree.len {
@@ -30762,7 +31306,7 @@ const TEXT_WINDOWS_PLATFORM_FILES: Str =
     \\            return false
     \\        }
     \\    }
-    \\    return reached.units[tree.len] == 0x5C
+    \\    return reached.len == tree.len or reached.units[tree.len] == 0x5C
     \\} inside
     \\
     \\/// A handle a path was opened with, and whether opening it created the file.
@@ -30786,8 +31330,8 @@ const TEXT_WINDOWS_PLATFORM_FILES: Str =
     \\    return SetFileInformationByHandle(handle, class: REMOVAL_CLASS, information: hw::Ptr.of_view_mut(mut removed.view_mut()), len: 4) != 0
     \\} mark_removed
     \\
-    \\/// Closes a handle unless its file lies beneath the working directory, removing the file when
-    \\/// its open created it: whether it lies there.
+    \\/// Closes a handle unless its file is or lies beneath the working directory, removing the file
+    \\/// when its open created it: whether it lies there.
     \\fn keep_inside(opened: Opened) -> bool fails sys::fs::FsError {
     \\    if try inside(opened.handle) {
     \\        return true
@@ -30799,8 +31343,29 @@ const TEXT_WINDOWS_PLATFORM_FILES: Str =
     \\    return false
     \\} keep_inside
     \\
-    \\/// Opens an existing directory of a full path, creating it when it is missing.
-    \\fn open_directory(path: Path) -> Opened fails sys::fs::FsError {
+    \\/// The attributes of an open file.
+    \\fn attributes(handle: u64) -> u32 fails sys::fs::FsError {
+    \\    var information = Array[u32, 13].filled(0)
+    \\    if GetFileInformationByHandle(handle, information: hw::Ptr.of_view_mut(mut information.view_mut())) == 0 {
+    \\        fail failure(last_error())
+    \\    }
+    \\    return information[0]
+    \\} attributes
+    \\
+    \\/// The kind of an entry with these attributes: a reparse point or a device is neither a file nor
+    \\/// a directory.
+    \\fn kind_of(found: u32) -> sys::fs::Kind {
+    \\    if (found & (REPARSE_POINT | DEVICE)) != 0 {
+    \\        return sys::fs::Kind.Other
+    \\    }
+    \\    if (found & DIRECTORY) != 0 {
+    \\        return sys::fs::Kind.Directory
+    \\    }
+    \\    return sys::fs::Kind.File
+    \\} kind_of
+    \\
+    \\/// Opens what a full path names, creating a directory there when nothing is.
+    \\fn open_or_create_directory(path: Path) -> Opened fails sys::fs::FsError {
     \\    match attempt open_path(path, access: READ_ATTRIBUTES, disposition: OPEN_EXISTING, flags: BACKUP_SEMANTICS) {
     \\        Ok(opened) => return opened
     \\        Err(error) => match error {
@@ -30812,23 +31377,31 @@ const TEXT_WINDOWS_PLATFORM_FILES: Str =
     \\        fail failure(last_error())
     \\    }
     \\    return try open_path(path, access: READ_ATTRIBUTES, disposition: OPEN_EXISTING, flags: BACKUP_SEMANTICS)
-    \\} open_directory
+    \\} open_or_create_directory
     \\
-    \\/// Creates each missing directory of a full path's segments but its last, each once it is found
-    \\/// to lie beneath the working directory; each separator after the first segment ends the path in
-    \\/// turn, then is put back.
+    \\/// Makes sure a full path names a directory beneath the working directory, creating it when
+    \\/// nothing is there; anything else there fails with `Denied`.
+    \\fn enter_directory(path: Path) fails sys::fs::FsError {
+    \\    let opened = try open_or_create_directory(path)
+    \\    if not try keep_inside(opened) {
+    \\        fail sys::fs::FsError.Denied
+    \\    }
+    \\    defer close(opened.handle)
+    \\    if kind_of(try attributes(opened.handle)) != sys::fs::Kind.Directory {
+    \\        fail sys::fs::FsError.Denied
+    \\    }
+    \\} enter_directory
+    \\
+    \\/// Creates each missing directory of a full path's segments but its last; each separator after
+    \\/// the first segment ends the path in turn, then is put back.
     \\fn make_parents(mut path: Path) fails sys::fs::FsError {
     \\    for at in (path.base + 1)..<path.len {
     \\        if path.units[at] != 0x5C {
     \\            continue
     \\        }
     \\        path.units[at] = 0
-    \\        let opened = try open_directory(path)
+    \\        try enter_directory(path)
     \\        path.units[at] = 0x5C
-    \\        if not try keep_inside(opened) {
-    \\            fail sys::fs::FsError.Denied
-    \\        }
-    \\        discard CloseHandle(opened.handle)
     \\    }
     \\} make_parents
     \\
@@ -30864,6 +31437,11 @@ const TEXT_WINDOWS_PLATFORM_FILES: Str =
     \\    discard CloseHandle(handle)
     \\} close
     \\
+    \\/// Ends a search.
+    \\fn end_search(search: u64) {
+    \\    discard FindClose(search)
+    \\} end_search
+    \\
     \\/// Writes every byte of `data` to a file at its position.
     \\fn write_whole(handle: u64, data: Slice[u8]) fails sys::fs::FsError {
     \\    var done: usize = 0
@@ -30890,6 +31468,78 @@ const TEXT_WINDOWS_PLATFORM_FILES: Str =
     \\    }
     \\    return usize.widen(read[0])
     \\} read_some
+    \\
+    \\/// Moves an open file or directory to a full path, replacing a file there.
+    \\fn move_to(handle: u64, path: Path) fails sys::fs::FsError {
+    \\    var information = Array[u32, 1_030].filled(0)
+    \\    information[0] = 1
+    \\    information[4] = u32.fit(2 * path.len)
+    \\    for at in 0..<path.len {
+    \\        let unit = u32.widen(path.units[at])
+    \\        let word = 5 + at / 2
+    \\        if at % 2 == 0 {
+    \\            information[word] = unit
+    \\        } else {
+    \\            information[word] = information[word] | (unit << 16)
+    \\        }
+    \\    }
+    \\    if SetFileInformationByHandle(handle, class: RENAME_CLASS, information: hw::Ptr.of_view_mut(mut information.view_mut()), len: u32.fit(24 + 2 * path.len)) == 0 {
+    \\        fail failure(last_error())
+    \\    }
+    \\} move_to
+    \\
+    \\/// The full path searching every entry of an open directory.
+    \\fn search_pattern(handle: u64) -> Path fails sys::fs::FsError {
+    \\    var pattern = Path(units: Array[u16, 2_048].filled(0), len: 0, base: 0)
+    \\    final_path(handle, buffer: mut pattern)
+    \\    if pattern.len == 0 {
+    \\        fail sys::fs::FsError.InvalidPath
+    \\    }
+    \\    if pattern.units[pattern.len - 1] != 0x5C and not push_unit(mut pattern, unit: 0x5C) {
+    \\        fail sys::fs::FsError.InvalidPath
+    \\    }
+    \\    if not push_unit(mut pattern, unit: 0x2A) {
+    \\        fail sys::fs::FsError.InvalidPath
+    \\    }
+    \\    pattern.units[pattern.len] = 0
+    \\    return pattern
+    \\} search_pattern
+    \\
+    \\/// The unit at an index of the name a search's data holds, 0 past its 260 units.
+    \\fn name_unit(data: Slice[u32], at: usize) -> u16 {
+    \\    if at >= 260 {
+    \\        return 0
+    \\    }
+    \\    let word = data[11 + at / 2]
+    \\    if at % 2 == 1 {
+    \\        return u16.truncate(word >> 16)
+    \\    }
+    \\    return u16.truncate(word)
+    \\} name_unit
+    \\
+    \\/// Adds the entry a search's data holds to `entries` unless it is `.` or `..`; a name holding an
+    \\/// unpaired surrogate fails with `Denied`.
+    \\fn add_entry(mut entries: mem::List[sys::fs::Entry], data: Slice[u32], alloc: mem::Alloc) fails sys::fs::FsError {
+    \\    if name_unit(data, at: 0) == 0x2E and (name_unit(data, at: 1) == 0 or (name_unit(data, at: 1) == 0x2E and name_unit(data, at: 2) == 0)) {
+    \\        return
+    \\    }
+    \\    var name = text::String.empty(alloc)
+    \\    var at: usize = 0
+    \\    while name_unit(data, at) != 0 {
+    \\        var point = u32.widen(name_unit(data, at))
+    \\        let low = u32.widen(name_unit(data, at: at + 1))
+    \\        at += 1
+    \\        if point >= 0xD800 and point < 0xDC00 and low >= 0xDC00 and low < 0xE000 {
+    \\            point = 0x1_0000 + ((point - 0xD800) << 10) + (low - 0xDC00)
+    \\            at += 1
+    \\        }
+    \\        let Some(c) = char.checked_from_bits(point) else {
+    \\            fail sys::fs::FsError.Denied
+    \\        }
+    \\        mut name.push(c)
+    \\    }
+    \\    mut entries.push(sys::fs::Entry(name: take name, kind: kind_of(data[0])))
+    \\} add_entry
     \\
     \\pkg fn fs_open(dir: i32, prefix: Str, path: Str) -> i32 fails sys::fs::FsError {
     \\    return descriptor(try open_reading(prefix, path))
@@ -30925,7 +31575,7 @@ const TEXT_WINDOWS_PLATFORM_FILES: Str =
     \\
     \\pkg fn fs_remove(dir: i32, prefix: Str, path: Str) fails sys::fs::FsError {
     \\    let full = try full_path(prefix, path)
-    \\    let opened = try open_path(full, access: DELETE_ACCESS, disposition: OPEN_EXISTING, flags: OPEN_REPARSE_POINT)
+    \\    let opened = try open_path(full, access: DELETE_ACCESS, disposition: OPEN_EXISTING, flags: OPEN_REPARSE_POINT | BACKUP_SEMANTICS)
     \\    if not try keep_inside(opened) {
     \\        fail sys::fs::FsError.Denied
     \\    }
@@ -30936,6 +31586,74 @@ const TEXT_WINDOWS_PLATFORM_FILES: Str =
     \\        fail failure(error)
     \\    }
     \\} fs_remove
+    \\
+    \\pkg fn fs_create_dir(dir: i32, prefix: Str, path: Str) fails sys::fs::FsError {
+    \\    var full = try full_path(prefix, path)
+    \\    try make_parents(mut full)
+    \\    try enter_directory(full)
+    \\} fs_create_dir
+    \\
+    \\pkg fn fs_rename(dir: i32, prefix: Str, from: Str, to: Str) fails sys::fs::FsError {
+    \\    let source = try full_path(prefix, path: from)
+    \\    var target = try full_path(prefix, path: to)
+    \\    let opened = try open_path(source, access: DELETE_ACCESS, disposition: OPEN_EXISTING, flags: OPEN_REPARSE_POINT | BACKUP_SEMANTICS)
+    \\    if not try keep_inside(opened) {
+    \\        fail sys::fs::FsError.Denied
+    \\    }
+    \\    defer close(opened.handle)
+    \\    try make_parents(mut target)
+    \\    try move_to(opened.handle, path: target)
+    \\} fs_rename
+    \\
+    \\pkg fn fs_kind(dir: i32, prefix: Str, path: Str) -> sys::fs::Kind fails sys::fs::FsError {
+    \\    let full = try full_path(prefix, path)
+    \\    var flags = BACKUP_SEMANTICS
+    \\    if path.byte_len() > 0 {
+    \\        flags = flags | OPEN_REPARSE_POINT
+    \\    }
+    \\    let opened = try open_path(full, access: READ_ATTRIBUTES, disposition: OPEN_EXISTING, flags)
+    \\    if not try keep_inside(opened) {
+    \\        fail sys::fs::FsError.Denied
+    \\    }
+    \\    defer close(opened.handle)
+    \\    return kind_of(try attributes(opened.handle))
+    \\} fs_kind
+    \\
+    \\pkg fn fs_list(dir: i32, prefix: Str, path: Str, alloc: mem::Alloc) -> mem::List[sys::fs::Entry] fails sys::fs::FsError {
+    \\    let full = try full_path(prefix, path)
+    \\    let opened = try open_path(full, access: READ_ATTRIBUTES, disposition: OPEN_EXISTING, flags: BACKUP_SEMANTICS)
+    \\    if not try keep_inside(opened) {
+    \\        fail sys::fs::FsError.Denied
+    \\    }
+    \\    defer close(opened.handle)
+    \\    if kind_of(try attributes(opened.handle)) != sys::fs::Kind.Directory {
+    \\        fail sys::fs::FsError.Denied
+    \\    }
+    \\    let pattern = try search_pattern(opened.handle)
+    \\    var entries = mem::List[sys::fs::Entry].empty(alloc)
+    \\    var data = Array[u32, 148].filled(0)
+    \\    let search = FindFirstFileW(hw::Ptr.of_view(pattern.units.view()), data: hw::Ptr.of_view_mut(mut data.view_mut()))
+    \\    if search == INVALID {
+    \\        let error = last_error()
+    \\        if error != NO_ENTRY {
+    \\            fail failure(error)
+    \\        }
+    \\        return entries
+    \\    }
+    \\    defer end_search(search)
+    \\    loop {
+    \\        try add_entry(mut entries, data: data.view(), alloc)
+    \\        if FindNextFileW(search, data: hw::Ptr.of_view_mut(mut data.view_mut())) == 0 {
+    \\            let error = last_error()
+    \\            if error != NO_MORE_ENTRIES {
+    \\                fail failure(error)
+    \\            }
+    \\            break
+    \\        }
+    \\    }
+    \\    mut entries.sort_by(fn(left: sys::fs::Entry, right: sys::fs::Entry) => left.name.as_str().cmp(right.name.as_str()))
+    \\    return entries
+    \\} fs_list
     \\
     \\pkg fn file_read(fd: i32, address: u64, len: usize) -> usize fails sys::fs::FsError {
     \\    return try read_some(handle_of(fd), address, len)

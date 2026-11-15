@@ -66,6 +66,14 @@ pub fn Fs.write_all(self, path: Str, data: Slice[u8]) fails fs::FsError uses wai
 
 pub fn Fs.remove(self, path: Str) fails fs::FsError uses wait
 
+pub fn Fs.create_dir(self, path: Str) fails fs::FsError uses wait
+
+pub fn Fs.rename(self, from: Str, to: Str) fails fs::FsError uses wait
+
+pub fn Fs.kind(self, path: Str) -> fs::Kind fails fs::FsError uses wait
+
+pub fn Fs.list(self, path: Str, alloc: mem::Alloc) -> mem::List[fs::Entry] fails fs::FsError uses wait
+
 pub open struct Net {
 } Net
 
@@ -149,6 +157,17 @@ pub open enum StdioError derives Render {
 pub open struct File {
 } File
 
+pub closed enum Kind derives Copy, Eq, Render {
+    File
+    Directory
+    Other
+} Kind
+
+pub closed struct Entry {
+    pub name: text::String
+    pub kind: Kind
+} Entry
+
 pub fn File.read(mut self, mut buf: Untrusted[SliceMut[u8]]) -> usize fails FsError uses wait
 
 pub fn File.write(mut self, data: Slice[u8]) -> usize fails FsError uses wait
@@ -196,7 +215,7 @@ pub open enum NetError derives Render {
 ```
 
 - A `sys::Fs` reaches one directory tree. A path is relative, its segments separated by `/`, and names the entry its segments reach from the tree's root; an empty segment, `.`, `..` or a segment holding the char `'\0'` fails with `sys::fs::FsError.InvalidPath`. Resolution never leaves the tree: a symbolic link leading outside it fails with `sys::fs::FsError.Denied`. `subdir` checks only the path's form.
-- `open` opens a file for reading and `create` creates or truncates one for writing; the other direction fails with `sys::fs::FsError.Denied`. `read_all` returns a file's contents, drawn through `alloc`, and traps when `alloc` is exhausted (`trap.exhausted`). `write_all` replaces a file's contents, creating it when missing, `remove` deletes a file and `byte_len` returns a file's length in bytes. `create` and `write_all` create the missing directories of their path. A missing file fails with `sys::fs::FsError.NotFound`, a full device with `sys::fs::FsError.NoSpace`, and a path naming a directory where a file is expected or a refusal by the platform with `sys::fs::FsError.Denied`.
+- `open` opens a file for reading and `create` creates or truncates one for writing; the other direction fails with `sys::fs::FsError.Denied`. `read_all` returns a file's contents, drawn through `alloc`, and traps when `alloc` is exhausted (`trap.exhausted`). `write_all` replaces a file's contents, creating it when missing, `remove` deletes a file or an empty directory and `byte_len` returns a file's length in bytes. `create_dir` creates a directory, doing nothing when one is there, and `rename` moves the file or directory `from` names to `to`, replacing a file there. `create`, `write_all`, `create_dir` and `rename` create the missing directories of their path, of `to` for `rename`. `kind` gives what the path names: a file, a directory or another entry. `list` gives the entries of a directory, drawn through `alloc` and trapping when it is exhausted, in byte order of name, each with its name and kind, `.` and `..` excluded; a name that is not UTF-8 fails it with `sys::fs::FsError.Denied`. The empty path names the tree's root for `kind` and `list`, and fails with `sys::fs::FsError.InvalidPath` for every other operation. A missing file fails with `sys::fs::FsError.NotFound`, a full device with `sys::fs::FsError.NoSpace`, and a path naming a directory where a file is expected, a file where a directory is expected, a directory `remove` finds not empty or a refusal by the platform with `sys::fs::FsError.Denied`.
 - `sys::Net.listen` accepts TCP connections on `port` at every local address, failing with `sys::net::NetError.AddressInUse` when the port is taken. `sys::Net.connect` opens one to `host`, an IPv4 or IPv6 address literal or a name the platform resolves, failing with `sys::net::NetError.Refused` when the peer refuses it and with `sys::net::NetError.Unreachable` when the host does not resolve or cannot be reached. Port 0 and a refusal by the platform fail with `sys::net::NetError.Denied`. A read of a connection returns 0 once the peer has closed it and every byte it sent has been read, and fails with `sys::net::NetError.Reset` once the peer has reset it and every byte that reached it has been read; a write on a connection the peer closed or reset fails with `sys::net::NetError.Reset`. `sys::net::Conn.close` sends the data not yet sent, shuts the connection down and returns once the platform reports it closed; `sys::net::Conn.abandon` discards the data not yet sent and resets the connection.
 - A `sys::Clock` counts monotonic time in nanoseconds from the minting of its root grant, and has a **resolution**, 1 ns for a root grant's clock. `elapsed_ns` returns the nanoseconds elapsed, rounded down to a multiple of the resolution, and never decreases; `elapsed_ms` returns them divided by 1,000,000. `sleep_ns` returns once at least `ns` nanoseconds have elapsed and the elapsed nanoseconds are a multiple of the resolution. `sleep(ms)` is `sleep_ns` of `ms` × 1,000,000, or of the largest `u64` when that product exceeds it; every millisecond form of the clock's waits converts its duration so.
 - `c.coarse(ns)` returns a clock reading the same time with the greater of `c`'s resolution and `ns` ([attenuation](#attenuation)), and fails with `sys::Revoked.Stale` when `c` is stale. Code given only a clock of resolution r can time nothing finer than r.
@@ -254,6 +273,10 @@ pub interface FsService {
     fn write(self, file: u64, data: Slice[u8]) -> usize fails fs::FsError uses wait limits stack 4_096
     fn byte_len(self, file: u64) -> u64 fails fs::FsError uses wait limits stack 4_096
     fn release(self, file: u64) limits stack 4_096
+    fn create_dir(self, path: Str) fails fs::FsError uses wait limits stack 4_096
+    fn rename(self, from: Str, to: Str) fails fs::FsError uses wait limits stack 4_096
+    fn kind(self, path: Str) -> fs::Kind fails fs::FsError uses wait limits stack 4_096
+    fn list(self, path: Str, alloc: mem::Alloc) -> mem::List[fs::Entry] fails fs::FsError uses wait limits stack 4_096
 } FsService
 
 pub interface NetService {
@@ -316,7 +339,7 @@ pub fn Runner.put_resource(self, id: u64, take resource: Held) fails RunnerError
 
 - `sys::Runner.denied()` gives a runner whose handle is stale from the start.
 - `C.served(service)` of `Fs`, `Net`, `Clock`, `WallClock`, `Log`, `Random`, `Stdio` or `Runner` returns a capability whose entry derives from the entry of `service` ([capability tables](#capability-tables)), so revoking `service`, or closing its minter, revokes it; it fails with `sys::Revoked.Stale` when `service` is stale.
-- The operations of a served capability call `service`'s methods on the calling task, on every target: `Log.info`, `warn` and `error` call `log` with their level, their message and the rendering of their value within the budget of 1,024 bytes; `Random.fill` calls `fill`; `Clock.elapsed_ns` calls `elapsed_ns`, its reading rounded down to a multiple of the clock's resolution, and `elapsed_ms` that reading in whole milliseconds; `Clock.sleep` and `sleep_ns` call `sleep_ns` with their duration in nanoseconds; `WallClock.now_ns` calls `now_ns`, its reading rounded down likewise; `Stdio.read_in`, `write_out` and `write_err` call the method of their name; `Fs.open`, `create`, `read_all`, `write_all` and `remove` call the method of their name with their path joined, by `/`, to the paths of the `subdir` calls the capability derives through; and `Net.listen` and `connect` call the method of their name. Each operation fails as its method fails, a count past `buf`'s or `data`'s length counting as that length and a write's count of 0 for a `data` that is not empty as 1. The checks of the capability's own restrictions come first: an operation that the form of its path, `read_only` or `only_host` refuses calls no method.
+- The operations of a served capability call `service`'s methods on the calling task, on every target: `Log.info`, `warn` and `error` call `log` with their level, their message and the rendering of their value within the budget of 1,024 bytes; `Random.fill` calls `fill`; `Clock.elapsed_ns` calls `elapsed_ns`, its reading rounded down to a multiple of the clock's resolution, and `elapsed_ms` that reading in whole milliseconds; `Clock.sleep` and `sleep_ns` call `sleep_ns` with their duration in nanoseconds; `WallClock.now_ns` calls `now_ns`, its reading rounded down likewise; `Stdio.read_in`, `write_out` and `write_err` call the method of their name; `Fs.open`, `create`, `read_all`, `write_all`, `remove`, `create_dir`, `kind` and `list` call the method of their name with their path, and `rename` with each of its paths, joined, by `/` when the path is not empty, to the paths of the `subdir` calls the capability derives through; and `Net.listen` and `connect` call the method of their name. Each operation fails as its method fails, a count past `buf`'s or `data`'s length counting as that length and a write's count of 0 for a `data` that is not empty as 1. The checks of the capability's own restrictions come first: an operation that the form of its path, `read_only` or `only_host` refuses calls no method.
 - A file, listener or connection opened through a served capability holds the number its method returned, and its operations call the method of their name with that number, except `sys::net::Conn.abandon`, which calls `reset`. Releasing a file or listener calls `release`, and [settlement](11-errors-domains.md#settlement) releasing a connection calls `reset`. `release`, `reset` and `close` are called whether or not the resource's entry is revoked.
 - The operations of a served `Runner`, `runner.send_to(port, hash, bytes, handles)`, `call`, `reply`, `publish`, `sync`, `capability`, `drop_capability`, `resource`, `take_resource` and `put_resource`, call `service`'s method of their name with their arguments on the calling task, and fail as it fails. [Component contexts, ports and resources](26-components.md#runner-capabilities) act through them, and a kernel relays them for an instance in an isolated space ([component instances](#component-instances)). `RunnerError.Unknown` is how a kind refuses a port, request, capability or resource it does not know.
 - Each call of a method above, other than the `release` or `reset` that releasing a resource or `abandon` makes, runs on the calling task's stack when that stack has room for the method's `stack N`, and otherwise on a new [segment](17-suspension-io.md#grown-stacks) of it, of 64 KiB or of that room if more, returned once the method returns. A segment that cannot be drawn, or a call made on a stack other than a running task's, as an interrupt fn's, traps (`trap.exhausted`). A [stack use](10-effects-digests.md#stack-limits) counts such a call as a call of a support routine.
@@ -738,7 +761,7 @@ pub fn hold_isolated[T, E](cpu: hw::Ring0, job: sys::load::Isolated, component: 
 
 ## Attenuation
 
-**Attenuation** is deriving a capability with less authority through an ordinary method. The std attenuations are `sys::Fs.subdir`, which reaches only the tree under `path`; `sys::Fs.read_only`, whose `create`, `write_all` and `remove` fail with `sys::fs::FsError.Denied`; `sys::Net.only_host`, whose `connect` fails with `sys::net::NetError.Denied` unless its `host` equals, byte for byte, the `host` that `only_host` received and the source's `connect` does not deny that `host`, and whose `listen` always fails with it; `sys::Clock.coarse` and `sys::WallClock.coarse`, whose clock has a coarser resolution; `task::Executor.coarse`, whose delays end on a coarser resolution ([executors](16-concurrency.md#executors)); and `mem::Alloc.split` ([budgets](12-memory.md#budgets)).
+**Attenuation** is deriving a capability with less authority through an ordinary method. The std attenuations are `sys::Fs.subdir`, which reaches only the tree under `path`; `sys::Fs.read_only`, whose `create`, `write_all`, `remove`, `create_dir` and `rename` fail with `sys::fs::FsError.Denied`; `sys::Net.only_host`, whose `connect` fails with `sys::net::NetError.Denied` unless its `host` equals, byte for byte, the `host` that `only_host` received and the source's `connect` does not deny that `host`, and whose `listen` always fails with it; `sys::Clock.coarse` and `sys::WallClock.coarse`, whose clock has a coarser resolution; `task::Executor.coarse`, whose delays end on a coarser resolution ([executors](16-concurrency.md#executors)); and `mem::Alloc.split` ([budgets](12-memory.md#budgets)).
 
 - A std attenuation other than `split` adds an entry deriving from its source's entry to its source's table and returns a handle to it. The new entry keeps every restriction of its source, and revoking the source revokes it. An implementation may instead return a handle to an existing entry with the same source and restriction.
 - Any code may attenuate: a type whose private field holds a capability and whose methods expose less authority attenuates it.

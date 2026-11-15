@@ -91,7 +91,7 @@ The table names every pub std type, interface, free function and registry with t
 | `task` | `task::Executor`, `task::Share`, `task::Account` | [Executors](16-concurrency.md#executors) |
 | `task` | `task::Cancelled` | [Cancellation](11-errors-domains.md#cancellation) |
 | `task` | `task::Completion` | [Completion I/O](17-suspension-io.md#completion-io) |
-| `sys` | `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log`, `sys::Stdio`, `sys::StdioError`, `sys::fs::File`, `sys::fs::FsError`, `sys::net::Listener`, `sys::net::Conn`, `sys::net::NetError` | [Std capabilities](14-authority.md#std-capabilities) |
+| `sys` | `sys::Fs`, `sys::Net`, `sys::Clock`, `sys::WallClock`, `sys::Random`, `sys::Log`, `sys::Stdio`, `sys::StdioError`, `sys::fs::File`, `sys::fs::Kind`, `sys::fs::Entry`, `sys::fs::FsError`, `sys::net::Listener`, `sys::net::Conn`, `sys::net::NetError` | [Std capabilities](14-authority.md#std-capabilities) |
 | `sys` | `sys::LogLevel`, `sys::LogService`, `sys::RandomService`, `sys::StdioService`, `sys::FsService`, `sys::NetService`, `sys::Runner`, `sys::RunnerError`, `sys::RunnerService` | [Served capabilities](14-authority.md#served-capabilities) |
 | `sys` | `sys::Revoked`, `sys::Capability`, `sys::revocable`, `sys::Revoker` | [Revocation](14-authority.md#revocation) |
 | `sys` | `sys::Kind`, `sys::Minter`, `sys::reach`, `sys::derive` | [Capability kinds](14-authority.md#capability-kinds) |
@@ -349,8 +349,8 @@ Apart from [device accesses](10-effects-digests.md#reversibility), the std opera
 | Operations | Class |
 | --- | --- |
 | `sys::Log.info`, `sys::Log.warn`, `sys::Log.error`, `sys::Stdio.write_out`, `sys::Stdio.write_err`, `boot::Services.write_console`, `boot::Services.measure` | `recorded` |
-| `sys::fs::File.write`, `sys::Net.listen` | `restorable` |
-| `sys::Fs.create`, `sys::Fs.write_all`, `sys::Fs.remove`, `boot::Services.write_file`, `boot::Services.delete_file`, `boot::Services.set_variable`, `boot::Services.submit_tpm` | `irreversible(erase)` |
+| `sys::fs::File.write`, `sys::Fs.create_dir`, `sys::Net.listen` | `restorable` |
+| `sys::Fs.create`, `sys::Fs.write_all`, `sys::Fs.remove`, `sys::Fs.rename`, `boot::Services.write_file`, `boot::Services.delete_file`, `boot::Services.set_variable`, `boot::Services.submit_tpm` | `irreversible(erase)` |
 | `sys::Net.connect`, `sys::net::Conn.write`, `sys::net::Conn.close`, `sys::net::Conn.abandon` | `irreversible(emit)` |
 | `hw::Ring0.firmware_call`, `boot::Machine.enter` | `irreversible(emit, actuate, erase, spend)` |
 

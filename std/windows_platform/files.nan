@@ -16,8 +16,16 @@ foreign fn SetEndOfFile(handle: u64) -> i32 convention "win64"
 
 foreign fn SetFileInformationByHandle(handle: u64, class: u32, information: hw::Ptr[u32], len: u32) -> i32 convention "win64"
 
+foreign fn GetFileInformationByHandle(handle: u64, information: hw::Ptr[u32]) -> i32 convention "win64"
+
+foreign fn FindFirstFileW(name: hw::Ptr[u16], data: hw::Ptr[u32]) -> u64 convention "win64"
+
+foreign fn FindNextFileW(search: u64, data: hw::Ptr[u32]) -> i32 convention "win64"
+
+foreign fn FindClose(search: u64) -> i32 convention "win64"
+
 /// The access rights of a file read from, of one written to and removed when it was created
-/// outside, and of one removed.
+/// outside, and of one removed or renamed.
 const READ_ACCESS: u32 = 0x8000_0000
 
 const WRITE_ACCESS: u32 = 0x4001_0000
@@ -45,11 +53,25 @@ const READ_ATTRIBUTES: u32 = 0x80
 /// The handle `CreateFileW` gives on failure.
 const INVALID: u64 = 0xFFFF_FFFF_FFFF_FFFF
 
-/// The error code of a file or directory that already exists, and the information class
-/// marking a file for removal once its handles close.
+/// The error code of a file or directory that already exists, and the information classes
+/// marking a file for removal once its handles close and renaming it.
 const ALREADY_EXISTS: u32 = 183
 
 const REMOVAL_CLASS: u32 = 4
+
+const RENAME_CLASS: u32 = 3
+
+/// The negated error codes of a search finding no entry and of one finding no more.
+const NO_ENTRY: i64 = -2
+
+const NO_MORE_ENTRIES: i64 = -18
+
+/// The attributes of a directory, a device and a reparse point such as a symbolic link.
+const DIRECTORY: u32 = 0x10
+
+const DEVICE: u32 = 0x40
+
+const REPARSE_POINT: u32 = 0x400
 
 /// The UTF-16 units a path buffer holds, and the most a full path has, its NUL excluded.
 const PATH_UNITS: usize = 2_048
@@ -162,8 +184,8 @@ fn final_path(handle: u64, mut buffer: Path) {
     }
 } final_path
 
-/// Whether an open handle's final path lies beneath the final path of the working directory,
-/// which `.` opens.
+/// Whether an open handle's final path is or lies beneath the final path of the working
+/// directory, which `.` opens.
 fn inside(handle: u64) -> bool fails sys::fs::FsError {
     var working = Array[u16, 2].filled(0)
     working[0] = 0x2E
@@ -176,7 +198,7 @@ fn inside(handle: u64) -> bool fails sys::fs::FsError {
     discard CloseHandle(root)
     var reached = Path(units: Array[u16, 2_048].filled(0), len: 0, base: 0)
     final_path(handle, buffer: mut reached)
-    if tree.len == 0 or reached.len <= tree.len {
+    if tree.len == 0 or reached.len < tree.len {
         return false
     }
     for at in 0..<tree.len {
@@ -184,7 +206,7 @@ fn inside(handle: u64) -> bool fails sys::fs::FsError {
             return false
         }
     }
-    return reached.units[tree.len] == 0x5C
+    return reached.len == tree.len or reached.units[tree.len] == 0x5C
 } inside
 
 /// A handle a path was opened with, and whether opening it created the file.
@@ -208,8 +230,8 @@ fn mark_removed(handle: u64) -> bool {
     return SetFileInformationByHandle(handle, class: REMOVAL_CLASS, information: hw::Ptr.of_view_mut(mut removed.view_mut()), len: 4) != 0
 } mark_removed
 
-/// Closes a handle unless its file lies beneath the working directory, removing the file when
-/// its open created it: whether it lies there.
+/// Closes a handle unless its file is or lies beneath the working directory, removing the file
+/// when its open created it: whether it lies there.
 fn keep_inside(opened: Opened) -> bool fails sys::fs::FsError {
     if try inside(opened.handle) {
         return true
@@ -221,8 +243,29 @@ fn keep_inside(opened: Opened) -> bool fails sys::fs::FsError {
     return false
 } keep_inside
 
-/// Opens an existing directory of a full path, creating it when it is missing.
-fn open_directory(path: Path) -> Opened fails sys::fs::FsError {
+/// The attributes of an open file.
+fn attributes(handle: u64) -> u32 fails sys::fs::FsError {
+    var information = Array[u32, 13].filled(0)
+    if GetFileInformationByHandle(handle, information: hw::Ptr.of_view_mut(mut information.view_mut())) == 0 {
+        fail failure(last_error())
+    }
+    return information[0]
+} attributes
+
+/// The kind of an entry with these attributes: a reparse point or a device is neither a file nor
+/// a directory.
+fn kind_of(found: u32) -> sys::fs::Kind {
+    if (found & (REPARSE_POINT | DEVICE)) != 0 {
+        return sys::fs::Kind.Other
+    }
+    if (found & DIRECTORY) != 0 {
+        return sys::fs::Kind.Directory
+    }
+    return sys::fs::Kind.File
+} kind_of
+
+/// Opens what a full path names, creating a directory there when nothing is.
+fn open_or_create_directory(path: Path) -> Opened fails sys::fs::FsError {
     match attempt open_path(path, access: READ_ATTRIBUTES, disposition: OPEN_EXISTING, flags: BACKUP_SEMANTICS) {
         Ok(opened) => return opened
         Err(error) => match error {
@@ -234,23 +277,31 @@ fn open_directory(path: Path) -> Opened fails sys::fs::FsError {
         fail failure(last_error())
     }
     return try open_path(path, access: READ_ATTRIBUTES, disposition: OPEN_EXISTING, flags: BACKUP_SEMANTICS)
-} open_directory
+} open_or_create_directory
 
-/// Creates each missing directory of a full path's segments but its last, each once it is found
-/// to lie beneath the working directory; each separator after the first segment ends the path in
-/// turn, then is put back.
+/// Makes sure a full path names a directory beneath the working directory, creating it when
+/// nothing is there; anything else there fails with `Denied`.
+fn enter_directory(path: Path) fails sys::fs::FsError {
+    let opened = try open_or_create_directory(path)
+    if not try keep_inside(opened) {
+        fail sys::fs::FsError.Denied
+    }
+    defer close(opened.handle)
+    if kind_of(try attributes(opened.handle)) != sys::fs::Kind.Directory {
+        fail sys::fs::FsError.Denied
+    }
+} enter_directory
+
+/// Creates each missing directory of a full path's segments but its last; each separator after
+/// the first segment ends the path in turn, then is put back.
 fn make_parents(mut path: Path) fails sys::fs::FsError {
     for at in (path.base + 1)..<path.len {
         if path.units[at] != 0x5C {
             continue
         }
         path.units[at] = 0
-        let opened = try open_directory(path)
+        try enter_directory(path)
         path.units[at] = 0x5C
-        if not try keep_inside(opened) {
-            fail sys::fs::FsError.Denied
-        }
-        discard CloseHandle(opened.handle)
     }
 } make_parents
 
@@ -286,6 +337,11 @@ fn close(handle: u64) {
     discard CloseHandle(handle)
 } close
 
+/// Ends a search.
+fn end_search(search: u64) {
+    discard FindClose(search)
+} end_search
+
 /// Writes every byte of `data` to a file at its position.
 fn write_whole(handle: u64, data: Slice[u8]) fails sys::fs::FsError {
     var done: usize = 0
@@ -312,6 +368,78 @@ fn read_some(handle: u64, address: u64, len: usize) -> usize fails sys::fs::FsEr
     }
     return usize.widen(read[0])
 } read_some
+
+/// Moves an open file or directory to a full path, replacing a file there.
+fn move_to(handle: u64, path: Path) fails sys::fs::FsError {
+    var information = Array[u32, 1_030].filled(0)
+    information[0] = 1
+    information[4] = u32.fit(2 * path.len)
+    for at in 0..<path.len {
+        let unit = u32.widen(path.units[at])
+        let word = 5 + at / 2
+        if at % 2 == 0 {
+            information[word] = unit
+        } else {
+            information[word] = information[word] | (unit << 16)
+        }
+    }
+    if SetFileInformationByHandle(handle, class: RENAME_CLASS, information: hw::Ptr.of_view_mut(mut information.view_mut()), len: u32.fit(24 + 2 * path.len)) == 0 {
+        fail failure(last_error())
+    }
+} move_to
+
+/// The full path searching every entry of an open directory.
+fn search_pattern(handle: u64) -> Path fails sys::fs::FsError {
+    var pattern = Path(units: Array[u16, 2_048].filled(0), len: 0, base: 0)
+    final_path(handle, buffer: mut pattern)
+    if pattern.len == 0 {
+        fail sys::fs::FsError.InvalidPath
+    }
+    if pattern.units[pattern.len - 1] != 0x5C and not push_unit(mut pattern, unit: 0x5C) {
+        fail sys::fs::FsError.InvalidPath
+    }
+    if not push_unit(mut pattern, unit: 0x2A) {
+        fail sys::fs::FsError.InvalidPath
+    }
+    pattern.units[pattern.len] = 0
+    return pattern
+} search_pattern
+
+/// The unit at an index of the name a search's data holds, 0 past its 260 units.
+fn name_unit(data: Slice[u32], at: usize) -> u16 {
+    if at >= 260 {
+        return 0
+    }
+    let word = data[11 + at / 2]
+    if at % 2 == 1 {
+        return u16.truncate(word >> 16)
+    }
+    return u16.truncate(word)
+} name_unit
+
+/// Adds the entry a search's data holds to `entries` unless it is `.` or `..`; a name holding an
+/// unpaired surrogate fails with `Denied`.
+fn add_entry(mut entries: mem::List[sys::fs::Entry], data: Slice[u32], alloc: mem::Alloc) fails sys::fs::FsError {
+    if name_unit(data, at: 0) == 0x2E and (name_unit(data, at: 1) == 0 or (name_unit(data, at: 1) == 0x2E and name_unit(data, at: 2) == 0)) {
+        return
+    }
+    var name = text::String.empty(alloc)
+    var at: usize = 0
+    while name_unit(data, at) != 0 {
+        var point = u32.widen(name_unit(data, at))
+        let low = u32.widen(name_unit(data, at: at + 1))
+        at += 1
+        if point >= 0xD800 and point < 0xDC00 and low >= 0xDC00 and low < 0xE000 {
+            point = 0x1_0000 + ((point - 0xD800) << 10) + (low - 0xDC00)
+            at += 1
+        }
+        let Some(c) = char.checked_from_bits(point) else {
+            fail sys::fs::FsError.Denied
+        }
+        mut name.push(c)
+    }
+    mut entries.push(sys::fs::Entry(name: take name, kind: kind_of(data[0])))
+} add_entry
 
 pkg fn fs_open(dir: i32, prefix: Str, path: Str) -> i32 fails sys::fs::FsError {
     return descriptor(try open_reading(prefix, path))
@@ -347,7 +475,7 @@ pkg fn fs_write_all(dir: i32, prefix: Str, path: Str, data: Slice[u8]) fails sys
 
 pkg fn fs_remove(dir: i32, prefix: Str, path: Str) fails sys::fs::FsError {
     let full = try full_path(prefix, path)
-    let opened = try open_path(full, access: DELETE_ACCESS, disposition: OPEN_EXISTING, flags: OPEN_REPARSE_POINT)
+    let opened = try open_path(full, access: DELETE_ACCESS, disposition: OPEN_EXISTING, flags: OPEN_REPARSE_POINT | BACKUP_SEMANTICS)
     if not try keep_inside(opened) {
         fail sys::fs::FsError.Denied
     }
@@ -358,6 +486,74 @@ pkg fn fs_remove(dir: i32, prefix: Str, path: Str) fails sys::fs::FsError {
         fail failure(error)
     }
 } fs_remove
+
+pkg fn fs_create_dir(dir: i32, prefix: Str, path: Str) fails sys::fs::FsError {
+    var full = try full_path(prefix, path)
+    try make_parents(mut full)
+    try enter_directory(full)
+} fs_create_dir
+
+pkg fn fs_rename(dir: i32, prefix: Str, from: Str, to: Str) fails sys::fs::FsError {
+    let source = try full_path(prefix, path: from)
+    var target = try full_path(prefix, path: to)
+    let opened = try open_path(source, access: DELETE_ACCESS, disposition: OPEN_EXISTING, flags: OPEN_REPARSE_POINT | BACKUP_SEMANTICS)
+    if not try keep_inside(opened) {
+        fail sys::fs::FsError.Denied
+    }
+    defer close(opened.handle)
+    try make_parents(mut target)
+    try move_to(opened.handle, path: target)
+} fs_rename
+
+pkg fn fs_kind(dir: i32, prefix: Str, path: Str) -> sys::fs::Kind fails sys::fs::FsError {
+    let full = try full_path(prefix, path)
+    var flags = BACKUP_SEMANTICS
+    if path.byte_len() > 0 {
+        flags = flags | OPEN_REPARSE_POINT
+    }
+    let opened = try open_path(full, access: READ_ATTRIBUTES, disposition: OPEN_EXISTING, flags)
+    if not try keep_inside(opened) {
+        fail sys::fs::FsError.Denied
+    }
+    defer close(opened.handle)
+    return kind_of(try attributes(opened.handle))
+} fs_kind
+
+pkg fn fs_list(dir: i32, prefix: Str, path: Str, alloc: mem::Alloc) -> mem::List[sys::fs::Entry] fails sys::fs::FsError {
+    let full = try full_path(prefix, path)
+    let opened = try open_path(full, access: READ_ATTRIBUTES, disposition: OPEN_EXISTING, flags: BACKUP_SEMANTICS)
+    if not try keep_inside(opened) {
+        fail sys::fs::FsError.Denied
+    }
+    defer close(opened.handle)
+    if kind_of(try attributes(opened.handle)) != sys::fs::Kind.Directory {
+        fail sys::fs::FsError.Denied
+    }
+    let pattern = try search_pattern(opened.handle)
+    var entries = mem::List[sys::fs::Entry].empty(alloc)
+    var data = Array[u32, 148].filled(0)
+    let search = FindFirstFileW(hw::Ptr.of_view(pattern.units.view()), data: hw::Ptr.of_view_mut(mut data.view_mut()))
+    if search == INVALID {
+        let error = last_error()
+        if error != NO_ENTRY {
+            fail failure(error)
+        }
+        return entries
+    }
+    defer end_search(search)
+    loop {
+        try add_entry(mut entries, data: data.view(), alloc)
+        if FindNextFileW(search, data: hw::Ptr.of_view_mut(mut data.view_mut())) == 0 {
+            let error = last_error()
+            if error != NO_MORE_ENTRIES {
+                fail failure(error)
+            }
+            break
+        }
+    }
+    mut entries.sort_by(fn(left: sys::fs::Entry, right: sys::fs::Entry) => left.name.as_str().cmp(right.name.as_str()))
+    return entries
+} fs_list
 
 pkg fn file_read(fd: i32, address: u64, len: usize) -> usize fails sys::fs::FsError {
     return try read_some(handle_of(fd), address, len)

@@ -251,16 +251,25 @@ fn fs(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let capability = supply.param(0).address();
     let ([directory, _, _, flags], table) = checked_served(lo, fx, supply, capability);
     let member = supply.member();
-    if matches!(member, "create" | "write_all" | "remove") {
+    if matches!(
+        member,
+        "create" | "write_all" | "remove" | "create_dir" | "rename"
+    ) {
         let read_only = fx.b.ins().icmp_imm_s(IntCC::NotEqual, flags, 0);
         fx.when(read_only, |fx| fail_with(lo, fx, supply, "Denied"));
     }
-    if matches!(
-        member,
-        "subdir" | "open" | "create" | "read_all" | "write_all" | "remove"
-    ) {
-        let (start, len) = view(fx, supply.param(1));
-        let valid = valid_path(fx, start, len);
+    let paths = match member {
+        "read_only" => 0,
+        "rename" => 2,
+        _ => 1,
+    };
+    for index in 1..=paths {
+        let (start, len) = view(fx, supply.param(index));
+        let mut valid = valid_path(fx, start, len);
+        if matches!(member, "kind" | "list") {
+            let root = fx.b.ins().icmp_imm_s(IntCC::Equal, len, 0);
+            valid = fx.b.ins().bor(valid, root);
+        }
         let invalid = fx.b.ins().bxor_imm_s(valid, 1);
         fx.when(invalid, |fx| fail_with(lo, fx, supply, "InvalidPath"));
     }
@@ -294,6 +303,10 @@ fn fs(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             "read_all" => sims::fs::read_all(lo, fx, supply, directory),
             "write_all" => sims::fs::write_all(lo, fx, supply, directory),
             "remove" => sims::fs::remove(lo, fx, supply, directory),
+            "create_dir" => sims::fs::create_dir(lo, fx, supply, directory),
+            "rename" => sims::fs::rename(lo, fx, supply, directory),
+            "kind" => sims::fs::kind(lo, fx, supply, directory),
+            "list" => sims::fs::list(lo, fx, supply, directory),
             member => panic!("no lowering of sys::Fs.{member}"),
         }
         return;
@@ -314,6 +327,16 @@ fn fs(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             vec![directory, path, supply.param(1), supply.param(2)],
         ),
         "remove" => ("fs_remove", vec![directory, path, supply.param(1)]),
+        "create_dir" => ("fs_create_dir", vec![directory, path, supply.param(1)]),
+        "rename" => (
+            "fs_rename",
+            vec![directory, path, supply.param(1), supply.param(2)],
+        ),
+        "kind" => ("fs_kind", vec![directory, path, supply.param(1)]),
+        "list" => (
+            "fs_list",
+            vec![directory, path, supply.param(1), supply.param(2)],
+        ),
         member => panic!("no lowering of sys::Fs.{member}"),
     };
     let called = lo.platform_call(fx, name, &args);
@@ -324,7 +347,7 @@ fn fs(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let fd = fx.b.ins().sextend(PTR, result.scalar());
             ret_resource(lo, fx, supply, handle, fd);
         }
-        "read_all" => supply.ret(lo, fx, result),
+        "read_all" | "kind" | "list" => supply.ret(lo, fx, result),
         _ => supply.done(lo, fx),
     });
 }

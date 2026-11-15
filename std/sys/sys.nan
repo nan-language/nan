@@ -72,6 +72,14 @@ pub fn Fs.write_all(self, path: Str, data: Slice[u8]) fails fs::FsError uses wai
 
 pub fn Fs.remove(self, path: Str) fails fs::FsError uses wait
 
+pub fn Fs.create_dir(self, path: Str) fails fs::FsError uses wait
+
+pub fn Fs.rename(self, from: Str, to: Str) fails fs::FsError uses wait
+
+pub fn Fs.kind(self, path: Str) -> fs::Kind fails fs::FsError uses wait
+
+pub fn Fs.list(self, path: Str, alloc: mem::Alloc) -> mem::List[fs::Entry] fails fs::FsError uses wait
+
 pub open struct Net {
 } Net
 
@@ -195,6 +203,10 @@ pub interface FsService {
     fn write(self, file: u64, data: Slice[u8]) -> usize fails fs::FsError uses wait limits stack 4_096
     fn byte_len(self, file: u64) -> u64 fails fs::FsError uses wait limits stack 4_096
     fn release(self, file: u64) limits stack 4_096
+    fn create_dir(self, path: Str) fails fs::FsError uses wait limits stack 4_096
+    fn rename(self, from: Str, to: Str) fails fs::FsError uses wait limits stack 4_096
+    fn kind(self, path: Str) -> fs::Kind fails fs::FsError uses wait limits stack 4_096
+    fn list(self, path: Str, alloc: mem::Alloc) -> mem::List[fs::Entry] fails fs::FsError uses wait limits stack 4_096
 } FsService
 
 pub interface NetService {
@@ -986,6 +998,30 @@ fn Shelf.release(self, file: u64) limits stack 4_096 {
     discard reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => state.fetch_add(1))
 } Shelf.release
 
+fn Shelf.create_dir(self, path: Str) limits stack 4_096 {
+} Shelf.create_dir
+
+fn Shelf.rename(self, from: Str, to: Str) fails fs::FsError limits stack 4_096 {
+    if from.byte_len() == to.byte_len() {
+        fail fs::FsError.Denied
+    }
+} Shelf.rename
+
+/// A directory for the empty path, a file for any other.
+fn Shelf.kind(self, path: Str) -> fs::Kind limits stack 4_096 {
+    if path.byte_len() == 0 {
+        return fs::Kind.Directory
+    }
+    return fs::Kind.File
+} Shelf.kind
+
+/// One file, named by the path.
+fn Shelf.list(self, path: Str, alloc: mem::Alloc) -> mem::List[fs::Entry] limits stack 4_096 {
+    var entries = mem::List[fs::Entry].empty(alloc)
+    mut entries.push(fs::Entry(name: text::String.of(path, alloc), kind: fs::Kind.File))
+    return entries
+} Shelf.list
+
 /// Connections named by the length of their host or by their port, a line counting every call.
 struct Line {
 } Line
@@ -1583,6 +1619,23 @@ test read_only_fs_refuses_writes for Fs.read_only {
     expect denied
 } read_only_fs_refuses_writes
 
+test read_only_fs_refuses_directory_changes for Fs.read_only {
+    let world = testing::world()
+    try await world.fs.write_all("note", data: b"x")
+    let reader = try world.fs.read_only()
+    let made = attempt await reader.create_dir("logs")
+    let moved = attempt await reader.rename("note", to: "kept")
+    expect denied_by(made) and denied_by(moved)
+} read_only_fs_refuses_directory_changes
+
+/// Whether an outcome is a refusal with `Denied`.
+fn denied_by(outcome: Result[Unit, fs::FsError]) -> bool {
+    return match outcome {
+        Err(fs::FsError.Denied) => true
+        else => false
+    }
+} denied_by
+
 test open_of_a_missing_file_fails for Fs.open {
     let world = testing::world()
     let outcome = attempt await world.fs.open("missing")
@@ -1627,6 +1680,89 @@ test removed_file_cannot_be_opened for Fs.remove {
     }
     expect missing
 } removed_file_cannot_be_opened
+
+test removed_empty_directories_leave_their_parent for Fs.remove {
+    let world = testing::world()
+    try await world.fs.create_dir("logs/old")
+    try await world.fs.remove("logs/old")
+    let left = try await world.fs.list("logs", alloc: world.alloc)
+    try await world.fs.write_all("logs/day", data: b"x")
+    let outcome = attempt await world.fs.remove("logs")
+    let refused = match outcome {
+        Err(fs::FsError.Denied) => true
+        else => false
+    }
+    expect left.len() == 0 and refused
+} removed_empty_directories_leave_their_parent
+
+test created_directories_hold_no_entries for Fs.create_dir {
+    let world = testing::world()
+    try await world.fs.create_dir("logs/old")
+    try await world.fs.create_dir("logs/old")
+    let logs = try await world.fs.list("logs", alloc: world.alloc)
+    let old = try await world.fs.list("logs/old", alloc: world.alloc)
+    try await world.fs.write_all("note", data: b"x")
+    let outcome = attempt await world.fs.create_dir("note")
+    let refused = match outcome {
+        Err(fs::FsError.Denied) => true
+        else => false
+    }
+    expect logs.len() == 1 and logs[0].name.as_str() == "old" and logs[0].kind == fs::Kind.Directory
+    expect old.len() == 0 and refused
+} created_directories_hold_no_entries
+
+test renamed_entries_move_below_new_directories for Fs.rename {
+    let world = testing::world()
+    try await world.fs.write_all("draft", data: b"new")
+    try await world.fs.write_all("final/note", data: b"old")
+    try await world.fs.rename("draft", to: "final/note")
+    let replaced = try await world.fs.read_all("final/note", alloc: world.alloc)
+    try await world.fs.rename("final", to: "kept/final")
+    let moved = try await world.fs.read_all("kept/final/note", alloc: world.alloc)
+    let outcome = attempt await world.fs.kind("draft")
+    let missing = match outcome {
+        Err(fs::FsError.NotFound) => true
+        else => false
+    }
+    let root = try await world.fs.list("", alloc: world.alloc)
+    expect testing::same(replaced.view(), expected: Untrusted.of(b"new")) and testing::same(moved.view(), expected: Untrusted.of(b"new"))
+    expect missing and root.len() == 1 and root[0].name.as_str() == "kept"
+} renamed_entries_move_below_new_directories
+
+test kinds_tell_files_from_directories for Fs.kind {
+    let world = testing::world()
+    try await world.fs.write_all("notes/day", data: b"x")
+    let root = try await world.fs.kind("")
+    let notes = try await world.fs.kind("notes")
+    let day = try await world.fs.kind("notes/day")
+    let outcome = attempt await world.fs.kind("notes/night")
+    let missing = match outcome {
+        Err(fs::FsError.NotFound) => true
+        else => false
+    }
+    expect root == fs::Kind.Directory and notes == fs::Kind.Directory and day == fs::Kind.File and missing
+} kinds_tell_files_from_directories
+
+test listed_entries_come_in_byte_order_of_name for Fs.list {
+    let world = testing::world()
+    try await world.fs.write_all("b", data: b"x")
+    try await world.fs.write_all("a/c", data: b"x")
+    try await world.fs.create_dir("c")
+    let root = try await world.fs.list("", alloc: world.alloc)
+    let file = attempt await world.fs.list("b", alloc: world.alloc)
+    let refused = match file {
+        Err(fs::FsError.Denied) => true
+        else => false
+    }
+    let absent = attempt await world.fs.list("d", alloc: world.alloc)
+    let missing = match absent {
+        Err(fs::FsError.NotFound) => true
+        else => false
+    }
+    expect root.len() == 3 and root[0].name.as_str() == "a" and root[1].name.as_str() == "b" and root[2].name.as_str() == "c"
+    expect root[0].kind == fs::Kind.Directory and root[1].kind == fs::Kind.File and root[2].kind == fs::Kind.Directory
+    expect refused and missing
+} listed_entries_come_in_byte_order_of_name
 
 test narrowed_net_cannot_listen for Net.only_host {
     let world = testing::world()
@@ -2996,6 +3132,9 @@ test served_files_call_their_kind for Fs.served {
     let read = try await reads_back(reader, path: "notes")
     let written = attempt await reader.write_all("notes", data: b"x")
     let removed = attempt await docs.remove("notes")
+    let renamed = attempt await docs.rename("a", to: "b")
+    let kind = try await fs.kind("")
+    let listed = try await docs.list("notes", alloc: world.alloc)
     let released = reach(counter, body: tally_count)
     minter.revoke(shelf)
     let opened = attempt await docs.open("notes")
@@ -3011,7 +3150,12 @@ test served_files_call_their_kind for Fs.served {
         Err(fs::FsError.Revoked(Revoked.Stale)) => true
         else => false
     }
+    let joined = match renamed {
+        Err(fs::FsError.Denied) => true
+        else => false
+    }
     expect path.byte_len() == 10 and read and refused and missing and revoked and released == Some(1)
+    expect joined and kind == fs::Kind.Directory and listed.len() == 1 and listed[0].name.as_str() == "docs/notes"
 } served_files_call_their_kind
 
 /// Whether `net` denies a connection to `host`, abandoning one it opens.

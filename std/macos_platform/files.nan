@@ -9,6 +9,12 @@ foreign fn mkdirat(dir: i32, path: hw::Ptr[u8], mode: u16) -> i32 convention "da
 
 foreign fn unlinkat(dir: i32, path: hw::Ptr[u8], flags: i32) -> i32 convention "darwin"
 
+foreign fn renameat(from_dir: i32, from: hw::Ptr[u8], to_dir: i32, to: hw::Ptr[u8]) -> i32 convention "darwin"
+
+foreign fn getattrlistat(dir: i32, path: hw::Ptr[u8], attributes: hw::Ptr[AttrList], buffer: u64, size: usize, options: u64) -> i32 convention "darwin"
+
+foreign fn getattrlistbulk(dir: i32, attributes: hw::Ptr[AttrList], buffer: u64, size: usize, options: u64) -> i32 convention "darwin"
+
 /// The open flags of a file read from, written to after truncation or created, and of a
 /// directory, each closed on exec and resolved beneath the directory it opens from.
 const READ_ONLY: i32 = 0x0100_1000
@@ -21,6 +27,45 @@ const DIRECTORY: i32 = 0x0110_1000
 const FILE_MODE: u64 = 0x1A4
 
 const DIRECTORY_MODE: u16 = 0x1ED
+
+/// The `unlinkat` flag removing a directory.
+const REMOVE_DIRECTORY: i32 = 0x80
+
+/// The common attributes `getattrlistat` and `getattrlistbulk` are asked for: which were returned,
+/// an entry's name and its type.
+const RETURNED_ATTRIBUTES: u32 = 0x8000_0000
+
+const NAME_ATTRIBUTE: u32 = 0x1
+
+const TYPE_ATTRIBUTE: u32 = 0x8
+
+/// The options of `getattrlistat` not following a final symbolic link, and of `getattrlistbulk`
+/// giving every attribute asked for its place.
+const NO_FOLLOW: u64 = 0x1
+
+const PACK_INVALID: u64 = 0x8
+
+/// The types of a regular file and of a directory the type attribute gives.
+const REGULAR_TYPE: u32 = 1
+
+const DIRECTORY_TYPE: u32 = 2
+
+/// The offsets in an entry `getattrlistbulk` gives of the reference to its name and of its type,
+/// after its length and the attributes returned.
+const BULK_NAME: usize = 24
+
+const BULK_TYPE: usize = 32
+
+/// `struct attrlist`: the five groups of attributes asked for.
+layout AttrList: bytes 24 le {
+    count: u16 at 0
+    reserved: u16 at 2
+    common: u32 at 4
+    volume: u32 at 8
+    directory: u32 at 12
+    file: u32 at 16
+    fork: u32 at 20
+} AttrList
 
 /// The longest path the platform functions join, in bytes, its NUL excluded.
 const PATH_LIMIT: usize = 4_095
@@ -60,6 +105,18 @@ fn joined(prefix: Str, path: Str, mut buffer: Array[u8, 4_096]) -> bool {
     buffer[at] = 0
     return true
 } joined
+
+/// `joined` for an operation on a directory, where the empty path names `prefix` itself, and `.`
+/// the tree's root when `prefix` is empty too.
+fn joined_directory(prefix: Str, path: Str, mut buffer: Array[u8, 4_096]) -> bool {
+    if not path.is_empty() {
+        return joined(prefix, path, mut buffer)
+    }
+    if prefix.is_empty() {
+        return joined(prefix, path: ".", mut buffer)
+    }
+    return joined(prefix: "", path: prefix, mut buffer)
+} joined_directory
 
 /// The failure of an error number of a file operation.
 fn failure(code: i32) -> sys::fs::FsError {
@@ -147,6 +204,75 @@ fn open_beneath(dir: i32, prefix: Str, path: Str, flags: i32) -> i32 fails sys::
     return fd
 } open_beneath
 
+/// The type the type attribute gives of the entry `name` of the directory open as `fd`, a final
+/// symbolic link not followed.
+fn entry_type(fd: i32, name: Slice[u8]) -> u32 fails sys::fs::FsError {
+    var asked = AttrList(count: 5, reserved: 0, common: TYPE_ATTRIBUTE, volume: 0, directory: 0, file: 0, fork: 0)
+    var attributes = Array[u8, 8].filled(0)
+    let address = u64.widen(hw::Ptr.of_view_mut(mut attributes.view_mut()).addr())
+    if getattrlistat(fd, path: hw::Ptr.of_view(name), attributes: hw::Ptr.of_mut(mut asked), buffer: address, size: 8, options: NO_FOLLOW) != 0 {
+        fail failure(last_error())
+    }
+    return attributes.view().u32_le(4)
+} entry_type
+
+/// The kind of an entry of a type the type attribute gives.
+fn kind_of(type: u32) -> sys::fs::Kind {
+    return match type {
+        REGULAR_TYPE => sys::fs::Kind.File
+        DIRECTORY_TYPE => sys::fs::Kind.Directory
+        else => sys::fs::Kind.Other
+    }
+} kind_of
+
+/// Appends the `count` entries `getattrlistbulk` wrote to `buffer`: each its length, the
+/// attributes returned, the reference to its NUL-terminated name and its type.
+fn bulk_entries(buffer: Slice[u8], count: usize, mut into: mem::List[sys::fs::Entry], alloc: mem::Alloc) fails sys::fs::FsError {
+    var at: usize = 0
+    for _ in 0..<count {
+        if at > buffer.len() or buffer.len() - at < BULK_TYPE + 4 {
+            fail sys::fs::FsError.Denied
+        }
+        let length = usize.widen(buffer.u32_le(at))
+        let named_at = at + BULK_NAME
+        let name_length = usize.widen(buffer.u32_le(named_at + 4))
+        let Some(from_reference) = buffer.split_at(named_at) else {
+            fail sys::fs::FsError.Denied
+        }
+        let Some(from_name) = from_reference.tail.split_at(usize.widen(buffer.u32_le(named_at))) else {
+            fail sys::fs::FsError.Denied
+        }
+        if name_length == 0 {
+            fail sys::fs::FsError.Denied
+        }
+        let Some(spelt) = from_name.tail.prefix(name_length - 1) else {
+            fail sys::fs::FsError.Denied
+        }
+        let Ok(name) = attempt text::String.try_from_utf8(spelt, alloc) else {
+            fail sys::fs::FsError.Denied
+        }
+        mut into.push(sys::fs::Entry(name: take name, kind: kind_of(buffer.u32_le(at + BULK_TYPE))))
+        if length == 0 or length > buffer.len() - at {
+            fail sys::fs::FsError.Denied
+        }
+        at += length
+    }
+} bulk_entries
+
+/// The order of two names byte by byte, a name before each longer one it starts.
+fn byte_order(left: Slice[u8], right: Slice[u8]) -> core::Ordering {
+    for at in 0..<left.len() {
+        if at == right.len() {
+            return core::Ordering.Greater
+        }
+        let ordered = left[at].cmp(right[at])
+        if ordered != core::Ordering.Equal {
+            return ordered
+        }
+    }
+    return left.len().cmp(right.len())
+} byte_order
+
 /// Reads at most `len` bytes at `address` from a file at its position: the count, 0 at its end.
 fn read_file(fd: i32, address: u64, len: usize) -> usize fails sys::fs::FsError {
     loop {
@@ -224,17 +350,108 @@ pkg fn fs_remove(dir: i32, prefix: Str, path: Str) fails sys::fs::FsError {
         fail sys::fs::FsError.InvalidPath
     }
     let parent = try open_parent(dir, path: buffer)
+    defer close_parent(dir, parent)
     let Some(parts) = buffer.view().split_at(parent.name) else {
-        close_parent(dir, parent)
         fail sys::fs::FsError.InvalidPath
     }
-    let removed = unlinkat(parent.fd, path: hw::Ptr.of_view(parts.tail), flags: 0)
-    let code = last_error()
-    close_parent(dir, parent)
-    if removed != 0 {
-        fail failure(code)
+    var flags: i32 = 0
+    if try entry_type(parent.fd, name: parts.tail) == DIRECTORY_TYPE {
+        flags = REMOVE_DIRECTORY
+    }
+    if unlinkat(parent.fd, path: hw::Ptr.of_view(parts.tail), flags) != 0 {
+        fail failure(last_error())
     }
 } fs_remove
+
+pkg fn fs_create_dir(dir: i32, prefix: Str, path: Str) fails sys::fs::FsError {
+    var buffer = Array[u8, 4_096].filled(0)
+    if not joined(prefix, path, mut buffer) {
+        fail sys::fs::FsError.InvalidPath
+    }
+    try make_parents(dir, path: buffer)
+    let parent = try open_parent(dir, path: buffer)
+    defer close_parent(dir, parent)
+    let Some(parts) = buffer.view().split_at(parent.name) else {
+        fail sys::fs::FsError.InvalidPath
+    }
+    if mkdirat(parent.fd, path: hw::Ptr.of_view(parts.tail), mode: DIRECTORY_MODE) == 0 {
+        return
+    }
+    let code = last_error()
+    if code != EEXIST {
+        fail failure(code)
+    }
+    if try entry_type(parent.fd, name: parts.tail) != DIRECTORY_TYPE {
+        fail sys::fs::FsError.Denied
+    }
+} fs_create_dir
+
+pkg fn fs_rename(dir: i32, prefix: Str, from: Str, to: Str) fails sys::fs::FsError {
+    var source = Array[u8, 4_096].filled(0)
+    var target = Array[u8, 4_096].filled(0)
+    if not joined(prefix, path: from, buffer: mut source) or not joined(prefix, path: to, buffer: mut target) {
+        fail sys::fs::FsError.InvalidPath
+    }
+    let source_parent = try open_parent(dir, path: source)
+    defer close_parent(dir, parent: source_parent)
+    try make_parents(dir, path: target)
+    let target_parent = try open_parent(dir, path: target)
+    defer close_parent(dir, parent: target_parent)
+    let Some(source_parts) = source.view().split_at(source_parent.name) else {
+        fail sys::fs::FsError.InvalidPath
+    }
+    let Some(target_parts) = target.view().split_at(target_parent.name) else {
+        fail sys::fs::FsError.InvalidPath
+    }
+    if renameat(source_parent.fd, from: hw::Ptr.of_view(source_parts.tail), to_dir: target_parent.fd, to: hw::Ptr.of_view(target_parts.tail)) != 0 {
+        fail failure(last_error())
+    }
+} fs_rename
+
+pkg fn fs_kind(dir: i32, prefix: Str, path: Str) -> sys::fs::Kind fails sys::fs::FsError {
+    var buffer = Array[u8, 4_096].filled(0)
+    if not joined_directory(prefix, path, mut buffer) {
+        fail sys::fs::FsError.InvalidPath
+    }
+    let parent = try open_parent(dir, path: buffer)
+    defer close_parent(dir, parent)
+    let Some(parts) = buffer.view().split_at(parent.name) else {
+        fail sys::fs::FsError.InvalidPath
+    }
+    return kind_of(try entry_type(parent.fd, name: parts.tail))
+} fs_kind
+
+pkg fn fs_list(dir: i32, prefix: Str, path: Str, alloc: mem::Alloc) -> mem::List[sys::fs::Entry] fails sys::fs::FsError {
+    var buffer = Array[u8, 4_096].filled(0)
+    if not joined_directory(prefix, path, mut buffer) {
+        fail sys::fs::FsError.InvalidPath
+    }
+    let fd = open_path(dir, path: buffer.view(), flags: DIRECTORY, mode: 0)
+    if fd < 0 {
+        fail failure(last_error())
+    }
+    defer release(fd)
+    var asked = AttrList(count: 5, reserved: 0, common: RETURNED_ATTRIBUTES | NAME_ATTRIBUTE | TYPE_ATTRIBUTE, volume: 0, directory: 0, file: 0, fork: 0)
+    var entries = mem::List[sys::fs::Entry].empty(alloc)
+    var chunk = Array[u8, 4_096].filled(0)
+    loop {
+        let address = u64.widen(hw::Ptr.of_view_mut(mut chunk.view_mut()).addr())
+        let count = getattrlistbulk(fd, attributes: hw::Ptr.of_mut(mut asked), buffer: address, size: 4_096, options: PACK_INVALID)
+        if count == 0 {
+            break
+        }
+        if count > 0 {
+            try bulk_entries(chunk.view(), count: usize.fit(count), into: mut entries, alloc)
+            continue
+        }
+        let code = last_error()
+        if code != EINTR {
+            fail failure(code)
+        }
+    }
+    mut entries.sort_by(fn(left: sys::fs::Entry, right: sys::fs::Entry) => byte_order(left.name.as_bytes(), right: right.name.as_bytes()))
+    return entries
+} fs_list
 
 pkg fn file_read(fd: i32, address: u64, len: usize) -> usize fails sys::fs::FsError {
     return try read_file(fd, address, len)

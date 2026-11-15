@@ -44,17 +44,19 @@ const VOLATILE: [&str; 8] = [
 
 /// The operations of the sys capabilities and their resources whose class is not `traceless`
 /// on the host targets and under `any`, with that class.
-const SYS: [(&str, Class); 14] = [
+const SYS: [(&str, Class); 16] = [
     ("sys::Log.info", Class::Recorded),
     ("sys::Log.warn", Class::Recorded),
     ("sys::Log.error", Class::Recorded),
     ("sys::Stdio.write_out", Class::Recorded),
     ("sys::Stdio.write_err", Class::Recorded),
     ("sys::fs::File.write", Class::Restorable),
+    ("sys::Fs.create_dir", Class::Restorable),
     ("sys::Net.listen", Class::Restorable),
     ("sys::Fs.create", Class::Irreversible(ERASE)),
     ("sys::Fs.write_all", Class::Irreversible(ERASE)),
     ("sys::Fs.remove", Class::Irreversible(ERASE)),
+    ("sys::Fs.rename", Class::Irreversible(ERASE)),
     ("sys::Net.connect", Class::Irreversible(EMIT)),
     ("sys::net::Conn.write", Class::Irreversible(EMIT)),
     ("sys::net::Conn.close", Class::Irreversible(EMIT)),

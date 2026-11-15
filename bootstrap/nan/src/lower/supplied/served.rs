@@ -98,8 +98,8 @@ fn method_abi(lo: &mut Lowering, interface: ItemId, method: u32) -> (Abi, Option
     (abi, head.limits.stack)
 }
 
-/// An operation of a served `Fs` opening, reading, writing or removing a file: the kind's method
-/// of its name with its path joined to the entry's, a file it opens holding the number the kind
+/// An operation of a served `Fs`: the kind's method of its name with each of its paths joined
+/// to the entry's, by `/` when both are not empty, a file it opens holding the number the kind
 /// gave it.
 pub fn fs(
     lo: &mut Lowering,
@@ -110,16 +110,27 @@ pub fn fs(
 ) {
     let member = supply.member();
     let (prefix, prefix_len) = checked_text(lo, fx, supply, capability);
-    let separated = fx.b.ins().icmp_imm_s(IntCC::NotEqual, prefix_len, 0);
-    let path = view(fx, supply.param(1));
-    let (joined, len) = tables::join(lo, fx, (prefix, prefix_len), path, separated);
+    let paths = if member == "rename" { 2 } else { 1 };
+    let mut joined = Vec::new();
+    for index in 1..=paths {
+        let path = view(fx, supply.param(index));
+        let prefixed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, prefix_len, 0);
+        let named = fx.b.ins().icmp_imm_s(IntCC::NotEqual, path.1, 0);
+        let separated = fx.b.ins().band(prefixed, named);
+        joined.push(tables::join(lo, fx, (prefix, prefix_len), path, separated));
+    }
     lo.record_free(fx, prefix);
-    let mut args = vec![new_view(fx, joined, len)];
-    if matches!(member, "read_all" | "write_all") {
+    let mut args: Vec<Held> = joined
+        .iter()
+        .map(|(text, len)| new_view(fx, *text, *len))
+        .collect();
+    if matches!(member, "read_all" | "write_all" | "list") {
         args.push(supply.param(2));
     }
     let called = call(lo, fx, "FsService", member, kind, &args);
-    lo.record_free(fx, joined);
+    for (text, _) in joined {
+        lo.record_free(fx, text);
+    }
     supply.forward_failure(lo, fx, &called);
     match member {
         "open" | "create" => {
@@ -135,7 +146,7 @@ pub fn fs(
                 ("FsService", "release"),
             );
         }
-        "read_all" => supply.ret(lo, fx, called.result),
+        "read_all" | "kind" | "list" => supply.ret(lo, fx, called.result),
         _ => supply.done(lo, fx),
     }
 }

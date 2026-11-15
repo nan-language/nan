@@ -7,10 +7,37 @@ layout OpenHow: bytes 24 le {
     resolve: u64 at 16
 } OpenHow
 
-/// The open flags of a file read from, written to after truncation, or created.
+/// The open flags of a file read from, written to after truncation, or created, of a directory
+/// read from, and of a path whose entry's kind is read.
 const READ_ONLY: u64 = 0x8_0000
 
 const WRITE_CREATE: u64 = 0x8_0241
+
+const DIRECTORY_ONLY: u64 = 0x9_0000
+
+const PATH_ONLY: u64 = 0x28_0000
+
+/// The errors of a directory where a file is expected and of a file where a directory is.
+const EISDIR: i32 = 21
+
+/// The `unlinkat` flag removing a directory.
+const AT_REMOVEDIR: u32 = 0x200
+
+/// The `statx` flag reading the descriptor's own entry, and the file type bits of its mode.
+const AT_EMPTY_PATH: u32 = 0x1000
+
+const MODE_TYPE: u16 = 0xF000
+
+const MODE_FILE: u16 = 0x8000
+
+const MODE_DIRECTORY: u16 = 0x4000
+
+/// The types `getdents64` gives a regular file and a directory.
+const DT_FILE: u8 = 8
+
+const DT_DIRECTORY: u8 = 4
+
+foreign fn getdents64(fd: i32, buffer: hw::Ptr[u8], len: usize) -> isize convention "sysv"
 
 /// Resolution staying beneath the directory and following no magic links.
 const BENEATH: u64 = 0x0A
@@ -18,12 +45,18 @@ const BENEATH: u64 = 0x0A
 /// The longest path the platform functions join, in bytes, its NUL excluded.
 const PATH_LIMIT: usize = 4_095
 
-/// `prefix`, `/` when it is not empty, `path` and a NUL, in a buffer; false when it is too long.
+/// `prefix`, `/` when neither is empty, `path` and a NUL, in a buffer, `.` for two empty texts;
+/// false when it is too long.
 fn joined(prefix: Str, path: Str, mut buffer: Array[u8, 4_096]) -> bool {
     let head = prefix.as_bytes()
     let tail = path.as_bytes()
+    if head.len() == 0 and tail.len() == 0 {
+        buffer[0] = b'.'
+        buffer[1] = 0
+        return true
+    }
     var separator: usize = 0
-    if head.len() > 0 {
+    if head.len() > 0 and tail.len() > 0 {
         separator = 1
     }
     if head.len() + separator + tail.len() > PATH_LIMIT {
@@ -145,11 +178,126 @@ pkg fn fs_remove(dir: i32, prefix: Str, path: Str) fails sys::fs::FsError uses w
         fail sys::fs::FsError.InvalidPath
     }
     let address = u64.widen(hw::Ptr.of_view(buffer.view()).addr())
-    let result = try await submit(operation(OP_UNLINKAT, fd: dir, address, len: 0, offset: 0))
+    var result = try await submit(operation(OP_UNLINKAT, fd: dir, address, len: 0, offset: 0))
+    if result == -EISDIR {
+        var request = operation(OP_UNLINKAT, fd: dir, address, len: 0, offset: 0)
+        request.op_flags = AT_REMOVEDIR
+        result = try await submit(request)
+    }
     if result < 0 {
         fail failure(result)
     }
 } fs_remove
+
+pkg fn fs_create_dir(dir: i32, prefix: Str, path: Str) fails sys::fs::FsError uses wait {
+    var buffer = Array[u8, 4_096].filled(0)
+    if not joined(prefix, path, mut buffer) {
+        fail sys::fs::FsError.InvalidPath
+    }
+    try await make_parents(dir, path: buffer)
+    let address = u64.widen(hw::Ptr.of_view(buffer.view()).addr())
+    let result = try await submit(operation(OP_MKDIRAT, fd: dir, address, len: 0x1ED, offset: 0))
+    if result == -EEXIST {
+        if try await fs_kind(dir, prefix, path) != sys::fs::Kind.Directory {
+            fail sys::fs::FsError.Denied
+        }
+        return
+    }
+    if result < 0 {
+        fail failure(result)
+    }
+} fs_create_dir
+
+pkg fn fs_rename(dir: i32, prefix: Str, from: Str, to: Str) fails sys::fs::FsError uses wait {
+    var source = Array[u8, 4_096].filled(0)
+    var target = Array[u8, 4_096].filled(0)
+    if not joined(prefix, path: from, buffer: mut source) or not joined(prefix, path: to, buffer: mut target) {
+        fail sys::fs::FsError.InvalidPath
+    }
+    try await make_parents(dir, path: target)
+    let source_address = u64.widen(hw::Ptr.of_view(source.view()).addr())
+    let target_address = u64.widen(hw::Ptr.of_view(target.view()).addr())
+    let result = try await submit(operation(OP_RENAMEAT, fd: dir, address: source_address, len: u32.truncate(dir), offset: target_address))
+    if result < 0 {
+        fail failure(result)
+    }
+} fs_rename
+
+pkg fn fs_kind(dir: i32, prefix: Str, path: Str) -> sys::fs::Kind fails sys::fs::FsError uses wait {
+    let fd = try await open_beneath(dir, prefix, path, flags: PATH_ONLY)
+    defer release(fd)
+    var status = Array[u8, 256].filled(0)
+    let empty = Array[u8, 1].filled(0)
+    let path_address = u64.widen(hw::Ptr.of_view(empty.view()).addr())
+    let status_address = u64.widen(hw::Ptr.of_view_mut(mut status.view_mut()).addr())
+    var request = operation(OP_STATX, fd, address: path_address, len: 1, offset: status_address)
+    request.op_flags = AT_EMPTY_PATH
+    let result = try await submit(request)
+    if result < 0 {
+        fail failure(result)
+    }
+    let kind = status.view().u16_le(28) & MODE_TYPE
+    if kind == MODE_FILE {
+        return sys::fs::Kind.File
+    }
+    if kind == MODE_DIRECTORY {
+        return sys::fs::Kind.Directory
+    }
+    return sys::fs::Kind.Other
+} fs_kind
+
+pkg fn fs_list(dir: i32, prefix: Str, path: Str, alloc: mem::Alloc) -> mem::List[sys::fs::Entry] fails sys::fs::FsError uses wait {
+    let fd = try await open_beneath(dir, prefix, path, flags: DIRECTORY_ONLY)
+    defer release(fd)
+    var entries = mem::List[sys::fs::Entry].empty(alloc)
+    var records = Array[u8, 4_096].filled(0)
+    loop {
+        let count = getdents64(fd, buffer: hw::Ptr.of_view_mut(mut records.view_mut()), len: 4_096)
+        if count < 0 {
+            fail sys::fs::FsError.Denied
+        }
+        if count == 0 {
+            break
+        }
+        var at: usize = 0
+        while at + 19 < usize.fit(count) {
+            let length = usize.widen(records.view().u16_le(at + 16))
+            let stop = name_end(records.view(), at: at + 19, end: at + length)
+            let Some(parts) = records.view().split_at(stop) else {
+                fail sys::fs::FsError.Denied
+            }
+            let Some(named) = parts.head.split_at(at + 19) else {
+                fail sys::fs::FsError.Denied
+            }
+            if named.tail != b"." and named.tail != b".." {
+                let Ok(text) = attempt text::String.try_from_utf8(named.tail, alloc) else {
+                    fail sys::fs::FsError.Denied
+                }
+                let kind = match records[at + 18] {
+                    DT_FILE => sys::fs::Kind.File
+                    DT_DIRECTORY => sys::fs::Kind.Directory
+                    else => sys::fs::Kind.Other
+                }
+                mut entries.push(sys::fs::Entry(name: take text, kind: kind))
+            }
+            if length == 0 {
+                break
+            }
+            at += length
+        }
+    }
+    mut entries.sort_by(fn(left: sys::fs::Entry, right: sys::fs::Entry) => left.name.as_str().cmp(right.name.as_str()))
+    return entries
+} fs_list
+
+/// Where the name of a directory record from `at` ends: its NUL, or `end`.
+fn name_end(records: Slice[u8], at: usize, end: usize) -> usize {
+    var stop = at
+    while stop < end and stop < records.len() and records[stop] != 0 {
+        stop += 1
+    }
+    return stop
+} name_end
 
 pkg fn file_read(fd: i32, address: u64, len: usize) -> usize fails sys::fs::FsError uses wait {
     let count = try await read_at(fd, address, len)

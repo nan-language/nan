@@ -1,41 +1,20 @@
 # NaN
 
-NaN is a programming language made for agentic coding: performant, fast and safe, with strong versioning so that compiled NaN artefacts can reuse each other. Its toolchain is written in NaN and compiles itself. It targets Linux, Windows and macOS on x86_64 and AArch64, UEFI and bare metal.
+NaN is a programming language made for agentic coding: performant, fast and safe, with strong versioning so that compiled NaN artefacts can reuse each other. Its toolchain is written in NaN and compiles itself. It targets Linux, Windows, macOS and NaN OS on x86_64 and AArch64, UEFI and bare metal.
 
 The language is specified in [docs/spec](docs/spec/00-charter.md); [the primer](docs/spec/39-primer.md) is the short introduction.
 
 ## Installation
 
-On Linux or macOS, x86_64 or AArch64:
+Linux or macOS:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nan-language/nan/main/install.sh | sh
 ```
 
-This installs `~/.local/bin/nan`; `NAN_INSTALL_DIR` sets another directory, `NAN_VERSION` another release (`v0.1.0`).
+Fedora: `sudo dnf copr enable @nanlang/nan && sudo dnf install nan`. Ubuntu 22.04 or later: `sudo add-apt-repository ppa:nanlang/nan && sudo apt install nan`. Windows: download `nan-<version>-<arch>-windows.exe` from the [releases](https://github.com/nan-language/nan/releases) and put it on the `PATH` as `nan.exe`.
 
-On Windows, x86_64 or AArch64: download `nan-<version>-<arch>-windows.exe` from the [releases](https://github.com/nan-language/nan/releases), check it against its `.sha256`, and put it on the `PATH` as `nan.exe`.
-
-Fedora (Copr):
-
-```bash
-sudo dnf copr enable @nanlang/nan
-sudo dnf install nan
-```
-
-Ubuntu 22.04 or later (PPA):
-
-```bash
-sudo add-apt-repository ppa:nanlang/nan
-sudo apt install nan
-```
-
-Requirements:
-
-- Linux programs: a C compiler as `cc`; for the other architecture, `x86_64-linux-gnu-gcc` or `aarch64-linux-gnu-gcc`.
-- Running Windows programs and their tests on Linux: Wine, as `wine`.
-- Running macOS programs and their tests: macOS 15 or later on a Mac of their architecture.
-- `uefi` and `bare` programs: QEMU 10.2 or later and `swtpm`; for `uefi`, the OVMF or AAVMF firmware.
+Building for Linux needs `cc`, or `x86_64-linux-gnu-gcc` / `aarch64-linux-gnu-gcc` for the other architecture. Running Windows programs on Linux needs Wine; macOS programs need macOS 15 or later; UEFI and bare-metal programs need QEMU 10.2 or later, `swtpm` and, for UEFI, OVMF or AAVMF.
 
 ## Usage
 
@@ -44,50 +23,26 @@ Run `nan` from a directory of NaN packages. Most commands take a scope: a packag
 | Command | Does |
 | --- | --- |
 | `nan check` | Report diagnostics |
-| `nan fmt` | Rewrite files into canonical format |
-| `nan build` | Write a program's image under `.nan/images/<target>/` |
-| `nan run` | Build and run a program; Windows images run under Wine on Linux, UEFI and bare images boot under QEMU, state in `.nan/machine/<target>/` |
-| `nan test` | Run tests; `--affected` only those changed since they passed, `--replay <token>` a failing run |
-| `nan show <path> --api` | Print an item's head, contracts and digest, std included |
-| `nan primer` | Print the primer |
-| `nan lsp` | Serve the Language Server Protocol on standard input and output, for editors and agent harnesses |
-
-Packages and releases:
-
-| Command | Does |
-| --- | --- |
-| `nan dep sync` | Lock dependencies, named by `dep` directives by path or local store name |
-| `nan api update` | Record API snapshots |
-| `nan seal <item> --as <principal>` | Seal an item holding a trust escape |
-| `nan verify` | Release gate: accept a package ready to publish |
-| `nan publish --local <dir> --name <name>` | Append a release to the local store in `~/.nan/store`, signed with `--as <principal>` |
-| `nan upgrade` | Move a package to newer releases |
-| `nan key new <principal>` | Make a secret key in `~/.nan/keys` and print its public key |
-| `nan key trust <principal> <key>` | Trust a principal's key in the current package |
-| `nan diff <old> <new>` | Compare two versions of a workspace |
-| `nan merge <base> <ours> <theirs>` | Merge three versions; a git merge driver with `--path` |
-
-A kernel declaring loaded registries also gets an interface file, against which `nan build <package> --against <file> --as <principal>` writes a signed bundle it loads.
+| `nan fmt` | Format files |
+| `nan build` | Build a program into `.nan/images/<target>/` |
+| `nan build <package> --against <interface>` | Build a bundle a NaN OS kernel loads |
+| `nan run` | Build and run a program |
+| `nan test` | Run tests |
+| `nan lsp` | Serve the Language Server Protocol |
+| `nan dep sync` | Lock dependencies |
+| `nan verify` | Check a package is ready to publish |
+| `nan publish --local <dir>` | Publish a release to the local store |
 
 ## Development
 
-`toolchain/` holds the NaN toolchain; `nan build nan` there builds it into `toolchain/.nan/images/x86_64-linux/nan`, or for another host target once `targets` in `nan/package.nan` names it, after `nan dep approve nan` for a Windows or macOS one.
-
-`bootstrap/` holds the bootstrap compiler, in Rust with Cranelift. It built the first NaN toolchain and checks every toolchain change against its own output; it freezes when the NaN toolchain 1.0 is released. It requires [rustup](https://rustup.rs) and the linker Rust uses on the system: `cc` on Linux, Xcode's command line tools on macOS, the Visual Studio build tools on Windows. From `bootstrap/`:
+`toolchain/` holds the NaN toolchain: `nan build nan` there builds it. `bootstrap/` holds the Rust bootstrap compiler, which checks every toolchain change against its own output; it needs [rustup](https://rustup.rs) and the system linker. From `bootstrap/`:
 
 ```bash
 rustup toolchain install
 cargo install --locked cargo-nextest@0.9.148
+cargo build
+cargo nextest run
 ```
-
-| Command | Does |
-| --- | --- |
-| `cargo build` | Build to `bootstrap/target/debug/nan` |
-| `cargo fmt --all` | Format |
-| `cargo clippy --workspace --all-targets -- -D warnings` | Lint |
-| `cargo nextest run` | Run all tests |
-| `cargo nextest run -p nan --test <harness> -E 'test(/<name>/)'` | Run one test of a harness: `conformance` (chapter), `programs`, `milestones`, `self_check`, `measurements` |
-| `cargo run -p nanbench -- <command>` | Nanbench: `tokens`, `measure`, `compare` (`c++`), `corpus`, `run <model>` (`ANTHROPIC_API_KEY`), `report` |
 
 ## License
 

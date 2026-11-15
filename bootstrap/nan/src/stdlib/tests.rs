@@ -21,9 +21,10 @@ fn std_checks_without_diagnostics() {
 }
 
 /// The types of the values only machine targets give.
-const MACHINE_VALUES: [&str; 27] = [
+const MACHINE_VALUES: [&str; 28] = [
     "boot::Machine",
     "boot::Kernel",
+    "boot::HeapMeter",
     "boot::Services",
     "boot::Module",
     "sys::load::Loader",

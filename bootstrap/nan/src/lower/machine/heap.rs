@@ -36,13 +36,20 @@ const CHUNK_CLASS: i64 = 16;
 const CLASSES: u64 = 64;
 
 /// The offsets of the allocators' state: their spin lock, the next free byte and the end of the
-/// chunk blocks are carved from, the chunk map holding a bit per chunk set while it is handed
-/// out, and each size class's free-list head.
+/// chunk blocks are carved from, the bytes of the chunks the map hands out and the most it has
+/// handed out, the bytes of the live records other than task stacks, of the live task stacks
+/// and of the runs of chunks handed out whole, the chunk map holding a bit per chunk set while
+/// it is handed out, and each size class's free-list head.
 mod allocators {
     pub const LOCK: u64 = 0;
     pub const CARVE: u64 = 8;
     pub const CARVE_END: u64 = 16;
-    pub const MAP: u64 = 24;
+    pub const DRAWN: u64 = 24;
+    pub const PEAK: u64 = 32;
+    pub const RECORDS: u64 = 40;
+    pub const STACKS: u64 = 48;
+    pub const WHOLE: u64 = 56;
+    pub const MAP: u64 = 64;
     pub const FREE: u64 = MAP + super::CHUNKS / 8;
     pub const SIZE: u64 = FREE + 8 * super::CLASSES;
 }
@@ -87,12 +94,13 @@ pub fn map_chunks(lo: &mut Lowering, fx: &mut Fx, count: Value) -> Value {
     let state = heap_state(lo, fx);
     let flags = lock(lo, fx, state);
     let base = take_boot_chunks(lo, fx, state, count);
-    unlock(lo, fx, state, flags);
+    let len = fx.b.ins().ishl_imm_s(count, CHUNK_CLASS);
     let taken = fx.b.ins().icmp_imm_s(IntCC::NotEqual, base, 0);
-    fx.when(taken, |fx| {
-        let len = fx.b.ins().ishl_imm_s(count, CHUNK_CLASS);
-        clear(lo, fx, base, len);
-    });
+    let zero = fx.ptr(0);
+    let counted = fx.b.ins().select(taken, len, zero);
+    tally(fx, state, allocators::WHOLE, counted, true);
+    unlock(lo, fx, state, flags);
+    fx.when(taken, |fx| clear(lo, fx, base, len));
     base
 }
 
@@ -101,7 +109,55 @@ pub fn unmap_chunks(lo: &mut Lowering, fx: &mut Fx, base: Value, count: Value) {
     let state = heap_state(lo, fx);
     let flags = lock(lo, fx, state);
     give_boot_chunks(lo, fx, state, base, count);
+    let len = fx.b.ins().ishl_imm_s(count, CHUNK_CLASS);
+    tally(fx, state, allocators::WHOLE, len, false);
     unlock(lo, fx, state, flags);
+}
+
+/// Counts a task stack `RecordAlloc` gave, when it is not zero, among the live task stacks
+/// rather than the other records, or the other way round when `drawn` is false.
+pub fn count_stack(lo: &mut Lowering, fx: &mut Fx, stack: Value, drawn: bool) {
+    let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, stack, 0);
+    fx.when(present, |fx| {
+        let block = fx.b.ins().iadd_imm_s(stack, -(HEADER as i64));
+        let class = fx.load(PTR, block, 0);
+        let bytes = block_bytes(fx, class);
+        let state = heap_state(lo, fx);
+        let flags = lock(lo, fx, state);
+        tally(fx, state, allocators::STACKS, bytes, drawn);
+        tally(fx, state, allocators::RECORDS, bytes, !drawn);
+        unlock(lo, fx, state, flags);
+    });
+}
+
+/// The bytes of the chunks the map hands out, the most it has handed out, and those of the live
+/// records other than task stacks, of the live task stacks and of the runs of chunks handed out
+/// whole, read together.
+pub fn reading(lo: &mut Lowering, fx: &mut Fx) -> [Value; 5] {
+    let state = heap_state(lo, fx);
+    let flags = lock(lo, fx, state);
+    let counts = [
+        allocators::DRAWN,
+        allocators::PEAK,
+        allocators::RECORDS,
+        allocators::STACKS,
+        allocators::WHOLE,
+    ]
+    .map(|at| fx.load(PTR, state, at));
+    unlock(lo, fx, state, flags);
+    counts
+}
+
+/// Adds `bytes` to the count at `at` of the allocators' state, or subtracts them when `adding`
+/// is false, giving the new count. The caller holds the lock.
+fn tally(fx: &mut Fx, state: Value, at: u64, bytes: Value, adding: bool) -> Value {
+    let count = fx.load(PTR, state, at);
+    let count = match adding {
+        true => fx.b.ins().iadd(count, bytes),
+        false => fx.b.ins().isub(count, bytes),
+    };
+    fx.store(count, state, at);
+    count
 }
 
 /// Takes the first run of `count` chunks the boot heap has free, or gives zero when none is
@@ -109,10 +165,31 @@ pub fn unmap_chunks(lo: &mut Lowering, fx: &mut Fx, base: Value, count: Value) {
 /// the kernel refuses. The caller holds the lock and clears the chunks.
 fn take_boot_chunks(lo: &mut Lowering, fx: &mut Fx, state: Value, count: Value) -> Value {
     let supply = boot_supply(lo, fx, state);
-    let base = take_chunks(fx, supply, count);
-    if !lo.user() {
-        return base;
+    let mut base = take_chunks(fx, supply, count);
+    if lo.user() {
+        base = draw_from_kernel(lo, fx, supply, base, count);
     }
+    let len = fx.b.ins().ishl_imm_s(count, CHUNK_CLASS);
+    let taken = fx.b.ins().icmp_imm_s(IntCC::NotEqual, base, 0);
+    let zero = fx.ptr(0);
+    let counted = fx.b.ins().select(taken, len, zero);
+    let drawn = tally(fx, state, allocators::DRAWN, counted, true);
+    let peak = fx.load(PTR, state, allocators::PEAK);
+    let peak = fx.b.ins().umax(peak, drawn);
+    fx.store(peak, state, allocators::PEAK);
+    base
+}
+
+/// The run of `count` chunks from `base` an isolated space's runtime took from the map, once
+/// its kernel gives it, or zero when `base` is zero or the kernel refuses, the run then returned
+/// to the map.
+fn draw_from_kernel(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: ChunkSupply,
+    base: Value,
+    count: Value,
+) -> Value {
     let taken = fx.b.ins().icmp_imm_s(IntCC::NotEqual, base, 0);
     let refused = fx.choose_in(
         lo,
@@ -134,11 +211,12 @@ fn take_boot_chunks(lo: &mut Lowering, fx: &mut Fx, state: Value, count: Value) 
 /// releases them to its kernel first. The caller holds the lock.
 fn give_boot_chunks(lo: &mut Lowering, fx: &mut Fx, state: Value, base: Value, count: Value) {
     let supply = boot_supply(lo, fx, state);
+    let len = fx.b.ins().ishl_imm_s(count, CHUNK_CLASS);
     if lo.user() {
-        let len = fx.b.ins().ishl_imm_s(count, CHUNK_CLASS);
         space::call(lo, fx, space::RELEASE, &[base, len]);
     }
     give_chunks(fx, supply, base, count);
+    tally(fx, state, allocators::DRAWN, len, false);
 }
 
 /// Gives `count` chunks from `base` back to a supply.
@@ -330,8 +408,11 @@ fn record_alloc(lo: &mut Lowering, fx: &mut Fx, size: Value) -> Value {
             )
         },
     )[0];
-    unlock(lo, fx, state, flags);
     let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, block, 0);
+    let zero = fx.ptr(0);
+    let counted = fx.b.ins().select(present, bytes, zero);
+    tally(fx, state, allocators::RECORDS, counted, true);
+    unlock(lo, fx, state, flags);
     fx.choose_in(
         lo,
         present,
@@ -385,8 +466,10 @@ fn record_free(lo: &mut Lowering, fx: &mut Fx, address: Value) {
     fx.when(present, |fx| {
         let block = fx.b.ins().iadd_imm_s(address, -(HEADER as i64));
         let class = fx.load(PTR, block, 0);
+        let bytes = block_bytes(fx, class);
         let state = heap_state(lo, fx);
         let flags = lock(lo, fx, state);
+        tally(fx, state, allocators::RECORDS, bytes, false);
         let large =
             fx.b.ins()
                 .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, class, CHUNK_CLASS);
@@ -395,7 +478,6 @@ fn record_free(lo: &mut Lowering, fx: &mut Fx, address: Value) {
             large,
             &[],
             |lo, fx| {
-                let bytes = block_bytes(fx, class);
                 let count = fx.b.ins().ushr_imm_s(bytes, CHUNK_CLASS);
                 give_boot_chunks(lo, fx, state, block, count);
                 Vec::new()

@@ -1,4 +1,4 @@
-//! Takes the 1 GiB frames of the highest usable memory, writes a word at each end of those above 4 GiB through the entry root, and reads the words back; splits one region at its middle; checks the regions against the memory map, the image's segments, the boot area, the entry root's tables and the start information, and the clock's registers against the HPET's; once anchored, watches the charge of a pool's budget while a draw through a budget split from it crosses a threshold.
+//! Takes the 1 GiB frames of the highest usable memory, writes a word at each end of those above 4 GiB through the entry root, and reads the words back; splits one region at its middle; checks the regions against the memory map, the image's segments, the boot area, the entry root's tables and the start information, and the clock's registers against the HPET's; once anchored, watches the charge of a pool's budget while a draw through a budget split from it crosses a threshold, and reads the boot heap while a task and an allocation live.
 
 /// The memory the entry root maps with the tables the image holds, and the bytes of a frame.
 const MAPPED: u64 = 0x1_0000_0000
@@ -152,6 +152,34 @@ fn watch_follows_draws(exec: task::Executor, alloc: mem::Alloc) -> bool fails ta
     return ran.is_ok() and band == 1
 } watch_follows_draws
 
+/// The chunks the boot heap's reading counts while an allocation of two chunks drawn through
+/// `alloc` lives.
+fn chunks_holding(meter: boot::HeapMeter, alloc: mem::Alloc) -> u64 {
+    let bytes = mem::Bytes.zeroed(131_072, alloc)
+    let chunks = meter.read().chunks
+    discard bytes.len()
+    return chunks
+} chunks_holding
+
+/// Whether the boot heap's reading keeps its counts within what it has drawn, and counts a
+/// task's stack and an allocation of two chunks while each lives.
+fn heap_follows_draws(meter: boot::HeapMeter, exec: task::Executor, alloc: mem::Alloc) -> bool fails task::Cancelled uses wait {
+    let before = meter.read()
+    var stacks: u64 = 0
+    let ran = attempt await task::scope(exec, body: fn[mut stacks](s: task::Scope) fails task::Cancelled uses wait {
+        let reading = s.spawn(fn() -> u64 limits stack 4_096 {
+            return meter.read().stacks
+        })
+        stacks = try await take reading.join()
+    })
+    let chunks = chunks_holding(meter, alloc)
+    let after = meter.read()
+    let within = before.records + before.stacks + before.chunks <= before.drawn and before.drawn <= before.peak and before.peak <= before.size
+    let counted = stacks > before.stacks and chunks >= before.chunks + 131_072
+    let returned = after.stacks == before.stacks and after.chunks == before.chunks
+    return ran.is_ok() and before.size == 16_777_216 and within and counted and returned
+} heap_follows_draws
+
 fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     var regions = mut k.regions()
     if layout_agrees(k, regions, listed: true, alloc: k.alloc()) {
@@ -185,10 +213,14 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
         say(text: "region split at its middle\n")
     }
     let alloc = k.alloc()
+    let meter = k.heap()
     take k.anchor(take regions, run: fn(exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
         say(text: "anchored\n")
         if try await watch_follows_draws(exec, alloc) {
             say(text: "watch follows draws\n")
+        }
+        if try await heap_follows_draws(meter, exec, alloc) {
+            say(text: "heap follows draws\n")
         }
     })
 } main

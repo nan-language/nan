@@ -15,6 +15,8 @@ pub fn Kernel.clock(self) -> sys::Clock
 
 pub fn Kernel.wall_clock(self) -> Option[sys::WallClock]
 
+pub fn Kernel.heap(self) -> HeapMeter
+
 pub fn Kernel.regions(mut self) -> mem::List[hw::Region]
 
 pub fn Kernel.ring0(mut self) -> Option[hw::Ring0]
@@ -26,6 +28,20 @@ pub fn Kernel.pci_functions(mut self) -> mem::List[hw::PciFunction]
 pub fn Kernel.pci_ports(mut self) -> mem::List[hw::PciPort]
 
 pub fn Kernel.anchor[S: Any and Send](take self, take state: S, take run: task fn(exec: task::Executor) fails task::Cancelled uses wait) -> Never
+
+pub open struct HeapMeter derives Copy, Send {
+} HeapMeter
+
+pub fn HeapMeter.read(self) -> HeapUse
+
+pub closed struct HeapUse derives Copy, Eq {
+    pub size: u64
+    pub drawn: u64
+    pub peak: u64
+    pub records: u64
+    pub stacks: u64
+    pub chunks: u64
+} HeapUse
 ```
 
 ```nan-api
@@ -44,6 +60,7 @@ pub fn cpu_hardware_id(cpu: u32) -> Option[u64] limits pure, notrap, terminates
 - The [entry function](27-program-model.md#entry) of a bare target's image starts on the boot CPU with maskable interrupts disabled and every other CPU stopped, on `x86_64-bare` with SSE enabled and AVX enabled when the CPU has it, and on `aarch64-bare` with floating point and Advanced SIMD enabled.
 - On the x86_64 machine targets, the boot CPU runs the entry function, and every other CPU step 2 of `anchor`, with `CR0.WP` and `EFER.NXE` set, so that kernel writes honour read-only pages and execute-disable bits take effect.
 - `k.alloc()` is the root allocator of `boot::Kernel` ([allocators](12-memory.md#allocators)). Its root cell's supply is the **boot heap**, which the [boot area](#physical-memory) holds in the size its target's [descriptor](27-program-model.md#descriptors) states. Every call returns the same handle.
+- `k.heap()` returns the boot heap's meter, through which `meter.read()` reads the boot heap without drawing from it. `size` is its bytes, `drawn` the bytes of its chunks in use and `peak` the most `drawn` has been. Of `drawn`, `records` is the bytes of the runtime's live records other than task stacks, such as capability record blocks and task records, `stacks` that of the live task stacks and stack segments it holds as records, and `chunks` that of the chunks drawn whole: through `k.alloc()` and the cells split from it ([budgets](12-memory.md#budgets)), and for CPU stacks and device tables. The rest holds freed records kept for later ones.
 - `k.clock()` is the kernel's clock ([kernel time](#kernel-time)), whose nanoseconds count from the minting of the root grant. Every call returns the same handle.
 - `k.wall_clock()` returns `Some` of the kernel's wall clock when the wall clock source of its target's [descriptor](27-program-model.md#descriptors) gave a time as the root grant was minted, the same handle on every call, and `None` otherwise. Its reading is that time, taken as UTC, advanced by the kernel clock.
 - The first call of `k.regions()` returns, in address order, a region for each range of usable memory below 128 TiB outside the image, which holds the boot stack, outside the [boot area](#physical-memory) and the [entry root](#physical-memory)'s tables, outside the first MiB on x86_64, outside the [start information](#start-information) with its module list, memory map, command line, modules and their names on a bare target, and outside the device tree and the ranges its memory reservation block lists on `aarch64-bare`; the list is drawn through `k.alloc()` and traps on exhaustion (`trap.exhausted`). Usable memory is, on a bare target with a start information, the entries of type 1 of its memory map, on `aarch64-bare` without one, the ranges of the device tree's memory nodes and, on the UEFI targets, the `EfiConventionalMemory`, `EfiBootServicesCode` and `EfiBootServicesData` entries of the firmware's final memory map. Later calls return an empty list.

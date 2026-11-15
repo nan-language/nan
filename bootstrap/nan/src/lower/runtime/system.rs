@@ -174,7 +174,11 @@ pub fn unmap_chunks(lo: &mut Lowering, fx: &mut Fx, base: Value, count: Value) {
 /// guard region unprotected since its stacks have static bounds.
 pub fn map_stack(lo: &mut Lowering, fx: &mut Fx, len: Value, guarded: bool) -> Value {
     match lo.machine() {
-        true => lo.record_alloc(fx, len),
+        true => {
+            let stack = lo.record_alloc(fx, len);
+            heap::count_stack(lo, fx, stack, true);
+            stack
+        }
         false if lo.windows() => host::windows::map_stack(lo, fx, len, guarded),
         false => host::linux::map_stack(lo, fx, len, guarded),
     }
@@ -183,7 +187,10 @@ pub fn map_stack(lo: &mut Lowering, fx: &mut Fx, len: Value, guarded: bool) -> V
 /// Returns a task stack `map_stack` gave.
 pub fn unmap_stack(lo: &mut Lowering, fx: &mut Fx, stack: Value, len: Value) {
     match lo.machine() {
-        true => lo.record_free(fx, stack),
+        true => {
+            heap::count_stack(lo, fx, stack, false);
+            lo.record_free(fx, stack);
+        }
         false if lo.windows() => host::windows::unmap(lo, fx, stack),
         false => host::linux::unmap(lo, fx, stack, len),
     }

@@ -1,6 +1,6 @@
 //! The root grants of the machine targets, `boot::Kernel` and `boot::Machine`: their root
-//! allocator, clocks, `hw::Ring0`, the usable memory of the machine and the modules of the start
-//! information, the IOMMU and PCI functions std's `hw` enables and lists, the firmware services of the UEFI targets, the anchor a kernel installs before
+//! allocator, the boot heap's meter, clocks, `hw::Ring0`, the usable memory of the machine and
+//! the modules of the start information, the IOMMU and PCI functions std's `hw` enables and lists, the firmware services of the UEFI targets, the anchor a kernel installs before
 //! its executor starts, and what the start information and the firmware's tables give std. The
 //! installed anchor lies in storage the image reserves, whose address and the location of the
 //! `anchor` call the runtime state records.
@@ -46,6 +46,7 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "boot::Kernel.pci_ports" => pci_listed(lo, fx, supply, "ports", "ports_enumerated"),
         "boot::Kernel.anchor" => anchor(lo, fx, supply),
         "boot::Kernel.policy" => lo.install_policy(fx, supply),
+        "boot::HeapMeter.read" => heap_use(lo, fx, supply),
         "boot::Module.contents" => module_contents(lo, fx, supply),
         "boot::Module.clear" => {
             let (base, len) = module_extent(lo, fx, supply);
@@ -198,6 +199,27 @@ fn pci_listed(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, taken: &str, list
 pub(super) fn field(lo: &mut Lowering, supply: &Supply, name: &str) -> u64 {
     let grant = supply.owner.clone().expect("a root grant");
     lo.layouts.field(lo.ck, &grant, None, name).offset
+}
+
+/// `meter.read()`: the boot heap's size and the counts its allocators keep, read together.
+fn heap_use(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
+    let result = supply.abi.result.clone();
+    let layout = lo.layout(&result);
+    let slot = fx.slot(layout.size, layout.align);
+    let size = fx.ptr(heap::BOOT_HEAP);
+    let [drawn, peak, records, stacks, chunks] = heap::reading(lo, fx);
+    for (name, count) in [
+        ("size", size),
+        ("drawn", drawn),
+        ("peak", peak),
+        ("records", records),
+        ("stacks", stacks),
+        ("chunks", chunks),
+    ] {
+        let at = lo.layouts.field(lo.ck, &result, None, name).offset;
+        fx.store(count, slot, at);
+    }
+    supply.ret(lo, fx, Held::Address(slot));
 }
 
 /// `k.wall_clock()`: `Some` of the kernel's wall clock when its source gave a time at the

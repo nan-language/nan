@@ -20,15 +20,27 @@ const CHUNK_CLASS: i64 = 16
 const HEAP_CLASSES: u64 = 64
 
 /// The offsets of the allocators' state: their spin lock, the next free byte and the end of the
-/// chunk blocks are carved from, the chunk map holding a bit per chunk set while it is handed
-/// out, and each size class's free-list head.
+/// chunk blocks are carved from, the bytes of the chunks the map hands out and the most it has
+/// handed out, the bytes of the live records other than task stacks, of the live task stacks
+/// and of the runs of chunks handed out whole, the chunk map holding a bit per chunk set while
+/// it is handed out, and each size class's free-list head.
 const ALLOCATORS_LOCK: u64 = 0
 
 const ALLOCATORS_CARVE: u64 = 8
 
 const ALLOCATORS_CARVE_END: u64 = 16
 
-const ALLOCATORS_MAP: u64 = 24
+const ALLOCATORS_DRAWN: u64 = 24
+
+const ALLOCATORS_PEAK: u64 = 32
+
+const ALLOCATORS_RECORDS: u64 = 40
+
+const ALLOCATORS_STACKS: u64 = 48
+
+const ALLOCATORS_WHOLE: u64 = 56
+
+const ALLOCATORS_MAP: u64 = 64
 
 const ALLOCATORS_FREE: u64 = ALLOCATORS_MAP + CHUNKS / 8
 
@@ -74,10 +86,13 @@ fn heap_map_chunks(mut lo: Lowering, mut fx: Fx, count: clif::Value) -> clif::Va
     let state = heap_state(mut lo, mut fx)
     let flags = heap_lock(mut lo, mut fx, state)
     let base = take_boot_chunks(mut lo, mut fx, state, count)
-    unlock(mut lo, mut fx, state, flags)
+    let len = mut fx.b.ishl_imm_s(count, y: CHUNK_CLASS)
     let taken = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: base, y: 0)
+    let zero_value = mut fx.ptr(0)
+    let counted = mut fx.b.select(taken, x: len, y: zero_value)
+    discard tally(mut fx, state, at: ALLOCATORS_WHOLE, bytes: counted, adding: true)
+    unlock(mut lo, mut fx, state, flags)
     mut fx.if_true(taken, then: fn[mut lo](mut fx1: Fx) {
-        let len = mut fx1.b.ishl_imm_s(count, y: CHUNK_CLASS)
         heap_clear(mut lo, fx: mut fx1, base, len)
     })
     return base
@@ -88,18 +103,84 @@ fn heap_unmap_chunks(mut lo: Lowering, mut fx: Fx, base: clif::Value, count: cli
     let state = heap_state(mut lo, mut fx)
     let flags = heap_lock(mut lo, mut fx, state)
     give_boot_chunks(mut lo, mut fx, state, base, count)
+    let len = mut fx.b.ishl_imm_s(count, y: CHUNK_CLASS)
+    discard tally(mut fx, state, at: ALLOCATORS_WHOLE, bytes: len, adding: false)
     unlock(mut lo, mut fx, state, flags)
 } heap_unmap_chunks
+
+/// Counts a task stack `RecordAlloc` gave, when it is not zero, among the live task stacks
+/// rather than the other records, or the other way round when `drawn` is false.
+fn heap_count_stack(mut lo: Lowering, mut fx: Fx, stack: clif::Value, drawn: bool) {
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: stack, y: 0)
+    mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+        let block = mut fx1.b.iadd_imm_s(stack, y: -i64.fit(HEAP_HEADER))
+        let class = mut fx1.load(PTR, addr: block, offset: 0)
+        let block_size = block_bytes(mut fx1, class)
+        let state = heap_state(mut lo, fx: mut fx1)
+        let flags = heap_lock(mut lo, fx: mut fx1, state)
+        discard tally(mut fx1, state, at: ALLOCATORS_STACKS, bytes: block_size, adding: drawn)
+        discard tally(mut fx1, state, at: ALLOCATORS_RECORDS, bytes: block_size, adding: not drawn)
+        unlock(mut lo, fx: mut fx1, state, flags)
+    })
+} heap_count_stack
+
+/// The bytes of the chunks the map hands out, the most it has handed out, and those of the live
+/// records other than task stacks, of the live task stacks and of the runs of chunks handed out
+/// whole, read together.
+fn heap_reading(mut lo: Lowering, mut fx: Fx) -> Array[clif::Value, 5] {
+    let state = heap_state(mut lo, mut fx)
+    let flags = heap_lock(mut lo, mut fx, state)
+    var counts = Array[clif::Value, 5].filled(state)
+    var offsets = Array[u64, 5].filled(ALLOCATORS_DRAWN)
+    offsets[1] = ALLOCATORS_PEAK
+    offsets[2] = ALLOCATORS_RECORDS
+    offsets[3] = ALLOCATORS_STACKS
+    offsets[4] = ALLOCATORS_WHOLE
+    for index in 0usize..<5 {
+        counts[index] = mut fx.load(PTR, addr: state, offset: offsets[index])
+    }
+    unlock(mut lo, mut fx, state, flags)
+    return counts
+} heap_reading
+
+/// Adds `bytes` to the count at `at` of the allocators' state, or subtracts them when `adding`
+/// is false, giving the new count. The caller holds the lock.
+fn tally(mut fx: Fx, state: clif::Value, at: u64, bytes: clif::Value, adding: bool) -> clif::Value {
+    let held = mut fx.load(PTR, addr: state, offset: at)
+    var count = held
+    if adding {
+        count = mut fx.b.iadd(held, y: bytes)
+    } else {
+        count = mut fx.b.isub(held, y: bytes)
+    }
+    mut fx.store(count, addr: state, offset: at)
+    return count
+} tally
 
 /// Takes the first run of `count` chunks the boot heap has free, or gives zero when none is
 /// free; an isolated space's runtime draws the run from its kernel, returning it to the map when
 /// the kernel refuses. The caller holds the lock and clears the chunks.
 fn take_boot_chunks(mut lo: Lowering, mut fx: Fx, state: clif::Value, count: clif::Value) -> clif::Value {
     let supply = boot_supply(mut lo, mut fx, state)
-    let base = take_chunks(mut fx, supply, count)
-    if not lo.user() {
-        return base
+    var base = take_chunks(mut fx, supply, count)
+    if lo.user() {
+        base = draw_from_kernel(mut lo, mut fx, supply, base, count)
     }
+    let len = mut fx.b.ishl_imm_s(count, y: CHUNK_CLASS)
+    let taken = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: base, y: 0)
+    let zero_value = mut fx.ptr(0)
+    let counted = mut fx.b.select(taken, x: len, y: zero_value)
+    let drawn = tally(mut fx, state, at: ALLOCATORS_DRAWN, bytes: counted, adding: true)
+    let peak = mut fx.load(PTR, addr: state, offset: ALLOCATORS_PEAK)
+    let raised = mut fx.b.umax(peak, y: drawn)
+    mut fx.store(raised, addr: state, offset: ALLOCATORS_PEAK)
+    return base
+} take_boot_chunks
+
+/// The run of `count` chunks from `base` an isolated space's runtime took from the map, once
+/// its kernel gives it, or zero when `base` is zero or the kernel refuses, the run then returned
+/// to the map.
+fn draw_from_kernel(mut lo: Lowering, mut fx: Fx, supply: ChunkSupply, base: clif::Value, count: clif::Value) -> clif::Value {
     let taken = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: base, y: 0)
     let refused = mut fx.choose_in(mut lo, condition: taken, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         let len = mut fx1.b.ishl_imm_s(count, y: CHUNK_CLASS)
@@ -119,19 +200,20 @@ fn take_boot_chunks(mut lo: Lowering, mut fx: Fx, state: clif::Value, count: cli
     })
     let zero = mut fx.ptr(0)
     return mut fx.b.select(failed, x: zero, y: base)
-} take_boot_chunks
+} draw_from_kernel
 
 /// Returns `count` chunks from `base` to the boot heap's map; an isolated space's runtime
 /// releases them to its kernel first. The caller holds the lock.
 fn give_boot_chunks(mut lo: Lowering, mut fx: Fx, state: clif::Value, base: clif::Value, count: clif::Value) {
     let supply = boot_supply(mut lo, mut fx, state)
+    let len = mut fx.b.ishl_imm_s(count, y: CHUNK_CLASS)
     if lo.user() {
-        let len = mut fx.b.ishl_imm_s(count, y: CHUNK_CLASS)
         var args = Array[clif::Value, 2].filled(base)
         args[1] = len
         discard space_call(mut lo, mut fx, number: SPACE_RELEASE, args: args.view())
     }
     give_chunks(mut fx, supply, base, count)
+    discard tally(mut fx, state, at: ALLOCATORS_DRAWN, bytes: len, adding: false)
 } give_boot_chunks
 
 /// Gives `count` chunks from `base` back to a supply.
@@ -356,8 +438,11 @@ fn record_alloc(mut lo: Lowering, mut fx: Fx, size: clif::Value) -> clif::Value 
         })
     })
     let block = blocks[0]
-    unlock(mut lo, mut fx, state, flags)
     let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: block, y: 0)
+    let zero_value = mut fx.ptr(0)
+    let counted = mut fx.b.select(present, x: block_size, y: zero_value)
+    discard tally(mut fx, state, at: ALLOCATORS_RECORDS, bytes: counted, adding: true)
+    unlock(mut lo, mut fx, state, flags)
     let usable_values = mut fx.choose_in(mut lo, condition: present, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         mut fx1.store(class, addr: block, offset: 0)
         let usable = mut fx1.b.iadd_imm_s(block, y: i64.fit(HEAP_HEADER))
@@ -415,11 +500,12 @@ fn record_free(mut lo: Lowering, mut fx: Fx, address: clif::Value) {
     mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
         let block = mut fx1.b.iadd_imm_s(address, y: -i64.fit(HEAP_HEADER))
         let class = mut fx1.load(PTR, addr: block, offset: 0)
+        let block_size = block_bytes(mut fx1, class)
         let state = heap_state(mut lo, fx: mut fx1)
         let flags = heap_lock(mut lo, fx: mut fx1, state)
+        discard tally(mut fx1, state, at: ALLOCATORS_RECORDS, bytes: block_size, adding: false)
         let large = mut fx1.b.icmp_imm_s(clif::IntCC.SignedGreaterThanOrEqual, x: class, y: CHUNK_CLASS)
         discard mut fx1.choose_in(mut lo, condition: large, results: mem::List[clif::Type].empty(fx1.alloc).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
-            let block_size = block_bytes(mut fx2, class)
             let count = mut fx2.b.ushr_imm_s(block_size, y: CHUNK_CLASS)
             give_boot_chunks(mut lo2, fx: mut fx2, state, base: block, count)
             return mem::List[clif::Value].empty(fx2.alloc)

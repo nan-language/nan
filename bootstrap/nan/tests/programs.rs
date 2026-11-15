@@ -1,7 +1,7 @@
 //! The program harness: builds each program of `tests/programs` and compares what its image
 //! writes with the program's `expected` file, whose first line states the exit status. A host
 //! program runs as a process, writing standard output then standard error: a Windows program as
-//! `nan run` launches it under Wine, in a Wine prefix of its own made first. One for another
+//! `nan run` launches it under Wine, in a Wine prefix of its own held in a session set up first. One for another
 //! architecture than this machine's, or a Windows program where Wine does not run, is only
 //! built. A machine program boots under its emulator,
 //! writing the serial port until it ends the emulator through the exit port; on a UEFI target the
@@ -23,6 +23,7 @@ use std::process::Command;
 use datatest_stable::Utf8Path;
 
 mod machine;
+mod wine;
 
 datatest_stable::harness! {
     { test = program, root = "tests/programs", pattern = r"^[a-z0-9_]+/expected$" },
@@ -83,7 +84,7 @@ fn run_host(root: &Path, target: &str, name: &str) -> std::io::Result<(i32, Stri
 }
 
 /// Runs a Windows program's image as `nan run` launches it, under Wine in a prefix of its own
-/// that Wine sets up first, giving its exit status and what it writes; none when `nan run`
+/// held in a session set up first, giving its exit status and what it writes; none when `nan run`
 /// launches nothing, the program being for another architecture or Wine not running.
 fn run_windows(
     tmp: &Path,
@@ -97,21 +98,14 @@ fn run_windows(
         }
         return Ok(None);
     };
-    fs::create_dir_all(tmp.join("wine"))?;
     let prefix = tmp.join("wine").join(name);
-    let wine = |args: &[String]| {
-        let mut command = Command::new(&launch.program);
-        command
-            .args(args)
-            .envs(launch.env.iter().copied())
-            .env("WINEPREFIX", &prefix)
-            .current_dir(root);
-        command
-    };
-    if !prefix.exists() {
-        wine(&["wineboot".to_owned(), "--init".to_owned()]).output()?;
-    }
-    let run = wine(&launch.args).output()?;
+    let _session = wine::Session::start(&launch, &prefix)?;
+    let run = Command::new(&launch.program)
+        .args(&launch.args)
+        .envs(launch.env.iter().copied())
+        .env("WINEPREFIX", &prefix)
+        .current_dir(root)
+        .output()?;
     let mut written = String::from_utf8_lossy(&run.stdout).into_owned();
     written.push_str(&String::from_utf8_lossy(&run.stderr));
     Ok(Some((run.status.code().unwrap_or(-1), written)))

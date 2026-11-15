@@ -34,6 +34,7 @@ use datatest_stable::Utf8Path;
 
 mod common;
 mod machine;
+mod wine;
 
 use common::{Example, examples, nan, unmark};
 
@@ -865,7 +866,7 @@ fn compare_program(
 }
 
 /// Runs the Windows image of `program` that each toolchain builds in its workspace with
-/// `nan run`, under Wine in a prefix of its own that Wine sets up first, and compares what both
+/// `nan run`, under Wine in a prefix of its own held in a session set up first, and compares what both
 /// write and the statuses they end with; nothing where Wine does not run.
 fn compare_wine(
     toolchain: &Toolchain,
@@ -881,24 +882,17 @@ fn compare_wine(
         return Err(format!("nan run {program} reports\n{}", run.output));
     };
     let prefix = bootstrap.join(".wine");
-    let wine = |args: &[String]| {
-        let mut command = Command::new(&launch.program);
-        command
-            .args(args)
-            .envs(launch.env.iter().copied())
-            .env("WINEPREFIX", &prefix)
-            .current_dir(bootstrap)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        command
-    };
-    Supervised::start(
-        wine(&["wineboot".to_owned(), "--init".to_owned()]),
-        RUN_LIMIT,
-    )?
-    .finish()?;
-    let expected = Supervised::start(wine(&launch.args), RUN_LIMIT)?.finish()?;
+    let _session = wine::Session::start(&launch, &prefix).map_err(|error| error.to_string())?;
+    let mut command = Command::new(&launch.program);
+    command
+        .args(&launch.args)
+        .envs(launch.env.iter().copied())
+        .env("WINEPREFIX", &prefix)
+        .current_dir(bootstrap)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let expected = Supervised::start(command, RUN_LIMIT)?.finish()?;
     let (front_dir, front_store) = fronts(bootstrap, store);
     let mut command = Command::new(&toolchain.image);
     command

@@ -1,0 +1,120 @@
+//! Pairs of tasks pass tokens through a queue behind a spin lock: a producer posts `filled` after each push and waits on `emptied` while the queue is full, and a consumer drains the queue each time `filled` wakes it, then posts `emptied`. Every task is placed on CPU 0, the other CPUs steal from it, and slices last 5 µs, so that tasks are often preempted while they wait and resume on another CPU. Then writes whether every token was counted.
+
+registers Uart {
+    data: u8 at 0x0 write
+} Uart
+
+/// The tokens each pair passes, and the pairs.
+const TOKENS: u64 = 2_000_000
+
+const PAIRS: u64 = 8
+
+struct Stealing {
+} Stealing
+
+impl Stealing: hw::Policy
+
+fn Stealing.place(self, t: hw::IrqsDisabled, task: hw::TaskView) -> hw::Placement limits notrap, terminates, noalloc, stack 4_096 {
+    return hw::Placement(cpu: 0, key: 0, bound: false)
+} Stealing.place
+
+fn Stealing.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Option[hw::Steal] limits notrap, terminates, noalloc, stack 4_096 {
+    return Some(hw::Steal(cpu: 0, tasks: 1))
+} Stealing.steal
+
+fn Stealing.slice(self, t: hw::IrqsDisabled, cpu: u32, task: hw::TaskView) -> u64 limits notrap, terminates, noalloc, stack 4_096 {
+    return 5_000
+} Stealing.slice
+
+fn Stealing.idle(self, t: hw::IrqsDisabled, cpu: u32, until_ns: Option[u64]) -> hw::Idle limits notrap, terminates, noalloc, stack 4_096 {
+    return hw::Idle.Halt
+} Stealing.idle
+
+fn say(text: Str) {
+    var uart = trusted "the board decodes port 0x3F8 to its first 16550 UART and nothing else maps it" { hw::Ports[Uart].map(0x3F8) }
+    for byte in text.as_bytes() {
+        mut uart.write(Uart.data, value: byte)
+    }
+    take uart.unmap()
+} say
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    let alloc = k.alloc()
+    mut k.policy(Stealing())
+    let total = mem::Shared.of(core::atomic::AtomicU64.of(0), alloc)
+    take k.anchor(0u8, run: fn[take total](exec: task::Executor) fails task::Cancelled uses wait limits stack 16_384 {
+        let counting = total.share()
+        try await task::scope(exec, body: fn(s: task::Scope) {
+            for _ in 0..<PAIRS {
+                let queue = mem::Shared.of(hw::SpinLock.of(mem::Bounded[u64, 64].empty()), alloc)
+                let filled = mem::Shared.of(hw::Signal[Unit].empty(), alloc)
+                let emptied = mem::Shared.of(hw::Signal[Unit].empty(), alloc)
+                let consumed = queue.share()
+                let woken = filled.share()
+                let freed = emptied.share()
+                let tally = counting.share()
+                discard s.spawn(fn[take queue, take filled, take emptied]() fails task::Cancelled uses wait limits stack 16_384 {
+                    try await produce(queue, filled, emptied)
+                })
+                discard s.spawn(fn[take consumed, take woken, take freed, take tally]() fails task::Cancelled uses wait limits stack 16_384 {
+                    let taken = try await consume(consumed, filled: woken, emptied: freed)
+                    discard tally.contents().fetch_add(taken)
+                })
+            }
+        })
+        if total.contents().load() == PAIRS * TOKENS {
+            say(text: "every token counted\n")
+        } else {
+            say(text: "tokens lost\n")
+        }
+    })
+} main
+
+/// Queues `TOKENS` tokens, posting `filled` after each, waiting on `emptied` while the queue is full.
+fn produce(queue: mem::Shared[hw::SpinLock[mem::Bounded[u64, 64]]], filled: mem::Shared[hw::Signal[Unit]], emptied: mem::Shared[hw::Signal[Unit]]) fails task::Cancelled uses wait {
+    var token: u64 = 0
+    while token < TOKENS {
+        let held = token
+        let pushed = hw::without_irqs(fn(t: hw::IrqsDisabled) -> bool limits notrap {
+            let fitted = queue.contents().with(t, body: fn(mut waiting: mem::Bounded[u64, 64]) -> bool limits notrap, terminates, noalloc {
+                if waiting.is_full() {
+                    return false
+                }
+                mut waiting.push(held)
+                return true
+            })
+            if fitted {
+                filled.contents().post(t, value: Unit)
+            }
+            return fitted
+        })
+        if pushed {
+            token += 1
+        } else {
+            try await emptied.contents().wait()
+        }
+    }
+} produce
+
+/// Takes `TOKENS` tokens, waiting on `filled` while the queue is empty and posting `emptied` after each drain; gives how many it took.
+fn consume(queue: mem::Shared[hw::SpinLock[mem::Bounded[u64, 64]]], filled: mem::Shared[hw::Signal[Unit]], emptied: mem::Shared[hw::Signal[Unit]]) -> u64 fails task::Cancelled uses wait {
+    var taken: u64 = 0
+    while taken < TOKENS {
+        try await filled.contents().wait()
+        loop {
+            let next = hw::without_irqs(fn(t: hw::IrqsDisabled) -> Option[u64] limits notrap {
+                return queue.contents().with(t, body: fn(mut waiting: mem::Bounded[u64, 64]) -> Option[u64] limits notrap, terminates, noalloc {
+                    return mut waiting.pop()
+                })
+            })
+            let Some(_) = next else {
+                break
+            }
+            taken += 1
+        }
+        hw::without_irqs(fn(t: hw::IrqsDisabled) limits notrap {
+            emptied.contents().post(t, value: Unit)
+        })
+    }
+    return taken
+} consume

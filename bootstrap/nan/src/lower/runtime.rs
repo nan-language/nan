@@ -204,6 +204,8 @@ pub enum Routine {
     /// `() -> thread`: the record of the executor thread running the caller, which a call
     /// reads anew after each suspension as a task may resume on another thread.
     Thread,
+    /// `() -> task`: the record of the task running the caller, zero outside one.
+    Current,
     /// `()`: a scheduling point of the running task on the seeded scheduler.
     Yield,
     /// `(seed, stream, index) -> value`: value `index` of a stream of a seed.
@@ -297,6 +299,7 @@ impl Routine {
             Routine::Lock => "_NSstack_switch_lock",
             Routine::Unlock => "_NSstack_switch_unlock",
             Routine::Thread => "_NSstack_switch_thread",
+            Routine::Current => "_NSstack_switch_current",
             Routine::Yield => "_NSreplay_yield",
             Routine::Stream => "_NSreplay_stream",
             Routine::ClockNow => "_NSstack_switch_clock_now",
@@ -375,7 +378,11 @@ impl Routine {
             Routine::Park | Routine::Schedule | Routine::Yield | Routine::IommuFlush => (&[], &[]),
             Routine::Stream => (&[P, P, P], &[P]),
             Routine::Draw => (&[P, P, P, P], &[P]),
-            Routine::Origin | Routine::Init | Routine::Thread | Routine::ClockNow => (&[], &[P]),
+            Routine::Origin
+            | Routine::Init
+            | Routine::Thread
+            | Routine::Current
+            | Routine::ClockNow => (&[], &[P]),
             Routine::IoSubmit => (&[P], &[types::I8, types::I32]),
             Routine::Request => (&[P, P, P, P, P], &[types::I8, types::I64]),
             Routine::Watch => (&[types::I32, types::I16], &[types::I8, types::I64]),
@@ -784,6 +791,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         | Routine::Schedule
         | Routine::ThreadMain
         | Routine::Thread
+        | Routine::Current
         | Routine::Stop => tasks::define(lo, fx, routine),
         Routine::RegionOpen | Routine::Cancel | Routine::Origin => regions::define(lo, fx, routine),
         Routine::CownRelease => super::supplied::tasks::cowns::release_routine(lo, fx),

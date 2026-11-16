@@ -113,7 +113,9 @@ pub fn ring0(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 fn run_user(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, split: bool) {
     let exit_ty = supply.abi.result.clone();
     let user_state = supply.param(1).address();
+    let flags = lo.call_stub(fx, Stub::IrqSave, &[])[0];
     let (_, enters) = lo.thread_context(fx);
+    lo.call_stub(fx, Stub::IrqRestore, &[flags]);
     let outside = fx.b.ins().bxor_imm_s(enters, 1);
     fx.when(outside, |fx| {
         let exit = lo.variant_value(fx, &exit_ty, "Interrupted", &[], None);

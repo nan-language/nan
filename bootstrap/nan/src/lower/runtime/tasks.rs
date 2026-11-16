@@ -398,6 +398,11 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
             };
             fx.b.ins().return_(&[record]);
         }
+        Routine::Current => {
+            fx.entry();
+            let record = current_task(lo, fx);
+            fx.b.ins().return_(&[record]);
+        }
         _ => unreachable!("a task routine"),
     }
 }
@@ -411,16 +416,28 @@ pub fn waiting_on(lo: &mut Lowering, fx: &mut Fx, what: i64) {
     fx.atomic_store(what, word);
 }
 
-/// The task the running executor thread runs, zero outside a task.
+/// The task the running executor thread runs, zero outside a task. A kernel reads it with
+/// maskable interrupts disabled, so that its task stays on the CPU whose record it reads; a
+/// bundle reads it through `Current`.
 pub fn current_task(lo: &mut Lowering, fx: &mut Fx) -> Value {
+    if lo.portable() {
+        return lo.call_routine(fx, Routine::Current, &[])[0];
+    }
+    let flags = lo
+        .on_cpus()
+        .then(|| lo.call_stub(fx, Stub::IrqSave, &[])[0]);
     let thread = lo.thread(fx);
     let inside = fx.b.ins().icmp_imm_s(IntCC::NotEqual, thread, 0);
-    fx.choose(
+    let record = fx.choose(
         inside,
         &[PTR],
         |fx| vec![fx.load(PTR, thread, thread::CURRENT)],
         |fx| vec![fx.ptr(0)],
-    )[0]
+    )[0];
+    if let Some(flags) = flags {
+        lo.call_stub(fx, Stub::IrqRestore, &[flags]);
+    }
+    record
 }
 
 /// Whether a task's record links a deadline, and the earliest nanosecond at which one of them
@@ -769,11 +786,15 @@ fn spawn(lo: &mut Lowering, fx: &mut Fx) {
     fx.b.ins().return_(&[record]);
 }
 
-/// The first code a task runs, on its own stack: its glue, then its end, then it leaves the
-/// list of live tasks and switches away for the last time.
+/// The first code a task runs, on its own stack, with maskable interrupts enabled on a kernel:
+/// its glue, then its end, then it leaves the list of live tasks and switches away for the last
+/// time.
 fn task_start(lo: &mut Lowering, fx: &mut Fx) {
     let params = fx.entry();
     let record = params[0];
+    if lo.on_cpus() {
+        lo.call_stub(fx, Stub::Sti, &[]);
+    }
     if lo.windows() {
         host::windows::enter_task_stack(lo, fx, record);
     }
@@ -817,8 +838,12 @@ fn task_start(lo: &mut Lowering, fx: &mut Fx) {
     fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
 }
 
-/// Switches from the running task to its thread's scheduler.
+/// Switches from the running task to its thread's scheduler; on a kernel, with maskable
+/// interrupts disabled, so that its task stays on the CPU whose scheduler it switches to.
 fn switch_out(lo: &mut Lowering, fx: &mut Fx, record: Value) {
+    if lo.on_cpus() {
+        lo.call_stub(fx, Stub::Cli, &[]);
+    }
     let thread = lo.thread(fx);
     let scheduler = fx.offset(thread, thread::CONTEXT);
     let context = fx.offset(record, task::CONTEXT);
@@ -845,7 +870,8 @@ pub fn yield_preempted(lo: &mut Lowering, fx: &mut Fx) {
     });
 }
 
-/// Suspends the running task until a wake, unless one came since it last ran.
+/// Suspends the running task until a wake, unless one came since it last ran; a kernel task
+/// resumes with maskable interrupts enabled.
 fn park(lo: &mut Lowering, fx: &mut Fx) {
     let record = current_task(lo, fx);
     let word = fx.offset(record, task::STATE);
@@ -861,6 +887,9 @@ fn park(lo: &mut Lowering, fx: &mut Fx) {
         &[],
         |lo, fx| {
             switch_out(lo, fx, record);
+            if lo.on_cpus() {
+                lo.call_stub(fx, Stub::Sti, &[]);
+            }
             Vec::new()
         },
         |_, fx| {
@@ -1086,24 +1115,8 @@ fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let scheduler = fx.offset(thread, thread::CONTEXT);
     let context = fx.offset(record, task::CONTEXT);
     if lo.on_cpus() {
-        // A preempted task resumes through the seam that preempted it, whose return restores its
-        // interrupt flag; every other task runs with maskable interrupts enabled.
-        let preempted = fx.load(PTR, record, task::PREEMPTED);
-        let resumed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, preempted, 0);
-        fx.choose_in(
-            lo,
-            resumed,
-            &[],
-            |_, fx| {
-                let zero = fx.ptr(0);
-                fx.store(zero, record, task::PREEMPTED);
-                Vec::new()
-            },
-            |lo, fx| {
-                lo.call_stub(fx, Stub::Sti, &[]);
-                Vec::new()
-            },
-        );
+        let zero = fx.ptr(0);
+        fx.store(zero, record, task::PREEMPTED);
     }
     lo.switch_stacks(fx, scheduler, context, record);
     if owners {

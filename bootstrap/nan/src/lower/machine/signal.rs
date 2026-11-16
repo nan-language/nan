@@ -139,9 +139,11 @@ impl Lowering<'_, '_> {
     }
 
     /// Halts the running CPU until an interrupt arrives, with maskable interrupts enabled while it
-    /// waits and its record saying so, which keeps the seam from preempting the caller. Returns at
-    /// once inside an interrupt fn and before the anchor is installed.
+    /// waits and its record saying so, which keeps the seam from preempting the caller, and
+    /// disabled from reading that record until the wait, so that the caller stays on its CPU.
+    /// Returns at once inside an interrupt fn and before the anchor is installed.
     pub fn wait_for_interrupt(&mut self, fx: &mut Fx) {
+        let flags = self.call_stub(fx, Stub::IrqSave, &[])[0];
         let (record, waits) = self.thread_context(fx);
         fx.when(waits, |fx| {
             let one = fx.ptr(1);
@@ -150,5 +152,6 @@ impl Lowering<'_, '_> {
             let zero = fx.ptr(0);
             fx.store(zero, record, cpu::WAITING);
         });
+        self.call_stub(fx, Stub::IrqRestore, &[flags]);
     }
 }

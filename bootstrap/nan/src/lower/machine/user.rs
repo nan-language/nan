@@ -173,7 +173,7 @@ const SYSCALL_CLEARED: u64 = 0x4_7700;
 
 impl Lowering<'_, '_> {
     /// The running CPU's record, and whether the running code is in thread context: the anchor
-    /// is installed and no interrupt fn runs.
+    /// is installed and no interrupt fn runs. The caller has disabled maskable interrupts.
     pub fn thread_context(&mut self, fx: &mut Fx) -> (Value, Value) {
         let state_address = self.state(fx);
         let anchor = fx.load(PTR, state_address, state::ANCHOR);

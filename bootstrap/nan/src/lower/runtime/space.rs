@@ -1,7 +1,8 @@
 //! An isolated space's runtime: its one executor thread, which runs in user mode over a boot
 //! area its kernel maps as it is used, the system calls through which it reads its kernel's
 //! clock, waits for its first timer or its doorbell and ends, and its start, which runs
-//! `nanos::isolated` as its first task.
+//! `nanos::isolated` as its first task. A test image running alone in a space runs on such a
+//! runtime too, writing its standard streams and ending with its exit status through its kernel.
 
 use cranelift_codegen::ir::{
     AbiParam, InstBuilder, Signature, TrapCode, Value, condcodes::IntCC, types,
@@ -141,12 +142,29 @@ pub fn reap(lo: &mut Lowering, fx: &mut Fx) {
     fx.when(armed, |fx| lo.expire_timers(fx));
 }
 
-/// `Exit`: ends the space as a trap abandoning it.
-pub fn exit(lo: &mut Lowering, fx: &mut Fx) {
+/// `Exit`: ends a test image's space with its status, and another space as a trap abandoning it.
+pub fn exit(lo: &mut Lowering, fx: &mut Fx, status: Value) {
+    if !lo.seeded() {
+        return abandon(lo, fx);
+    }
+    call(lo, fx, END, &[status]);
+    fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
+}
+
+/// Ends the space as a trap abandoning it.
+fn abandon(lo: &mut Lowering, fx: &mut Fx) {
     let how = fx.ptr(TRAPPED);
     let kind = fx.ptr(super::super::trap::kind_number("trap.abandoned") as u64);
     call(lo, fx, END, &[how, kind]);
     fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
+}
+
+/// Writes a byte range to a test image's standard stream `fd`, 1 or 2, through its kernel.
+pub fn write_stream(lo: &mut Lowering, fx: &mut Fx, fd: i64, text: Value, len: Value) {
+    let handle = fx.ptr(0);
+    let operation = fx.ptr(fd as u64);
+    let none = fx.ptr(0);
+    call(lo, fx, INVOKE, &[handle, operation, text, len, none, none]);
 }
 
 impl Lowering<'_, '_> {
@@ -188,7 +206,7 @@ impl Lowering<'_, '_> {
                 &[glue, zero, zero, zero, usable, zero, process, root],
             )[0];
             let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
-            fx.when(missing, |fx| exit(lo, fx));
+            fx.when(missing, |fx| abandon(lo, fx));
             fx.store(start, record, task::ARGUMENT);
             fx.store(record, state_address, state::ENTRY_TASK);
             lo.call_routine(fx, Routine::Wake, &[record]);

@@ -1,7 +1,8 @@
 //! The bundle writer: links the object of a bundle's lowering from address zero and writes the
-//! bundle, each import bound to the index of the export its kernel's interface names; and the
-//! image of a kernel's user-mode runtime, a bundle whose job is the runtime's start, recording
-//! where it defines each export.
+//! bundle, each import bound to the index of the export its kernel's interface names; the image of
+//! a kernel's user-mode runtime, a bundle whose job is the runtime's start, recording where it
+//! defines each export; and a test image running alone in an isolated space, a bundle of the same
+//! form that no kernel's interface names and that exports nothing.
 
 use super::{Access, Imports, Linked, PAGE, link};
 use crate::encoding::{Record, bytes, list, uvar};
@@ -48,7 +49,7 @@ pub fn write(
     };
     bytes(
         &mut out,
-        &body(&linked, contributed, &parts, interface, &index),
+        &body(&linked, contributed, &parts, &interface.hash, &index),
     );
     let mut sections = Record::default();
     if let Some(seed) = seed {
@@ -78,16 +79,37 @@ pub fn runtime(
         .iter()
         .map(|name| linked.symbols.get(name).map_or(0, |at| at + 1))
         .collect();
+    unimported(&linked, &interface.hash, &exports, (start, stack), boot)
+}
+
+/// The image of a test running alone in an isolated space, from the object of its lowering: a
+/// bundle whose job is its start routine, with the stack that routine runs on, whose interface
+/// hash is empty, which exports nothing, and which records the bytes of the boot area it runs
+/// over.
+pub fn alone(object: &[u8], start: &str, stack: u64, boot: u64) -> Vec<u8> {
+    let linked = link(object, 0, PAGE, Imports::None);
+    unimported(&linked, &[], &[], (start, stack), boot)
+}
+
+/// An unsigned bundle importing nothing, of an interface hash, whose job is its start routine by
+/// symbol with its stack, recording where it defines each export and its boot area's bytes.
+fn unimported(
+    linked: &Linked,
+    hash: &[u8],
+    exports: &[u64],
+    job: (&str, u64),
+    boot: u64,
+) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
     uvar(&mut out, VERSION);
     let none = |_: &str| None;
     let parts = Parts {
-        job: Some((start, stack)),
+        job: Some(job),
         components: &[],
-        runtime: Some((&exports, boot)),
+        runtime: Some((exports, boot)),
         lines: crate::lower::LINES,
     };
-    bytes(&mut out, &body(&linked, &[], &parts, interface, &none));
+    bytes(&mut out, &body(linked, &[], &parts, hash, &none));
     out.extend(Record::default().finish());
     out
 }
@@ -109,7 +131,7 @@ fn body(
     linked: &Linked,
     contributed: &[Contributed],
     parts: &Parts,
-    interface: &Interface,
+    hash: &[u8],
     index: &dyn Fn(&str) -> Option<usize>,
 ) -> Vec<u8> {
     let mut image = Vec::new();
@@ -124,7 +146,7 @@ fn body(
         uvar(out, u128::from(second));
     };
     let mut record = Record::default();
-    record.field(1, field(|out| out.extend_from_slice(&interface.hash)));
+    record.field(1, hash.to_vec());
     record.field(2, image);
     record.field(3, field(|out| uvar(out, u128::from(linked.end()))));
     if !relocations.is_empty() {

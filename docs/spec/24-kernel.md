@@ -1823,6 +1823,8 @@ pub fn Loader.isolate_unverified(self, bundle: Slice[u8], alloc: mem::Alloc) -> 
 pub open struct Isolated {
 } Isolated
 
+pub fn Isolated.of_test(image: Slice[u8], alloc: mem::Alloc) -> Isolated fails LoadError
+
 pub fn Isolated.job(self) -> Option[Job]
 
 pub fn Isolated.component(self, name: Str) -> Option[Job]
@@ -1862,6 +1864,7 @@ pub fn Space.release(take self, mut frames: mem::List[hw::PhysFrame[4_096]])
 
 - `loader.isolate(bundle, keys, alloc)` verifies a bundle as `prepare` does, and fails with `Interface` too when the kernel holds no user-mode runtime. The isolated bundle keeps copies of the bundle and of the runtime, and its component entries, drawn through `alloc`; `isolated.job()` gives its job and `isolated.component(name)` the entry of its component entry `name`, none when it has none of that name, as they run in every space.
 - `loader.isolate_unverified(bundle, alloc)` is `isolate` without the signature check. It is a trusted primitive whose soundness condition is that `bundle` is a bundle the toolchain built against the kernel's interface file.
+- `sys::load::Isolated.of_test(image, alloc)` makes, from a copy of `image` drawn through `alloc`, the isolated bundle of a [test image](22-testing.md#emulator-runs) of a nanos target, which runs alone in its spaces in place of the user-mode runtime: a bundle whose part 1 is empty, which imports nothing, whose job entry is the start of its runtime and which states the bytes of its boot area. It fails with `Malformed` for any other bytes, and its spaces map no bundle after it; `isolated.job()` gives none.
 - `isolated.space(cpu, data, mut frames, alloc)` makes a space of frames taken from the end of `frames`, each cleared: from `0x80_0000_0000`, the **user window**, it maps the runtime's image, then the bundle's, both relocated for their addresses there and the bundle's imports bound to the runtime's exports, their pages mapped as `prepare` maps them but for user mode; then the runtime's stack and `data` bytes the caller lays out, readable and writable, never executable; then 32 pages for the user frames it shares; then the boot area the runtime runs over, whose boot heap holds 768 MiB, of which it maps only the pages drawn. The window spans at most 1 GiB. Its root maps the window and the entry area `cpu.entry_area()` gives ([split tables](#split-tables)), each page of the entry area with the attributes the running root maps it with then, and nothing else. It fails with `Unplaceable` when `frames` holds too few frames or the entry area reaches the window, and with `Interface` when the bundle imports what the runtime does not export.
 - `space.start()` is the address at which a thread runs the runtime, with the address of the start record `nanos::run_isolated` or `nanos::hold_isolated` lays out in its first argument register and that of the boot area, `space.boot_area()`, in its second; its stack pointer starts at `space.stack()`, and the caller's data starts at `space.data()`.
 - `space.share(frame)` maps `frame`, readable and writable, never executable, at the next of the pages for user frames, and gives its address there; it fails with `Unplaceable` once those pages are all mapped. The space does not own the frame, `read` and `write` do not reach it, and its mapping ends with the space.

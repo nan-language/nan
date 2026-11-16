@@ -402,7 +402,8 @@ pub fn program_tasks(workspace: &Workspace) -> Vec<TaskStack> {
 /// Writes the image of a lowered object at `image` through a staged file beside it, replacing any
 /// earlier image at once: on a Linux target an executable the target's linker links, giving the
 /// linker's output when it fails; on a Windows, macOS or machine target the image writer's,
-/// entered by the program entry seam.
+/// entered by the program entry seam; on a nanos target, whose programs are bundles, a test image
+/// running alone in an isolated space.
 pub fn write_image(target: Target, object: &[u8], image: &Path) -> io::Result<Result<(), String>> {
     let directory = image.parent().expect("an image lies in a directory");
     fs::create_dir_all(directory)?;
@@ -420,6 +421,15 @@ pub fn write_image(target: Target, object: &[u8], image: &Path) -> io::Result<Re
         _ => None,
     };
     match entry {
+        None if target.is_nanos() => {
+            let bytes = crate::image::bundle::alone(
+                object,
+                lower::SPACE_START,
+                lower::SPACE_STACK,
+                lower::SPACE_BOOT,
+            );
+            fs::write(&new, bytes)?;
+        }
         Some(entry) => {
             let bytes = crate::image::write(target, object, entry, &name);
             fs::write(&new, bytes)?;

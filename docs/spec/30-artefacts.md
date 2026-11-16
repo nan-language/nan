@@ -217,6 +217,7 @@ A **bundle** is the `.nbun` file that `nan build <package> --against <interface 
 - A bundle build checks the package's dependency closure and release-checks its releases as a final build does. It is an error (`target.bundle-interface`), reported on the package's `package` line with a `note` reason, when the interface file cannot be read or does not decode, when it records another toolchain hash or a target the package does not declare, when a package of the closure has another code root than the interface file records under its name, when an interrupt fn of a package outside the kernel's final closure states a larger `stack N` than the file's part 5, when the bundle's code reaches a support routine or runtime data the kernel does not export, and when a nanos program's closure contributes to a loaded registry.
 - A `stack N` of the type of a loaded registry's function field demands `N` less 1 KiB of each function a contribution names for it, the rest left to its gate, reported at the contribution, and demands `N` of the gate in the kernel's final build, reported at the registry.
 - The [user-mode runtime](24-kernel.md#isolated-spaces) a kernel's final build holds is an unsigned bundle built against the kernel's own interface file, imports none, and whose job entry is the runtime's start, with the stack that start runs on.
+- A [test image](22-testing.md#emulator-runs) of a nanos target is an unsigned bundle of the same form against no interface file, which imports and exports nothing and holds the support routines its runs need, lowered for user mode; its runtime's start takes the address of the start record of a [test run](14-authority.md#jobs) in place of a job's.
 - A bundle build also writes `<package>.narts` beside the bundle: the artefacts of the bundle's final closure, std included, as the content of a [host section](#host-sections) `.nan` holds them; and `<package>.ntree`, the hash of the encoding of the list of their code roots, as the host section `.nan.tree` holds it.
 - `nan build --as <principal>` signs the bundle with the principal's secret key, as [publishing](29-identity-versioning.md#publishing) signs an artefact, failing as publishing does when the user directory lacks it.
 
@@ -224,7 +225,7 @@ Its bytes, in the forms of the canonical NIR encoding, are the magic `4E 42 55 4
 
 | Key | Content |
 | --- | --- |
-| 1 | the interface hash of the kernel, as its 33 bytes |
+| 1 | the interface hash of the kernel, as its 33 bytes, or no byte for a test image |
 | 2 | the bytes of the image, laid out from offset 0: its code, then its read-only data, then its writable data, each part from a 4 KiB boundary |
 | 3 | the bytes the image occupies in memory, those past part 2 being zeros, a uvar |
 | 4 | the base relocations, absent when there are none: the offset of each word to which loading adds the image's address, a list of uvars |
@@ -234,8 +235,8 @@ Its bytes, in the forms of the canonical NIR encoding, are the magic `4E 42 55 4
 | 8 | the offsets in the image of its read-only data and of its writable data, a pair of uvars |
 | 9 | for a nanos program whose entry is `main`, the offset of its job entry and the bytes of stack its task needs, a pair of uvars |
 | 10 | for a nanos program listing component entries, a list of them in byte order of name: each its name as a text, then the offset of its entry and the bytes of stack its task needs as uvars |
-| 11 | for a user-mode runtime, for each export of the interface, the offset of its definition plus one, or 0 where it defines none, a list of uvars |
-| 12 | for a user-mode runtime, the bytes of the boot area it runs over, a uvar |
+| 11 | for a user-mode runtime, for each export of the interface, the offset of its definition plus one, or 0 where it defines none, a list of uvars, empty for a test image |
+| 12 | for a user-mode runtime or a test image, the bytes of the boot area it runs over, a uvar |
 
 - Words are 8 bytes, least significant byte first. The encoding of the image's code and line tables belongs to the kernel's ABI.
 

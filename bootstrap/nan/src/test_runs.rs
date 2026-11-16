@@ -6,6 +6,8 @@
 mod outcome;
 mod setup;
 mod shrink;
+#[cfg(test)]
+mod tests;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};

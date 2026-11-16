@@ -69,8 +69,8 @@ A **run** is one execution of a test body on one [run target](#emulator-runs). O
 - a failure escapes the body (`test.escaped-failure`), reported with its variant's path and, when its type implements `Render`, its rendering within a render budget of 4,096 bytes; a trap while rendering it fails the run with that trap's report;
 - the target did not run (`test.target-not-run`);
 - on a host target, no task of the domain is ready and no deadline is pending (`test.stalled`);
-- the run uses more than 10 seconds of host processor time, its process's or its emulator's (`test.timeout`), its domain then being [abandoned](11-errors-domains.md#abandoning-a-domain) without a trap report.
-- its process or its emulator ends without writing the run's outcome (`test.crashed`), reported by the signal ending the process or the status it exits with.
+- the run uses more than 10 seconds of host processor time, its process's or its emulator's, or of its kernel's clock in its space (`test.timeout`), its domain then being [abandoned](11-errors-domains.md#abandoning-a-domain) without a trap report.
+- its process, its emulator or its space ends without writing the run's outcome (`test.crashed`), reported by the signal ending the process or the status it exits with.
 
 These codes and `test.emulator-unavailable` are the **test-run codes**. `nan test` reports a failing test as [checking commands](33-toolchain.md#checking-commands) state, its cause being its test-run code or trap kind; a test-run code is never a diagnostic. A test passes when every run passes, and reports only its failing run of lowest index. Runs share no state, and their outcomes never depend on how many execute at once.
 
@@ -433,12 +433,13 @@ A test is affected on a run target when it has no recorded pass there under the 
 
 ## Emulator runs
 
-A package's tests run on each declared [target](27-program-model.md#targets), `any` standing for the host target of the system running the toolchain and the machine's architecture, such as `x86_64-linux`, which is the **run target** of their runs. On a host target each run is a process of the system running the toolchain, under the descriptor's emulator, Wine, for a Windows target on Linux.
+A package's tests run on each declared [target](27-program-model.md#targets), `any` standing for the target of the system running the toolchain and the machine's architecture, such as `x86_64-linux`, or `x86_64-nanos` for the toolchain running as a [job](14-authority.md#jobs) of a NaN OS kernel, which is the **run target** of their runs. On a host target each run is a process of the system running the toolchain, under the descriptor's emulator, Wine, for a Windows target on Linux.
 
 - On the machine targets, each run boots, under the emulator of the target's [descriptor](27-program-model.md#descriptors), a [test image](30-artefacts.md#lowering) of the test's reach and the support routines. It starts the seeded scheduler on one processor, runs the body as its first task, writes the outcome, test trace and any trap report to the descriptor's serial port, then writes the byte 0 to its [exit port](27-program-model.md#descriptors), which ends the run. The image holds the registry tables that the tested package admits ([contributors](25-registries.md#contributors)).
+- On a nanos target, the toolchain runs as the job of an [isolated space](24-kernel.md#isolated-spaces), and each run is a [test run](14-authority.md#jobs) its kernel serves it: a test image of the test's reach and the support routines, lowered for user mode, runs alone in a new isolated space, writes the outcome, test trace and any trap report to its standard output, then ends its space with status 0.
 - Each boot finds the machine as new: its serial port reads no input, its console port is connected to nothing, its disks are blank, its firmware's variables are the firmware's template and its TPM's state is new, and what it writes to them, or to its boot volume, lasts until the boot ends. Its network reaches no host outside the machine, and a reset ends the run.
 - The run's domain is that boot's kernel domain: a trap halts it, and the report on serial is the run's failure. When no task is ready and no deadline is pending, the processor waits for an interrupt.
-- When the emulator or `swtpm` cannot be started, for a Linux or macOS target when the toolchain runs on another system or the machine running it has another architecture, for a Windows target when the machine has another architecture or, the toolchain running on Linux, Wine cannot be started, and on a nanos target, every run on that target fails (`test.emulator-unavailable`).
+- When the emulator or `swtpm` cannot be started, for a Linux or macOS target when the toolchain runs on another system or the machine running it has another architecture, for a Windows target when the machine has another architecture or, the toolchain running on Linux, Wine cannot be started, and for a nanos target when the toolchain does not run as the job of an isolated space on a machine of its architecture, every run on that target fails (`test.emulator-unavailable`).
 
 ```nan
 // file: checksum/package.nan

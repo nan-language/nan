@@ -18817,7 +18817,7 @@ const TEXT_NANOS_HELD: Str =
     \\
 
 const TEXT_NANOS_ISOLATED: Str =
-    \\//! Jobs in isolated spaces: the kernel's side, which runs a job's space in user mode and serves its system calls through the space's table of handles, and the first task of the space's runtime, which runs the job on a world whose log, standard streams, random source and link's channels reach the kernel through those calls.
+    \\//! Jobs in isolated spaces: the kernel's side, which runs a job's space in user mode and serves its system calls through the space's table of handles, running the test images it asks for in spaces of their own, and the first task of the space's runtime, which runs the job on a world whose log, standard streams, random source and link's channels reach the kernel through those calls.
     \\
     \\/// The system calls of an isolated space: waiting until a deadline of the kernel's clock, drawing
     \\/// and releasing pages of its boot area, reading that clock, invoking an operation of a capability
@@ -18867,6 +18867,8 @@ const TEXT_NANOS_ISOLATED: Str =
     \\
     \\const FILL: u64 = 0
     \\
+    \\const TEST_RUN: u64 = 0
+    \\
     \\/// The operations of the file system the kernel serves a job's space: those of `sys::FsService`
     \\/// but `read_all` and `write_all`, which the space makes of the others.
     \\const FS_OPEN: u64 = 0
@@ -18907,6 +18909,17 @@ const TEXT_NANOS_ISOLATED: Str =
     \\
     \\/// The most bytes the encoding of what crosses into a space's table takes.
     \\const CARRIED_BYTES: usize = 16
+    \\
+    \\/// The bytes of a test image's start record: where the texts naming its run lie and their length.
+    \\const TEST_START_BYTES: usize = 16
+    \\
+    \\/// The nanoseconds of the kernel's clock a test run may take, and the statuses a run ends with
+    \\/// when it takes more and when its thread faults on a page it cannot draw.
+    \\const TEST_NS: u64 = 10_000_000_000
+    \\
+    \\const TIMED_OUT: u64 = 124
+    \\
+    \\const CRASHED: u64 = 70
     \\
     \\/// How an `CALL_END` call says the job ended: returned, failed, trapped, given an input it does not
     \\/// decode or cancelled.
@@ -18981,6 +18994,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    Stdio(sys::Stdio)
     \\    Random(sys::Random)
     \\    Fs(sys::Fs)
+    \\    Tests
     \\    Channel(usize)
     \\    Runner(sys::Runner)
     \\} Holding
@@ -19033,6 +19047,14 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    kind: u8
     \\} Listed
     \\
+    \\/// The arguments of a test run: the paths of the test image and of the file taking its output, and
+    \\/// the texts naming the run.
+    \\struct TestRun derives Encode {
+    \\    image: text::String
+    \\    output: text::String
+    \\    texts: mem::List[text::String]
+    \\} TestRun
+    \\
     \\/// The arguments of a call handed to the runner capability through a port.
     \\struct Sending derives Encode {
     \\    port: u64
@@ -19083,6 +19105,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    let stdio = held_by(table, holding: Holding.Stdio(services.stdio))
     \\    let random = held_by(table, holding: Holding.Random(services.random))
     \\    let fs = held_by(table, holding: Holding.Fs(services.fs))
+    \\    discard held_by(table, holding: Holding.Tests)
     \\    let channels = table.count.load()
     \\    for index in 0..<link.channels.len() {
     \\        discard held_by(table, holding: Holding.Channel(index))
@@ -19282,7 +19305,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\                        Err(_) => INVALID
     \\                    }
     \\                } else if number == CALL_INVOKE {
-    \\                    answer = try await invoked(mut space, state, served, link, mut ids, mut files, alloc)
+    \\                    answer = try await invoked(cpu, mut space, state, served, link, halted, mut ids, mut files, mut frames, alloc)
     \\                }
     \\                state.regs[register(ROLE_RESULT)] = Untrusted.of(answer)
     \\            }
@@ -19348,8 +19371,9 @@ const TEXT_NANOS_ISOLATED: Str =
     \\/// Serves an `CALL_INVOKE` call: the handle of an entry of the space's table, the operation, the
     \\/// address and length of its arguments and the address and capacity of its result; `ids` keeps
     \\/// what crossed into the table for each capability the runner capability holds by number, and
-    \\/// `files` the files the space opened.
-    \\fn invoked(mut space: sys::load::Space, state: hw::UserState, served: Serving, link: Link, mut ids: mem::Map[u64, Carried], mut files: Files, alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    \\/// `files` the files the space opened. A test run's space draws from `frames` and stops once
+    \\/// `halted` gives true.
+    \\fn invoked(cpu: hw::Ring0, mut space: sys::load::Space, state: hw::UserState, served: Serving, link: Link, halted: fn() -> bool, mut ids: mem::Map[u64, Carried], mut files: Files, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
     \\    let handle = user_word(state.regs[register(0)])
     \\    let operation = user_word(state.regs[register(1)])
     \\    let target = user_word(state.regs[register(4)])
@@ -19380,6 +19404,11 @@ const TEXT_NANOS_ISOLATED: Str =
     \\            }
     \\        }
     \\        Holding.Fs(fs) => return try await filed(mut space, fs, operation, args, target, capacity, mut files, alloc)
+    \\        Holding.Tests => {
+    \\            if operation == TEST_RUN {
+    \\                return try await test_served(cpu, services: served.services, args, halted, mut frames, alloc)
+    \\            }
+    \\        }
     \\        Holding.Channel(index) => {
     \\            if operation == NOTIFY {
     \\                link.heard_from(index)
@@ -19471,6 +19500,156 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        Err(sys::RunnerError.Unknown) or Err(sys::RunnerError.Cancelled(_)) => return INVALID
     \\    }
     \\} outcome_of
+    \\
+    \\/// Serves a test run: runs the test image at the path its arguments name in the file system of
+    \\/// `services` alone in a space of its own, on the texts they give, writing what it writes to its
+    \\/// standard output into a file made at the output path they name, and gives the status it ends
+    \\/// with.
+    \\fn test_served(cpu: hw::Ring0, services: Services, args: Untrusted[mem::Bytes], halted: fn() -> bool, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    \\    let Ok(asked) = attempt mem::wire::Codec[TestRun].decode(args.view(), alloc) else {
+    \\        return INVALID
+    \\    }
+    \\    let read = attempt await services.fs.read_all(asked.image.as_str(), alloc)
+    \\    let Ok(image) = read else {
+    \\        return failed_with(read)
+    \\    }
+    \\    let Ok(alone) = attempt sys::load::Isolated.of_test(bytes_of(image.view(), alloc).view(), alloc) else {
+    \\        return INVALID
+    \\    }
+    \\    let made = attempt await services.fs.create(asked.output.as_str())
+    \\    let Ok(output) = made else {
+    \\        return failed_with(made)
+    \\    }
+    \\    var texts = mem::Bytes.empty(alloc)
+    \\    for text in asked.texts {
+    \\        mut texts.append(text.as_bytes())
+    \\        mut texts.push(0)
+    \\    }
+    \\    let Some(frame) = mut frames.pop() else {
+    \\        return INVALID
+    \\    }
+    \\    var extended = Some(hw::ExtendedState.of(take frame))
+    \\    var file = output
+    \\    let ran = attempt await test_space(cpu, image: alone, texts: texts.view(), output: mut file, clock: services.clock, halted, mut extended, mut frames, alloc)
+    \\    match extended {
+    \\        Some(owned) => mut frames.push(take owned.into_frame())
+    \\        None => {}
+    \\    }
+    \\    match ran {
+    \\        Ok(status) => return status
+    \\        Err(cancelled) => fail cancelled
+    \\    }
+    \\} test_served
+    \\
+    \\/// Runs a test image's space on `texts` until it ends, writing what it writes to its standard
+    \\/// output into `output`, and gives the status it ends with: the one it gives, `TIMED_OUT` once it
+    \\/// has run for `TEST_NS` or `halted` gives true, and `CRASHED` when its thread faults on a page it
+    \\/// cannot draw or on another exception.
+    \\fn test_space(cpu: hw::Ring0, image: sys::load::Isolated, texts: Slice[u8], mut output: sys::fs::File, clock: sys::Clock, halted: fn() -> bool, mut extended: Option[hw::ExtendedState], mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    \\    let Ok(made) = attempt image.space(cpu, data: u64.widen(TEST_START_BYTES + texts.len() + 1), mut frames, alloc) else {
+    \\        return INVALID
+    \\    }
+    \\    var space = made
+    \\    let start = space.data()
+    \\    var record = mem::Bytes.zeroed(TEST_START_BYTES, alloc)
+    \\    mut record.view_mut().write_u64_le(0, value: start + u64.widen(TEST_START_BYTES))
+    \\    mut record.view_mut().write_u64_le(8, value: u64.widen(texts.len()))
+    \\    discard attempt mut space.write(start, bytes: record.view())
+    \\    discard attempt mut space.write(start + u64.widen(TEST_START_BYTES), bytes: texts)
+    \\    var state = hw::UserState(regs: Array[Untrusted[u64], 31].filled(Untrusted.of(0)), sp: Untrusted.of(space.stack()), ip: Untrusted.of(space.start()), flags: Untrusted.of(0))
+    \\    state.regs[register(0)] = Untrusted.of(start)
+    \\    state.regs[register(1)] = Untrusted.of(space.boot_area())
+    \\    let began = elapsed_of(clock)
+    \\    var status = TIMED_OUT
+    \\    loop {
+    \\        if halted() or elapsed_of(clock).saturating_sub(began) > TEST_NS {
+    \\            break
+    \\        }
+    \\        match space.run(cpu, mut state, mut extended) {
+    \\            hw::UserExit.Interrupted => {}
+    \\            hw::UserExit.Fault(fault) => {
+    \\                let Ok(1) = attempt mut space.draw(fault.address, len: 1, mut frames) else {
+    \\                    status = CRASHED
+    \\                    break
+    \\                }
+    \\            }
+    \\            hw::UserExit.Syscall => {
+    \\                let number = user_word(state.regs[register(ROLE_NUMBER)])
+    \\                if number == CALL_END {
+    \\                    status = user_word(state.regs[register(0)]) % 256
+    \\                    break
+    \\                }
+    \\                var answer = INVALID
+    \\                if number == CALL_DRAW {
+    \\                    answer = match attempt mut space.draw(user_word(state.regs[register(0)]), len: user_word(state.regs[register(1)]), mut frames) {
+    \\                        Ok(_) => 0
+    \\                        Err(_) => INVALID
+    \\                    }
+    \\                } else if number == CALL_RELEASE {
+    \\                    answer = match attempt mut space.give_back(user_word(state.regs[register(0)]), len: user_word(state.regs[register(1)]), mut frames) {
+    \\                        Ok(_) => 0
+    \\                        Err(_) => INVALID
+    \\                    }
+    \\                } else if number == CALL_INVOKE {
+    \\                    match attempt await test_output(space, state, mut output, alloc) {
+    \\                        Ok(given) => {
+    \\                            answer = given
+    \\                        }
+    \\                        Err(cancelled) => {
+    \\                            take space.release(mut frames)
+    \\                            fail cancelled
+    \\                        }
+    \\                    }
+    \\                }
+    \\                state.regs[register(ROLE_RESULT)] = Untrusted.of(answer)
+    \\            }
+    \\        }
+    \\    }
+    \\    take space.release(mut frames)
+    \\    return status
+    \\} test_space
+    \\
+    \\/// Serves a test image's `CALL_INVOKE` call: a write to its standard output goes into `output`, one
+    \\/// to its standard error nowhere, and any other call fails.
+    \\fn test_output(space: sys::load::Space, state: hw::UserState, mut output: sys::fs::File, alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    \\    let operation = user_word(state.regs[register(1)])
+    \\    if operation == WRITE_ERR {
+    \\        return 0
+    \\    }
+    \\    if operation != WRITE_OUT {
+    \\        return INVALID
+    \\    }
+    \\    let Ok(written) = attempt copied(space, state, at: 2, alloc) else {
+    \\        return INVALID
+    \\    }
+    \\    try await written_out(mut output, data: bytes_of(written.view(), alloc).view())
+    \\    return 0
+    \\} test_output
+    \\
+    \\/// The nanoseconds of a clock, 0 once it is revoked.
+    \\fn elapsed_of(clock: sys::Clock) -> u64 {
+    \\    return match attempt clock.elapsed_ns() {
+    \\        Ok(ns) => ns
+    \\        Err(_) => 0
+    \\    }
+    \\} elapsed_of
+    \\
+    \\/// Writes all of `data` to a file, as far as the file takes it.
+    \\fn written_out(mut output: sys::fs::File, data: Slice[u8]) fails task::Cancelled uses wait {
+    \\    var done: usize = 0
+    \\    while done < data.len() {
+    \\        let Some(parts) = data.split_at(done) else {
+    \\            return
+    \\        }
+    \\        let Ok(count) = attempt await mut output.write(parts.tail) else {
+    \\            return
+    \\        }
+    \\        if count == 0 {
+    \\            return
+    \\        }
+    \\        done += count
+    \\    }
+    \\} written_out
     \\
     \\/// Serves an operation of the standard streams a space holds: its result's address and capacity
     \\/// are `target` and `capacity`.
@@ -20012,6 +20191,8 @@ const TEXT_NANOS_ISOLATED: Str =
     \\
     \\const FS_HANDLE: u64 = 3
     \\
+    \\const TESTS_HANDLE: u64 = 4
+    \\
     \\pub open struct SpaceCalls derives Copy {
     \\} SpaceCalls
     \\
@@ -20087,6 +20268,16 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    var scratch = Array[u8, SCRATCH_BYTES].filled(0)
     \\    return try space_list(FS_HANDLE, path, alloc, scratch: mut scratch.view_mut())
     \\} SpaceCalls.list
+    \\
+    \\pub fn SpaceCalls.run_test(self, image: Str, output: Str, texts: Slice[text::String], alloc: mem::Alloc) -> u8 fails sys::fs::FsError {
+    \\    var given = mem::List[text::String].empty(alloc)
+    \\    for text in texts {
+    \\        mut given.push(text::String.of(text.as_str(), alloc))
+    \\    }
+    \\    let args = encoded(TestRun(image: text::String.of(image, alloc), output: text::String.of(output, alloc), texts: take given), alloc)
+    \\    var nothing = Array[u8, 1].filled(0)
+    \\    return u8.truncate(try space_call(TESTS_HANDLE, operation: TEST_RUN, args: args.view(), result: mut nothing.view_mut()))
+    \\} SpaceCalls.run_test
     \\
     \\pub fn SpaceCalls.read_in(self, mut buf: SliceMut[u8]) -> usize fails sys::StdioError {
     \\    return try streamed_in(STDIO_HANDLE, mut buf)
@@ -22343,6 +22534,12 @@ const TEXT_SYS_LOAD_LOAD: Str =
     \\    if table == 0 or not same_interface(bundle, hash: parts.hash, table) {
     \\        fail LoadError.Interface
     \\    }
+    \\    return try shaped(parts)
+    \\} placeable_parts
+    \\
+    \\/// Parts whose image holds its line tables and its job entry in its code, its read-only data
+    \\/// following its code and its writable data following those, each from a page.
+    \\fn shaped(parts: Parts) -> Parts fails LoadError {
     \\    let image = u64.widen(parts.image.len)
     \\    let ordered = parts.read_only <= parts.writable and parts.writable <= parts.size and parts.read_only % PAGE == 0 and parts.writable % PAGE == 0
     \\    let coded = not parts.job or parts.entry < parts.read_only
@@ -22350,7 +22547,7 @@ const TEXT_SYS_LOAD_LOAD: Str =
     \\        fail LoadError.Malformed
     \\    }
     \\    return parts
-    \\} placeable_parts
+    \\} shaped
     \\
     \\/// Relocates and binds the image copied at `base` for its address in the window, giving the
     \\/// entries it adds.
@@ -22402,8 +22599,7 @@ const TEXT_SYS_LOAD_LOAD: Str =
     \\/// The parts a bundle's body records, keyed from 1: a runtime's image adds where it defines each
     \\/// export and the bytes of its boot area.
     \\fn parts_of(bundle: Slice[u8], body: Span) -> Parts fails LoadError {
-    \\    let empty = Span(start: 0, len: 0)
-    \\    var parts = Parts(hash: empty, image: empty, size: 0, relocations: empty, imports: empty, lines: 0, contributions: empty, read_only: 0, writable: 0, job: false, entry: 0, stack: 0, components: empty, exports: empty, boot: 0)
+    \\    var parts = no_parts()
     \\    var reader = Reader(at: body.start, end: body.start + body.len)
     \\    var last: u64 = 0
     \\    var held: u64 = 0
@@ -22476,6 +22672,12 @@ const TEXT_SYS_LOAD_LOAD: Str =
     \\    }
     \\    return parts
     \\} parts_of
+    \\
+    \\/// The parts of an empty body.
+    \\fn no_parts() -> Parts {
+    \\    let empty = Span(start: 0, len: 0)
+    \\    return Parts(hash: empty, image: empty, size: 0, relocations: empty, imports: empty, lines: 0, contributions: empty, read_only: 0, writable: 0, job: false, entry: 0, stack: 0, components: empty, exports: empty, boot: 0)
+    \\} no_parts
     \\
     \\/// The span of a bundle's body, after its magic and version and before its sections, which
     \\/// extend to its end.
@@ -23336,7 +23538,7 @@ const TEXT_SYS_LOAD_LOAD: Str =
     \\
 
 const TEXT_SYS_LOAD_SPACES: Str =
-    \\//! Isolated spaces: bundles verified for them, and spaces of 4 KiB frames mapped for user mode at the user window, where the kernel's user-mode runtime runs a bundle's job with the runtime's exports bound to its imports.
+    \\//! Isolated spaces: bundles verified for them, test images running alone in them, and spaces of 4 KiB frames mapped for user mode at the user window, where the kernel's user-mode runtime runs a bundle's job with the runtime's exports bound to its imports.
     \\
     \\/// The user window: its first address, the top-level entry mapping it, and the most pages a space
     \\/// maps there, those 512 tables of pages map.
@@ -23363,7 +23565,8 @@ const TEXT_SYS_LOAD_SPACES: Str =
     \\const SHARED_PAGES: u64 = 32
     \\
     \\/// A bundle verified for isolated spaces: its bytes and their parts, its component entries as
-    \\/// every space places them, and the image of the kernel's user-mode runtime and its parts.
+    \\/// every space places them, and the image of the kernel's user-mode runtime and its parts; or a
+    \\/// test image, which runs alone in its spaces in place of that runtime, the bundle empty.
     \\pub open struct Isolated {
     \\    bundle: mem::Bytes
     \\    parts: Parts
@@ -23460,6 +23663,16 @@ const TEXT_SYS_LOAD_SPACES: Str =
     \\    return Isolated(bundle: take copy, parts: parts, components: take components, runtime_image: take runtime_copy, runtime: runtime)
     \\} Loader.isolated_of
     \\
+    \\pub fn Isolated.of_test(image: Slice[u8], alloc: mem::Alloc) -> Isolated fails LoadError {
+    \\    let runtime = try shaped(try parts_of(image, body: try body_of(image)))
+    \\    if not runtime.job or runtime.imports.len != 0 or runtime.hash.len != 0 or runtime.boot == 0 {
+    \\        fail LoadError.Malformed
+    \\    }
+    \\    var copy = mem::Bytes.empty(alloc)
+    \\    mut copy.append(image)
+    \\    return Isolated(bundle: mem::Bytes.empty(alloc), parts: no_parts(), components: mem::List[Exported].empty(alloc), runtime_image: take copy, runtime: runtime)
+    \\} Isolated.of_test
+    \\
     \\pub fn Isolated.job(self) -> Option[Job] {
     \\    if not self.parts.job {
     \\        return None
@@ -23489,11 +23702,16 @@ const TEXT_SYS_LOAD_SPACES: Str =
     \\    let image_base = image_window(self.runtime)
     \\    var runtime_copy = try relocated_copy(self.runtime_image.view(), parts: self.runtime, window: USER_WINDOW, alloc)
     \\    let runtime_base = address_of(mut runtime_copy)
-    \\    set_word(runtime_base + self.runtime.lines + LINES_NEXT, value: image_base + self.parts.lines)
-    \\    var image_copy = try self.bound_copy(window: image_base, alloc)
+    \\    var image_copy = mem::Bytes.empty(alloc)
+    \\    if self.parts.size > 0 {
+    \\        set_word(runtime_base + self.runtime.lines + LINES_NEXT, value: image_base + self.parts.lines)
+    \\        image_copy = try self.bound_copy(window: image_base, alloc)
+    \\    }
     \\    var space = try mapped(plan, reach, mut frames, alloc)
     \\    mut space.fill(at_page: 0, from: runtime_base, len: self.runtime.size)
-    \\    mut space.fill(at_page: plan.image, from: address_of(mut image_copy), len: self.parts.size)
+    \\    if self.parts.size > 0 {
+    \\        mut space.fill(at_page: plan.image, from: address_of(mut image_copy), len: self.parts.size)
+    \\    }
     \\    sync(space.pages[0].base(), len: plan.stack * PAGE)
     \\    return space
     \\} Isolated.space

@@ -1876,15 +1876,19 @@ fn language_server(_: &Utf8Path, _: String) -> datatest_stable::Result<()> {
 }
 
 /// The commands the toolchain's job runs in turn in the kernel `space_host`.
-const NANOS_COMMANDS: [&str; 3] = [
+const NANOS_COMMANDS: [&str; 4] = [
     "check hello",
     "build space_host",
     "build hello --against .nan/images/x86_64-bare/space_host.nlif",
+    "test halves",
 ];
+
+/// The packages the toolchain's job checks, builds and tests.
+const NANOS_PACKAGES: [&str; 3] = ["hello", "halves", "space_host"];
 
 /// Builds the NaN toolchain for `x86_64-nanos` against the kernel `space_host`, boots the kernel
 /// with a boot module holding the toolchain's bundle, its tree file, its commands and the packages
-/// `hello` and `space_host`, and compares what the toolchain's commands write and exit with in the
+/// it checks, builds and tests, and compares what the toolchain's commands write and exit with in the
 /// kernel's isolated spaces with what the bootstrap's do.
 fn nanos_toolchain(path: &Utf8Path, _: String) -> datatest_stable::Result<()> {
     if std::env::consts::ARCH != "x86_64" {
@@ -1923,7 +1927,7 @@ fn nanos_toolchain(path: &Utf8Path, _: String) -> datatest_stable::Result<()> {
             format!("{}\n", NANOS_COMMANDS.join("\n")).into_bytes(),
         ),
     ];
-    for package in ["hello", "space_host"] {
+    for package in NANOS_PACKAGES {
         tree(&source.join(package), &format!("{package}/"), &mut files)?;
     }
     let mut module = Vec::new();
@@ -1936,7 +1940,7 @@ fn nanos_toolchain(path: &Utf8Path, _: String) -> datatest_stable::Result<()> {
     let module_path = dir.join("module");
     fs::write(&module_path, module)?;
     let checked = base().join("nanos-checked");
-    for package in ["hello", "space_host"] {
+    for package in NANOS_PACKAGES {
         copy_tree(&source.join(package), &checked.join(package), false)?;
     }
     let mut expected = String::new();

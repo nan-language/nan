@@ -1,8 +1,9 @@
 //! Test images: a package's tests lowered for their runs on a run target, each run a process on
-//! a host target and a boot of the emulator on a machine target. The seam reads which test and
-//! run to perform and starts the entry task, which mints the run's simulated world, runs the test
-//! as the first task of a new test domain on the seeded scheduler, then writes the run's outcome
-//! as a frame on standard output, or the serial port of a machine, and ends the run.
+//! a host target, a boot of the emulator on a machine target and an isolated space of the kernel
+//! running the toolchain on a nanos target. The seam reads which test and run to perform and
+//! starts the entry task, which mints the run's simulated world, runs the test as the first task
+//! of a new test domain on the seeded scheduler, then writes the run's outcome as a frame on
+//! standard output, or the serial port of a machine, and ends the run.
 //!
 //! A frame is its kind's byte, its payload's length as 4 bytes little-endian, then the payload.
 //! An outcome's payload is its code, whether the test's target ran and whether a scheduling
@@ -127,16 +128,21 @@ pub fn lower(ck: &Checker, tests: &Tests) -> Lowered {
         ran: None,
         state: None,
     };
+    let linking = match ck.db.target.is_nanos() {
+        true => super::load::Linking::Runtime,
+        false => super::load::Linking::Image,
+    };
     let mut lowering = Lowering::new(
         ck,
         tests.prefixes.clone(),
         tests.roots.clone(),
         None,
         Some(runtime),
-        super::load::Linking::Image,
+        linking,
     );
     let entry = entry_glue(&mut lowering, tests);
     match (lowering.machine(), lowering.windows()) {
+        (true, _) if lowering.user() => space_seam(&mut lowering, entry),
         (true, _) => machine_seam(&mut lowering, entry),
         (false, true) => super::host::windows::test_seam(&mut lowering, entry),
         (false, false) => super::host::posix::test_seam(&mut lowering, entry),
@@ -251,6 +257,29 @@ fn machine_seam(lo: &mut Lowering, entry: FuncId) {
         },
     );
     lo.entry_seam(boot, super::machine::BOOT_STACK);
+}
+
+/// The start routine of a test image running alone in an isolated space, which its kernel enters
+/// with the address of a start record, holding the address and the length of the texts naming the
+/// run, each NUL-terminated, and with the address of the boot area: it sets up the runtime over
+/// the boot area and starts the run.
+fn space_seam(lo: &mut Lowering, entry: FuncId) {
+    let mut signature = Signature::new(CALL_CONV);
+    signature.params.extend([AbiParam::new(PTR); 2]);
+    let start = lo
+        .module
+        .declare_function(super::runtime::space::START, Linkage::Local, &signature)
+        .expect("the start routine");
+    lo.define(start, signature, lines::HIDDEN, |lo, fx| {
+        let params = fx.entry();
+        let (record, area) = (params[0], params[1]);
+        let state_address = lo.state(fx);
+        fx.store(area, state_address, state::BOOT_AREA);
+        system::start(lo, fx);
+        let (bytes, len) = (fx.load(PTR, record, 0), fx.load(PTR, record, 8));
+        let (count, texts) = texts(lo, fx, bytes, len);
+        start_run(lo, fx, entry, count, texts);
+    });
 }
 
 /// The NUL-terminated texts of a run file's bytes, which a NUL follows: their count and an array

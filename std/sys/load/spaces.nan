@@ -1,4 +1,4 @@
-//! Isolated spaces: bundles verified for them, and spaces of 4 KiB frames mapped for user mode at the user window, where the kernel's user-mode runtime runs a bundle's job with the runtime's exports bound to its imports.
+//! Isolated spaces: bundles verified for them, test images running alone in them, and spaces of 4 KiB frames mapped for user mode at the user window, where the kernel's user-mode runtime runs a bundle's job with the runtime's exports bound to its imports.
 
 /// The user window: its first address, the top-level entry mapping it, and the most pages a space
 /// maps there, those 512 tables of pages map.
@@ -25,7 +25,8 @@ const CHUNK_PAGES: u64 = 16
 const SHARED_PAGES: u64 = 32
 
 /// A bundle verified for isolated spaces: its bytes and their parts, its component entries as
-/// every space places them, and the image of the kernel's user-mode runtime and its parts.
+/// every space places them, and the image of the kernel's user-mode runtime and its parts; or a
+/// test image, which runs alone in its spaces in place of that runtime, the bundle empty.
 pub open struct Isolated {
     bundle: mem::Bytes
     parts: Parts
@@ -122,6 +123,16 @@ fn Loader.isolated_of(self, bundle: Slice[u8], body: Span, alloc: mem::Alloc) ->
     return Isolated(bundle: take copy, parts: parts, components: take components, runtime_image: take runtime_copy, runtime: runtime)
 } Loader.isolated_of
 
+pub fn Isolated.of_test(image: Slice[u8], alloc: mem::Alloc) -> Isolated fails LoadError {
+    let runtime = try shaped(try parts_of(image, body: try body_of(image)))
+    if not runtime.job or runtime.imports.len != 0 or runtime.hash.len != 0 or runtime.boot == 0 {
+        fail LoadError.Malformed
+    }
+    var copy = mem::Bytes.empty(alloc)
+    mut copy.append(image)
+    return Isolated(bundle: mem::Bytes.empty(alloc), parts: no_parts(), components: mem::List[Exported].empty(alloc), runtime_image: take copy, runtime: runtime)
+} Isolated.of_test
+
 pub fn Isolated.job(self) -> Option[Job] {
     if not self.parts.job {
         return None
@@ -151,11 +162,16 @@ pub fn Isolated.space(self, cpu: hw::Ring0, data: u64, mut frames: mem::List[hw:
     let image_base = image_window(self.runtime)
     var runtime_copy = try relocated_copy(self.runtime_image.view(), parts: self.runtime, window: USER_WINDOW, alloc)
     let runtime_base = address_of(mut runtime_copy)
-    set_word(runtime_base + self.runtime.lines + LINES_NEXT, value: image_base + self.parts.lines)
-    var image_copy = try self.bound_copy(window: image_base, alloc)
+    var image_copy = mem::Bytes.empty(alloc)
+    if self.parts.size > 0 {
+        set_word(runtime_base + self.runtime.lines + LINES_NEXT, value: image_base + self.parts.lines)
+        image_copy = try self.bound_copy(window: image_base, alloc)
+    }
     var space = try mapped(plan, reach, mut frames, alloc)
     mut space.fill(at_page: 0, from: runtime_base, len: self.runtime.size)
-    mut space.fill(at_page: plan.image, from: address_of(mut image_copy), len: self.parts.size)
+    if self.parts.size > 0 {
+        mut space.fill(at_page: plan.image, from: address_of(mut image_copy), len: self.parts.size)
+    }
     sync(space.pages[0].base(), len: plan.stack * PAGE)
     return space
 } Isolated.space

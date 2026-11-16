@@ -50,7 +50,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
         (Routine::Exit, true) => {
             let status = fx.entry()[0];
             match lo.user() {
-                true => space::exit(lo, fx),
+                true => space::exit(lo, fx, status),
                 false => lo.exit_machine(fx, status),
             }
         }
@@ -140,10 +140,12 @@ pub fn refuse(lo: &mut Lowering, fx: &mut Fx, why: &str) {
 }
 
 /// Writes a byte range to a standard stream: on a host target to its descriptor, on a machine
-/// target to the serial port, which carries both streams; an isolated space has none.
+/// target to the serial port, which carries both streams, and from a test image in an isolated
+/// space through its kernel; an isolated space's runtime has none.
 pub fn write_stream(lo: &mut Lowering, fx: &mut Fx, fd: i64, text: Value, len: Value) {
     match (lo.machine(), lo.user()) {
         (true, false) => lo.serial_write(fx, text, len),
+        (true, true) if lo.seeded() => space::write_stream(lo, fx, fd, text, len),
         (true, true) => {}
         (false, _) if lo.windows() => host::windows::write_all(lo, fx, fd, text, len),
         (false, _) => host::posix::write_all(lo, fx, fd, text, len),

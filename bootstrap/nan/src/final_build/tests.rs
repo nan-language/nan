@@ -16,7 +16,7 @@ fn a_symbol_no_library_defines_fails_the_link() {
         ),
     ]);
     let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
-    let built = build(&workspace, 0, None).expect("a final build");
+    let built = build(&workspace, 0, None, &[]).expect("a final build");
     let reported: Vec<(Code, Option<u32>)> = (built.diagnostics.iter())
         .map(|diagnostic| (diagnostic.code, diagnostic.line))
         .collect();

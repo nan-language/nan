@@ -209,7 +209,7 @@ The **interface hash** of a kernel is the hash of its interface file's bytes, wh
 
 ## Bundles
 
-A **bundle** is the `.nbun` file that `nan build <package> --against <interface file>` writes into `.nan/images/<target>/`, for the target the interface file names, or for a nanos program for the nanos target of that target's architecture. Its **bundle build** lowers the contributions to loaded registries that the package admits as the judging root and that packages outside the kernel's final closure make, with every function their values reach, at the codegen level of the interface file's part 6. Registries that are not loaded have the tables of the package's own dependency closure.
+A **bundle** is the `.nbun` file that `nan build <package> --against <interface file>`, or the [final build](27-program-model.md#final-builds) of a nanos program, writes into `.nan/images/<target>/`, for the target the interface file names, or for a nanos program for the nanos target of that target's architecture. Its **bundle build** lowers the contributions to loaded registries that the package admits as the judging root and that packages outside the kernel's final closure make, with every function their values reach, at the codegen level of the interface file's part 6. Registries that are not loaded have the tables of the package's own dependency closure.
 
 - The bundle build of a nanos program lowers its **job entry**, which [`nanos::run`](14-authority.md#jobs) calls: it decodes the job's input, runs the entry function, and encodes its result, renders its failure or reports its cancellation, through the job adapters of `nanos`. The entry function's `limits stack N`, when it states one, bounds the job entry's stack use, the adapter's and the extended state's included ([floating point](24-kernel.md#floating-point)), reported on the entry function's head; otherwise the job's stack [grows](17-suspension-io.md#grown-stacks).
 - The bundle build of a nanos program listing component entries lowers, for each, its **component entry**, which [`nanos::hold`](14-authority.md#component-instances) and `nanos::hold_isolated` call: it runs the instance task through the component adapter of `nanos`, on a stack that grows.
@@ -288,6 +288,14 @@ wrote .nan/images/x86_64-nanos/hello.narts
 wrote .nan/images/x86_64-nanos/hello.nbun
 wrote .nan/images/x86_64-nanos/hello.ntree
 ok build hello --against .nan/images/x86_64-bare/kernel.nlif: files 3, errors 0, incomplete 0
+$ nan build
+ok build .: files 5, errors 0, incomplete 0
+wrote .nan/images/x86_64-bare/kernel.elf
+wrote .nan/images/x86_64-bare/kernel.nlif
+wrote .nan/images/x86_64-nanos/hello.narts
+wrote .nan/images/x86_64-nanos/hello.nbun
+wrote .nan/images/x86_64-nanos/hello.ntree
+ok build .: files 5, errors 0, incomplete 0
 ```
 
 ## Host symbol names

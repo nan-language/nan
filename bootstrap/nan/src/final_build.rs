@@ -46,17 +46,18 @@ impl Build {
 
 /// Performs the final build of the program at index `program` of the workspace, comparing its
 /// code roots with those of the image at the path `compared` gives, written as it gives, when
-/// given.
+/// given; a nanos program's is its bundle build against a kernel's interface file among
+/// `companions`, the files earlier final builds wrote beside their images.
 pub fn build(
     workspace: &Workspace,
     program: usize,
     compared: Option<(&Path, &str)>,
+    companions: &[String],
 ) -> io::Result<Build> {
     let source = &workspace.packages[program];
     let target = source.program_target();
     if target.is_nanos() {
-        let reason = "a nanos program builds only against a kernel's interface file";
-        return Ok(Build::failed(vec![bundle::interface_error(source, reason)]));
+        return bundle::kernel_bundle(workspace, program, companions);
     }
     let mut diagnostics: Vec<Diagnostic> =
         check::reported(workspace, &crate::scope::Scope::Workspace);

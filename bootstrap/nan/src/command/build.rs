@@ -78,11 +78,14 @@ pub fn run(
     let mut diagnostics = Vec::new();
     let mut images = Vec::new();
     let mut companions = Vec::new();
-    for program in &programs {
+    let (nanos, others): (Vec<usize>, Vec<usize>) = programs
+        .iter()
+        .partition(|program| workspace.packages[**program].program_target().is_nanos());
+    for program in others.iter().chain(&nanos) {
         let compared = compared
             .as_ref()
             .map(|(path, image)| (path.as_path(), *image));
-        let build = final_build::build(workspace, *program, compared)?;
+        let build = final_build::build(workspace, *program, compared, &companions)?;
         diagnostics.extend(build.diagnostics);
         images.extend(build.image);
         companions.extend(build.companions);

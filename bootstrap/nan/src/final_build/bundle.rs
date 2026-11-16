@@ -273,6 +273,31 @@ pub fn bundle(
     })
 }
 
+/// The bundle build of the nanos program at index `program` of the workspace against the one
+/// interface file among `companions` of a kernel of its architecture.
+pub fn kernel_bundle(
+    workspace: &Workspace,
+    program: usize,
+    companions: &[String],
+) -> io::Result<Build> {
+    let source = &workspace.packages[program];
+    let arch = source
+        .program_target()
+        .arch()
+        .expect("a nanos target's architecture");
+    let directory = format!(".nan/images/{}/", Target::of(arch, Kind::Bare).name());
+    let interfaces: Vec<&String> = companions
+        .iter()
+        .filter(|path| path.starts_with(&directory) && path.ends_with(".nlif"))
+        .collect();
+    let reason = match interfaces[..] {
+        [interface] => return bundle(workspace, program, &workspace.root.join(interface), None),
+        [] => "a nanos program builds only against a kernel's interface file",
+        _ => "several kernels of its architecture export their load ABI",
+    };
+    Ok(Build::failed(vec![interface_error(source, reason)]))
+}
+
 /// The admitted contributions of a bundle's closure to loaded registries by packages outside the
 /// kernel's final closure, whose packages `kernel` names, with their registries, in byte order of
 /// canonical path.

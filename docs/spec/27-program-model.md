@@ -550,7 +550,7 @@ A final build proceeds in this order:
 3. It applies every other rule stated for final builds, such as those of [registries](25-registries.md#tables), [stack limits](10-effects-digests.md#stack-limits) and the [closure summary](14-authority.md#authority-summaries).
 4. It [lowers](30-artefacts.md#lowering) the reach and writes the image.
 
-Each step runs only when the steps before it reported no error, and a final build reporting an error writes no image; incompleteness stops nothing. A nanos program's final build is the [bundle build](30-artefacts.md#bundles) against a bare kernel's interface; without one it is an error (`target.bundle-interface`), reported on the root's `package` line before step 1.
+Each step runs only when the steps before it reported no error, and a final build reporting an error writes no image; incompleteness stops nothing. A nanos program's final build is the [bundle build](30-artefacts.md#bundles) against the [interface file](30-artefacts.md#interface-files) of the bare kernel of its architecture whose final build the same command performs before it; without exactly one such kernel exporting its load ABI it is an error (`target.bundle-interface`), reported on the root's `package` line before step 1.
 
 ```nan
 // file: stats/package.nan

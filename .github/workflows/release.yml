@@ -8,19 +8,10 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    strategy:
-      matrix:
-        include:
-          - arch: x86_64
-            runner: ubuntu-26.04
-          - arch: aarch64
-            runner: ubuntu-26.04-arm
-    runs-on: ${{ matrix.runner }}
+  tag:
+    runs-on: ubuntu-26.04
     env:
       TAG: ${{ github.ref_name }}
-      TARGET: ${{ matrix.arch }}-linux
-      IMAGE: nan-${{ github.ref_name }}-${{ matrix.arch }}-linux
     steps:
       - uses: actions/checkout@v7
         with:
@@ -29,65 +20,27 @@ jobs:
         run: |
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "$TAG is not vX.Y.Z"; exit 1; }
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "$TAG is not on main"; exit 1; }
-      - name: Install the pinned toolchain
-        working-directory: bootstrap
-        run: rustup toolchain install
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            bootstrap/target
-          key: release-${{ matrix.arch }}-${{ hashFiles('bootstrap/rust-toolchain.toml', 'bootstrap/Cargo.lock') }}
-      - name: Build the bootstrap
-        working-directory: bootstrap
-        run: cargo build --release -q -p nan
-      - name: Declare the host target of the runner's architecture
-        run: |
-          sed -i "s/^    targets x86_64-linux\$/    targets $TARGET/" toolchain/nan/package.nan
-          grep -q "^    targets $TARGET\$" toolchain/nan/package.nan
-      # Each stage builds a fresh copy of toolchain/ with an empty user directory, so that no
-      # stage reuses another's proofs; the second and third stages must be equal byte for byte,
-      # and the bootstrap's stage comparison must accept the second.
-      - name: Build the NaN toolchain three times
-        run: |
-          stage() {
-            rm -rf ~/.nan "$RUNNER_TEMP/$2"
-            cp -r toolchain "$RUNNER_TEMP/$2"
-            (cd "$RUNNER_TEMP/$2" && "$1" build nan)
-            cp "$RUNNER_TEMP/$2/.nan/images/$TARGET/nan" "$RUNNER_TEMP/$2.image"
-          }
-          stage "$PWD/bootstrap/target/release/nan" first
-          stage "$RUNNER_TEMP/first.image" second
-          stage "$RUNNER_TEMP/second.image" third
-          cmp "$RUNNER_TEMP/second.image" "$RUNNER_TEMP/third.image"
-          rm -rf ~/.nan "$RUNNER_TEMP/compared"
-          cp -r toolchain "$RUNNER_TEMP/compared"
-          (cd "$RUNNER_TEMP/compared" && "$GITHUB_WORKSPACE/bootstrap/target/release/nan" build nan --compare-with "$RUNNER_TEMP/second.image")
-      - name: Identify the image
-        run: |
-          cp "$RUNNER_TEMP/second.image" "$IMAGE"
-          sha256sum "$IMAGE" > "$IMAGE.sha256"
-          objcopy --dump-section .nan.tree="$RUNNER_TEMP/tree" "$IMAGE"
-          od -An -tx1 -v "$RUNNER_TEMP/tree" | tr -d ' \n' > "$IMAGE.tree"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: ${{ env.IMAGE }}
-          path: ${{ env.IMAGE }}*
-          if-no-files-found: error
+
+  linux:
+    needs: tag
+    uses: ./.github/workflows/linux.yml
+    with:
+      tag: ${{ github.ref_name }}
 
   windows:
+    needs: tag
     uses: ./.github/workflows/windows.yml
     with:
       tag: ${{ github.ref_name }}
 
   macos:
+    needs: tag
     uses: ./.github/workflows/macos.yml
     with:
       tag: ${{ github.ref_name }}
 
   publish:
-    needs: [build, windows, macos]
+    needs: [linux, windows, macos]
     runs-on: ubuntu-26.04
     env:
       TAG: ${{ github.ref_name }}
@@ -98,43 +51,39 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
-      # A Windows image's tree hash is the contents of its PE section `.nantree`, whose header
-      # gives its size and its offset in the file.
-      - name: Identify the Windows images
+      # An image's tree hash is the contents of its tree section: `.nan.tree` of an ELF image,
+      # `.nantree` of a PE image and `__nantree` of a Mach-O image, each section's header giving
+      # its size and its offset in the file.
+      - name: Identify the images
         run: |
-          for arch in x86_64 aarch64; do
-            image="nan-$TAG-$arch-windows.exe"
+          for image in nan-"$TAG"-*-linux nan-"$TAG"-*-windows.exe nan-"$TAG"-*-macos; do
             sha256sum "$image" > "$image.sha256"
             python3 - "$image" > "$image.tree" <<'PYTHON'
           import sys
           data = open(sys.argv[1], "rb").read()
           number = lambda at, width: int.from_bytes(data[at:at + width], "little")
-          signature = number(0x3C, 4)
-          table = signature + 24 + number(signature + 20, 2)
-          for at in range(table, table + 40 * number(signature + 6, 2), 40):
-              if data[at:at + 8] == b".nantree":
-                  print(data[number(at + 20, 4):][:number(at + 8, 4)].hex(), end="")
-          PYTHON
-            [ -s "$image.tree" ]
-          done
-      # A macOS image's tree hash is the contents of its Mach-O section `__nantree`, whose header
-      # in its segment's load command gives its size and its offset in the file.
-      - name: Identify the macOS images
-        run: |
-          for arch in x86_64 aarch64; do
-            image="nan-$TAG-$arch-macos"
-            sha256sum "$image" > "$image.sha256"
-            python3 - "$image" > "$image.tree" <<'PYTHON'
-          import sys
-          data = open(sys.argv[1], "rb").read()
-          number = lambda at, width: int.from_bytes(data[at:at + width], "little")
-          at = 32
-          for _ in range(number(16, 4)):
-              if number(at, 4) == 0x19:
-                  for section in range(at + 72, at + 72 + 80 * number(at + 64, 4), 80):
-                      if data[section:section + 16].rstrip(b"\0") == b"__nantree":
-                          print(data[number(section + 48, 4):][:number(section + 40, 8)].hex(), end="")
-              at += number(at + 4, 4)
+          def sections():
+              if data[:4] == b"\x7fELF":
+                  table, size, count = number(0x28, 8), number(0x3A, 2), number(0x3C, 2)
+                  names = number(table + size * number(0x3E, 2) + 0x18, 8)
+                  for at in range(table, table + size * count, size):
+                      name = data[names + number(at, 4):].split(b"\0", 1)[0]
+                      yield name, number(at + 0x18, 8), number(at + 0x20, 8)
+              elif data[:2] == b"MZ":
+                  signature = number(0x3C, 4)
+                  table = signature + 24 + number(signature + 20, 2)
+                  for at in range(table, table + 40 * number(signature + 6, 2), 40):
+                      yield data[at:at + 8].rstrip(b"\0"), number(at + 20, 4), number(at + 8, 4)
+              else:
+                  at = 32
+                  for _ in range(number(16, 4)):
+                      if number(at, 4) == 0x19:
+                          for section in range(at + 72, at + 72 + 80 * number(at + 64, 4), 80):
+                              yield data[section:section + 16].rstrip(b"\0"), number(section + 48, 4), number(section + 40, 8)
+                      at += number(at + 4, 4)
+          for name, offset, size in sections():
+              if name in (b".nan.tree", b".nantree", b"__nantree"):
+                  print(data[offset:offset + size].hex(), end="")
           PYTHON
             [ -s "$image.tree" ]
           done
@@ -272,8 +221,8 @@ jobs:
 #           useradd -m builder
 #           install -d -o builder /home/builder/nan-bin
 #           sed -e "s/@VERSION@/${TAG#v}/" \
-#               -e "s/@SHA256_X86_64@/$(cut -d' ' -f1 "nan-$TAG-x86_64-linux.sha256")/" \
-#               -e "s/@SHA256_AARCH64@/$(cut -d' ' -f1 "nan-$TAG-aarch64-linux.sha256")/" \
+#               -e "s/@SHA256_X86_64@/$(sha256sum "nan-$TAG-x86_64-linux" | cut -d' ' -f1)/" \
+#               -e "s/@SHA256_AARCH64@/$(sha256sum "nan-$TAG-aarch64-linux" | cut -d' ' -f1)/" \
 #               -e "s/@SHA256_LICENSE@/$(sha256sum LICENSE | cut -d' ' -f1)/" \
 #               .github/aur/PKGBUILD > /home/builder/nan-bin/PKGBUILD
 #           cd /home/builder/nan-bin

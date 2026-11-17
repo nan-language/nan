@@ -72,11 +72,14 @@ const CONTROL_C_EXIT: i64 = 0xC000_013A;
 /// The size of each thread's stack for stack overflow reports.
 const TRAP_STACK: u64 = 65_536;
 
-/// A task stack's guard region: a page no access reaches, the stack's floor, then the pages the
-/// system guards. A touch of a guarded page while the stack is the running thread's makes the
-/// system raise a stack overflow, those pages then holding the handler's frames.
-pub const GUARD: u64 = 12_288;
+/// A task stack's guard region: a page no access reaches, the stack's floor, then room for a
+/// stack overflow's handler, then the page the system guards. A touch of the guarded page while
+/// the stack is the running thread's makes the system raise a stack overflow, whose exception
+/// frame, with the processor's extended state, and the handler's frames then fill that page and
+/// the room below, which no guarded page interrupts.
+pub const GUARD: u64 = 16_384;
 const FLOOR: u64 = 4_096;
+const GUARDED: u64 = 4_096;
 const PAGE_GUARD: i64 = 0x100;
 
 /// The offsets in a thread's environment block of the bounds of the stack it runs on: its top,
@@ -1016,14 +1019,14 @@ pub fn map_stack(lo: &mut Lowering, fx: &mut Fx, len: Value, guarded: bool) -> V
     base
 }
 
-/// Protects the guard region at the base of a stack, its floor inaccessible and the rest
+/// Protects the guard region at the base of a stack, its floor inaccessible and its top page
 /// guarded, or makes it accessible again.
 pub fn protect_guard(lo: &mut Lowering, fx: &mut Fx, base: Value, accessible: bool) {
     let parts = match accessible {
         true => vec![(0, GUARD, PAGE_READWRITE)],
         false => vec![
             (0, FLOOR, PAGE_NOACCESS),
-            (FLOOR, GUARD - FLOOR, PAGE_READWRITE | PAGE_GUARD),
+            (GUARD - GUARDED, GUARDED, PAGE_READWRITE | PAGE_GUARD),
         ],
     };
     let old = fx.slot(8, 8);

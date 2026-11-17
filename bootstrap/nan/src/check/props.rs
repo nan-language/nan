@@ -324,6 +324,36 @@ impl Checker<'_> {
         self.base_facts(item).is_some()
     }
 
+    /// The properties of a base type, each type parameter assumed to have each property.
+    pub fn base_props(&self, item: ItemId) -> Option<Props> {
+        let facts = self.base_facts(item)?;
+        let declared = |property: Property| matches!(facts[property as usize], Rule::Yes);
+        let possible = |property: Property| !matches!(facts[property as usize], Rule::No);
+        Some(Props {
+            linear: declared(Property::Linear),
+            view: declared(Property::View),
+            copy: possible(Property::Copy),
+            send: possible(Property::Send),
+            inert: possible(Property::Inert),
+            any_bits: possible(Property::AnyBits),
+        })
+    }
+
+    /// The parameters of a base type a property of it depends on, by the rule its facts give.
+    fn base_dependent_params(&self, item: ItemId, property: Property) -> Option<Vec<usize>> {
+        let facts = self.base_facts(item)?;
+        let count = self.shapes(item).len();
+        let considered = match BRANDED.contains(&self.db.canonical(item).as_str()) {
+            true => count.min(1),
+            false => count,
+        };
+        Some(match facts[property as usize] {
+            Rule::First => (0..count.min(1)).collect(),
+            Rule::All | Rule::Some => (0..considered).collect(),
+            Rule::No | Rule::Yes => Vec::new(),
+        })
+    }
+
     /// Whether a type item is a primitive capability: one std lists, or a capability kind.
     pub fn is_primitive_capability(&self, item: ItemId) -> bool {
         self.db.is_std(item) && PRIMITIVE_CAPABILITIES.contains(&self.db.canonical(item).as_str())
@@ -571,7 +601,8 @@ impl Checker<'_> {
     /// The indexes of the type parameters of a struct or enum that a property depends on: those
     /// occurring at a dependent position of a constituent.
     pub fn dependent_params(&self, item: ItemId, property: Property) -> Vec<usize> {
-        self.dependent_params_from(item, property, &mut Vec::new())
+        self.base_dependent_params(item, property)
+            .unwrap_or_else(|| self.dependent_params_from(item, property, &mut Vec::new()))
     }
 
     /// The dependent parameters of a struct or enum, those of the items in `seen`, being decided
@@ -610,17 +641,9 @@ impl Checker<'_> {
                 found.push(param.index as usize)
             }
             Ty::Item(item, args) => {
-                let follows: Vec<usize> = match self.base_facts(*item) {
-                    Some(facts) => {
-                        let rule = facts[property as usize];
-                        match rule {
-                            Rule::First => vec![0],
-                            Rule::All | Rule::Some => (0..args.len()).collect(),
-                            _ => Vec::new(),
-                        }
-                    }
-                    None => self.dependent_params_from(*item, property, seen),
-                };
+                let follows = self
+                    .base_dependent_params(*item, property)
+                    .unwrap_or_else(|| self.dependent_params_from(*item, property, seen));
                 for index in follows {
                     if let Some(Arg::Ty(arg)) = args.get(index) {
                         self.collect_dependent(arg, owner, property, found, seen);

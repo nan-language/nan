@@ -86,6 +86,16 @@ api core::Option.is_some core/core.nan:8
         example Some(3u8).is_some()
     digest: effects none | authority none | may-trap no | terminates
 ok show core::Option.is_some --api: records 1
+$ nan show sys::Handle --api
+ok show sys::Handle --api: records 2
+api sys::Handle sys/sys.nan:617
+    pub open struct Handle {
+    } Handle
+    properties: Copy, Send
+api sys::Handle.of sys/sys.nan:620
+    pub fn Handle.of[C: Capability and Copy](capability: C) -> Handle
+    digest: effects none | authority sys::Handle | may-trap no | terminates
+ok show sys::Handle --api: records 2
 ```
 
 ### Writing commands

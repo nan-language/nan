@@ -1767,7 +1767,7 @@ pub fn Bundle.unload(take self)
 
 pub fn Bundle.share(self) -> Load
 
-pub open struct Load {
+pub open struct Load derives Send {
 } Load
 
 pub fn Load.share(self) -> Load

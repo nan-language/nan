@@ -131,9 +131,13 @@ impl Checker<'_> {
         lines
     }
 
-    /// The properties consumers see of a struct or enum: those of a closed type as computed, and
-    /// of an open one its head's and those its `derives` clause lists.
+    /// The properties consumers see of a struct or enum: those of a base type its owning chapter
+    /// gives, of a closed type as computed, and of an open one its head's and those its `derives`
+    /// clause lists.
     pub fn consumer_props(&self, item: ItemId) -> Props {
+        if let Some(props) = self.base_props(item) {
+            return props;
+        }
         let ast = self.db.ast(item);
         let props = self.definition_props(item);
         if !ast.is_open() {

@@ -434,7 +434,7 @@ pkg fn default_stack() -> usize {
 
 ```nan
 // file: probe/package.nan
-//! Register counts for both host targets.
+//! Register counts for both Linux targets.
 
 package probe {
     language 1

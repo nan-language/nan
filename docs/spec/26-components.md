@@ -1391,7 +1391,7 @@ pub closed struct OperationSchema derives Encode {
     pub failure: Option[TypeSchema]
 } OperationSchema
 
-pub closed enum Reversibility derives Copy, Eq, Encode {
+pub closed enum Reversibility derives Copy, Eq, Render, Encode {
     Traceless
     Recorded
     Restorable

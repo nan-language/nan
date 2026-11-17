@@ -734,7 +734,7 @@ A **PCI function** is an `hw::PciFunction`, an endpoint below a host bridge that
 ```nan-api
 // module: hw
 
-pub open linear struct PciFunction {
+pub open linear struct PciFunction derives Send {
 } PciFunction
 
 pub closed struct PciAddress derives Copy, Eq, Ord, Hash, Render {
@@ -766,7 +766,7 @@ pub closed enum PowerState derives Copy, Eq, Render {
     Suspended
 } PowerState
 
-pub open linear struct PciKeeper {
+pub open linear struct PciKeeper derives Send {
 } PciKeeper
 
 pub fn PciFunction.address(self) -> PciAddress
@@ -963,7 +963,7 @@ A **PCI port** is an `hw::PciPort`, a bridge below a host bridge that `boot::Ker
 ```nan-api
 // module: hw
 
-pub open linear struct PciPort {
+pub open linear struct PciPort derives Send {
 } PciPort
 
 pub closed enum PortKind derives Copy, Eq, Render {
@@ -1471,7 +1471,7 @@ pub fn Services.config_table(self, table: ConfigTable, alloc: mem::Alloc) -> Unt
 
 pub fn Services.acpi_table(self, signature: Array[u8, 4], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails ServiceError
 
-pub open enum ServiceError derives Render {
+pub open enum ServiceError derives Render, Send, Inert {
     NotFound
     DeviceError
     OutOfMemory
@@ -1689,7 +1689,7 @@ pub fn Kernel.clock_registers(self) -> Extent
 
 pub fn Kernel.start_extents(self, alloc: mem::Alloc) -> mem::List[Extent]
 
-pub open linear struct Module {
+pub open linear struct Module derives Send {
 } Module
 
 pub fn Module.name(self, alloc: mem::Alloc) -> Untrusted[mem::Bytes]
@@ -1751,12 +1751,12 @@ pub fn Loader.prepare_unverified(self, bundle: Slice[u8], alloc: mem::Alloc) -> 
 
 pub fn Loader.reclaim(self) -> usize fails task::Cancelled uses wait
 
-pub open linear struct Prepared {
+pub open linear struct Prepared derives Send {
 } Prepared
 
 pub fn Prepared.load(take self) -> Bundle fails LoadError
 
-pub open linear struct Bundle {
+pub open linear struct Bundle derives Send {
 } Bundle
 
 pub fn Bundle.domain(self) -> mem::Shared[sys::Abandoner]
@@ -1776,7 +1776,7 @@ pub fn Load.job(self) -> Option[Job]
 
 pub fn Load.component(self, name: Str) -> Option[Job]
 
-pub open struct Job derives Copy {
+pub open struct Job derives Copy, Send {
 } Job
 
 pub fn Job.stack(self) -> usize
@@ -1820,7 +1820,7 @@ pub fn Loader.isolate(self, bundle: Slice[u8], keys: Slice[core::crypto::PublicK
 
 pub fn Loader.isolate_unverified(self, bundle: Slice[u8], alloc: mem::Alloc) -> Isolated fails LoadError
 
-pub open struct Isolated {
+pub open struct Isolated derives Send {
 } Isolated
 
 pub fn Isolated.of_test(image: Slice[u8], alloc: mem::Alloc) -> Isolated fails LoadError
@@ -1831,7 +1831,7 @@ pub fn Isolated.component(self, name: Str) -> Option[Job]
 
 pub fn Isolated.space(self, cpu: hw::Ring0, data: u64, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Space fails LoadError
 
-pub open linear struct Space {
+pub open linear struct Space derives Send {
 } Space
 
 pub fn Space.start(self) -> u64

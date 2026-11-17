@@ -465,6 +465,18 @@ pub closed struct Window derives Inert { // error: prop.promise-not-open
 } Window
 ```
 
+In the next example, `sys::Domain` is an open type of std whose `derives` clause lists no promise, so it is not Send for consumers, whatever its fields give.
+
+```nan
+pub fn sendable[T: Send](value: T) -> bool {
+    return true
+} sendable
+
+pub fn domain_sendable(domain: sys::Domain) -> bool {
+    return sendable(domain) // error: generic.unsatisfied-bound
+} domain_sendable
+```
+
 ### Interface facts
 
 The **interface facts** of a type are whether it is linear, a view, a state token or a type containing a state token, whether it derives `Copy`, its promises when it is `pub`, whether it is a [parsing type](15-untrusted.md#validator-classes) when it is a `pub` struct or enum, whether it [holds an Untrusted instantiation](15-untrusted.md#validator-classes) when it is a `pub` struct or enum deriving `Encode`, and the dependent parameters on which each of these rests. They enter the type's [interface hash](29-identity-versioning.md#hashes). The interface facts of a function are its [codec uses](15-untrusted.md#validate-grants), which enter its interface hash.

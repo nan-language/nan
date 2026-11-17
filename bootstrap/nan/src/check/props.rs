@@ -534,9 +534,9 @@ impl Checker<'_> {
             _ => false,
         };
         let is_enum = matches!(ast.kind, ItemKind::Enum(_) | ItemKind::Protocol(_));
-        let foreign_open = !self.db.is_std(item) && ast.is_open() && self.consumer_view(item);
+        let consumer_open = ast.is_open() && self.consumer_view(item);
         let promise = |property: Property, name: &str| {
-            if foreign_open {
+            if consumer_open {
                 derives(name)
             } else {
                 all(property)
@@ -548,13 +548,13 @@ impl Checker<'_> {
             copy: derives("Copy") && !linear && !view,
             send: promise(Property::Send, "Send"),
             inert: promise(Property::Inert, "Inert"),
-            any_bits: !foreign_open
+            any_bits: !consumer_open
                 && !linear
                 && !view
                 && !has_predicate
                 && !is_enum
                 && all(Property::AnyBits)
-                || foreign_open && derives("AnyBits"),
+                || consumer_open && derives("AnyBits"),
         }
     }
 

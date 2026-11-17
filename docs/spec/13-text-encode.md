@@ -640,7 +640,7 @@ pub interface Decoder {
     fn end(mut self) fails DecodeError limits terminates
 } Decoder
 
-pub open enum DecodeError derives Copy, Eq, Hash, Render {
+pub open enum DecodeError derives Copy, Eq, Hash, Render, Send, Inert {
     Truncated
     Malformed
     Trailing
@@ -818,7 +818,7 @@ A **flexible** struct keeps the record fields that decoding it from `mem::wire` 
 ```nan-api
 // module: mem::wire
 
-pub open enum Kept {
+pub open enum Kept derives Send, Inert {
     Empty
     Fields(Untrusted[mem::Bytes])
 } Kept
@@ -1044,7 +1044,7 @@ An **erased decoder** is a `mem::wire::Erased`: the schema hash of a type and a 
 ```nan-api
 // module: mem::wire
 
-pub open struct Erased derives Copy {
+pub open struct Erased derives Copy, Inert {
     pub schema: SchemaHash
     pub canonical: fn(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails core::DecodeError limits terminates, stack 16_384
     pub canonical_located: fn(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Untrusted[mem::Bytes] fails DecodeFailure limits terminates, stack 16_384

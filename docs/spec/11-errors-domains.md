@@ -258,7 +258,7 @@ pub fn first_byte(text: Slice[u8]) -> u8 fails ParseError {
 ```nan-api
 // module: task
 
-pub open struct Cancelled derives Send {
+pub open struct Cancelled derives Send, Inert {
 } Cancelled
 
 impl Cancelled: Render
@@ -478,7 +478,7 @@ pub fn Abandoner.run_sized[T: Send, E: Send](self, take body: task fn() -> T fai
 
 pub fn Abandoner.trigger(self) limits notrap, terminates, noalloc
 
-pub open struct Trap derives Send {
+pub open struct Trap derives Send, Inert {
 } Trap
 
 impl Trap: Render

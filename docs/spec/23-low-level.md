@@ -961,12 +961,12 @@ An **I/O domain** is a set of pages that the PCI functions attached to it reach 
 ```nan-api
 // module: hw
 
-pub open linear struct Iommu {
+pub open linear struct Iommu derives Send {
 } Iommu
 
 pub fn Iommu.domain(self) -> IoDomain fails IommuError
 
-pub open linear struct IoDomain {
+pub open linear struct IoDomain derives Send {
 } IoDomain
 
 pub fn IoDomain.space(self) -> IoSpace

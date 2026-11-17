@@ -144,7 +144,7 @@ pub fn Stdio.write_out(self, data: Slice[u8]) fails StdioError uses wait
 
 pub fn Stdio.write_err(self, data: Slice[u8]) fails StdioError uses wait
 
-pub open enum StdioError derives Render {
+pub open enum StdioError derives Render, Send, Inert {
     Closed
     Revoked(Revoked) from
     Cancelled(task::Cancelled) from
@@ -174,7 +174,7 @@ pub fn File.write(mut self, data: Slice[u8]) -> usize fails FsError uses wait
 
 pub fn File.byte_len(self) -> u64 fails FsError uses wait
 
-pub open enum FsError derives Render {
+pub open enum FsError derives Render, Send, Inert {
     NotFound
     Denied
     InvalidPath
@@ -203,7 +203,7 @@ pub fn Conn.close(take self) fails NetError uses wait
 
 pub fn Conn.abandon(take self)
 
-pub open enum NetError derives Render {
+pub open enum NetError derives Render, Send, Inert {
     Refused
     Reset
     Unreachable
@@ -656,7 +656,7 @@ pub closed enum IsolatedError derives Render {
     Cancelled(task::Cancelled) from
 } IsolatedError
 
-pub open linear struct Link {
+pub open linear struct Link derives Send {
 } Link
 
 pub closed enum LinkError derives Render {
@@ -741,10 +741,10 @@ pub interface Environment {
     fn build(take world: World) -> Self fails CapError
 } Environment
 
-pub open linear struct Instance {
+pub open linear struct Instance derives Send {
 } Instance
 
-pub open struct Inbox {
+pub open struct Inbox derives Send {
 } Inbox
 
 pub closed enum InstanceError derives Render {

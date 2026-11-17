@@ -5,8 +5,10 @@
 use cranelift_codegen::ir::{
     AbiParam, InstBuilder, Signature, Type, Value, condcodes::IntCC, types,
 };
+use cranelift_module::FuncId;
 
 use super::super::super::fx::{Fx, PTR};
+use super::super::super::nested::nested_signature;
 use super::super::super::runtime::Routine;
 use super::super::super::runtime::report::decode_utf8;
 use super::super::super::{CALL_CONV, Glue, Lowering};
@@ -872,12 +874,10 @@ fn rendering_pass(fx: &mut Fx, values: &[Value], end: Value) -> (Value, Vec<Valu
     (again, vec![next, next_depth, next_quote])
 }
 
-/// Passes over any value, nested no deeper than decoding reads.
-pub fn skip_value(lo: &mut Lowering, fx: &mut Fx, state: Value) -> Value {
-    let mut signature = Signature::new(CALL_CONV);
-    signature.params.push(AbiParam::new(PTR));
-    signature.returns.push(AbiParam::new(types::I32));
-    let function = lo.glue_function(Glue::ConstructionSkip, signature, |lo, fx| {
+/// The function passing over any value, nested no deeper than decoding reads, as a nested call
+/// does: given the reader, the allocator and a target, both unused, giving its code.
+pub fn skipper(lo: &mut Lowering) -> FuncId {
+    lo.glue_function(Glue::ConstructionSkip, nested_signature(), |lo, fx| {
         let state = fx.entry()[0];
         let stop = |fx: &mut Fx, failed: Value| {
             let bad = fx.b.ins().icmp_imm_s(IntCC::NotEqual, failed, 0);
@@ -995,8 +995,14 @@ pub fn skip_value(lo: &mut Lowering, fx: &mut Fx, state: Value) -> Value {
         });
         let (_, _, _, failed) = number(lo, fx, state);
         fx.b.ins().return_(&[failed]);
-    });
+    })
+}
+
+/// Passes over any value inside another, calling the skipper directly.
+fn skip_value(lo: &mut Lowering, fx: &mut Fx, state: Value) -> Value {
+    let function = skipper(lo);
+    let unused = fx.ptr(0);
     let reference = lo.call_ref(fx, function);
-    let call = fx.b.ins().call(reference, &[state]);
+    let call = fx.b.ins().call(reference, &[state, unused, unused]);
     fx.b.inst_results(call)[0]
 }

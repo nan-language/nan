@@ -584,7 +584,7 @@ The **stack use** of a lowered function is its frame size plus the largest stack
 - A direct call site uses the callee's stack use computed with each of the callee's function-typed parameters that receives a function argument at that site bound to that argument's stack use: a closure's own stack use, a named function's stack use through its [checking entry](18-contracts.md#checking-entries), the stack bound of the calling function's own parameter when the argument is that parameter, or the N of the `stack N` that a function value's type demands, none when it demands none. Each of its `Dyn` parameters is bound likewise: to the largest stack use among the implementing functions of the methods of a `Dyn[I].view(x)` or `text::fmt` call written as the argument, to the stack bound of the calling function's own parameter when the argument is that parameter, and to none for any other `Dyn` value. In lowered code, a call to a method of a generic parameter's bound is a direct call to the implementing function that the instantiation selects.
 - A `task fn` argument runs on a stack of its own, so the stack bound of a `task fn` parameter is instead the stack use of moving the argument's captures into another domain ([domain memory](11-errors-domains.md#domain-memory)): the stack use of the walk over a closure's captures, 0 for a named function or a closure none of whose captures moving reaches, the stack bound of the calling function's own parameter, and none for another function value or for a parameter of a function judged on its own. The walk calls the move of each capture's type, which calls the move of each type the values it holds have, so it reaches itself, and is unbounded, exactly when a capture's type holds itself through what moving it reaches, as an enum holding a `mem::Box` of itself does; the `raised` reason then names that type.
 - A [release](07-ownership.md#ownership) calls the release of the type of each part it releases, except among the types whose values hold each other through boxes, shared values, lists, sets, maps and hash maps, inline or through the structs, enums and arrays they hold: one walk releases the values of such types that a release reaches, keeping its place in them rather than on the stack, and reaches no release of them again, so its stack use does not grow with their depth. A release therefore reaches itself, and is unbounded, exactly when its type holds itself through another value, as an enum holding a `mem::Arena` of itself does; the `called` reason of the release of a field or payload of a type of the workspace lies on the line declaring that field or variant, and the `raised` reason names the type whose release the path reaches again.
-- A decoding in the [wire format](13-text-encode.md#wire-format), or through the calls of a std decoder, of a type holding itself through the parts its decoding reads, and the writing of the encoding `canonical` gives of a value it so decoded, is a **nested call**. Every cycle of the calls its decoding and encoding functions make of each other passes a sequence, map, record or variant, of which a decoding nests at most 128, so its **need** is the stack use of what it calls with the frames of each such cycle counted 129 times. It runs on the running task's stack when that has room for its need, and otherwise on memory drawn through the decoding's allocator, failing with `OutOfMemory` when that cannot be drawn. Its call site uses the stub call bound, and is unbounded when its need is.
+- A decoding in the [wire format](13-text-encode.md#wire-format), [JSON](13-text-encode.md#json) or [construction text](13-text-encode.md#construction-text), or through the calls of a std decoder, of a type holding itself through the parts its decoding reads, the passing over of a field value that a decoding of an open type skips in JSON or construction text, and the writing of the encoding `canonical` gives of a value it so decoded, is a **nested call**. Every cycle of the calls its decoding, passing and encoding functions make of each other passes a sequence, map, record or variant, of which a decoding nests at most 128, so its **need** is the stack use of what it calls with the frames of each such cycle counted 129 times. It runs on the running task's stack when that has room for its need, and otherwise on memory drawn through the decoding's allocator, failing with `OutOfMemory` when that cannot be drawn. Its call site uses the stub call bound, and is unbounded when its need is.
 - A call through the function's own function-typed parameter uses that parameter's stack bound; a [domain run](11-errors-domains.md#domain-run) moving the captures of its `task fn` parameter makes such a call. So does a call of a method of the function's own `Dyn` parameter whose interface method head demands no `stack` limit, `value.render` in a `text::Writer.write` among them.
 - An indirect call site uses the N of the `stack N` that its function type, registry field type or interface method head demands; a call to a foreign fn the N of its `stack N`; a call to a compiler stub or support routine the stub call bound that [descriptors](27-program-model.md#descriptors) give.
 - An `await when` releasing its cowns moves each one's value into the storage of the domain its chunks pass to ([domain memory](11-errors-domains.md#domain-memory)), so each release uses the stub call bound plus the largest stack use among the moves of the cowns' value types, and is unbounded when one of them is.
@@ -820,6 +820,51 @@ error limit.stack-unbounded forests/forests.nan:8 forests::felled
         Grove(mem::Arena[Forest])
     because raised - - Forest
 failed build forests: files 0, errors 1, incomplete 0
+```
+
+In the next example, decoding `Settings` passes over the field it does not declare, and decoding `Chain` reaches itself: both are nested calls, so their call sites use the stub call bound.
+
+```nan
+// file: settings/package.nan
+//! Settings read from text.
+
+package settings {
+    language 1
+    targets x86_64-linux
+    entry main
+    allow validate in settings
+} settings
+
+// file: settings/settings.nan
+//! Reads settings from construction text and chains from JSON.
+
+pub open struct Settings derives Encode {
+    pub retries: u32
+} Settings
+
+pub closed enum Chain derives Encode {
+    End
+    Link(mem::Box[Chain])
+} Chain
+
+pub fn retries(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> u32 limits stack 16_384 {
+    let Ok(read) = attempt text::construction::Codec[Settings].decode(raw, alloc) else {
+        return 0
+    }
+    return read.retries
+} retries
+
+pub fn linked(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> bool limits stack 16_384 {
+    return match attempt text::json::Codec[Chain].decode(raw, alloc) {
+        Ok(Chain.Link(_)) => true
+        else => false
+    }
+} linked
+
+fn main(take world: host::World) fails task::Cancelled uses wait {
+    world.log.info("retries", value: retries(Untrusted.of(b"Settings(retries: 3, backoff: Backoff(steps: [1, 2]))"), alloc: world.alloc))
+    world.log.info("linked", value: linked(Untrusted.of(b"{\"Link\": \"End\"}"), alloc: world.alloc))
+} main
 ```
 
 ## Function types

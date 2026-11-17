@@ -144,15 +144,18 @@ impl Lowering<'_, '_> {
     }
 
     /// The functions lowered whose calls of each other pass a nesting on every cycle: the
-    /// decoding functions of the formats bounding their nestings, and the wire format's encoding
-    /// functions, which a nested call runs only on a value such a decoding read.
+    /// decoding functions of the formats bounding their nestings, the functions passing over the
+    /// values the text formats skip, and the wire format's encoding functions, which a nested
+    /// call runs only on a value such a decoding read.
     fn nesting_functions(&self) -> HashSet<FuncId> {
         (self.glues.iter())
             .filter_map(|(glue, id)| match glue {
                 Glue::Decode(format, _) if super::supplied::codecs::nests(self, format) => {
                     Some(*id)
                 }
-                Glue::Encode(super::supplied::codecs::Format::Wire, _) => Some(*id),
+                Glue::Encode(super::supplied::codecs::Format::Wire, _)
+                | Glue::ConstructionSkip
+                | Glue::JsonSkip => Some(*id),
                 _ => None,
             })
             .collect()

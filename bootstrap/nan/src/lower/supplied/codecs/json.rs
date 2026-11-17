@@ -5,7 +5,10 @@ use cranelift_codegen::ir::{
     AbiParam, InstBuilder, Signature, Type, Value, condcodes::IntCC, types,
 };
 
+use cranelift_module::FuncId;
+
 use super::super::super::fx::{Fx, PTR};
+use super::super::super::nested::nested_signature;
 use super::super::super::runtime::Routine;
 use super::super::super::{CALL_CONV, Glue, Lowering};
 use super::super::mem::vector;
@@ -950,12 +953,10 @@ pub fn element_follows(
     (parts[0], parts[1])
 }
 
-/// Passes over any JSON value, nested no deeper than decoding reads.
-pub fn skip_value(lo: &mut Lowering, fx: &mut Fx, state: Value) -> Value {
-    let mut signature = Signature::new(CALL_CONV);
-    signature.params.push(AbiParam::new(PTR));
-    signature.returns.push(AbiParam::new(types::I32));
-    let function = lo.glue_function(Glue::JsonSkip, signature, |lo, fx| {
+/// The function passing over any JSON value, nested no deeper than decoding reads, as a nested
+/// call does: given the reader, the allocator and a target, both unused, giving its code.
+pub fn skipper(lo: &mut Lowering) -> FuncId {
+    lo.glue_function(Glue::JsonSkip, nested_signature(), |lo, fx| {
         let params = fx.entry();
         let state = params[0];
         let (byte, failed) = peek(fx, state);
@@ -1009,9 +1010,15 @@ pub fn skip_value(lo: &mut Lowering, fx: &mut Fx, state: Value) -> Value {
         }
         let (_, _, _, failed) = number(lo, fx, state);
         fx.b.ins().return_(&[failed]);
-    });
+    })
+}
+
+/// Passes over any JSON value inside another, calling the skipper directly.
+fn skip_value(lo: &mut Lowering, fx: &mut Fx, state: Value) -> Value {
+    let function = skipper(lo);
+    let unused = fx.ptr(0);
     let reference = lo.call_ref(fx, function);
-    let call = fx.b.ins().call(reference, &[state]);
+    let call = fx.b.ins().call(reference, &[state, unused, unused]);
     fx.b.inst_results(call)[0]
 }
 

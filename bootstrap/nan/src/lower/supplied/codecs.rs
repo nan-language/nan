@@ -1425,10 +1425,10 @@ fn decode_every(lo: &mut Lowering, fx: &mut Fx, protocol: ItemId, args: &[Value]
 }
 
 /// Whether every cycle of a format's decoding functions' calls of each other passes a nesting,
-/// which the format bounds: the wire format's, and the calls of a std decoder.
+/// which the format bounds: the wire and text formats', and the calls of a std decoder.
 pub fn nests(lo: &Lowering, format: &DecodeFormat) -> bool {
     match format {
-        DecodeFormat::Wire => true,
+        DecodeFormat::Wire | DecodeFormat::Construction | DecodeFormat::Json => true,
         DecodeFormat::Calls(Ty::Item(item, _)) => lo.ck.db.is_std(*item),
         _ => false,
     }
@@ -2556,13 +2556,18 @@ fn decode_record(
                     }
                     None => {
                         let failed = match &decoding.format {
-                            DecodeFormat::Construction => {
-                                construction::skip_value(lo, fx, reader_state)
-                            }
                             DecodeFormat::Calls(decoder) => {
                                 calls::read(lo, fx, decoder, reader_state, "skip", &[]).1
                             }
-                            _ => json::skip_value(lo, fx, reader_state),
+                            format => {
+                                let skipper = match format {
+                                    DecodeFormat::Construction => construction::skipper(lo),
+                                    _ => json::skipper(lo),
+                                };
+                                let unused = fx.ptr(0);
+                                let args = [reader_state, decoding.alloc, unused];
+                                lo.nested_call(fx, skipper, &args)
+                            }
                         };
                         check(lo, fx, failed, release_read);
                     }

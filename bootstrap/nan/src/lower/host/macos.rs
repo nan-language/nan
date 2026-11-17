@@ -411,8 +411,6 @@ pub fn define_watch(lo: &mut Lowering, fx: &mut Fx) {
     fx.store(filter, op, operation::WAITER);
     let fd = fx.b.ins().sextend(PTR, fd);
     fx.store(fd, op, operation::LINK);
-    let word = fx.offset(record, task::IO);
-    fx.atomic_store(op, word);
     let at = fx.slot(event::SIZE, 8);
     let filter16 = fx.b.ins().ireduce(types::I16, filter);
     let flags = event::ADD | event::ONESHOT | event::UDATA_SPECIFIC;
@@ -421,11 +419,12 @@ pub fn define_watch(lo: &mut Lowering, fx: &mut Fx) {
     let added = change(lo, fx, port, at);
     let refused = fx.b.ins().icmp_imm_s(IntCC::NotEqual, added, 0);
     fx.when(refused, |fx| {
-        tasks::release_io(lo, fx, word, op);
         let error = last_error(lo, fx);
         let no = fx.int(types::I8, 0);
         fx.b.ins().return_(&[no, error]);
     });
+    let word = fx.offset(record, task::IO);
+    fx.atomic_store(op, word);
     let cancelled = origin(fx, region);
     let cancelled = fx.b.ins().icmp_imm_s(IntCC::NotEqual, cancelled, 0);
     fx.when(cancelled, |fx| lo.cancel_operation(fx, op));

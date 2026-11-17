@@ -1353,9 +1353,9 @@ fn io_submit(lo: &mut Lowering, fx: &mut Fx) {
     let size = fx.ptr(operation::SIZE);
     lo.call_routine(fx, Routine::Fill, &[op, zero, size]);
     fx.store(record, op, operation::TASK);
+    host::linux::submit(lo, fx, entry, Some(op));
     let word = fx.offset(record, task::IO);
     fx.atomic_store(op, word);
-    host::linux::submit(lo, fx, entry, Some(op));
     let cancelled = origin(fx, region);
     let cancelled = fx.b.ins().icmp_imm_s(IntCC::NotEqual, cancelled, 0);
     fx.when(cancelled, |fx| host::linux::cancel_operation(lo, fx, op));

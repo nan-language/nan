@@ -482,16 +482,15 @@ pub fn idle(lo: &mut Lowering, fx: &mut Fx) {
     fx.atomic_store(zero, idle);
 }
 
-/// Handles the completions on the running thread's ring, first submitting the cancellations
-/// other threads have asked of it and, when `wait` is given and nonzero, waiting for a
-/// completion.
+/// Handles the completions on the running thread's ring, first waiting for one when `wait` is
+/// given and nonzero, then submits the cancellations other threads have asked of it: a thread
+/// asks before it sends the wake that the completions handled may hold.
 pub fn reap(lo: &mut Lowering, fx: &mut Fx, wait: Option<Value>) {
     let current = lo.thread(fx);
     let ring = fx.load(PTR, current, thread::RING);
     if let Some(wait) = wait {
         fx.when(wait, |fx| enter(lo, fx, ring, 0, 1, uring::GET_EVENTS));
     }
-    submit_requested(lo, fx, current);
     let head_address = fx.load(PTR, ring, ring::CQ_HEAD);
     let tail_address = fx.load(PTR, ring, ring::CQ_TAIL);
     let mask_address = fx.load(PTR, ring, ring::CQ_MASK);
@@ -519,6 +518,7 @@ pub fn reap(lo: &mut Lowering, fx: &mut Fx, wait: Option<Value>) {
             (more, vec![next])
         });
     });
+    submit_requested(lo, fx, current);
 }
 
 /// Delivers a completion to the operation it reaches, which leaves its thread's operations in

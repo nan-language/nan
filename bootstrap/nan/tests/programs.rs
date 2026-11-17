@@ -1,9 +1,11 @@
 //! The program harness: builds each program of `tests/programs` and compares what its image
-//! writes with the program's `expected` file, whose first line states the exit status. A host
-//! program runs as a process, writing standard output then standard error: a Windows program as
-//! `nan run` launches it under Wine, in a Wine prefix of its own held in a session set up first. One for another
-//! architecture or system than this machine's, or a Windows program where Wine does not run, is
-//! only built. A machine program boots under its emulator,
+//! writes with the program's `expected` file, whose first line states the exit status. A program
+//! whose `expected` is a directory is built and run for each target a file of it is named after,
+//! its manifest declaring that target, and expects that file's text. A host program runs as a
+//! process, writing standard output then standard error: a Windows program off Windows as
+//! `nan run` launches it under Wine, in a Wine prefix of its own held in a session set up first.
+//! One for another architecture or system than this machine's, or a Windows program where Wine
+//! does not run, is only built. A machine program boots under its emulator, on Linux or macOS,
 //! writing the serial port until it ends the emulator through the exit port; on a UEFI target the
 //! firmware writes first, so its output only ends with the expected text. A machine program with an
 //! `emulator` file boots once per line of it, the line's words added to the emulator's arguments.
@@ -17,17 +19,18 @@
 //! use the harnesses' home directory.
 
 use std::fs;
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 use datatest_stable::Utf8Path;
 
+#[cfg(unix)]
 mod machine;
+#[cfg(not(windows))]
 mod wine;
 
 datatest_stable::harness! {
-    { test = program, root = "tests/programs", pattern = r"^[a-z0-9_]+/expected$" },
+    { test = program, root = "tests/programs", pattern = r"^[a-z0-9_]+/expected(/[a-z0-9_]+-[a-z]+)?$" },
 }
 
 /// Copies a directory's files and directories into another, made anew.
@@ -39,12 +42,15 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
     for entry in fs::read_dir(from)? {
         let entry = entry?;
         let target = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir(&entry.path(), &target)?;
-        } else if !["expected", "emulator", "monitor", "codegen"]
+        if ["expected", "emulator", "monitor", "codegen"]
             .iter()
             .any(|kept| entry.file_name() == *kept)
         {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
             fs::copy(entry.path(), target)?;
         }
     }
@@ -74,16 +80,42 @@ fn build(root: &Path, name: &str) -> datatest_stable::Result<()> {
     Ok(())
 }
 
+/// Rewrites a program's manifest to declare `target`.
+fn retarget(package: &Path, target: &str) -> std::io::Result<()> {
+    let path = package.join("package.nan");
+    let manifest = fs::read_to_string(&path)?;
+    let retargeted: String = manifest
+        .lines()
+        .map(|line| match line.trim().starts_with("targets ") {
+            true => format!("    targets {target}\n"),
+            false => format!("{line}\n"),
+        })
+        .collect();
+    fs::write(path, retargeted)
+}
+
 /// The status a run ends with: its exit code, or the negated number of the signal ending it.
+#[cfg(unix)]
 fn status_of(status: ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
     status
         .code()
         .unwrap_or_else(|| -status.signal().unwrap_or(0))
 }
 
+/// The status a run ends with: its exit code.
+#[cfg(windows)]
+fn status_of(status: ExitStatus) -> i32 {
+    status.code().expect("a Windows process's exit code")
+}
+
 /// Runs a host program's image, giving its exit status and what it writes.
 fn run_host(root: &Path, target: &str, name: &str) -> std::io::Result<(i32, String)> {
-    let run = Command::new(root.join(".nan/images").join(target).join(name))
+    let image = match target.ends_with("-windows") {
+        true => format!("{name}.exe"),
+        false => name.to_owned(),
+    };
+    let run = Command::new(root.join(".nan/images").join(target).join(image))
         .current_dir(root)
         .output()?;
     let mut written = String::from_utf8_lossy(&run.stdout).into_owned();
@@ -92,10 +124,11 @@ fn run_host(root: &Path, target: &str, name: &str) -> std::io::Result<(i32, Stri
 }
 
 /// Runs a Windows program's image as `nan run` launches it, under Wine in a prefix of its own
-/// held in a session set up first, giving its exit status and what it writes; none when `nan run`
-/// launches nothing, the program being for another architecture or Wine not running.
+/// `prefix` held in a session set up first, giving its exit status and what it writes; none when
+/// `nan run` launches nothing, the program being for another architecture or Wine not running.
+#[cfg(not(windows))]
 fn run_windows(
-    tmp: &Path,
+    prefix: &Path,
     root: &Path,
     name: &str,
 ) -> datatest_stable::Result<Option<(i32, String)>> {
@@ -106,12 +139,11 @@ fn run_windows(
         }
         return Ok(None);
     };
-    let prefix = tmp.join("wine").join(name);
-    let _session = wine::Session::start(&launch, &prefix)?;
+    let _session = wine::Session::start(&launch, prefix)?;
     let run = Command::new(&launch.program)
         .args(&launch.args)
         .envs(launch.env.iter().copied())
-        .env("WINEPREFIX", &prefix)
+        .env("WINEPREFIX", prefix)
         .current_dir(root)
         .output()?;
     let mut written = String::from_utf8_lossy(&run.stdout).into_owned();
@@ -157,6 +189,7 @@ fn runs_level(level: &str) -> bool {
 
 /// Builds each package of a kernel's `bundles` directory against the kernel's interface, signed
 /// by `tester`, and gives the emulator arguments passing each bundle to the kernel.
+#[cfg(unix)]
 fn bundles(root: &Path, name: &str, target: &str) -> datatest_stable::Result<Vec<String>> {
     let Ok(entries) = fs::read_dir(root.join(name).join("bundles")) else {
         return Ok(Vec::new());
@@ -208,6 +241,7 @@ fn synced(root: &Path, package: &str) -> datatest_stable::Result<()> {
 
 /// Gives the principal `tester` the key of the seed of 32 bytes 7 in the harnesses' home
 /// directory.
+#[cfg(unix)]
 fn sign_as_tester() -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let keys = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("home/.nan/keys");
@@ -225,34 +259,36 @@ fn sign_as_tester() -> std::io::Result<()> {
 }
 
 fn program(path: &Utf8Path, expected: String) -> datatest_stable::Result<()> {
-    let source = path.parent().expect("a program directory");
+    let parent = path.parent().expect("a program directory");
+    let (source, given) = match parent.file_name() {
+        Some("expected") => (
+            parent.parent().expect("a program directory"),
+            path.file_name(),
+        ),
+        _ => (parent, None),
+    };
     let name = source.file_name().expect("a program name");
+    let run = match given {
+        Some(target) => format!("{name}-{target}"),
+        None => name.to_owned(),
+    };
     let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    let root = tmp.join("programs").join(name);
+    let root = tmp.join("programs").join(&run);
     copy_dir(source.as_std_path(), &root.join(name))?;
+    if let Some(target) = given {
+        retarget(&root.join(name), target)?;
+    }
     fs::create_dir_all(tmp.join("home"))?;
     nan::use_home(tmp.join("home"), None);
     synced(&root, name)?;
     build(&root, name)?;
     let (wanted_status, wanted) = expected.split_once('\n').expect("an expected status line");
     let target = target(&root.join(name))?;
-    let bundles = bundles(&root, name, &target)?;
     let mut runs = Vec::new();
     let (arch, kind) = target.rsplit_once('-').expect("a concrete target");
+    let native = arch == std::env::consts::ARCH && kind == std::env::consts::OS;
     match kind {
-        "linux" | "macos" if arch != std::env::consts::ARCH || kind != std::env::consts::OS => {}
-        "windows" => {
-            if let Some((status, written)) = run_windows(&tmp, &root, name)? {
-                runs.push((
-                    String::new(),
-                    status,
-                    written,
-                    wanted_status,
-                    wanted.to_owned(),
-                ));
-            }
-        }
-        "linux" | "macos" => {
+        "linux" | "macos" | "windows" if native => {
             let (status, written) = run_host(&root, &target, name)?;
             runs.push((
                 String::new(),
@@ -276,7 +312,25 @@ fn program(path: &Utf8Path, expected: String) -> datatest_stable::Result<()> {
                 runs.push((format!(" at {level}"), status, written, status_line, text));
             }
         }
+        #[cfg(not(windows))]
+        "windows" => {
+            let prefix = tmp.join("wine").join(&run);
+            if let Some((status, written)) = run_windows(&prefix, &root, name)? {
+                runs.push((
+                    String::new(),
+                    status,
+                    written,
+                    wanted_status,
+                    wanted.to_owned(),
+                ));
+            }
+        }
+        #[cfg(windows)]
+        "windows" => {}
+        "linux" | "macos" => {}
+        #[cfg(unix)]
         _ => {
+            let bundles = bundles(&root, name, &target)?;
             let boots = match fs::read_to_string(source.join("emulator")) {
                 Ok(lines) => lines.lines().map(str::to_owned).collect(),
                 Err(_) => vec![String::new()],
@@ -312,6 +366,8 @@ fn program(path: &Utf8Path, expected: String) -> datatest_stable::Result<()> {
                 ));
             }
         }
+        #[cfg(windows)]
+        _ => return Err(format!("{name} boots only on Linux or macOS").into()),
     }
     for (label, status, written, wanted_status, wanted) in runs {
         let shown = match target.ends_with("-uefi") {

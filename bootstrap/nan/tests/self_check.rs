@@ -42,7 +42,7 @@ use common::{Example, examples, nan, unmark};
 datatest_stable::harness! {
     { test = chapter, root = "../../docs/spec", pattern = r"^\d\d-[a-z-]+\.md$" },
     { test = std_package, root = "../../std", pattern = r"^[a-z_]+/package\.nan$" },
-    { test = program, root = "tests/programs", pattern = r"^[a-z0-9_]+/expected$" },
+    { test = program, root = "tests/programs", pattern = r"^[a-z0-9_]+/expected(/[a-z0-9_]+-[a-z]+)?$" },
     { test = toolchain, root = "../../toolchain", pattern = r"^nan/package\.nan$" },
     { test = internal_error, root = "../../toolchain", pattern = r"^nan/nan\.nan$" },
     { test = signing, root = "../../docs/spec", pattern = r"^31-trust\.md$" },
@@ -1150,13 +1150,39 @@ fn std_package(path: &Utf8Path, _: String) -> datatest_stable::Result<()> {
 }
 
 fn program(path: &Utf8Path, _: String) -> datatest_stable::Result<()> {
-    let source = path.parent().expect("a program directory");
+    let parent = path.parent().expect("a program directory");
+    let (source, given) = match parent.file_name() {
+        Some("expected") => (
+            parent.parent().expect("a program directory"),
+            path.file_name(),
+        ),
+        _ => (parent, None),
+    };
     let name = source.file_name().expect("a program name");
-    let store = fresh_store(&format!("self-check-program-{name}"))?;
+    let run = match given {
+        Some(target) => format!("{name}-{target}"),
+        None => name.to_owned(),
+    };
+    let store = fresh_store(&format!("self-check-program-{run}"))?;
     let toolchain = Toolchain::new(image()?);
-    let dir = base().join("programs").join(name);
+    let dir = base().join("programs").join(&run);
     copy_tree(source.as_std_path(), &dir.join(name), true)?;
-    fs::remove_file(dir.join(name).join("expected"))?;
+    match given {
+        Some(target) => {
+            fs::remove_dir_all(dir.join(name).join("expected"))?;
+            let manifest = dir.join(name).join("package.nan");
+            let declared = fs::read_to_string(&manifest)?;
+            let line = declared
+                .lines()
+                .find(|line| line.trim().starts_with("targets "))
+                .expect("a program's targets directive");
+            fs::write(
+                &manifest,
+                declared.replace(line, &format!("    targets {target}")),
+            )?;
+        }
+        None => fs::remove_file(dir.join(name).join("expected"))?,
+    }
     drop(fs::remove_file(dir.join(name).join("emulator")));
     drop(fs::remove_file(dir.join(name).join("monitor")));
     let bundles = bundle_packages(&dir.join(name))?;

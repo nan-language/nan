@@ -11,6 +11,7 @@ use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 
 use super::super::Lowering;
 use super::super::fx::{Fx, PTR, unaligned};
+use super::super::load::WINDOW_ENTRY;
 use super::super::runtime::memory::CHUNK;
 use super::super::runtime::system::{self, unavailable_unless};
 use super::super::runtime::tasks::thread;
@@ -230,8 +231,14 @@ impl Lowering<'_, '_> {
     /// that its task stays on the CPU, and gives the root it replaces, zero for the entry root.
     /// The root is the x86_64 `cr3` or the AArch64 `TTBR0_EL1`, each installed by its stub, which
     /// receives `tagged` instead when given: the root with a PCID or ASID, whose translations
-    /// stay cached.
+    /// stay cached. In an x86_64 kernel with a load window, the root's top-level entry of the
+    /// window first takes the entry root's.
     pub fn swap_root(&mut self, fx: &mut Fx, root: Value, tagged: Option<Value>) -> Value {
+        if let Some((window, bits)) = self.window_root_entry() {
+            let table = self.data_address(fx, window);
+            let entry = fx.b.ins().iadd_imm_s(table, bits);
+            fx.store(entry, root, 8 * WINDOW_ENTRY as u64);
+        }
         let flags = self.call_stub(fx, Stub::IrqSave, &[])[0];
         let record = self.running_cpu(fx);
         let replaced = fx.load(PTR, record, cpu::ROOT);

@@ -1,4 +1,4 @@
-//! Finds its interface hash in a bundle, loads the signed bundle, refuses it again, faults writing its code, contains a trap in its domain, replaces and unloads it, finds its domain abandoned, calls a stale gate, reclaims many loads, then traps in its code.
+//! Installs a root of its own, finds its interface hash in a bundle, loads the signed bundle, refuses it again, faults writing its code, contains a trap in its domain, replaces and unloads it, finds its domain abandoned, calls a stale gate, reclaims many loads, then traps in its code.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -192,8 +192,20 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     let Some(loader) = k.loader() else {
         stop(text: "no loader\n")
     }
-    take k.anchor(0u8, run: fn[take loader](exec: task::Executor) fails task::Cancelled uses wait limits stack 262_144 {
-        try await run(loader, exec, alloc)
+    let Some(cpu) = mut k.ring0() else {
+        stop(text: "no ring0\n")
+    }
+    var regions = mut k.regions()
+    var frames = mem::List[hw::PhysFrame[4_096]].empty(alloc)
+    match mut regions.pop() {
+        Some(region) => take region.frames(mut frames)
+        None => stop(text: "no usable memory\n")
+    }
+    let root = build_root(mut frames)
+    mut k.policy(OneCpu())
+    take k.anchor(take frames, run: fn[take loader, take cpu, take root](exec: task::Executor) fails task::Cancelled uses wait limits stack 262_144 {
+        install_root(take root, cpu)
+        discard attempt await run(loader, exec, alloc)
         loop {
         }
     })
@@ -311,3 +323,98 @@ fn bundle_key() -> core::crypto::PublicKey {
     mut bytes.view_mut().copy_from(SIGNER)
     return core::crypto::PublicKey(bytes: bytes)
 } bundle_key
+
+/// The bits of a page-table entry: present, writable, a 2 MiB page, and uncached.
+const PRESENT: u64 = 0x1
+
+const WRITABLE: u64 = 0x2
+
+const LARGE: u64 = 0x80
+
+const UNCACHED: u64 = 0x18
+
+/// The kernel's policy, which keeps every task on CPU 0, where the kernel's own root is
+/// installed.
+struct OneCpu {
+} OneCpu
+
+impl OneCpu: hw::Policy
+
+fn OneCpu.place(self, t: hw::IrqsDisabled, task: hw::TaskView) -> hw::Placement limits notrap, terminates, noalloc, stack 4_096 {
+    return hw::Placement(cpu: 0, key: 0, bound: false)
+} OneCpu.place
+
+fn OneCpu.steal(self, t: hw::IrqsDisabled, cpu: u32, round: u32) -> Option[hw::Steal] limits notrap, terminates, noalloc, stack 4_096 {
+    return None
+} OneCpu.steal
+
+fn OneCpu.slice(self, t: hw::IrqsDisabled, cpu: u32, task: hw::TaskView) -> u64 limits notrap, terminates, noalloc, stack 4_096 {
+    return 1_000_000
+} OneCpu.slice
+
+fn OneCpu.idle(self, t: hw::IrqsDisabled, cpu: u32, until_ns: Option[u64]) -> hw::Idle limits notrap, terminates, noalloc, stack 4_096 {
+    return hw::Idle.Halt
+} OneCpu.idle
+
+fn set_entry(mut slot: u64, value: u64) {
+    slot = value
+} set_entry
+
+fn write_entry(table: u64, index: u64, value: u64) {
+    trusted "the entry lies in a page table no value owns" { hw::Ptr[u64].of_addr(usize.widen(table + 8 * index)).write(value) }
+} write_entry
+
+/// The last frame of a list, or a stop when none is left.
+fn next_frame(mut frames: mem::List[hw::PhysFrame[4_096]]) -> hw::PhysFrame[4_096] {
+    let Some(frame) = mut frames.pop() else {
+        stop(text: "out of frames\n")
+    }
+    return frame
+} next_frame
+
+/// Gives up an emptied frame as a page table, which no value owns from now on, and gives its
+/// address.
+fn page_table(take frame: hw::PhysFrame[4_096]) -> u64 {
+    let base = frame.base()
+    for index in 0u64..<512 {
+        set_entry(mut frame.contents_mut(hw::Offset[u64](bytes: 8 * index)), value: 0)
+    }
+    trusted "a page table's frame holds the frame, which no value owns from now on" { hw::Ptr[hw::PhysFrame[4_096]].of_addr(usize.widen(base)).write(take frame) }
+    write_entry(base, index: 0, value: 0)
+    return base
+} page_table
+
+/// A root of the kernel's own mapping the first 4 GiB at their physical addresses as the entry
+/// root does, and nothing at the load window's entry.
+fn build_root(mut frames: mem::List[hw::PhysFrame[4_096]]) -> hw::PageTableRoot {
+    var root = next_frame(mut frames)
+    for index in 0u64..<512 {
+        set_entry(mut root.contents_mut(hw::Offset[u64](bytes: 8 * index)), value: 0)
+    }
+    let kernel = page_table(next_frame(mut frames))
+    for gigabyte in 0u64..<4 {
+        let pages = page_table(next_frame(mut frames))
+        var flags = PRESENT | WRITABLE | LARGE
+        if gigabyte == 3 {
+            flags = flags | UNCACHED
+        }
+        for index in 0u64..<512 {
+            write_entry(pages, index, value: ((gigabyte << 30) + (index << 21)) | flags)
+        }
+        write_entry(kernel, index: gigabyte, value: pages | PRESENT | WRITABLE)
+    }
+    set_entry(mut root.contents_mut(hw::Offset[u64](bytes: 0)), value: kernel | PRESENT | WRITABLE)
+    return hw::PageTableRoot.of(take root)
+} build_root
+
+/// Installs `root` on the running CPU in place of the entry root.
+fn install_root(take root: hw::PageTableRoot, cpu: hw::Ring0) {
+    let replaced = trusted "root maps the first 4 GiB, which hold the image, the memory it reserves and every frame and region, as the entry root does, and maps nothing for user mode" { cpu.write_cr3(take root) }
+    match replaced {
+        Some(previous) => {
+            discard page_table(take previous.into_frame())
+        }
+        None => {
+        }
+    }
+} install_root

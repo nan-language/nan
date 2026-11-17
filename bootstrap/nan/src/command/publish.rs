@@ -85,7 +85,11 @@ pub fn run(
             .iter()
             .map(|diagnostic| record(workspace, &Scope::Package(index), diagnostic))
             .collect();
-        records.extend(fail_records(workspace, &Scope::Package(index), &report));
+        records.extend(fail_records(
+            workspace,
+            &Scope::Package(index),
+            &report.failures,
+        ));
         return Ok(output(invocation, &written, records, &diagnostics, &[]));
     }
     let mut refused: Vec<Diagnostic> = manifest

@@ -25,9 +25,20 @@ pkg enum Outcome {
     /// that forwarding rewrites, and its errors under the lock: its uses that stay moved and,
     /// when its own errors were ignored, every other.
     Resolved(lock: machine::Lock, changes: mem::List[Change], sources: mem::Map[text::String, mem::Bytes], errors: mem::List[diagnostic::Diagnostic])
-    /// No assignment is acceptable: the diagnostics the newest one fails with.
-    Unresolved(mem::List[diagnostic::Diagnostic])
+    /// No assignment is acceptable: why the newest one is not.
+    Unresolved(Rejection)
 } Outcome
+
+/// Why an assignment is not acceptable: the errors checking finds and the tests that fail.
+pkg struct Rejection {
+    pkg diagnostics: mem::List[diagnostic::Diagnostic]
+    pkg failures: mem::List[test_runs::Failure]
+} Rejection
+
+/// The rejection naming no reason.
+fn Rejection.empty(alloc: mem::Alloc) -> Rejection {
+    return Rejection(diagnostics: mem::List[diagnostic::Diagnostic].empty(alloc), failures: mem::List[test_runs::Failure].empty(alloc))
+} Rejection.empty
 
 /// A source a `dep` directive of the closure names: as the locking package's lock writes it, with
 /// the package it reaches and, for a path, the package's directory.
@@ -112,8 +123,8 @@ struct Resolver {
     entries: mem::List[mem::Shared[store::Entry]]
     /// The code root of each entry, by its position in `entries`.
     roots: mem::List[hashing::HashValue]
-    /// The failures of the first assignment judged, the newest.
-    newest: Option[mem::List[diagnostic::Diagnostic]]
+    /// Why the first assignment judged, the newest, is not acceptable.
+    newest: Option[Rejection]
     /// Whether the package's own errors make an assignment unacceptable: until no assignment is
     /// acceptable with them.
     own_errors: bool
@@ -141,7 +152,7 @@ pkg fn resolve(session: check::Session, package_index: usize, local: store::Stor
     let held = session.workspace.contents()
     let Some(root) = held.package_at(package_index) else {
         expect false
-        return Ok(Outcome.Unresolved(mem::List[diagnostic::Diagnostic].empty(alloc)))
+        return Ok(Outcome.Unresolved(Rejection.empty(alloc)))
     }
     var assigned = mem::List[Assigned].empty(alloc)
     var found: Option[mem::List[Assigned]] = None
@@ -158,21 +169,16 @@ pkg fn resolve(session: check::Session, package_index: usize, local: store::Stor
     let Some(assignment) = found else {
         let Some(manifest) = root.manifest else {
             expect false
-            return Ok(Outcome.Unresolved(mem::List[diagnostic::Diagnostic].empty(alloc)))
+            return Ok(Outcome.Unresolved(Rejection.empty(alloc)))
         }
         var path = text::String.of(root.dir.as_str(), alloc)
         mut path.append("/package.nan")
-        var diagnostics = mem::List[diagnostic::Diagnostic].empty(alloc)
-        mut diagnostics.push(diagnostic::Diagnostic.at(diagnostic::Code.DepUnresolved, path: path.as_str(), line: manifest.line, alloc))
-        match mut resolver.newest.extract() {
-            Some(newest) => {
-                for reported in take newest {
-                    mut diagnostics.push(take reported)
-                }
-            }
-            None => {}
+        var rejection = match mut resolver.newest.extract() {
+            Some(newest) => newest
+            None => Rejection.empty(alloc)
         }
-        return Ok(Outcome.Unresolved(diagnostic::sorted_diagnostics(take diagnostics, alloc)))
+        mut rejection.diagnostics.push(diagnostic::Diagnostic.at(diagnostic::Code.DepUnresolved, path: path.as_str(), line: manifest.line, alloc))
+        return Ok(Outcome.Unresolved(Rejection(diagnostics: diagnostic::sorted_diagnostics(take rejection.diagnostics, alloc), failures: take rejection.failures)))
     }
     return try resolver.lock(local, assigned: assignment.view())
 } resolve
@@ -364,9 +370,9 @@ fn Resolver.search(mut self, mut assigned: mem::List[Assigned], take pending: me
     if sources.len() == 0 {
         match try self.judge(assigned.view(), user_cache) {
             None => return Some(copied_assignment(assigned.view(), alloc))
-            Some(failures) => {
+            Some(rejection) => {
                 if self.newest.is_none() {
-                    self.newest = Some(take failures)
+                    self.newest = Some(take rejection)
                 }
                 return None
             }
@@ -542,18 +548,18 @@ fn lies_within(reported: diagnostic::Diagnostic, dir: Str) -> bool {
 /// Why an assignment is not acceptable, none when it is: the errors checking the closure
 /// finds on the package, the current states and the releases, but for what the package's
 /// lock leaves unapproved, and its failing tests.
-fn Resolver.judge(self, assigned: Slice[Assigned], user_cache: cache::Cache) -> Option[mem::List[diagnostic::Diagnostic]] fails platform::IoError {
+fn Resolver.judge(self, assigned: Slice[Assigned], user_cache: cache::Cache) -> Option[Rejection] fails platform::IoError {
     let alloc = self.alloc
     let lock = self.candidate_lock(assigned)
     let judged = try self.assigned(lock)
     let workspace_held = judged.session.workspace.contents()
     let Some(root) = workspace_held.package_at(self.package_index) else {
         expect false
-        return Some(mem::List[diagnostic::Diagnostic].empty(alloc))
+        return Some(Rejection.empty(alloc))
     }
     let root_dir = root.dir.as_str()
     let Some(closure) = workspace_held.closure_of(self.package_index) else {
-        return Some(mem::List[diagnostic::Diagnostic].empty(alloc))
+        return Some(Rejection.empty(alloc))
     }
     var dirs = mem::List[text::String].empty(alloc)
     for pair in assigned {
@@ -572,7 +578,7 @@ fn Resolver.judge(self, assigned: Slice[Assigned], user_cache: cache::Cache) -> 
         mut errors.push(take reported)
     }
     var own = mem::List[diagnostic::Diagnostic].empty(alloc)
-    var failures = mem::List[diagnostic::Diagnostic].empty(alloc)
+    var rejection = Rejection.empty(alloc)
     for reported in take errors {
         if reported.code.class() != diagnostic::Class.Error {
             continue
@@ -589,35 +595,33 @@ fn Resolver.judge(self, assigned: Slice[Assigned], user_cache: cache::Cache) -> 
         }
         let related = reported.path.is_none() or dirs.position(fn(dir: text::String) => lies_within(reported, dir: dir.as_str())).is_some()
         if related {
-            mut failures.push(take reported)
+            mut rejection.diagnostics.push(take reported)
         }
     }
     if own.len() == 0 {
         let changed = self.changed(lock)
         match try test_runs::run(judged.session, scope: scope::Scope.Package(self.package_index), runs: test_runs::Runs.Reaching(take changed), user_cache, checked: None) {
             Ok(report) => {
-                for failure in report.failures {
-                    mut failures.push(diagnostic::Diagnostic.at(diagnostic::Code.DepUnresolved, path: failure.path.as_str(), line: failure.line, alloc))
-                }
+                rejection.failures = report.failures
                 for reported in take report.diagnostics {
-                    mut failures.push(take reported)
+                    mut rejection.diagnostics.push(take reported)
                 }
             }
             Err(exposed) => {
                 var reported = diagnostic::Diagnostic.new(diagnostic::Code.BuildCacheExposed, alloc)
                 reported.path = Some(take exposed.path)
-                mut failures.push(take reported)
+                mut rejection.diagnostics.push(take reported)
             }
         }
     } else if self.own_errors {
         for reported in take own {
-            mut failures.push(take reported)
+            mut rejection.diagnostics.push(take reported)
         }
     }
-    if failures.len() == 0 {
+    if rejection.diagnostics.len() == 0 and rejection.failures.len() == 0 {
         return None
     }
-    return Some(take failures)
+    return Some(take rejection)
 } Resolver.judge
 
 /// The packages whose release a candidate lock assigns differently from the current lock: a
@@ -685,7 +689,7 @@ fn Resolver.lock(self, local: store::Store, assigned: Slice[Assigned]) -> Result
     let workspace_held = judged.session.workspace.contents()
     let Some(closure) = workspace_held.closure_of(self.package_index) else {
         expect false
-        return Ok(Outcome.Unresolved(mem::List[diagnostic::Diagnostic].empty(alloc)))
+        return Ok(Outcome.Unresolved(Rejection.empty(alloc)))
     }
     var deps = mem::List[machine::Locked].empty(alloc)
     var appended = mem::List[CurrentEntry].empty(alloc)

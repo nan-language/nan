@@ -38,7 +38,7 @@ pub fn run(
         .iter()
         .map(|diagnostic| record(workspace, &scope, diagnostic))
         .collect();
-    records.extend(fail_records(workspace, &scope, &report));
+    records.extend(fail_records(workspace, &scope, &report.failures));
     let failed = report.failures.len();
     Ok(Output {
         command: invocation.command(&written, true),

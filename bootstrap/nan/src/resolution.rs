@@ -17,7 +17,7 @@ use crate::release;
 use crate::scope::Scope;
 use crate::store::{Append, Class, Entry, Store};
 use crate::syntax::file::parse;
-use crate::test_runs::{self, Runs};
+use crate::test_runs::{self, Failure, Runs};
 use crate::workspace::manifest_deps;
 use crate::workspace::{Member, ReleaseStore, Workspace};
 
@@ -45,8 +45,15 @@ pub enum Outcome {
         sources: HashMap<String, Vec<u8>>,
         errors: Vec<Diagnostic>,
     },
-    /// No assignment is acceptable: the diagnostics the newest one fails with.
-    Unresolved(Vec<Diagnostic>),
+    /// No assignment is acceptable: why the newest one is not.
+    Unresolved(Rejection),
+}
+
+/// Why an assignment is not acceptable: the errors checking finds and the tests that fail.
+#[derive(Default)]
+pub struct Rejection {
+    pub diagnostics: Vec<Diagnostic>,
+    pub failures: Vec<Failure>,
 }
 
 /// A source a `dep` directive of the closure names: as the locking package's lock writes it, with
@@ -112,8 +119,8 @@ struct Resolver<'a> {
     package: usize,
     entries: Vec<Entry>,
     cache: &'a Cache,
-    /// The failures of the first assignment judged, the newest.
-    newest: Option<Vec<Diagnostic>>,
+    /// Why the first assignment judged, the newest, is not acceptable.
+    newest: Option<Rejection>,
     /// Whether the package's own errors make an assignment unacceptable: until no assignment is
     /// acceptable with them.
     own_errors: bool,
@@ -157,14 +164,14 @@ pub fn resolve(
     };
     let Some(assignment) = found else {
         let manifest = root.manifest.as_ref().expect("a package with a manifest");
-        let mut diagnostics = vec![Diagnostic::at(
+        let mut rejection = resolver.newest.take().unwrap_or_default();
+        rejection.diagnostics.push(Diagnostic::at(
             Code::DepUnresolved,
             &format!("{}/package.nan", root.dir),
             manifest.line,
-        )];
-        diagnostics.extend(resolver.newest.take().unwrap_or_default());
-        sort_diagnostics(&mut diagnostics);
-        return Ok(Ok(Outcome::Unresolved(diagnostics)));
+        ));
+        sort_diagnostics(&mut rejection.diagnostics);
+        return Ok(Ok(Outcome::Unresolved(rejection)));
     };
     resolver.lock(store, &assignment)
 }
@@ -284,8 +291,8 @@ impl Resolver<'_> {
         let Some(next) = pending.first().cloned() else {
             return match self.judge(assigned)? {
                 None => Ok(Some(assigned.clone())),
-                Some(failures) => {
-                    self.newest.get_or_insert(failures);
+                Some(rejection) => {
+                    self.newest.get_or_insert(rejection);
                     Ok(None)
                 }
             };
@@ -408,12 +415,12 @@ impl Resolver<'_> {
     /// Why an assignment is not acceptable, none when it is: the errors checking the closure
     /// finds on the package, the current states and the releases, but for what the package's
     /// lock leaves unapproved, and its failing tests.
-    fn judge(&self, assigned: &[(Source, Candidate)]) -> io::Result<Option<Vec<Diagnostic>>> {
+    fn judge(&self, assigned: &[(Source, Candidate)]) -> io::Result<Option<Rejection>> {
         let lock = self.candidate_lock(assigned);
         let (workspace, _) = self.assigned(&lock)?;
         let root = &workspace.packages[self.package];
         let Some(closure) = workspace.closure_of(root) else {
-            return Ok(Some(Vec::new()));
+            return Ok(Some(Rejection::default()));
         };
         let dirs: Vec<String> = assigned
             .iter()
@@ -443,7 +450,10 @@ impl Resolver<'_> {
                     || dirs.iter().any(|dir| within(diagnostic, dir))
             })
             .partition(|diagnostic| within(diagnostic, &root.dir));
-        let mut failures = others;
+        let mut rejection = Rejection {
+            diagnostics: others,
+            failures: Vec::new(),
+        };
         if own.is_empty() {
             let scope = Scope::Package(self.package);
             let changed = self.changed(&lock);
@@ -455,20 +465,19 @@ impl Resolver<'_> {
                 None,
             )? {
                 Ok(report) => {
-                    failures.extend(report.failures.iter().map(|failure| {
-                        Diagnostic::at(Code::DepUnresolved, &failure.path, failure.line)
-                    }));
-                    failures.extend(report.diagnostics);
+                    rejection.failures = report.failures;
+                    rejection.diagnostics.extend(report.diagnostics);
                 }
-                Err(exposed) => failures.push(Diagnostic {
+                Err(exposed) => rejection.diagnostics.push(Diagnostic {
                     path: Some(exposed.0),
                     ..Diagnostic::new(Code::BuildCacheExposed)
                 }),
             }
         } else if self.own_errors {
-            failures.extend(own);
+            rejection.diagnostics.extend(own);
         }
-        Ok((!failures.is_empty()).then_some(failures))
+        let acceptable = rejection.diagnostics.is_empty() && rejection.failures.is_empty();
+        Ok((!acceptable).then_some(rejection))
     }
 
     /// The packages whose release a candidate lock assigns differently from the current lock: a

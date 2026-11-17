@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 
+use super::test::fail_records;
 use super::{Invocation, Trace, apply, record};
 use crate::cache::Cache;
 use crate::check;
@@ -203,13 +204,19 @@ fn synced(
                     .map(|diagnostic| record(workspace, &Scope::Workspace, diagnostic)),
             );
         }
-        Outcome::Unresolved(diagnostics) => {
+        Outcome::Unresolved(rejection) => {
             changes.clear();
             records.extend(
-                diagnostics
+                rejection
+                    .diagnostics
                     .iter()
                     .map(|diagnostic| record(workspace, &Scope::Workspace, diagnostic)),
             );
+            records.extend(fail_records(
+                workspace,
+                &Scope::Workspace,
+                &rejection.failures,
+            ));
         }
     }
     Ok(())

@@ -375,10 +375,16 @@ fn a_changed_path_dependency_runs_the_affected_tests_of_a_sync_and_refuses_runs_
     run_in(&dir.join("app"), "dep sync");
     fs::write(dir.join("dial/dial.nan"), dial("8")).expect("a changed dial");
     let synced = run_in(&dir.join("app"), "dep sync").output;
-    assert!(
-        synced.contains("\nerror dep.unresolved app/app.nan:8 app::seventh\n"),
-        "{synced}"
-    );
+    for record in [
+        "error dep.unresolved app/package.nan:3 app",
+        "fail app::seventh app/app.nan:8 x86_64-linux trap.expect",
+    ] {
+        assert!(
+            synced.contains(&format!("\n{record}\n")),
+            "{record}: {synced}"
+        );
+    }
+    assert!(synced.contains(" errors 1, "), "{synced}");
     fs::write(dir.join("dial/dial.nan"), dial("true")).expect("a broken dial");
     let tested = run_in(dir, "test app").output;
     assert!(

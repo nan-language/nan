@@ -12,7 +12,7 @@ use crate::diagnostic::{Class, Code, Diagnostic, sort_diagnostics};
 use crate::fix;
 use crate::output::{Output, Record, Verdict};
 use crate::scope::Scope;
-use crate::test_runs::{self, Report, Runs, Token};
+use crate::test_runs::{self, Failure, Report, Runs, Token};
 use crate::workspace::Workspace;
 
 pub fn run(
@@ -72,7 +72,7 @@ pub fn run(
         .iter()
         .map(|diagnostic| record(workspace, &scope, diagnostic))
         .collect();
-    records.extend(fail_records(workspace, &scope, &report));
+    records.extend(fail_records(workspace, &scope, &report.failures));
     Ok(output(
         invocation,
         &written,
@@ -82,11 +82,10 @@ pub fn run(
     ))
 }
 
-/// A `fail` record per failing test of a report.
-pub fn fail_records(workspace: &Workspace, scope: &Scope, report: &Report) -> Vec<Record> {
+/// A `fail` record per failing test.
+pub fn fail_records(workspace: &Workspace, scope: &Scope, failures: &[Failure]) -> Vec<Record> {
     let writer = scope.package(workspace).and_then(|package| package.name());
-    report
-        .failures
+    failures
         .iter()
         .map(|failure| Record {
             word: "fail".to_owned(),

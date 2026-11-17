@@ -12,7 +12,13 @@ Linux or macOS:
 curl -fsSL https://raw.githubusercontent.com/nan-language/nan/main/install.sh | sh
 ```
 
-Fedora: `sudo dnf copr enable @nanlang/nan && sudo dnf install nan`. Ubuntu 22.04 or later: `sudo add-apt-repository ppa:nanlang/nan && sudo apt install nan`. Windows: download `nan-<version>-<arch>-windows.exe` from the [releases](https://github.com/nan-language/nan/releases) and put it on the `PATH` as `nan.exe`.
+Windows, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/nan-language/nan/main/install.ps1 | iex
+```
+
+Fedora: `sudo dnf copr enable @nanlang/nan && sudo dnf install nan`. Ubuntu 22.04 or later: `sudo add-apt-repository ppa:nanlang/nan && sudo apt install nan`.
 
 Building for Linux needs `cc`, or `x86_64-linux-gnu-gcc` / `aarch64-linux-gnu-gcc` for the other architecture. Running Windows programs on Linux needs Wine; macOS programs need macOS 15 or later; UEFI and bare-metal programs need QEMU 10.2 or later, `swtpm` and, for UEFI, OVMF or AAVMF.
 

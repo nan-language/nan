@@ -250,10 +250,10 @@ fn std_files(dir: &Path, prefix: &str, files: &mut Vec<(String, String)>) {
     }
 }
 
-/// The words of a std file's path, without its extension.
+/// The words of a std file's path, without its extension, a target variant's selector among them.
 fn path_words(path: &str) -> Vec<String> {
     path.trim_end_matches(".nan")
-        .split(['/', '_'])
+        .split(['/', '_', '@'])
         .map(str::to_owned)
         .collect()
 }

@@ -1,11 +1,14 @@
 #!/bin/bash
-# Boots kernel_steals until a boot stalls, dumping its scheduler. Usage: kernel_hunt.sh <nan> <out> <boots>
+# Boots kernel_steals until a boot stalls, dumping its scheduler; a perl substitution varies the
+# program. Usage: kernel_hunt.sh <nan> <out> <boots> [<substitution>...]
 set -u
-NAN=$1; OUT=$2; BOOTS=$3
+NAN=$1; OUT=$2; BOOTS=$3; shift 3
 mkdir -p "$OUT"
 work=$(mktemp -d)
 cp -R bootstrap/nan/tests/programs/kernel_steals "$work/kernel_steals"
 rm -f "$work/kernel_steals/expected"
+for change in "$@"; do perl -pi -e "$change" "$work/kernel_steals/kernel_steals.nan"; done
+grep -nE 'return (5_000|50_000)|hw::Idle\.' "$work/kernel_steals/kernel_steals.nan"
 (cd "$work" && "$NAN" build kernel_steals) || exit 1
 sha256sum "$work/.nan/images/x86_64-bare/kernel_steals.elf"
 for i in $(seq 1 "$BOOTS"); do

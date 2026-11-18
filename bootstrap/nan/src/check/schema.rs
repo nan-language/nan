@@ -492,7 +492,7 @@ impl Checker<'_> {
                     .filter(|field| !field.is_kept())
                     .map(|field| {
                         let value_ty = subst.ty(&field.ty);
-                        let defaulted = open && self.implements_default(&value_ty);
+                        let defaulted = open && self.takes_default(&value_ty);
                         Field {
                             key: field.name.clone(),
                             aliases: self.key_aliases_of(*item, &field.name),
@@ -552,10 +552,28 @@ impl Checker<'_> {
         node
     }
 
-    fn implements_default(&self, ty: &Ty) -> bool {
-        self.db
-            .core_item("Default")
-            .is_some_and(|interface| self.implements(ty, interface))
+    /// Whether a missing field of an open type, of type `ty`, takes a default when decoded.
+    pub fn takes_default(&self, ty: &Ty) -> bool {
+        self.decodes_empty(ty)
+            || self
+                .db
+                .core_item("Default")
+                .is_some_and(|interface| self.implements(ty, interface))
+    }
+
+    /// Whether a missing field of type `ty` takes the empty container drawn through the decoder's
+    /// allocator.
+    pub fn decodes_empty(&self, ty: &Ty) -> bool {
+        self.std_path(ty).is_some_and(|path| {
+            [
+                "text::String",
+                "mem::Bytes",
+                "mem::List",
+                "mem::Set",
+                "mem::Map",
+            ]
+            .contains(&path.as_str())
+        })
     }
 
     /// The aliases of a field's or variant's key: the old names of the `preserves` tombstones of

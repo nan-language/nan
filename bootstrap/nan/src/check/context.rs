@@ -427,8 +427,9 @@ fn greens_of(
 }
 
 /// The facts checking each item of the workspace reads that its context pack lacks: each item read
-/// outside the core vocabulary with neither a record of its own nor, for an impl line, the record
-/// of the type or interface showing it.
+/// outside the core vocabulary, which holds the impl lines of its types to its interfaces, with
+/// neither a record of its own nor, for an impl line, the record of the type or interface showing
+/// it.
 pub fn context_gaps(workspace: &Workspace) -> Vec<String> {
     let std = crate::stdlib::packages();
     let checkers = checkers(workspace, std);
@@ -447,17 +448,19 @@ pub fn context_gaps(workspace: &Workspace) -> Vec<String> {
             let pack = checker.context(&checkers, item, None, &mut apis);
             let shown: HashSet<&str> = pack.apis.iter().map(|api| api.path.as_str()).collect();
             let core = db.core();
-            for read in db.read_by(item) {
-                let ast = db.declaration(read);
-                let vocabulary = db.package_of(read) == core
-                    && ast
+            let vocabulary = |read: ItemId| {
+                db.package_of(read) == core
+                    && db
+                        .declaration(read)
                         .name()
-                        .is_some_and(|name| super::resolve::is_core_vocabulary(&name));
+                        .is_some_and(|name| super::resolve::is_core_vocabulary(&name))
+            };
+            for read in db.read_by(item) {
                 let path = checker
                     .canonical_path(read)
                     .or_else(|| checker.own_path(read))
                     .unwrap_or_default();
-                let present = vocabulary
+                let present = vocabulary(read)
                     || read == item
                     || shown.contains(path.as_str())
                     || match &checker.sig(read).kind {
@@ -470,10 +473,15 @@ pub fn context_gaps(workspace: &Workspace) -> Vec<String> {
                                         && api.lines.iter().any(|line| line.starts_with("impl "))
                                 })
                             };
-                            matches!(target, Some(TypeKey::Item(target)) if named(*target))
-                                || interface
-                                    .as_ref()
-                                    .is_some_and(|bound| named(bound.interface))
+                            let interface = interface.as_ref().map(|bound| bound.interface);
+                            let target = match target {
+                                Some(TypeKey::Item(target)) => Some(*target),
+                                _ => None,
+                            };
+                            target.zip(interface).is_some_and(|(target, interface)| {
+                                vocabulary(target) && vocabulary(interface)
+                            }) || target.is_some_and(named)
+                                || interface.is_some_and(named)
                         }
                         _ => false,
                     };

@@ -1475,11 +1475,24 @@ impl Decoding<'_, '_, '_, '_> {
         }))
     }
 
-    /// The default of a missing field's type, when it implements `Default`.
+    /// The default of a missing field's type, when it takes one: the empty container of a
+    /// growable container, else its `Default`.
     fn default(&mut self, ty: &Ty) -> Decoded<Val> {
-        let defaults = self.interp.ty_item("core", "Default");
-        if self.interp.ck.conformance(ty, defaults).is_none() {
+        if !self.interp.ck.takes_default(ty) {
             return fail("MissingField");
+        }
+        if self.interp.ck.decodes_empty(ty) {
+            let path = self.interp.ck.std_path(ty).expect("a std container");
+            let arg = |index: usize| ty.type_arg(index).cloned().unwrap_or(Ty::Unit);
+            let element = match path.as_str() {
+                "mem::List" | "mem::Set" => arg(0),
+                "mem::Map" => Ty::item(
+                    self.interp.ty_item("mem", "KeyValue"),
+                    vec![Arg::Ty(arg(0)), Arg::Ty(arg(1))],
+                ),
+                _ => Ty::Scalar(Scalar::U8),
+            };
+            return self.held(&path, Vec::new(), &element);
         }
         Ok(conformance(
             self.interp,

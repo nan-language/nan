@@ -2607,11 +2607,10 @@ fn decode_record(
     });
     end(lo, fx, decoding, release_read);
     unnest(fx, reader_state);
-    let default = lo.core_interface("Default");
     for (position, (_, field_ty, offset)) in record.fields.iter().enumerate() {
         let flag = fx.load(types::I8, read, position as u64);
         let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, flag, 0);
-        let defaults = record.open && lo.ck.conformance(field_ty, default).is_some();
+        let defaults = record.open && lo.ck.takes_default(field_ty);
         fx.when(missing, |fx| {
             if !defaults {
                 release_read(lo, fx);
@@ -2619,8 +2618,21 @@ fn decode_record(
                 return;
             }
             let at = fx.offset(target, *offset);
-            let made = lo.call_method(fx, field_ty, "Default", Vec::new(), &[]);
-            lo.store_held(fx, at, made, field_ty);
+            match kind_of(lo, field_ty) {
+                Kind::Text(None) | Kind::Bytes => vector::empty(fx, at, decoding.alloc, BYTE),
+                Kind::Sequence(element, Form::List | Form::Set) => {
+                    let shape = Element::of(lo, &element);
+                    vector::empty(fx, at, decoding.alloc, shape);
+                }
+                Kind::Map(key, value) => {
+                    let shape = Entries::of_map(lo, key, value).shape;
+                    vector::empty(fx, at, decoding.alloc, shape);
+                }
+                _ => {
+                    let made = lo.call_method(fx, field_ty, "Default", Vec::new(), &[]);
+                    lo.store_held(fx, at, made, field_ty);
+                }
+            }
             let one = fx.int(types::I8, 1);
             fx.store(one, read, position as u64);
         });

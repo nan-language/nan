@@ -181,7 +181,6 @@ fn judging(ck: &Checker, item: ItemId, old: &Entry, new: &Entry) -> Judging {
         }
         SigKind::Struct { fields } if opened(old_head, new_head) && held(&old.text[1..]) => {
             let encoded = new_head.contains("Encode");
-            let default = ck.db.core_item("Default");
             let defaulted = new.text[1..]
                 .iter()
                 .filter(|line| !old.text.contains(line))
@@ -193,10 +192,9 @@ fn judging(ck: &Checker, item: ItemId, old: &Entry, new: &Entry) -> Judging {
                         .next()
                         .unwrap_or_default();
                     !encoded
-                        || fields.iter().any(|field| {
-                            field.name == name.trim()
-                                && default.is_some_and(|default| ck.implements(&field.ty, default))
-                        })
+                        || fields
+                            .iter()
+                            .any(|field| field.name == name.trim() && ck.takes_default(&field.ty))
                 });
             match defaulted {
                 true => Judging::Compatible,

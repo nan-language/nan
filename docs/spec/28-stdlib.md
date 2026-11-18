@@ -232,6 +232,11 @@ pub fn Option.is_none(self) -> bool limits pure, notrap, terminates
 
 pub fn Option.extract(mut self) -> Option[T] limits pure, notrap, terminates
 
+impl Option: Default
+
+pub fn Option.default() -> Option[T] limits pure, terminates
+    example Option[u8].default() == None
+
 pub fn Result.is_ok(self) -> bool limits pure, notrap, terminates
 
 pub fn Result.is_err(self) -> bool limits pure, notrap, terminates
@@ -240,6 +245,7 @@ pub fn Result.is_err(self) -> bool limits pure, notrap, terminates
 - `is_some` and `is_ok` are true exactly for `Some` and `Ok`; `is_none` and `is_err` are their negations.
 - `pub fn Option.value_or(self, fallback: T) -> T limits pure, notrap, terminates` returns the payload of `Some`, and `fallback` for `None`. It exists only when `T` is Copy, as for [array and slice members](#array-and-slice-members); on any other instantiation the name is unknown (`name.unknown`).
 - `mut o.extract()` returns the value `o` held and leaves `None` in it; it moves the payload out of a place that [modes](07-ownership.md#modes) never move.
+- `Option[T]` implements `Default` for every `T`, its default being `None`.
 
 ```nan
 pub fn port_or_default(port: Option[u16]) -> u16

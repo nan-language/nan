@@ -299,7 +299,7 @@ An item is compatible with another for a role when their interface hashes are eq
 | Change | Compatible for |
 | --- | --- |
 | A new variant of an open enum that leaves every [promise](05-properties.md#promises) of the enum in place | every role |
-| A new field of an open struct that leaves every promise in place, of a type implementing `Default` when the struct derives `Encode` | every role |
+| A new field of an open struct that leaves every promise in place, of a type taking a default when missing ([decoding rules](13-text-encode.md#decoding-rules)) when the struct derives `Encode` | every role |
 | A struct declared `open` that becomes `flexible`, or `flexible` that becomes `open` | every role |
 | A new interface method with a default body, the interface staying Dyn-usable if it was | every role |
 | A weaker `requires` or a stronger `ensures` on a function that is not an interface method | `call`, `name` |

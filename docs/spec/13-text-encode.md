@@ -790,14 +790,28 @@ A struct or enum declared `open` and a struct declared `flexible` decode as open
 
 - A record key that is neither a field's key nor an alias fails a closed type with `UnknownKey`. An open type skips the field: `mem::wire` keeps it in a [flexible struct](#flexible-structs), and every other decoding discards it.
 - A field given twice, by its key or its aliases, fails with `DuplicateKey`.
-- A missing field of an open type whose field type implements `Default` takes that default. Any other missing field fails with `MissingField`.
+- A missing field of an open type whose field type is `text::String`, `mem::Bytes`, `mem::List[T]`, `mem::Set[T]` or `mem::Map[K, V]` takes the empty container, drawn through the decoder's allocator; one whose field type implements `Default` takes that default. Any other missing field fails with `MissingField`.
 - An unknown variant key fails closed and open types alike with `UnknownVariant`.
 - `text::json` and `text::construction` frame a record field by its key. This framing is the format space reserved for keeping skipped fields in those formats, which no language 1 decoder keeps.
 
 ```nan
+// file: config/package.nan
+//! Settings read from records that may lack fields.
+
+package config {
+    language 1
+    targets any
+    allow validate in config
+} config
+
+// file: config/config.nan
+//! Settings and their loading.
+
 pub open struct Config derives Eq, Encode {
     pub retries: u8
     pub verbose: bool
+    pub ports: mem::List[u16]
+    pub limit: Option[u32]
 } Config
 
 pub fn load_config(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Config fails core::DecodeError {
@@ -807,7 +821,7 @@ pub fn load_config(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Config fails
 test config_tolerates_new_fields for load_config {
     let world = testing::world()
     let loaded = attempt load_config(Untrusted.of(b"\x02\x04mode\x01\x07\x07retries\x01\x03"), alloc: world.alloc)
-    expect loaded == Ok(Config(retries: 3, verbose: false))
+    expect loaded == Ok(Config(retries: 3, verbose: false, ports: mem::List[u16].empty(world.alloc), limit: None))
 } config_tolerates_new_fields
 ```
 

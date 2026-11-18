@@ -1776,6 +1776,8 @@ pub fn Load.job(self) -> Option[Job]
 
 pub fn Load.component(self, name: Str) -> Option[Job]
 
+pub fn Load.schema(self, name: Str, alloc: mem::Alloc) -> Option[sys::ProtocolSchema]
+
 pub open struct Job derives Copy, Send {
 } Job
 
@@ -1802,7 +1804,7 @@ pub closed enum LoadError derives Copy, Eq, Render {
 - `bundle.replace(take next)` publishes in one change versions without the entries of `bundle` and with those of `next`, failing as `load` does and then changing nothing and retiring `next`'s placement. Each gate of `bundle` whose registry, key and field an entry of `next` shares then calls `next`'s function, and every other gate of `bundle` goes stale; `bundle` holds `next` from then on, with the same domain, and retires the placement it held.
 - `take bundle.unload()` triggers the bundle's domain, then publishes versions without the bundle's entries; every gate of the bundle goes stale and its placement is retired.
 - `bundle.share()` gives a **load**, a counted handle on the placement `bundle` holds, and `load.share()` another on the placement of `load`. A load is Send and never Copy. Each load counts on its placement until it is released or the domain owning it is settled, and a retired placement is never reclaimed while a load counts on it, so a load stays valid after its bundle is replaced or unloaded, and the jobs and instances running from it keep running the code they started with.
-- `load.job()` gives the job entry of a nanos program's load, none for another, `load.component(name)` the entry of the [component entry](27-program-model.md#entry) `name` of a nanos program's load, none when it has no component entry of that name, and `job.stack()` the stack the task of an entry needs: the `stack N` a job's entry function states, or, for another entry, the stack use of the entry up to its [grown calls](17-suspension-io.md#grown-stacks), at least 64 KiB; `nanos::run` runs a job ([jobs](14-authority.md#jobs)) and `nanos::hold` the instance task of a component ([component instances](14-authority.md#component-instances)), and `nanos::run_isolated` and `nanos::hold_isolated` run them in isolated spaces.
+- `load.job()` gives the job entry of a nanos program's load, none for another, `load.component(name)` the entry of the [component entry](27-program-model.md#entry) `name` of a nanos program's load, none when it has no component entry of that name, `load.schema(name, alloc)` the `sys::ProtocolSchema` of the protocol that entry's component serves, drawn through `alloc`, as `sys::Wire[P].schema` gives it ([protocol schemas](26-components.md#protocol-schemas)), none when it has no component entry of that name, and `job.stack()` the stack the task of an entry needs: the `stack N` a job's entry function states, or, for another entry, the stack use of the entry up to its [grown calls](17-suspension-io.md#grown-stacks), at least 64 KiB; `nanos::run` runs a job ([jobs](14-authority.md#jobs)) and `nanos::hold` the instance task of a component ([component instances](14-authority.md#component-instances)), and `nanos::run_isolated` and `nanos::hold_isolated` run them in isolated spaces.
 - `take prepared.load()`, `bundle.replace(take next)`, `take bundle.unload()` and `loader.reclaim()` take one lock of the kernel's, each publishing all its versions before the next starts.
 - A bundle's code runs on the kernel's runtime: its tasks, cells, capabilities and domains are the kernel's.
 - A bundle's code reaches the runtime it runs on only through the kernel's exports, so that an isolated space's runtime can serve it ([isolated spaces](#isolated-spaces)).
@@ -1828,6 +1830,8 @@ pub fn Isolated.of_test(image: Slice[u8], alloc: mem::Alloc) -> Isolated fails L
 pub fn Isolated.job(self) -> Option[Job]
 
 pub fn Isolated.component(self, name: Str) -> Option[Job]
+
+pub fn Isolated.schema(self, name: Str, alloc: mem::Alloc) -> Option[sys::ProtocolSchema]
 
 pub fn Isolated.space(self, cpu: hw::Ring0, data: u64, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Space fails LoadError
 
@@ -1862,7 +1866,7 @@ pub closed enum DrawError derives Copy, Eq, Render {
 pub fn Space.release(take self, mut frames: mem::List[hw::PhysFrame[4_096]])
 ```
 
-- `loader.isolate(bundle, keys, alloc)` verifies a bundle as `prepare` does, and fails with `Interface` too when the kernel holds no user-mode runtime. The isolated bundle keeps copies of the bundle and of the runtime, and its component entries, drawn through `alloc`; `isolated.job()` gives its job and `isolated.component(name)` the entry of its component entry `name`, none when it has none of that name, as they run in every space.
+- `loader.isolate(bundle, keys, alloc)` verifies a bundle as `prepare` does, and fails with `Interface` too when the kernel holds no user-mode runtime. The isolated bundle keeps copies of the bundle and of the runtime, and its component entries, drawn through `alloc`; `isolated.job()` gives its job, `isolated.component(name)` the entry of its component entry `name` as they run in every space, and `isolated.schema(name, alloc)` its protocol schema as `load.schema` does, none when it has none of that name.
 - `loader.isolate_unverified(bundle, alloc)` is `isolate` without the signature check. It is a trusted primitive whose soundness condition is that `bundle` is a bundle the toolchain built against the kernel's interface file.
 - `sys::load::Isolated.of_test(image, alloc)` makes, from a copy of `image` drawn through `alloc`, the isolated bundle of a [test image](22-testing.md#emulator-runs) of a nanos target, which runs alone in its spaces in place of the user-mode runtime: a bundle whose part 1 is empty, which imports nothing, whose job entry is the start of its runtime and which states the bytes of its boot area. It fails with `Malformed` for any other bytes, and its spaces map no bundle after it; `isolated.job()` gives none.
 - `isolated.space(cpu, data, mut frames, alloc)` makes a space of frames taken from the end of `frames`, each cleared: from `0x80_0000_0000`, the **user window**, it maps the runtime's image, then the bundle's, both relocated for their addresses there and the bundle's imports bound to the runtime's exports, their pages mapped as `prepare` maps them but for user mode; then the runtime's stack and `data` bytes the caller lays out, readable and writable, never executable; then 32 pages for the user frames it shares; then the boot area the runtime runs over, whose boot heap holds 768 MiB, of which it maps only the pages drawn. The window spans at most 1 GiB. Its root maps the window and the entry area `cpu.entry_area()` gives ([split tables](#split-tables)), each page of the entry area with the attributes the running root maps it with then, and nothing else. It fails with `Unplaceable` when `frames` holds too few frames or the entry area reaches the window, and with `Interface` when the bundle imports what the runtime does not export.

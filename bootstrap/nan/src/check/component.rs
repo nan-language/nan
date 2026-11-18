@@ -203,6 +203,15 @@ impl Checker<'_> {
         Some(self.fix_appending(item, before as u32, &format!(" derives {entry}")))
     }
 
+    /// The `mem::wire` encoding of the `sys::ProtocolSchema` of the protocol the component
+    /// whose state is the item `state` serves.
+    pub fn component_schema(&self, state: ItemId) -> Vec<u8> {
+        match self.component_of(&Ty::item(state, Vec::new())) {
+            Some((_, Ty::Item(protocol, _))) => self.protocol_schema(protocol),
+            other => unreachable!("a component's protocol, not {other:?}"),
+        }
+    }
+
     /// The Env and messages of the component whose state is `state`.
     pub fn component_of(&self, state: &Ty) -> Option<(Ty, Ty)> {
         let component = self.db.std_item("sys", "Component")?;

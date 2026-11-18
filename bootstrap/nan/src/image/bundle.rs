@@ -6,6 +6,7 @@
 
 use super::{Access, Imports, Linked, PAGE, link};
 use crate::encoding::{Record, bytes, list, uvar};
+use crate::lower::ComponentEntry;
 use crate::lower::load::{Contributed, Interface};
 
 /// The magic and format version of a bundle.
@@ -13,14 +14,13 @@ const MAGIC: &[u8; 4] = b"NBUN";
 const VERSION: u128 = 1;
 
 /// The bundle of a lowered object, with its job entry and the stack its task needs for a nanos
-/// program's, or each component entry by name with the stack its tasks need, signed by the key
-/// of a secret seed when one is given, or the names of the symbols it imports that the interface
-/// does not export.
+/// program's, or its component entries, signed by the key of a secret seed when one is given, or
+/// the names of the symbols it imports that the interface does not export.
 pub fn write(
     object: &[u8],
     contributed: &[Contributed],
     job: Option<u64>,
-    components: &[(String, u64)],
+    components: &[ComponentEntry],
     interface: &Interface,
     seed: Option<&[u8; 32]>,
 ) -> Result<Vec<u8>, Vec<String>> {
@@ -119,7 +119,7 @@ fn unimported(
 /// export and the bytes of its boot area, and the symbol of its line tables.
 struct Parts<'a> {
     job: Option<(&'a str, u64)>,
-    components: &'a [(String, u64)],
+    components: &'a [ComponentEntry],
     runtime: Option<(&'a [u64], u64)>,
     lines: &'a str,
 }
@@ -224,10 +224,11 @@ fn body(
         record.field(
             10,
             field(|out| {
-                list(out, parts.components.iter(), |out, (name, stack)| {
-                    bytes(out, name.as_bytes());
-                    let entry = linked.symbol(&format!("{}{name}", crate::lower::COMPONENT));
-                    pair(out, (entry, *stack));
+                list(out, parts.components.iter(), |out, component| {
+                    bytes(out, component.name.as_bytes());
+                    let symbol = format!("{}{}", crate::lower::COMPONENT, component.name);
+                    pair(out, (linked.symbol(&symbol), component.stack));
+                    bytes(out, &component.schema);
                 })
             }),
         );

@@ -234,7 +234,7 @@ Its bytes, in the forms of the canonical NIR encoding, are the magic `4E 42 55 4
 | 7 | the contributions, absent when there are none, in byte order of canonical path: each a record of 1 the export index of its registry's table record, 2 the offset and 3 the size of its entry, 4 its key field and 5 its unique fields, absent when there are none, as pairs of an offset in the entry and a form, and 6 the offsets in the entry of its function fields, absent when there are none; a form is 0 for `Str` and otherwise the integer's width in bytes, plus 128 when it is signed |
 | 8 | the offsets in the image of its read-only data and of its writable data, a pair of uvars |
 | 9 | for a nanos program whose entry is `main`, the offset of its job entry and the bytes of stack its task needs, a pair of uvars |
-| 10 | for a nanos program listing component entries, a list of them in byte order of name: each its name as a text, then the offset of its entry and the bytes of stack its task needs as uvars |
+| 10 | for a nanos program listing component entries, a list of them in byte order of name: each its name as a text, then the offset of its entry and the bytes of stack its task needs as uvars, then the `mem::wire` encoding of the `sys::ProtocolSchema` of the protocol its component serves, as bytes |
 | 11 | for a user-mode runtime, for each export of the interface, the offset of its definition plus one, or 0 where it defines none, a list of uvars, empty for a test image |
 | 12 | for a user-mode runtime or a test image, the bytes of the boot area it runs over, a uvar |
 

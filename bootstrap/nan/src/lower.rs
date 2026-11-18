@@ -314,10 +314,17 @@ pub struct Lowered {
     pub collisions: Vec<(String, String)>,
     /// The entries a bundle adds to loaded registries.
     pub contributed: Vec<load::Contributed>,
-    /// For a nanos program's bundle, the stack its job's task needs, and the name of each
-    /// component entry with the stack its task needs.
+    /// For a nanos program's bundle, the stack its job's task needs, and its component entries.
     pub job: Option<u64>,
-    pub components: Vec<(String, u64)>,
+    pub components: Vec<ComponentEntry>,
+}
+
+/// A component entry of a nanos program's bundle: its name, the stack its task needs and the
+/// `mem::wire` encoding of the `sys::ProtocolSchema` of the protocol its component serves.
+pub struct ComponentEntry {
+    pub name: String,
+    pub stack: u64,
+    pub schema: Vec<u8>,
 }
 
 /// What a final build lowers: the program's entry function and its target's entry landing fn,
@@ -553,10 +560,13 @@ pub fn lower_bundle(ck: &Checker, bundle: &Bundle) -> Lowered {
         lowering.contributed.push(contributed);
     }
     let job = bundle.entry.map(|entry| lowering.job_entry(entry));
-    let components: Vec<(String, FuncId)> = bundle
+    let components: Vec<(String, FuncId, Vec<u8>)> = bundle
         .components
         .iter()
-        .map(|(name, state)| (name.clone(), lowering.component_entry(name, *state)))
+        .map(|(name, state)| {
+            let entry = lowering.component_entry(name, *state);
+            (name.clone(), entry, ck.component_schema(*state))
+        })
         .collect();
     lowering.drain();
     let lowered = lowering.finish(None);
@@ -564,7 +574,11 @@ pub fn lower_bundle(ck: &Checker, bundle: &Bundle) -> Lowered {
         .map(|(entry, stack)| stack.unwrap_or_else(|| stack::grown_start(&lowered.frames, entry)));
     let components = components
         .into_iter()
-        .map(|(name, entry)| (name, stack::grown_start(&lowered.frames, entry)))
+        .map(|(name, entry, schema)| ComponentEntry {
+            name,
+            stack: stack::grown_start(&lowered.frames, entry),
+            schema,
+        })
         .collect();
     Lowered {
         job,

@@ -248,13 +248,13 @@ fn report(
     }
 }
 
-/// The image files of the workspace's programs for the machine targets of a UEFI target's
-/// architecture, other than `image`, which the boot volume of that UEFI target's image holds
-/// under `nan run`.
+/// The image files of the workspace's programs for the machine and nanos targets of a UEFI
+/// target's architecture, other than `image`, which the boot volume of that UEFI target's image
+/// holds under `nan run`.
 fn volume_files(workspace: &Workspace, uefi: Target, image: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let arch = uefi.arch().expect("a UEFI target's architecture");
-    for kind in [Kind::Uefi, Kind::Bare] {
+    for kind in [Kind::Uefi, Kind::Bare, Kind::Nanos] {
         let directory = workspace
             .root
             .join(".nan/images")

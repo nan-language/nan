@@ -1,7 +1,9 @@
 use std::fs;
+use std::path::Path;
 
 use crate::command::tests::run_in;
 use crate::workspace::tests::Scratch;
+use crate::workspace::{Target, Workspace};
 
 const MANIFEST: &str = "//! Exits.\n\npackage exits {\n    language 1\n    targets x86_64-linux\n    entry main\n} exits\n";
 
@@ -112,4 +114,44 @@ fn a_locked_release_reaches_the_methods_its_tests_call() {
     .expect("a changed count");
     let built = run_in(dir, "build exits");
     assert_eq!(built.status, 0, "{}", built.output);
+}
+
+#[test]
+fn a_uefi_boot_volume_holds_the_bare_and_nanos_images_of_its_architecture() {
+    let scratch = Scratch::new(&[("exits/package.nan", MANIFEST)]);
+    let images = scratch.0.join(".nan/images");
+    for image in [
+        "x86_64-uefi/loader.efi",
+        "x86_64-uefi/tool.efi",
+        "x86_64-bare/kernel.elf",
+        "x86_64-nanos/job.nbun",
+        "x86_64-nanos/job.narts",
+        "aarch64-nanos/other.nbun",
+        "x86_64-linux/exits",
+    ] {
+        let path = images.join(image);
+        fs::create_dir_all(path.parent().expect("a target directory")).expect("a directory");
+        fs::write(path, "").expect("an image file");
+    }
+    let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
+    let volume = super::volume_files(
+        &workspace,
+        Target::X64Uefi,
+        &images.join("x86_64-uefi/loader.efi"),
+    )
+    .expect("the volume's files");
+    let held: Vec<&Path> = volume
+        .iter()
+        .map(|path| path.strip_prefix(&images).expect("an image file"))
+        .collect();
+    assert_eq!(
+        held,
+        [
+            "x86_64-bare/kernel.elf",
+            "x86_64-nanos/job.narts",
+            "x86_64-nanos/job.nbun",
+            "x86_64-uefi/tool.efi",
+        ]
+        .map(Path::new)
+    );
 }

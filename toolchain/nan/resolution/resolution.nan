@@ -173,11 +173,23 @@ pkg fn resolve(session: check::Session, package_index: usize, local: store::Stor
         }
         var path = text::String.of(root.dir.as_str(), alloc)
         mut path.append("/package.nan")
-        var rejection = match mut resolver.newest.extract() {
-            Some(newest) => newest
-            None => Rejection.empty(alloc)
+        var rejection = Rejection.empty(alloc)
+        match resolver.without_candidate() {
+            Some(unreached) => {
+                var unresolved = diagnostic::Diagnostic.at(diagnostic::Code.DepUnresolved, path: path.as_str(), line: unreached.line, alloc)
+                mut unresolved.because.push(diagnostic::Reason.note(unreached.named.as_str(), alloc))
+                mut rejection.diagnostics.push(take unresolved)
+            }
+            None => {
+                match mut resolver.newest.extract() {
+                    Some(newest) => {
+                        rejection = newest
+                    }
+                    None => {}
+                }
+                mut rejection.diagnostics.push(diagnostic::Diagnostic.at(diagnostic::Code.DepUnresolved, path: path.as_str(), line: manifest.line, alloc))
+            }
         }
-        mut rejection.diagnostics.push(diagnostic::Diagnostic.at(diagnostic::Code.DepUnresolved, path: path.as_str(), line: manifest.line, alloc))
         return Ok(Outcome.Unresolved(Rejection(diagnostics: diagnostic::sorted_diagnostics(take rejection.diagnostics, alloc), failures: take rejection.failures)))
     }
     return try resolver.lock(local, assigned: assignment.view())
@@ -205,34 +217,105 @@ proj fn Resolver.root(self) -> workspace::Package {
 /// The sources of `dep` directives written in the package directory `dir`, as the locking
 /// package writes them; none when one has no candidate, reaching no package.
 fn Resolver.sources_of(self, dir: Str, deps: Slice[workspace::DepSource]) -> Option[mem::List[Source]] {
-    let alloc = self.alloc
-    let held = self.session.workspace.contents()
-    var sources = mem::List[Source].empty(alloc)
+    var sources = mem::List[Source].empty(self.alloc)
     for dep in deps {
-        if dep.path {
-            let target = workspace::resolve_source(dir, source: dep.written.as_str(), alloc)
-            let Some(at) = held.package_position(fn(candidate: workspace::Package) => candidate.dir.as_str() == target.as_str()) else {
-                return None
-            }
-            let Some(pack) = held.package_at(at) else {
-                expect false
-                return None
-            }
-            let Some(name) = pack.name() else {
-                return None
-            }
-            let written = workspace::relative_source(self.root().dir.as_str(), to: target.as_str(), alloc)
-            mut sources.push(Source(written: take written, package_name: text::String.of(name, alloc), dir: Some(take target)))
-            continue
+        match self.source(dir, written: dep.written.as_str(), path: dep.path) {
+            Ok(source) => mut sources.push(take source)
+            Err(_) => return None
         }
-        let Some(at) = self.entries.position(fn(entry: mem::Shared[store::Entry]) => named_as(entry.contents(), name: dep.written.as_str())) else {
-            return None
-        }
-        let package_name = text::String.of(self.entries[at].contents().package_name.as_str(), alloc)
-        mut sources.push(Source(written: text::String.of(dep.written.as_str(), alloc), package_name: take package_name, dir: None))
     }
     return Some(take sources)
 } Resolver.sources_of
+
+/// The source of a `dep` directive written in the package directory `dir`, as the locking package
+/// writes it, or, when it reaches no package, what it names: the directory of a path relative to
+/// the workspace root, a store name otherwise.
+fn Resolver.source(self, dir: Str, written: Str, path: bool) -> Result[Source, text::String] {
+    let alloc = self.alloc
+    if not path {
+        let Some(at) = self.entries.position(fn(entry: mem::Shared[store::Entry]) => named_as(entry.contents(), name: written)) else {
+            return Err(text::String.of(written, alloc))
+        }
+        let package_name = text::String.of(self.entries[at].contents().package_name.as_str(), alloc)
+        return Ok(Source(written: text::String.of(written, alloc), package_name: take package_name, dir: None))
+    }
+    let held = self.session.workspace.contents()
+    let target = workspace::resolve_source(dir, source: written, alloc)
+    let Some(at) = held.package_position(fn(candidate: workspace::Package) => candidate.dir.as_str() == target.as_str()) else {
+        return Err(take target)
+    }
+    let Some(pack) = held.package_at(at) else {
+        expect false
+        return Err(take target)
+    }
+    let Some(name) = pack.name() else {
+        return Err(take target)
+    }
+    let relative = workspace::relative_source(self.root().dir.as_str(), to: target.as_str(), alloc)
+    return Ok(Source(written: take relative, package_name: text::String.of(name, alloc), dir: Some(take target)))
+} Resolver.source
+
+/// A `dep` directive of the package through whose newest candidates a source without candidates
+/// is reached: its line, and what that source names.
+struct Unreached {
+    line: u32
+    named: text::String
+} Unreached
+
+/// The first `dep` directive of the package, in alias order, through whose newest candidates a
+/// source without candidates is reached.
+fn Resolver.without_candidate(self) -> Option[Unreached] {
+    let alloc = self.alloc
+    let root = self.root()
+    let Some(manifest) = root.manifest else {
+        return None
+    }
+    var order = mem::List[usize].empty(alloc)
+    for at in 0..<manifest.deps.len() {
+        if manifest.deps[at].source.is_some() {
+            mut order.push(at)
+        }
+    }
+    mut order.sort_by(fn(left: usize, right: usize) => manifest.deps[left].alias.as_str().cmp(manifest.deps[right].alias.as_str()))
+    for at in order {
+        let dep = manifest.deps[at]
+        var seen = mem::List[Source].empty(alloc)
+        match self.unreached(root.dir.as_str(), written: dep.written.as_str(), path: dep.path, seen: mut seen) {
+            Some(named) => return Some(Unreached(line: dep.line, named: take named))
+            None => {}
+        }
+    }
+    return None
+} Resolver.without_candidate
+
+/// What the first source without candidates names that a directive written in the package
+/// directory `dir` reaches through newest candidates, the sources in `seen` aside.
+fn Resolver.unreached(self, dir: Str, written: Str, path: bool, mut seen: mem::List[Source]) -> Option[text::String] {
+    let source = match self.source(dir, written, path) {
+        Ok(source) => source
+        Err(named) => return Some(take named)
+    }
+    if seen.position(fn(known: Source) => known == source).is_some() {
+        return None
+    }
+    let alloc = self.alloc
+    mut seen.push(source.copy(alloc))
+    let candidates = self.candidates(source)
+    if candidates.len() == 0 {
+        return match source.dir {
+            Some(held) => Some(text::String.of(held.as_str(), alloc))
+            None => Some(text::String.of(source.written.as_str(), alloc))
+        }
+    }
+    let reaching = self.manifest_of(candidates[0], source)
+    for dep in reaching.deps {
+        match self.unreached(reaching.dir.as_str(), written: dep.written.as_str(), path: dep.path, seen: mut seen) {
+            Some(named) => return Some(take named)
+            None => {}
+        }
+    }
+    return None
+} Resolver.unreached
 
 /// Whether a store entry is a named release of a store name.
 fn named_as(entry: store::Entry, name: Str) -> bool {
@@ -326,32 +409,43 @@ fn Resolver.descends(self, named: Slice[usize], at: usize, ancestor: hashing::Ha
 
 /// The dependency sources a candidate's manifest names; none when one has no candidate.
 fn Resolver.reached(self, candidate: Candidate, source: Source) -> Option[mem::List[Source]] {
+    let reaching = self.manifest_of(candidate, source)
+    return self.sources_of(reaching.dir.as_str(), deps: reaching.deps.view())
+} Resolver.reached
+
+/// The package directory of a candidate of a source, and the `dep` directives its manifest writes.
+struct Reaching {
+    dir: text::String
+    deps: mem::List[workspace::DepSource]
+} Reaching
+
+fn Resolver.manifest_of(self, candidate: Candidate, source: Source) -> Reaching {
     let alloc = self.alloc
     let held = self.session.workspace.contents()
     match candidate {
         Candidate.Current(index) => {
             let Some(pack) = held.package_at(index) else {
                 expect false
-                return Some(mem::List[Source].empty(alloc))
+                return Reaching(dir: text::String.empty(alloc), deps: mem::List[workspace::DepSource].empty(alloc))
             }
-            return self.sources_of(pack.dir.as_str(), deps: workspace::manifest_deps(pack, alloc).view())
+            return Reaching(dir: text::String.of(pack.dir.as_str(), alloc), deps: workspace::manifest_deps(pack, alloc))
         }
         Candidate.Stored(entry) => {
-            let Some(at) = entry.contents().sources.position(fn(file: artefact::SourceFile) => file.path.as_str() == "package.nan") else {
-                return Some(mem::List[Source].empty(alloc))
-            }
-            var manifest = mem::Bytes.empty(alloc)
-            mut manifest.append(entry.contents().sources[at].content.view())
-            let file = syntax::parse(take manifest, grammar: self.session.grammar.contents(), alloc)
             let dir = match source.dir {
                 Some(held_dir) => text::String.of(held_dir.as_str(), alloc)
                 None => text::String.of(source.package_name.as_str(), alloc)
             }
+            let Some(at) = entry.contents().sources.position(fn(file: artefact::SourceFile) => file.path.as_str() == "package.nan") else {
+                return Reaching(dir: take dir, deps: mem::List[workspace::DepSource].empty(alloc))
+            }
+            var manifest = mem::Bytes.empty(alloc)
+            mut manifest.append(entry.contents().sources[at].content.view())
+            let file = syntax::parse(take manifest, grammar: self.session.grammar.contents(), alloc)
             let deps = workspace::read_deps(file, dir: dir.as_str(), alloc)
-            return self.sources_of(dir.as_str(), deps: deps.view())
+            return Reaching(dir: take dir, deps: take deps)
         }
     }
-} Resolver.reached
+} Resolver.manifest_of
 
 /// The greatest acceptable assignment extending `assigned` to the sources of `pending`.
 fn Resolver.search(mut self, mut assigned: mem::List[Assigned], take pending: mem::List[Source], user_cache: cache::Cache) -> Option[mem::List[Assigned]] fails platform::IoError {

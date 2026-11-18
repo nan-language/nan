@@ -655,7 +655,7 @@ pub fn tally(left: u64, right: u64) -> u64 {
 
 `nan dep sync` resolves the dependency closure of a package P and writes its lock. A source's **candidates** are:
 
-- for a path source, exactly the release of the path's current state, appended to the local store as a path release when locked;
+- for a path source, exactly the release of the path's current state, appended to the local store as a path release when locked, and none when its directory is not a package of the [workspace](33-toolchain.md#commands);
 - for a store name under which P's lock names a release, that release and every named release under that store name of which it is an ancestor through parents;
 - for any other store name, every named release under it.
 
@@ -666,7 +666,7 @@ An **assignment** gives one candidate to each source of P's `dep` directives and
 3. the [release check](30-artefacts.md#releases) of every other assigned release, under each target P is checked for, finds no error;
 4. P's [reliance tests](22-testing.md#reliance-tests) and [affected tests](22-testing.md#affected-tests) pass, and so do the reliance tests recorded in each assigned release whose targets lie in a package assigned another release than the lock names.
 
-`nan dep sync` writes the greatest acceptable assignment, comparing assignments by the publication index of each package's release, 0 for a path release or an absent package, over the union of their package names in byte order, the first difference deciding. When none is acceptable, it searches again ignoring P's own errors in condition 2 and, while P has any, P's tests in condition 4, so that a package whose own source does not check still locks its closure, and then reports P's errors under the lock it writes; when none is acceptable then either, it is an error (`dep.unresolved`), reported on P's `package` line with the diagnostics of each condition that the assignment of each source's newest candidate fails. For each package whose locked release changes, `nan dep sync` prints both code roots, the release class of the new one with the old as its parent, and the epoch changes and widenings it brings.
+`nan dep sync` writes the greatest acceptable assignment, comparing assignments by the publication index of each package's release, 0 for a path release or an absent package, over the union of their package names in byte order, the first difference deciding. When none is acceptable, it searches again ignoring P's own errors in condition 2 and, while P has any, P's tests in condition 4, so that a package whose own source does not check still locks its closure, and then reports P's errors under the lock it writes; when none is acceptable then either, it is an error (`dep.unresolved`). When a source that the newest candidates reach has no candidate, it is reported on the first `dep` directive of P, in alias order, through whose newest candidates that source is reached, with a note naming it: a path source's directory relative to the workspace root, which lies outside the workspace when it starts with `..`, or a store name. Otherwise it is reported on P's `package` line with the diagnostics of each condition that the assignment of each source's newest candidate fails. For each package whose locked release changes, `nan dep sync` prints both code roots, the release class of the new one with the old as its parent, and the epoch changes and widenings it brings.
 
 In the next example, `example` does not check, so `nan dep sync` locks its closure ignoring its own error and reports that error.
 
@@ -686,7 +686,7 @@ error type.mismatch example/example.nan:3 example::ratio
 failed dep sync example: files 0, errors 1, incomplete 0
 ```
 
-In the next example, the local store holds no release under the store name `gauge`, so its source has no candidate and no assignment exists: `nan dep sync` reports `dep.unresolved` and writes no lock.
+In the next example, the local store holds no release under the store name `gauge`, so its source has no candidate and no assignment exists: `nan dep sync` reports `dep.unresolved` on its directive and writes no lock.
 
 ```nan
 // file: report/package.nan
@@ -707,8 +707,9 @@ pub const FIRST: u64 = gauge::START
 ```text
 $ nan dep sync report
 failed dep sync report: files 0, errors 1, incomplete 0
-error dep.unresolved report/package.nan:3 report
-    package report {
+error dep.unresolved report/package.nan:6 report
+        dep gauge "gauge" // error: dep.lock-stale
+    because note - - gauge
 failed dep sync report: files 0, errors 1, incomplete 0
 ```
 

@@ -9,7 +9,9 @@ use std::io;
 use crate::artefact;
 use crate::cache::{Cache, Exposed};
 use crate::check;
-use crate::diagnostic::{Class as DiagnosticClass, Code, Diagnostic, Fix, sort_diagnostics};
+use crate::diagnostic::{
+    Class as DiagnosticClass, Code, Diagnostic, Fix, Reason, sort_diagnostics,
+};
 use crate::fix;
 use crate::hash::Hash;
 use crate::machine::lock::{Entry as Authority, Lock, Locked};
@@ -164,12 +166,26 @@ pub fn resolve(
     };
     let Some(assignment) = found else {
         let manifest = root.manifest.as_ref().expect("a package with a manifest");
-        let mut rejection = resolver.newest.take().unwrap_or_default();
-        rejection.diagnostics.push(Diagnostic::at(
-            Code::DepUnresolved,
-            &format!("{}/package.nan", root.dir),
-            manifest.line,
-        ));
+        let path = format!("{}/package.nan", root.dir);
+        let mut rejection = match resolver.without_candidate() {
+            Some((line, source)) => {
+                let mut unresolved = Diagnostic::at(Code::DepUnresolved, &path, line);
+                unresolved.because.push(Reason::note(&source));
+                Rejection {
+                    diagnostics: vec![unresolved],
+                    failures: Vec::new(),
+                }
+            }
+            None => {
+                let mut rejection = resolver.newest.take().unwrap_or_default();
+                rejection.diagnostics.push(Diagnostic::at(
+                    Code::DepUnresolved,
+                    &path,
+                    manifest.line,
+                ));
+                rejection
+            }
+        };
         sort_diagnostics(&mut rejection.diagnostics);
         return Ok(Ok(Outcome::Unresolved(rejection)));
     };
@@ -180,37 +196,87 @@ impl Resolver<'_> {
     /// The sources of `dep` directives written in the package directory `dir`, as the locking
     /// package writes them; none when one has no candidate, reaching no package.
     fn sources_of(&self, dir: &str, deps: Vec<(String, String, bool)>) -> Option<Vec<Source>> {
-        let root = &self.workspace.packages[self.package];
         deps.into_iter()
-            .map(|(_, written, path)| {
-                if path {
-                    let target = crate::workspace::resolve_source(dir, &written);
-                    let package = self
-                        .workspace
-                        .packages
-                        .iter()
-                        .find(|package| package.dir == target)?
-                        .name()?
-                        .to_owned();
-                    Some(Source {
-                        written: crate::workspace::relative_source(&root.dir, &target),
-                        package,
-                        dir: Some(target),
-                    })
-                } else {
-                    let package = self
-                        .entries
-                        .iter()
-                        .find(|entry| entry.name.as_deref() == Some(written.as_str()))
-                        .map(|entry| entry.package.clone())?;
-                    Some(Source {
-                        written,
-                        package,
-                        dir: None,
-                    })
-                }
-            })
+            .map(|(_, written, path)| self.source(dir, &written, path).ok())
             .collect()
+    }
+
+    /// The source of a `dep` directive written in the package directory `dir`, as the locking
+    /// package writes it, or, when it reaches no package, what it names: the directory of a path
+    /// relative to the workspace root, a store name otherwise.
+    fn source(&self, dir: &str, written: &str, path: bool) -> Result<Source, String> {
+        if !path {
+            return self
+                .entries
+                .iter()
+                .find(|entry| entry.name.as_deref() == Some(written))
+                .map(|entry| Source {
+                    written: written.to_owned(),
+                    package: entry.package.clone(),
+                    dir: None,
+                })
+                .ok_or_else(|| written.to_owned());
+        }
+        let target = crate::workspace::resolve_source(dir, written);
+        let package = self
+            .workspace
+            .packages
+            .iter()
+            .find(|package| package.dir == target)
+            .and_then(|package| package.name());
+        match package {
+            Some(package) => Ok(Source {
+                written: crate::workspace::relative_source(
+                    &self.workspace.packages[self.package].dir,
+                    &target,
+                ),
+                package: package.to_owned(),
+                dir: Some(target),
+            }),
+            None => Err(target),
+        }
+    }
+
+    /// The first `dep` directive of the package, in alias order, through whose newest
+    /// candidates a source without candidates is reached: its line, and what that source names.
+    fn without_candidate(&self) -> Option<(u32, String)> {
+        let root = &self.workspace.packages[self.package];
+        let mut deps: Vec<_> = root
+            .manifest
+            .iter()
+            .flat_map(|manifest| &manifest.deps)
+            .filter(|dep| dep.source.is_some())
+            .collect();
+        deps.sort_by(|left, right| left.alias.cmp(&right.alias));
+        deps.into_iter().find_map(|dep| {
+            self.unreached(&root.dir, &dep.written, dep.path, &mut Vec::new())
+                .map(|source| (dep.line, source))
+        })
+    }
+
+    /// What the first source without candidates names that a directive written in the package
+    /// directory `dir` reaches through newest candidates, the sources in `seen` aside.
+    fn unreached(
+        &self,
+        dir: &str,
+        written: &str,
+        path: bool,
+        seen: &mut Vec<Source>,
+    ) -> Option<String> {
+        let source = match self.source(dir, written, path) {
+            Ok(source) => source,
+            Err(named) => return Some(named),
+        };
+        if seen.contains(&source) {
+            return None;
+        }
+        seen.push(source.clone());
+        let Some(newest) = self.candidates(&source).into_iter().next() else {
+            return Some(source.dir.unwrap_or(source.written));
+        };
+        let (dir, deps) = self.manifest_of(&newest, &source);
+        deps.into_iter()
+            .find_map(|(_, written, path)| self.unreached(&dir, &written, path, seen))
     }
 
     /// A source's candidates, newest first.
@@ -258,21 +324,33 @@ impl Resolver<'_> {
 
     /// The dependency sources a candidate's manifest names; none when one has no candidate.
     fn reached(&self, candidate: &Candidate, source: &Source) -> Option<Vec<Source>> {
+        let (dir, deps) = self.manifest_of(candidate, source);
+        self.sources_of(&dir, deps)
+    }
+
+    /// The package directory of a candidate of a source, and the `dep` directives its manifest
+    /// writes.
+    fn manifest_of(
+        &self,
+        candidate: &Candidate,
+        source: &Source,
+    ) -> (String, Vec<(String, String, bool)>) {
         match candidate {
             Candidate::Current(index) => {
                 let package = &self.workspace.packages[*index];
-                self.sources_of(&package.dir, manifest_deps(package))
+                (package.dir.clone(), manifest_deps(package))
             }
             Candidate::Stored(entry) => {
-                let Some((_, manifest)) =
-                    entry.sources.iter().find(|(path, _)| path == "package.nan")
-                else {
-                    return Some(Vec::new());
-                };
-                let file = parse(manifest.clone());
                 let dir = source.dir.clone().unwrap_or_else(|| source.package.clone());
-                let deps = crate::workspace::read_deps(&file, &dir);
-                self.sources_of(&dir, deps)
+                let deps = entry
+                    .sources
+                    .iter()
+                    .find(|(path, _)| path == "package.nan")
+                    .map(|(_, manifest)| {
+                        crate::workspace::read_deps(&parse(manifest.clone()), &dir)
+                    })
+                    .unwrap_or_default();
+                (dir, deps)
             }
         }
     }

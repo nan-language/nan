@@ -394,6 +394,27 @@ fn a_changed_path_dependency_runs_the_affected_tests_of_a_sync_and_refuses_runs_
 }
 
 #[test]
+fn a_path_source_outside_the_workspace_is_unresolved_on_its_directive() {
+    let scratch = Scratch::new(&[
+        (
+            "ws/dial/package.nan",
+            "//! Dials.\n\npackage dial {\n    language 1\n    targets any\n} dial\n",
+        ),
+        (
+            "other/app/package.nan",
+            "//! Apps.\n\npackage app {\n    language 1\n    targets any\n    dep dial \"../../ws/dial\"\n} app\n",
+        ),
+    ]);
+    let synced = run_in(&scratch.0.join("other"), "dep sync app").output;
+    assert!(
+        synced.contains(
+            "\nerror dep.unresolved app/package.nan:6 app\n        dep dial \"../../ws/dial\"\n    because note - - ../ws/dial\n"
+        ),
+        "{synced}"
+    );
+}
+
+#[test]
 fn a_test_reaching_a_rejected_item_reports_its_errors_and_runs_nothing() {
     let broken = HALVES.replace("value / 2", "value / true");
     let scratch = Scratch::new(&[("app/package.nan", MANIFEST), ("app/app.nan", &broken)]);

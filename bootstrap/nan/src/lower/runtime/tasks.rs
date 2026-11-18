@@ -988,7 +988,9 @@ fn enqueue(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     system::wake_idle(lo, fx);
 }
 
-/// Takes the first ready task, zero when none.
+/// Takes the first ready task, zero when none, waking an idle executor thread when another task
+/// remains ready: where the executor threads share the system queue wakes arrive on, the running
+/// thread may have taken the wake meant for an idle one.
 pub fn pop_ready(lo: &mut Lowering, fx: &mut Fx) -> Value {
     let state_address = lo.state(fx);
     let lock = fx.offset(state_address, state::QUEUE_LOCK);
@@ -1005,6 +1007,11 @@ pub fn pop_ready(lo: &mut Lowering, fx: &mut Fx) -> Value {
         });
     });
     lo.call_routine(fx, Routine::Unlock, &[lock]);
+    let rest = fx.offset(state_address, state::READY_HEAD);
+    let rest = fx.b.ins().atomic_load(PTR, MemFlagsData::trusted(), rest);
+    let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, rest, 0);
+    let more = fx.b.ins().band(present, more);
+    fx.when(more, |fx| system::wake_idle(lo, fx));
     head
 }
 

@@ -5,7 +5,8 @@
 //! free list, from which a later record of the class takes it, and a freed run of chunks returns
 //! to the map. Every record and chunk is cleared once its lock is released. An isolated space's
 //! runtime draws each run of chunks the map hands out from its kernel and releases each run
-//! returning to the map.
+//! returning to the map. A kernel grows its boot heap by regions, each a supply of chunks the
+//! map's runs are taken from once the boot heap has none free.
 
 use super::super::data::Reserved;
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, types};
@@ -45,7 +46,8 @@ const CLASSES: u64 = 64;
 /// The offsets of the allocators' state: their spin lock, the next free byte and the end of the
 /// chunk blocks are carved from, the bytes of the chunks the map hands out and the most it has
 /// handed out, the bytes of the live records, of the live task stacks among them, which change
-/// atomically without the lock, and of the runs of chunks handed out whole, each size class's
+/// atomically without the lock, and of the runs of chunks handed out whole, the bytes of the
+/// chunks of the regions the heap grew by and the record of the last of them, each size class's
 /// free-list head, and the chunk map holding a bit per chunk set while it is handed out.
 mod allocators {
     pub const LOCK: u64 = 0;
@@ -56,8 +58,19 @@ mod allocators {
     pub const RECORDS: u64 = 40;
     pub const STACKS: u64 = 48;
     pub const WHOLE: u64 = 56;
-    pub const FREE: u64 = 64;
+    pub const GROWN_BYTES: u64 = 64;
+    pub const GROWN: u64 = 72;
+    pub const FREE: u64 = 80;
     pub const MAP: u64 = FREE + 8 * super::CLASSES;
+}
+
+/// The offsets of the record of a region the boot heap grew by: the record of the region before
+/// it, its first chunk's address, its chunk count, then its map of a bit per chunk.
+mod grown {
+    pub const NEXT: u64 = 0;
+    pub const BASE: u64 = 8;
+    pub const COUNT: u64 = 16;
+    pub const MAP: u64 = 24;
 }
 
 /// The allocators' state of a boot heap of `bytes`.
@@ -140,14 +153,15 @@ pub fn count_stack(lo: &mut Lowering, fx: &mut Fx, stack: Value, drawn: bool) {
     });
 }
 
-/// The bytes of the chunks the map hands out, the most it has handed out, and those of the live
-/// records other than task stacks, of the live task stacks and of the runs of chunks handed out
-/// whole, read together. A stack counts among the records from its draw until it counts among
-/// the stacks, and from when it no longer does until it is freed.
-pub fn reading(lo: &mut Lowering, fx: &mut Fx) -> [Value; 5] {
+/// The bytes of the boot heap's chunks, of those the map hands out, the most it has handed out,
+/// and those of the live records other than task stacks, of the live task stacks and of the runs
+/// of chunks handed out whole, read together. A stack counts among the records from its draw
+/// until it counts among the stacks, and from when it no longer does until it is freed.
+pub fn reading(lo: &mut Lowering, fx: &mut Fx) -> [Value; 6] {
     let state = heap_state(lo, fx);
     let flags = lock(lo, fx, state);
-    let [drawn, peak, records, stacks, whole] = [
+    let [grown, drawn, peak, records, stacks, whole] = [
+        allocators::GROWN_BYTES,
         allocators::DRAWN,
         allocators::PEAK,
         allocators::RECORDS,
@@ -156,8 +170,33 @@ pub fn reading(lo: &mut Lowering, fx: &mut Fx) -> [Value; 5] {
     ]
     .map(|at| fx.load(PTR, state, at));
     unlock(lo, fx, state, flags);
+    let size = fx.b.ins().iadd_imm_s(grown, heap_bytes(lo) as i64);
     let records = fx.b.ins().isub(records, stacks);
-    [drawn, peak, records, stacks, whole]
+    [size, drawn, peak, records, stacks, whole]
+}
+
+/// Grows the boot heap by the `count` chunks from `first`, whose record and map it draws as a
+/// record, trapping when the heap cannot hold it.
+pub fn grow(lo: &mut Lowering, fx: &mut Fx, first: Value, count: Value) {
+    let words = fx.b.ins().iadd_imm_s(count, 63);
+    let words = fx.b.ins().ushr_imm_s(words, 6);
+    let size = fx.b.ins().imul_imm_s(words, 8);
+    let size = fx.b.ins().iadd_imm_s(size, grown::MAP as i64);
+    let record = lo.record_alloc(fx, size);
+    let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
+    fx.when(missing, |fx| {
+        super::super::runtime::report::raise_kind(lo, fx, "trap.exhausted")
+    });
+    fx.store(first, record, grown::BASE);
+    fx.store(count, record, grown::COUNT);
+    let state = heap_state(lo, fx);
+    let flags = lock(lo, fx, state);
+    let last = fx.load(PTR, state, allocators::GROWN);
+    fx.store(last, record, grown::NEXT);
+    fx.store(record, state, allocators::GROWN);
+    let len = fx.b.ins().ishl_imm_s(count, CHUNK_CLASS);
+    tally(fx, state, allocators::GROWN_BYTES, len, true);
+    unlock(lo, fx, state, flags);
 }
 
 /// Adds `bytes` to the count at `at` of the allocators' state, or subtracts them when `adding`
@@ -172,15 +211,17 @@ fn tally(fx: &mut Fx, state: Value, at: u64, bytes: Value, adding: bool) -> Valu
     count
 }
 
-/// Takes the first run of `count` chunks the boot heap has free, or gives zero when none is
-/// free; an isolated space's runtime draws the run from its kernel, returning it to the map when
-/// the kernel refuses. The caller holds the lock and clears the chunks.
+/// Takes the first run of `count` chunks the boot heap has free, then the first of the regions it
+/// grew by, last given first, or gives zero when none is free; an isolated space's runtime draws
+/// the run from its kernel, returning it to the map when the kernel refuses. The caller holds the
+/// lock and clears the chunks.
 fn take_boot_chunks(lo: &mut Lowering, fx: &mut Fx, state: Value, count: Value) -> Value {
     let supply = boot_supply(lo, fx, state);
     let mut base = take_chunks(fx, supply, count);
-    if lo.user() {
-        base = draw_from_kernel(lo, fx, supply, base, count);
-    }
+    base = match lo.user() {
+        true => draw_from_kernel(lo, fx, supply, base, count),
+        false => take_grown_chunks(fx, state, base, count),
+    };
     let len = fx.b.ins().ishl_imm_s(count, CHUNK_CLASS);
     let taken = fx.b.ins().icmp_imm_s(IntCC::NotEqual, base, 0);
     let zero = fx.ptr(0);
@@ -190,6 +231,30 @@ fn take_boot_chunks(lo: &mut Lowering, fx: &mut Fx, state: Value, count: Value) 
     let peak = fx.b.ins().umax(peak, drawn);
     fx.store(peak, state, allocators::PEAK);
     base
+}
+
+/// `base`, or when it is zero the first run of `count` chunks free in a region the boot heap grew
+/// by, last given first, zero when none has one.
+fn take_grown_chunks(fx: &mut Fx, state: Value, base: Value, count: Value) -> Value {
+    let last = fx.load(PTR, state, allocators::GROWN);
+    let found = fx.repeat(&[last, base], |fx, held| {
+        let (record, base) = (held[0], held[1]);
+        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record, 0);
+        let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, base, 0);
+        let searching = fx.b.ins().band(present, missing);
+        let next = fx.choose(
+            searching,
+            &[PTR, PTR],
+            |fx| {
+                let supply = grown_supply(fx, record);
+                let taken = take_chunks(fx, supply, count);
+                vec![fx.load(PTR, record, grown::NEXT), taken]
+            },
+            |_| vec![record, base],
+        );
+        (searching, next)
+    });
+    found[1]
 }
 
 /// The run of `count` chunks from `base` an isolated space's runtime took from the map, once
@@ -219,16 +284,47 @@ fn draw_from_kernel(
     fx.b.ins().select(failed, zero, base)
 }
 
-/// Returns `count` chunks from `base` to the boot heap's map; an isolated space's runtime
-/// releases them to its kernel first. The caller holds the lock.
+/// Returns `count` chunks from `base` to the map of the boot heap or of the region it grew by
+/// that holds them; an isolated space's runtime releases them to its kernel first. The caller
+/// holds the lock.
 fn give_boot_chunks(lo: &mut Lowering, fx: &mut Fx, state: Value, base: Value, count: Value) {
     let supply = boot_supply(lo, fx, state);
     let len = fx.b.ins().ishl_imm_s(count, CHUNK_CLASS);
     if lo.user() {
         space::call(lo, fx, space::RELEASE, &[base, len]);
+        give_chunks(fx, supply, base, count);
+    } else {
+        let booted = holds(fx, supply, base);
+        fx.when(booted, |fx| give_chunks(fx, supply, base, count));
+        let grown = fx.b.ins().bxor_imm_s(booted, 1);
+        fx.when(grown, |fx| {
+            let last = fx.load(PTR, state, allocators::GROWN);
+            fx.repeat(&[last], |fx, held| {
+                let supply = grown_supply(fx, held[0]);
+                let here = holds(fx, supply, base);
+                fx.when(here, |fx| give_chunks(fx, supply, base, count));
+                let again = fx.b.ins().bxor_imm_s(here, 1);
+                (again, vec![fx.load(PTR, held[0], grown::NEXT)])
+            });
+        });
     }
-    give_chunks(fx, supply, base, count);
     tally(fx, state, allocators::DRAWN, len, false);
+}
+
+/// Whether a supply's chunks hold an address.
+fn holds(fx: &mut Fx, supply: ChunkSupply, address: Value) -> Value {
+    let offset = fx.b.ins().isub(address, supply.base);
+    let len = fx.b.ins().ishl_imm_s(supply.count, CHUNK_CLASS);
+    fx.b.ins().icmp(IntCC::UnsignedLessThan, offset, len)
+}
+
+/// A region the boot heap grew by as a supply of chunks, by its record.
+fn grown_supply(fx: &mut Fx, record: Value) -> ChunkSupply {
+    ChunkSupply {
+        base: fx.load(PTR, record, grown::BASE),
+        count: fx.load(PTR, record, grown::COUNT),
+        map: fx.offset(record, grown::MAP),
+    }
 }
 
 /// Gives `count` chunks from `base` back to a supply.

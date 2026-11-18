@@ -244,6 +244,17 @@ pub fn user_frame(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 /// The new root cell over a region a store's `over` takes: its supply is the 64 KiB-aligned
 /// chunks lying wholly inside the region, and its limit their total size.
 pub fn region_cell(lo: &mut Lowering, fx: &mut Fx, region: Held) -> Value {
+    let (first, count) = region_chunks(fx, region);
+    let state_address = lo.state(fx);
+    let lock = fx.offset(state_address, state::LOCK);
+    lo.call_routine(fx, Routine::Lock, &[lock]);
+    let cell = memory::region_cell(lo, fx, first, count);
+    lo.call_routine(fx, Routine::Unlock, &[lock]);
+    cell
+}
+
+/// The first of the 64 KiB-aligned chunks lying wholly inside a region, and their count.
+pub fn region_chunks(fx: &mut Fx, region: Held) -> (Value, Value) {
     let held = region.address();
     let base = fx.load(PTR, held, region::BASE);
     let len = fx.load(PTR, held, region::LEN);
@@ -256,12 +267,7 @@ pub fn region_cell(lo: &mut Lowering, fx: &mut Fx, region: Held) -> Value {
     let zero = fx.ptr(0);
     let span = fx.b.ins().select(some, span, zero);
     let count = fx.b.ins().ushr_imm_s(span, 16);
-    let state_address = lo.state(fx);
-    let lock = fx.offset(state_address, state::LOCK);
-    lo.call_routine(fx, Routine::Lock, &[lock]);
-    let cell = memory::region_cell(lo, fx, first, count);
-    lo.call_routine(fx, Routine::Unlock, &[lock]);
-    cell
+    (first, count)
 }
 
 /// Appends a frame at a base address to a list of frames, trapping when the list cannot grow.

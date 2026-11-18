@@ -1,9 +1,17 @@
-//! Takes the 1 GiB frames of the highest usable memory, writes a word at each end of those above 4 GiB through the entry root, and reads the words back; splits one region at its middle; checks the regions against the memory map, the image's segments, the boot area, the entry root's tables and the start information, and the clock's registers against the HPET's; once anchored, watches the charge of a pool's budget while a draw through a budget split from it crosses a threshold, and reads the boot heap while a task and an allocation live.
+//! Takes the 1 GiB frames of the highest usable memory, writes a word at each end of those above 4 GiB through the entry root, and reads the words back; splits one region at its middle; checks the regions against the memory map, the image's segments, the boot area, the entry root's tables and the start information, and the clock's registers against the HPET's; once anchored, watches the charge of a pool's budget while a draw through a budget split from it crosses a threshold, and reads the boot heap, grown by a region, while a task and an allocation live and while an allocation larger than the boot area's heap lives.
 
 /// The memory the entry root maps with the tables the image holds, and the bytes of a frame.
 const MAPPED: u64 = 0x1_0000_0000
 
 const GIGABYTE: u64 = 1_073_741_824
+
+/// The bytes of the boot area's heap, of a chunk, and the fewest bytes of the region the heap
+/// grows by.
+const BOOT_HEAP: u64 = 16_777_216
+
+const CHUNK: u64 = 65_536
+
+const LEAST_GROWTH: u64 = 33_554_432
 
 registers Uart {
     data: u8 at 0x0 write
@@ -161,9 +169,42 @@ fn chunks_holding(meter: boot::HeapMeter, alloc: mem::Alloc) -> u64 {
     return chunks
 } chunks_holding
 
-/// Whether the boot heap's reading keeps its counts within what it has drawn, and counts a
-/// task's stack and an allocation of two chunks while each lives.
-fn heap_follows_draws(meter: boot::HeapMeter, exec: task::Executor, alloc: mem::Alloc) -> bool fails task::Cancelled uses wait {
+/// The chunks drawn whole while an allocation larger than the boot area's heap lives, none when it
+/// cannot be drawn.
+fn chunks_beyond(meter: boot::HeapMeter, alloc: mem::Alloc) -> u64 {
+    let Ok(bytes) = attempt mem::Bytes.try_zeroed(usize.widen(BOOT_HEAP + CHUNK), alloc) else {
+        return 0
+    }
+    let chunks = meter.read().chunks
+    discard bytes.len()
+    return chunks
+} chunks_beyond
+
+/// Grows the boot heap by the first region holding at least `LEAST_GROWTH` bytes, giving the bytes
+/// of its chunks, none when no region holds as many.
+fn grown_heap(k: boot::Kernel, mut regions: mem::List[hw::Region]) -> u64 {
+    let Some(at) = regions.position(fn(region: hw::Region) => region.byte_len() >= LEAST_GROWTH) else {
+        return 0
+    }
+    let region = mut regions.remove(at)
+    let start = (region.base() + CHUNK - 1) / CHUNK * CHUNK
+    let end = (region.base() + region.byte_len()) / CHUNK * CHUNK
+    k.grow_heap(take region)
+    return end - start
+} grown_heap
+
+/// Whether the boot heap, grown by `grown` bytes, holds an allocation larger than the boot area's
+/// heap while it lives and gets its chunks back once it is freed.
+fn heap_grew(meter: boot::HeapMeter, grown: u64, alloc: mem::Alloc) -> bool {
+    let before = meter.read()
+    let held = chunks_beyond(meter, alloc)
+    let after = meter.read()
+    return grown >= LEAST_GROWTH - CHUNK and held > before.chunks + BOOT_HEAP and after.chunks == before.chunks
+} heap_grew
+
+/// Whether the boot heap's reading counts the region it grew by, keeps its counts within what it
+/// has drawn, and counts a task's stack and an allocation of two chunks while each lives.
+fn heap_follows_draws(meter: boot::HeapMeter, grown: u64, exec: task::Executor, alloc: mem::Alloc) -> bool fails task::Cancelled uses wait {
     let before = meter.read()
     var stacks: u64 = 0
     let ran = attempt await task::scope(exec, body: fn[mut stacks](s: task::Scope) fails task::Cancelled uses wait {
@@ -177,7 +218,7 @@ fn heap_follows_draws(meter: boot::HeapMeter, exec: task::Executor, alloc: mem::
     let within = before.records + before.stacks + before.chunks <= before.drawn and before.drawn <= before.peak and before.peak <= before.size
     let counted = stacks > before.stacks and chunks >= before.chunks + 131_072
     let returned = after.stacks == before.stacks and after.chunks == before.chunks
-    return ran.is_ok() and before.size == 16_777_216 and within and counted and returned
+    return ran.is_ok() and before.size == BOOT_HEAP + grown and within and counted and returned
 } heap_follows_draws
 
 fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
@@ -212,6 +253,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     if split {
         say(text: "region split at its middle\n")
     }
+    let grown = grown_heap(k, mut regions)
     let alloc = k.alloc()
     let meter = k.heap()
     take k.anchor(take regions, run: fn(exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
@@ -219,8 +261,11 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
         if try await watch_follows_draws(exec, alloc) {
             say(text: "watch follows draws\n")
         }
-        if try await heap_follows_draws(meter, exec, alloc) {
+        if try await heap_follows_draws(meter, grown, exec, alloc) {
             say(text: "heap follows draws\n")
+        }
+        if heap_grew(meter, grown, alloc) {
+            say(text: "heap grew by a region\n")
         }
     })
 } main

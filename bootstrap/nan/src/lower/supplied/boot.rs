@@ -40,6 +40,11 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "boot::Kernel.wall_clock" => wall_clock(lo, fx, supply),
         "boot::Kernel.ring0" | "boot::Machine.ring0" => ring0(lo, fx, supply),
         "boot::Kernel.regions" => regions(lo, fx, supply),
+        "boot::Kernel.grow_heap" => {
+            let (first, count) = super::hw::region_chunks(fx, supply.param(1));
+            heap::grow(lo, fx, first, count);
+            supply.done(lo, fx);
+        }
         "boot::Kernel.modules" => modules(lo, fx, supply),
         "boot::Kernel.iommu" => iommu(lo, fx, supply),
         "boot::Kernel.pci_functions" => pci_listed(lo, fx, supply, "functions", "enumerated"),
@@ -206,8 +211,7 @@ fn heap_use(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let result = supply.abi.result.clone();
     let layout = lo.layout(&result);
     let slot = fx.slot(layout.size, layout.align);
-    let size = fx.ptr(heap::BOOT_HEAP);
-    let [drawn, peak, records, stacks, chunks] = heap::reading(lo, fx);
+    let [size, drawn, peak, records, stacks, chunks] = heap::reading(lo, fx);
     for (name, count) in [
         ("size", size),
         ("drawn", drawn),

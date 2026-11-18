@@ -17,7 +17,7 @@ use super::super::machine::Stub;
 use super::Supply;
 use crate::check::ty::Ty;
 
-pub use physical::{region, region_cell};
+pub use physical::{region, region_cell, region_chunks};
 pub use windows::dma_access;
 
 pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {

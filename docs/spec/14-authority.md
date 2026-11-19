@@ -747,12 +747,17 @@ pub open linear struct Instance derives Send {
 pub open struct Inbox derives Send {
 } Inbox
 
+pub closed struct Checkpoint derives Encode {
+    pub schema: mem::wire::SchemaHash
+    pub bytes: mem::Bytes
+} Checkpoint
+
 pub closed enum InstanceError derives Render {
     Ended
     Cancelled(task::Cancelled) from
 } InstanceError
 
-pub fn hold[T, E](load: sys::load::Load, component: Str, take world: World, take checkpoint: Option[mem::Bytes], runner: sys::Runner, exec: task::Executor, alloc: mem::Alloc, body: fn(take instance: Instance) -> T fails E uses wait limits stack 65_536) -> Option[T] fails E uses wait
+pub fn hold[T, E](load: sys::load::Load, component: Str, take world: World, take checkpoint: Option[Checkpoint], runner: sys::Runner, exec: task::Executor, alloc: mem::Alloc, body: fn(take instance: Instance) -> T fails E uses wait limits stack 65_536) -> Option[T] fails E uses wait
 
 pub fn Instance.domain(self) -> mem::Shared[sys::Abandoner]
 
@@ -768,7 +773,7 @@ pub fn Instance.start_keyed(mut self) -> usize fails InstanceError uses wait
 
 pub fn Instance.idle(self) -> bool fails InstanceError uses wait
 
-pub fn Instance.checkpoint(self) -> mem::Bytes fails InstanceError uses wait
+pub fn Instance.checkpoint(self) -> Checkpoint fails InstanceError uses wait
 
 pub fn Instance.resumed(mut self, reason: sys::ResumeReason) fails InstanceError uses wait
 
@@ -786,16 +791,17 @@ pub fn Instance.abandon(take self)
 
 pub fn Inbox.call(self, hash: sys::ProtocolHash, request: u64, take encoding: sys::Encoded, alloc: mem::Alloc) -> Option[sys::Encoded] fails sys::CallError[Never] uses wait
 
-pub fn hold_isolated[T, E](cpu: hw::Ring0, job: sys::load::Isolated, component: Str, services: Services, link: Link, take checkpoint: Option[mem::Bytes], runner: sys::Runner, mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState], exec: task::Executor, alloc: mem::Alloc, body: fn(take instance: Instance) -> T fails E uses wait limits stack 65_536) -> Option[T] fails E uses wait
+pub fn hold_isolated[T, E](cpu: hw::Ring0, job: sys::load::Isolated, component: Str, services: Services, link: Link, take checkpoint: Option[Checkpoint], runner: sys::Runner, mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState], exec: task::Executor, alloc: mem::Alloc, body: fn(take instance: Instance) -> T fails E uses wait limits stack 65_536) -> Option[T] fails E uses wait
 ```
 
 - The Env of a component entry implements `nanos::Environment`: `Env.build(world)` makes it from the world its kernel grants an instance, failing with `CapError.Missing` when `world.caps` lacks a capability the Env needs.
 - `nanos::hold(load, component, world, checkpoint, runner, exec, alloc, body: b)` runs the **instance task** of a new instance of the component entry `component` of `load` as the first task of a [domain run](11-errors-domains.md#domain-run) of a new abandoner on `exec` and `alloc`, whose stack holds what `job.stack()` gives for that entry and [grows](17-suspension-io.md#grown-stacks) beyond it, calls `b` with the instance on the calling task, and returns `Some` of what `b` returns once the instance's domain has ended. It returns `None`, running nothing, when `load` has no component entry of that name. The load is borrowed for the call, so its placement is never reclaimed under the instance.
 - `instance.domain()` shares the abandoner running the instance's domain, through which another task abandons an instance whose handler never returns.
-- The instance task owns `world` and `checkpoint`. It decodes `checkpoint`, builds the Env from `world`, then calls `sys::Stepper.start`, or `sys::Stepper.resume` with the decoded state when `checkpoint` is `Some`, attaches the runner capability `runner` to the stepper ([runner capabilities](26-components.md#runner-capabilities)), and holds the stepper until the instance ends. The component's handlers thus call the kind serving `runner` on the instance task, its calls through ports and its replies crossing as wire encodings.
-- Each operation of an instance named after a `sys::Stepper` operation has the instance task perform that operation, `checkpoint` giving the `mem::wire` encoding of the state, so a handler runs in the instance's domain and a trap in it abandons that domain alone. Each waits for the instance task to carry it out, and fails with `InstanceError.Ended` once the instance's domain has ended. A cancelled `incoming` or `ready` also ends the wait of the instance task.
+- A `nanos::Checkpoint` is a `mem::wire` encoding of a component's state, `bytes`, with the schema hash of the shape it encodes, `schema`.
+- The instance task owns `world` and `checkpoint`. It decodes `checkpoint` as `mem::wire::Codec[S].decode_from` decodes its bytes under its schema hash ([migrations](13-text-encode.md#migrations)), S being the component's state, so that a forward migration of S converts a state of an earlier shape, builds the Env from `world`, then calls `sys::Stepper.start`, or `sys::Stepper.resume` with the decoded state when `checkpoint` is `Some`, attaches the runner capability `runner` to the stepper ([runner capabilities](26-components.md#runner-capabilities)), and holds the stepper until the instance ends. The component's handlers thus call the kind serving `runner` on the instance task, its calls through ports and its replies crossing as wire encodings.
+- Each operation of an instance named after a `sys::Stepper` operation has the instance task perform that operation, `checkpoint` giving the `mem::wire` encoding of the state with the schema hash of S, so a handler runs in the instance's domain and a trap in it abandons that domain alone. Each waits for the instance task to carry it out, and fails with `InstanceError.Ended` once the instance's domain has ended. A cancelled `incoming` or `ready` also ends the wait of the instance task.
 - `instance.inbox()` gives an inbox of the instance. `inbox.call(hash, request, encoding, alloc)` has a task of the instance's domain serve the encoded call `encoding`, numbered `request`, as `sys::Wire[P].serve` does ([wire encoding](26-components.md#wire-encoding)) through the stepper's outbox, knowing no peer schemas, P being the protocol the component serves, and gives its reply drawn through `alloc` once a step of the instance's holder has handled the call, or `None` when its handler [postponed](26-components.md#runner-capabilities) it, the kernel then keeping it pending for the `reply` of `runner`. It fails as `serve` does, and as closed once the instance has ended.
-- `take instance.end()` has the instance task stop serving its inboxes and end the stepper, and returns once the instance's domain has ended, with how the instance ended: `Returned` with the `mem::wire` encoding of its last state; `Failed` with the rendering of the failure building its Env; `Cancelled` when its stepper's start or end met a cancellation; `Abandoned` when the abandoner `instance.domain()` shares abandoned the domain; `Trapped` with the trap that abandoned the domain otherwise; `Undecodable` when `checkpoint` is not the `mem::wire` encoding of a state of the component. It is no cancellation point. `take instance.abandon()` abandons the instance's domain without waiting.
+- `take instance.end()` has the instance task stop serving its inboxes and end the stepper, and returns once the instance's domain has ended, with how the instance ended: `Returned` with the `mem::wire` encoding of its last state; `Failed` with the rendering of the failure building its Env; `Cancelled` when its stepper's start or end met a cancellation; `Abandoned` when the abandoner `instance.domain()` shares abandoned the domain; `Trapped` with the trap that abandoned the domain otherwise; `Undecodable` when `decode_from` fails on `checkpoint`. It is no cancellation point. `take instance.abandon()` abandons the instance's domain without waiting.
 - Only std types and `mem::wire` encodings pass between a kernel and an instance task, which runs the code of the bundle: the state, the Env and the messages of the component never leave the bundle's code.
 - `nanos::hold_isolated(cpu, job, component, services, link, checkpoint, runner, mut frames, mut extended, exec, alloc, body: b)` holds an instance of the component entry `component` of a bundle verified for isolated spaces as `hold` does, its instance task running in a space of its own that it makes from `frames` and runs on `cpu` with the extended state `extended` holds, as `run_isolated` runs a job ([jobs](#jobs)). The instance's world is a job's in a space, its table holding the channels of `link` but the first. It returns `Some` of what `b` returns once the space has ended and its frames are back in `frames`, and `None`, running nothing, when the bundle has no component entry of that name. The instance's handlers, keyed tasks and checkpoints thus run in the space, and a trap in a handler ends the instance and its space alone.
 - The first channel of `link` carries the instance: the kernel sends down it each request of the holder, the end of each wait the holder no longer waits for, the protocol hash, number, bytes and handles of each call of an inbox, the instance's release by `end` and the reply to each call through a port, and the space's runtime sends up it each answer and each call the instance makes through a port, each as a `mem::wire` encoding after its length as four little-endian bytes. The kernel reads what the space sends as untrusted, and hears no more of an instance that sends a message it does not decode or longer than 1 MiB.

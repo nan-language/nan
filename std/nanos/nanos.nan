@@ -131,12 +131,17 @@ pub open struct Inbox derives Send {
     waits: task::Cown[Waits]
 } Inbox
 
+pub closed struct Checkpoint derives Encode {
+    pub schema: mem::wire::SchemaHash
+    pub bytes: mem::Bytes
+} Checkpoint
+
 pub closed enum InstanceError derives Render {
     Ended
     Cancelled(task::Cancelled) from
 } InstanceError
 
-pub fn hold[T, E](load: sys::load::Load, component: Str, take world: World, take checkpoint: Option[mem::Bytes], runner: sys::Runner, exec: task::Executor, alloc: mem::Alloc, body: fn(take instance: Instance) -> T fails E uses wait limits stack 65_536) -> Option[T] fails E uses wait {
+pub fn hold[T, E](load: sys::load::Load, component: Str, take world: World, take checkpoint: Option[Checkpoint], runner: sys::Runner, exec: task::Executor, alloc: mem::Alloc, body: fn(take instance: Instance) -> T fails E uses wait limits stack 65_536) -> Option[T] fails E uses wait {
     let Some(job) = load.component(component) else {
         return None
     }
@@ -195,11 +200,11 @@ pub fn Instance.idle(self) -> bool fails InstanceError uses wait {
     return try await self.flag(Request.Idle)
 } Instance.idle
 
-pub fn Instance.checkpoint(self) -> mem::Bytes fails InstanceError uses wait {
-    let Answer.Checkpointed(bytes) = try await self.ask(Request.Checkpoint) else {
+pub fn Instance.checkpoint(self) -> Checkpoint fails InstanceError uses wait {
+    let Answer.Checkpointed(checkpoint) = try await self.ask(Request.Checkpoint) else {
         fail InstanceError.Ended
     }
-    return bytes
+    return checkpoint
 } Instance.checkpoint
 
 pub fn Instance.resumed(mut self, reason: sys::ResumeReason) fails InstanceError uses wait {
@@ -266,7 +271,7 @@ const QUEUED_CALLS: usize = 16
 /// What `hold` gives the task of an instance's domain.
 struct Given {
     world: World
-    checkpoint: Option[mem::Bytes]
+    checkpoint: Option[Checkpoint]
 } Given
 
 /// A new instance and what the task of its domain receives, with the senders through which the
@@ -280,7 +285,7 @@ linear struct Opened {
 
 /// Opens an instance that resumes from `checkpoint`, routing the answers of its domain on a task
 /// of `s` until the domain has ended.
-fn opened(s: task::Scope, take checkpoint: Option[mem::Bytes], runner: sys::Runner, alloc: mem::Alloc) -> Opened {
+fn opened(s: task::Scope, take checkpoint: Option[Checkpoint], runner: sys::Runner, alloc: mem::Alloc) -> Opened {
     let task::Channel(sender: requests, receiver: asked) = task::Channel[Asked].bounded(1, alloc)
     let task::Channel(sender: inbox, receiver: called) = task::Channel[Called].bounded(QUEUED_CALLS, alloc)
     let task::Channel(sender: answering, receiver: answered) = task::Channel[Routed].bounded(QUEUED_CALLS, alloc)
@@ -300,7 +305,7 @@ fn opened(s: task::Scope, take checkpoint: Option[mem::Bytes], runner: sys::Runn
 /// from, none to start, the runner its component contexts act through, its holder's requests,
 /// the encoded calls of its inboxes and the sender of its answers to both.
 struct Launch {
-    checkpoint: Option[mem::Bytes]
+    checkpoint: Option[Checkpoint]
     runner: sys::Runner
     requests: task::Receiver[Asked]
     calls: task::Receiver[Called]
@@ -333,7 +338,7 @@ enum Answer {
     Done
     Flag(bool)
     Started(usize)
-    Checkpointed(mem::Bytes)
+    Checkpointed(Checkpoint)
     Health(sys::HealthReply)
     Served(Result[Option[sys::Encoded], sys::CallError[Never]])
 } Answer
@@ -488,7 +493,8 @@ fn hosted_unit[E: Render](take world: World, take input: mem::Bytes, main: fn(ta
 struct Hosted[S: sys::Component[Env, P] and Encode, Env: Environment and Send, P: sys::Protocol and Send] {
 } Hosted
 
-/// Runs a component instance for the kernel holding it: decodes its checkpoint, builds its Env from
+/// Runs a component instance for the kernel holding it: decodes its checkpoint through the
+/// migrations of S, builds its Env from
 /// `world`, starts it or resumes it from the checkpoint, attaches its runner, serves its inboxes
 /// and carries out its holder's requests until the holder releases it, then ends it, giving the
 /// encoding of its last state. It never fails.
@@ -498,8 +504,8 @@ fn Hosted.run(take world: World, take launch: Launch) -> Ended fails task::Cance
     let Launch(checkpoint: checkpoint, runner: runner, requests: requests, calls: calls, answers: answers) = launch
     var restored: Option[S] = None
     match checkpoint {
-        Some(bytes) => {
-            let Ok(state) = attempt mem::wire::Codec[S].decode(Untrusted.of(bytes.view()), alloc) else {
+        Some(given) => {
+            let Ok(state) = attempt mem::wire::Codec[S].decode_from(given.schema, raw: Untrusted.of(given.bytes.view()), alloc) else {
                 return Ended.Undecodable
             }
             restored = Some(take state)
@@ -588,7 +594,7 @@ fn carried[S: sys::Component[Env, P] and Encode, Env: Environment and Send, P: s
         Request.Ready(stop) => return try await waited(stepper, take stop, ready: true, exec)
         Request.StartKeyed => return Some(Answer.Started(mut stepper.start_keyed()))
         Request.Idle => return Some(Answer.Flag(stepper.idle()))
-        Request.Checkpoint => return Some(Answer.Checkpointed(encoded(stepper.state(), alloc)))
+        Request.Checkpoint => return Some(Answer.Checkpointed(Checkpoint(schema: mem::wire::Codec[S].schema_hash(), bytes: encoded(stepper.state(), alloc))))
         Request.Resumed(reason) => mut stepper.resumed(reason)
         Request.Pressure(level) => mut stepper.pressure(level)
         Request.Health => return Some(Answer.Health(mut stepper.health()))

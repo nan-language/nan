@@ -1,4 +1,4 @@
-//! Loads a component bundle and holds instances of its tally in domains of their own through `nanos::hold`, serving their logs on the serial port: calls with replies, a refusal, a transferred clock and a mismatched protocol hash, keyed tasks started on resume, the system interfaces, a checkpoint restored into a fresh instance, a trapping handler, a handler that never returns until its domain is abandoned, a missing component, the protocol schema the bundle records for the tally and none for a missing component, an Env the kernel's grants cannot build, and an instance running from the load a replacement of the bundle retires, and a relay calling the tally through the ports of a runner the kernel serves both: an addition answered at once, a total the tally postpones until a settlement the relay sends has it reply, a summary the tally publishes, a sync it asks for, a clock the runner holds for the relay as a capability by number until the relay drops it, and a file the runner holds for the relay as a resource by number, which the relay borrows, puts back, then takes and drops, after the runner refuses it a resource it does not hold.
+//! Loads a component bundle and holds instances of its tally in domains of their own through `nanos::hold`, serving their logs on the serial port: calls with replies, a refusal, a transferred clock and a mismatched protocol hash, keyed tasks started on resume, the system interfaces, a checkpoint restored into a fresh instance, a checkpoint of an earlier shape its migration converts and one of a schema it does not read, a trapping handler, a handler that never returns until its domain is abandoned, a missing component, the protocol schema the bundle records for the tally and none for a missing component, an Env the kernel's grants cannot build, and an instance running from the load a replacement of the bundle retires, and a relay calling the tally through the ports of a runner the kernel serves both: an addition answered at once, a total the tally postpones until a settlement the relay sends has it reply, a summary the tally publishes, a sync it asks for, a clock the runner holds for the relay as a capability by number until the relay drops it, and a file the runner holds for the relay as a resource by number, which the relay borrows, puts back, then takes and drops, after the runner refuses it a resource it does not hold.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -50,6 +50,11 @@ pub closed struct Tally derives Encode {
     pub suspended: bool
     pub pending: u64
 } Tally
+
+/// The tally's state as the first release of its bundle encoded it.
+struct FirstTally derives Encode {
+    total: u64
+} FirstTally
 
 /// The serial port serving a component's log, random source and standard streams.
 struct Console {
@@ -246,7 +251,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
 
 fn serve(loader: sys::load::Loader, mut bundle: sys::load::Bundle, grants: Grants) fails nanos::InstanceError uses wait {
     let load = bundle.share()
-    let Some(checkpoint) = try await nanos::hold(load, component: "Tally", world: granted(grants, clocked: true), checkpoint: None, runner: sys::Runner.denied(), exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) -> mem::Bytes fails nanos::InstanceError uses wait {
+    let Some(checkpoint) = try await nanos::hold(load, component: "Tally", world: granted(grants, clocked: true), checkpoint: None, runner: sys::Runner.denied(), exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) -> nanos::Checkpoint fails nanos::InstanceError uses wait {
         return try await started(take instance, grants)
     }) else {
         stop(text: "no tally\n")
@@ -254,6 +259,7 @@ fn serve(loader: sys::load::Loader, mut bundle: sys::load::Bundle, grants: Grant
     discard try await nanos::hold(load, component: "Tally", world: granted(grants, clocked: true), checkpoint: Some(take checkpoint), runner: sys::Runner.denied(), exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
         try await restored(take instance, grants)
     })
+    try await migrated(load, grants)
     discard try await nanos::hold(load, component: "Tally", world: granted(grants, clocked: true), checkpoint: None, runner: sys::Runner.denied(), exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
         try await trapped(take instance, grants)
     })
@@ -363,7 +369,7 @@ fn say_left(count: usize) {
 
 /// Starts the tally, calls it, asks after its health through the system interfaces and gives a
 /// checkpoint of it once idle.
-fn started(take instance: nanos::Instance, grants: Grants) -> mem::Bytes fails nanos::InstanceError uses wait {
+fn started(take instance: nanos::Instance, grants: Grants) -> nanos::Checkpoint fails nanos::InstanceError uses wait {
     var held = instance
     defer take held.abandon()
     try await ticked(mut held, reason: sys::ResumeReason.Started)
@@ -441,6 +447,25 @@ fn restored(take instance: nanos::Instance, grants: Grants) fails nanos::Instanc
     say(text: "restored ")
     report(try await take held.end(), alloc: grants.alloc)
 } restored
+
+/// Holds the tally from a checkpoint of the shape of its bundle's first release, which its
+/// migration converts, and from one of a schema the tally does not read.
+fn migrated(load: sys::load::Load, grants: Grants) fails nanos::InstanceError uses wait {
+    try await held_from(load, schema: mem::wire::Codec[FirstTally].schema_hash(), grants)
+    try await held_from(load, schema: mem::wire::Codec[u64].schema_hash(), grants)
+} migrated
+
+/// Holds the tally from the encoding of a state of its first release under `schema`, then ends
+/// it.
+fn held_from(load: sys::load::Load, schema: mem::wire::SchemaHash, grants: Grants) fails nanos::InstanceError uses wait {
+    var bytes = mem::Bytes.empty(grants.alloc)
+    mem::wire::Codec[FirstTally].encode(FirstTally(total: 7), out: mut bytes)
+    let checkpoint = nanos::Checkpoint(schema: schema, bytes: take bytes)
+    discard try await nanos::hold(load, component: "Tally", world: granted(grants, clocked: true), checkpoint: Some(take checkpoint), runner: sys::Runner.denied(), exec: grants.exec, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+        say(text: "migrated ")
+        report(try await take instance.end(), alloc: grants.alloc)
+    })
+} held_from
 
 /// Calls a handler of the tally that traps, which abandons the instance's domain.
 fn trapped(take instance: nanos::Instance, grants: Grants) fails nanos::InstanceError uses wait {
@@ -877,7 +902,7 @@ fn tallies(mut tally: nanos::Instance, take forwarded: task::Receiver[Forwarded]
     discard try await called(mut tally, hash: sys::Wire[Counter].hash(), request: sys::Encoded(bytes: take sent, handles: mem::List[sys::Handle].empty(grants.alloc)), grants)
     let synced = sys::reach(wired, body: fn(state: Wiring, record: u64) => state.syncs.load())
     if synced == Some(1) {
-        let checkpoint = try await tally.checkpoint()
+        let nanos::Checkpoint(schema: _, bytes: checkpoint) = try await tally.checkpoint()
         say(text: "synced ")
         report(nanos::Ended.Returned(take checkpoint), alloc: grants.alloc)
     }

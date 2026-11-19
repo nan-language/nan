@@ -171,6 +171,40 @@ fn Checker.add_digest_entries(self, held: mem::Shared[Digest], mut summary: mem:
     }
 } Checker.add_digest_entries
 
+/// The authority summary of a package of the closure of the workspace package `root`, over
+/// every target it declares: under each target other than the checker's, that of a checker of
+/// the part of `root`'s closure the package reaches.
+fn Checker.declared_summary(self, root: ty::PackageId, package_id: ty::PackageId) -> mem::Set[machine::SummaryEntry] {
+    let alloc = self.alloc()
+    let db = self.db()
+    var summary = self.authority_summary(package_id)
+    let data = db.package_data(package_id)
+    let Some(member) = data.member else {
+        return summary
+    }
+    let Some(workspace::Member.Source(root_index)) = db.package_data(root).member else {
+        return summary
+    }
+    let held = db.session.workspace.contents()
+    let Some(closure) = held.closure_of(root_index) else {
+        return summary
+    }
+    let reached = closure.reached_from(held, member, alloc)
+    for target in check_targets(db.source(package_id), alloc) {
+        if target == db.target or target == workspace::Target.Any {
+            continue
+        }
+        let checker = self.session().unchecked(reached, target)
+        let Some(other) = checker.package_named(data.name.as_str()) else {
+            continue
+        }
+        for entry in take checker.authority_summary(other) {
+            discard mut summary.insert(take entry)
+        }
+    }
+    return summary
+} Checker.declared_summary
+
 /// What a final-link root's final closure needs its lock to approve; nothing for a package
 /// that is no program.
 fn Checker.needed(self, root: ty::PackageId) -> Needed {
@@ -189,7 +223,7 @@ fn Checker.needed(self, root: ty::PackageId) -> Needed {
         if data.std {
             continue
         }
-        for entry in take self.authority_summary(package_id) {
+        for entry in take self.declared_summary(root, package_id) {
             discard mut needed.pairs.insert(NeededPair(package_name: text::String.of(data.name.as_str(), alloc), entry: take entry))
         }
         let Some(workspace::Member.Release(index)) = data.member else {
@@ -268,8 +302,8 @@ pkg fn Session.approvals(self, package_index: usize, take lock: machine::Lock, a
 } Session.approvals
 
 /// The authority summary of each package named in `names` that the closure of the workspace
-/// package at an index holds, empty for one it does not, over the targets the package is checked
-/// for, in the order of `names`.
+/// package at an index holds, empty for one it does not, over every target it declares, in the
+/// order of `names`.
 pkg fn Session.authority_summaries(self, package_index: usize, names: Slice[text::String]) -> mem::List[mem::Set[machine::SummaryEntry]] {
     let alloc = self.alloc
     var summaries = mem::List[mem::Set[machine::SummaryEntry]].empty(alloc)
@@ -286,12 +320,15 @@ pkg fn Session.authority_summaries(self, package_index: usize, names: Slice[text
     }
     for target in check_targets(source, alloc) {
         let checker = self.unchecked(closure, target)
+        let Some(root) = checker.db().package_of_member(workspace::Member.Source(package_index)) else {
+            continue
+        }
         for index in 0..<names.len() {
             let Some(package_id) = checker.package_named(names[index].as_str()) else {
                 continue
             }
             var summary = mut summaries.at_mut(index)
-            for entry in take checker.authority_summary(package_id) {
+            for entry in take checker.declared_summary(root, package_id) {
                 discard mut summary.insert(take entry)
             }
         }

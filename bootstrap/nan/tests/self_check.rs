@@ -1933,7 +1933,6 @@ fn nanos_toolchain(path: &Utf8Path, _: String) -> datatest_stable::Result<()> {
     let interface = ".nan/images/x86_64-bare/space_host.nlif";
     for args in [
         &["build", "space_host"][..],
-        &["dep", "approve", "nan"],
         &["build", "nan", "--against", interface],
     ] {
         let (output, status) = nan(&dir, args)?;

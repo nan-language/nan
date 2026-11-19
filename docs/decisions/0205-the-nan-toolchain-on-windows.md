@@ -1,6 +1,6 @@
 # 0205. The NaN toolchain on Windows
 
-Status: accepted
+Status: accepted; the copies' `nan dep approve` superseded by 0213
 
 ## Context
 

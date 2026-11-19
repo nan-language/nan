@@ -11,7 +11,7 @@ use super::db::PackageId;
 use super::ledger::Kind;
 use crate::diagnostic::{Code, Diagnostic, Reason, Role};
 use crate::machine::lock::{Entry, Lock};
-use crate::workspace::{Member, Workspace};
+use crate::workspace::{Member, Target, Workspace};
 
 /// What a final closure needs its root's lock to approve: pairs of a package and an entry of its
 /// authority summary, and pairs of a canonical path and a behaviour epoch.
@@ -62,6 +62,32 @@ impl Checker<'_> {
         summary
     }
 
+    /// The authority summary of a package of the closure of the workspace package `root`, over
+    /// every target it declares: under each target other than the checker's, that of a checker of
+    /// the part of `root`'s closure the package reaches.
+    fn declared_summary(&self, root: PackageId, package: PackageId) -> BTreeSet<Entry> {
+        let mut summary = self.authority_summary(package);
+        let data = self.db.package(package);
+        let workspace = self.db.workspace;
+        let (Some(member), Some(closure)) = (
+            data.member,
+            workspace.closure_of(self.db.package(root).source),
+        ) else {
+            return summary;
+        };
+        let reached = closure.reached_from(workspace, member);
+        for target in super::check_targets(data.source) {
+            if target == self.db.target || target == Target::Any {
+                continue;
+            }
+            let checker = super::unchecked(workspace, &reached, crate::stdlib::packages(), target);
+            if let Some(id) = checker.package_named(&data.name) {
+                summary.extend(checker.authority_summary(id));
+            }
+        }
+        summary
+    }
+
     /// What a final-link root's final closure needs its lock to approve; nothing for a package
     /// that is no program.
     pub fn needed(&self, root: PackageId) -> Needed {
@@ -85,7 +111,7 @@ impl Checker<'_> {
             .filter(|package| !self.db.package(*package).std)
         {
             let data = self.db.package(package);
-            for entry in self.authority_summary(package) {
+            for entry in self.declared_summary(root, package) {
                 needed.pairs.insert((data.name.clone(), entry));
             }
             if let Some(Member::Release(index)) = data.member
@@ -170,7 +196,7 @@ fn unapproved(
 }
 
 /// The authority summary of each package named in `names` that a workspace package's closure
-/// holds, over the targets the package is checked for.
+/// holds, over every target it declares.
 pub fn authority_summaries(
     workspace: &Workspace,
     package: &crate::workspace::Package,
@@ -182,16 +208,29 @@ pub fn authority_summaries(
     };
     for target in super::check_targets(package) {
         let checker = super::unchecked(workspace, closure, crate::stdlib::packages(), target);
+        let Some(root) = root_of(&checker, package) else {
+            continue;
+        };
         for name in names {
             if let Some(id) = checker.package_named(name) {
                 summaries
                     .entry((*name).to_owned())
                     .or_default()
-                    .extend(checker.authority_summary(id));
+                    .extend(checker.declared_summary(root, id));
             }
         }
     }
     summaries
+}
+
+/// A checker's id of a workspace package.
+fn root_of(checker: &Checker, package: &crate::workspace::Package) -> Option<PackageId> {
+    checker
+        .db
+        .packages
+        .iter()
+        .position(|data| std::ptr::eq(data.source, package))
+        .map(|index| PackageId(index as u32))
 }
 
 /// A lock with the approvals its package's final closure needs: every one when `all`, else those
@@ -210,13 +249,7 @@ pub fn approvals(
     let mut epochs = BTreeSet::new();
     for target in super::check_targets(package) {
         let checker = super::unchecked(workspace, closure, std, target);
-        let Some(root) = checker
-            .db
-            .packages
-            .iter()
-            .position(|data| std::ptr::eq(data.source, package))
-            .map(|index| PackageId(index as u32))
-        else {
+        let Some(root) = root_of(&checker, package) else {
             continue;
         };
         let needed = checker.needed(root);

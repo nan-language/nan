@@ -26,8 +26,8 @@ pub use bundle::{at_manifest, bundle};
 const LANDING: &str = "enter";
 
 /// What a final build reports and the image it writes, relative to the workspace root, with the
-/// files it writes beside the image: a kernel's interface file, or a bundle's artefacts and the
-/// hash of their code roots.
+/// files it writes beside the image: a machine image's artefacts and a kernel's interface file,
+/// or a bundle's artefacts and the hash of their code roots.
 pub struct Build {
     pub diagnostics: Vec<Diagnostic>,
     pub image: Option<String>,
@@ -115,6 +115,11 @@ pub fn build(
         return Ok(Build::failed(diagnostics));
     }
     let mut companions = Vec::new();
+    if target.is_machine() {
+        let path = format!(".nan/images/{}/{name}.narts", target.name());
+        write_file(&workspace.root.join(&path), &section(&artefacts))?;
+        companions.push(path);
+    }
     if let Some(file) = interface {
         let path = format!(".nan/images/{}/{name}.nlif", target.name());
         write_file(&workspace.root.join(&path), &file)?;

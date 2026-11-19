@@ -279,10 +279,11 @@ fn main(take world: nanos::World, take input: u32) -> u64 fails task::Cancelled 
 
 ```text
 $ nan build kernel
-ok build kernel: files 2, errors 0, incomplete 0
+ok build kernel: files 3, errors 0, incomplete 0
 wrote .nan/images/x86_64-bare/kernel.elf
+wrote .nan/images/x86_64-bare/kernel.narts
 wrote .nan/images/x86_64-bare/kernel.nlif
-ok build kernel: files 2, errors 0, incomplete 0
+ok build kernel: files 3, errors 0, incomplete 0
 $ nan build hello --against .nan/images/x86_64-bare/kernel.nlif
 ok build hello --against .nan/images/x86_64-bare/kernel.nlif: files 3, errors 0, incomplete 0
 wrote .nan/images/x86_64-nanos/hello.narts
@@ -290,13 +291,14 @@ wrote .nan/images/x86_64-nanos/hello.nbun
 wrote .nan/images/x86_64-nanos/hello.ntree
 ok build hello --against .nan/images/x86_64-bare/kernel.nlif: files 3, errors 0, incomplete 0
 $ nan build
-ok build .: files 5, errors 0, incomplete 0
+ok build .: files 6, errors 0, incomplete 0
 wrote .nan/images/x86_64-bare/kernel.elf
+wrote .nan/images/x86_64-bare/kernel.narts
 wrote .nan/images/x86_64-bare/kernel.nlif
 wrote .nan/images/x86_64-nanos/hello.narts
 wrote .nan/images/x86_64-nanos/hello.nbun
 wrote .nan/images/x86_64-nanos/hello.ntree
-ok build .: files 5, errors 0, incomplete 0
+ok build .: files 6, errors 0, incomplete 0
 ```
 
 ## Host symbol names

@@ -1,3 +1,4 @@
+use crate::check::schema::Node;
 use crate::check::ty::Ty;
 use crate::check::unchecked;
 use crate::workspace::tests::Scratch;
@@ -37,4 +38,27 @@ fn code_roots_record_exported_trees_and_the_foreign_instantiations_outside_other
         .expect("an entry for Option");
     let hash = checker.schema(&Ty::Item(*option, args.clone())).hash();
     assert_eq!(entry.schemas.into_iter().collect::<Vec<_>>(), [hash]);
+}
+
+#[test]
+fn a_tree_reads_back_from_its_encoding_without_its_names() {
+    let scratch = Scratch::new(&[
+        ("example/package.nan", MANIFEST),
+        ("example/example.nan", TYPES),
+    ]);
+    let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
+    let checker = unchecked(
+        &workspace,
+        &workspace.closures[0],
+        crate::stdlib::packages(),
+        Target::Any,
+    );
+    let package = checker.package_named("example").expect("the package");
+    let tree = checker.schema(&checker.recorded_schemas(package)["example::Outer"]);
+    let read = Node::read(&tree.wire()).expect("a tree");
+    assert_eq!(read.wire(), tree.wire());
+    assert!(read.accepts(&tree) && tree.accepts(&read));
+    let mut wire = tree.wire();
+    wire.push(0);
+    assert_eq!(Node::read(&wire), None);
 }

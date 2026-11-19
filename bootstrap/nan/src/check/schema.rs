@@ -620,5 +620,6 @@ impl Checker<'_> {
     }
 }
 
+mod read;
 #[cfg(test)]
 mod tests;

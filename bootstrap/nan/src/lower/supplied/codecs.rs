@@ -357,6 +357,11 @@ fn canonical_writer(lo: &mut Lowering, ty: &Ty) -> FuncId {
 /// The address of the schema hash of a type, as read-only data.
 fn schema_hash(lo: &mut Lowering, fx: &mut Fx, ty: &Ty) -> Value {
     let hash = lo.ck.schema(ty).hash();
+    hash_address(lo, fx, &hash)
+}
+
+/// The address of a schema hash, as read-only data.
+fn hash_address(lo: &mut Lowering, fx: &mut Fx, hash: &Hash) -> Value {
     let data = lo.bytes_data(&hash.0);
     lo.data_address(fx, data)
 }
@@ -366,6 +371,14 @@ fn same_hash(lo: &mut Lowering, fx: &mut Fx, wanted: Value, hash: Value) -> Valu
     let len = fx.ptr(33);
     let order = lo.call_routine(fx, Routine::Compare, &[wanted, hash, len])[0];
     fx.b.ins().icmp_imm_s(IntCC::Equal, order, 0)
+}
+
+/// The earlier schema hashes of a type that its own tree accepts.
+fn accepted_of(lo: &Lowering, ty: &Ty) -> Vec<Hash> {
+    match ty {
+        Ty::Item(item, args) if args.is_empty() => lo.ck.accepted_schemas(*item),
+        _ => Vec::new(),
+    }
 }
 
 /// The migrations of a type in one direction, each with its frozen shape.
@@ -399,8 +412,8 @@ fn migrate(lo: &mut Lowering, fx: &mut Fx, function: ItemId, value: Held, alloc:
 }
 
 /// `Codec.decode_from(schema, raw, alloc)`: one value read as `decode` reads it under the type's
-/// own schema hash, or one of a frozen shape that a forward migration converts, failing with
-/// `UnknownSchema` under another.
+/// own schema hash or an earlier one its tree accepts, or one of a frozen shape that a forward
+/// migration converts, failing with `UnknownSchema` under another.
 fn decode_from(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let ty = supply.type_arg(0);
     let layout = lo.layout(&ty);
@@ -412,8 +425,13 @@ fn decode_from(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let unknown = fx.int(types::I32, failure::UNKNOWN_SCHEMA);
     fx.store(unknown, code, 0);
     let own = schema_hash(lo, fx, &ty);
-    let same = same_hash(lo, fx, wanted, own);
-    fx.when(same, |fx| {
+    let mut readable = same_hash(lo, fx, wanted, own);
+    for hash in accepted_of(lo, &ty) {
+        let hash = hash_address(lo, fx, &hash);
+        let same = same_hash(lo, fx, wanted, hash);
+        readable = fx.b.ins().bor(readable, same);
+    }
+    fx.when(readable, |fx| {
         let read = read(lo, fx, supply, 1, &DecodeFormat::Wire, &ty, target);
         fx.store(read, code, 0);
     });

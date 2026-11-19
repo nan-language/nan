@@ -308,13 +308,13 @@ pub fn run(
             ));
         }
     };
-    for (module, ty, hash) in check::schema_records(&moved_workspace, index) {
+    for (module, recorded) in check::schema_records(&moved_workspace, index) {
         let held = modules.entry(module.clone()).or_insert_with(|| Module {
             name: module,
             ..Module::default()
         });
-        if !held.schemas.contains(&(ty.clone(), hash)) {
-            held.schemas.push((ty, hash));
+        if !held.schemas.contains(&recorded) {
+            held.schemas.push(recorded);
             held.schemas.sort();
         }
     }

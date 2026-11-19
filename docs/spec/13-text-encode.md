@@ -1163,7 +1163,7 @@ pub fn Codec.decode_from(schema: SchemaHash, raw: Untrusted[Slice[u8]], alloc: m
 pub fn Codec.encode_as(value: T, schema: SchemaHash, mut out: mem::Bytes, alloc: mem::Alloc) -> bool
 ```
 
-- `decode_from` reads one value as `decode` does when `schema` is the schema hash of `T`. When it is that of a frozen shape a forward migration of `T` converts from, it reads one value of that shape as `decode` does and gives the migration's conversion of it, drawn through `alloc`, failing with `OutOfMemory` when the migration fails. Otherwise it fails with `UnknownSchema`.
+- `decode_from` reads one value as `decode` does when `schema` is the schema hash of `T`, or one that the history records for `T` with a schema tree that `T`'s tree [accepts](29-identity-versioning.md#encode-class). When it is that of a frozen shape a forward migration of `T` converts from, it reads one value of that shape as `decode` does and gives the migration's conversion of it, drawn through `alloc`, failing with `OutOfMemory` when the migration fails. Otherwise it fails with `UnknownSchema`.
 - `encode_as` appends `value` as `encode` does and gives `true` when `schema` is the schema hash of `T`. When it is that of a frozen shape an inverse of `T` converts to, it appends the encoding of the inverse's conversion of `value`, drawn through `alloc`, and gives `true`. Otherwise it gives `false` and leaves `out` unchanged. It traps when memory is exhausted (`trap.exhausted`).
 
 ```nan
@@ -1179,8 +1179,8 @@ package settings {
 nan history 1
 name "settings"
 module settings
-schema Settings "agib35pkkvbgllndccsmcj2cjah4xoif2okmhv7ggxbrttxqz7p5kvz"
-check "agvy4nj42r4onb7j37h7jgwdeyr2widy7dqy5octinp36kno7rjiaxu"
+schema Settings "agib35pkkvbgllndccsmcj2cjah4xoif2okmhv7ggxbrttxqz7p5kvz" "aecw433emvzvwaqgkjswg33smqat2aqgmzuwk3deomwqcbahmfwgsyltmvzqcaajmrswmylvnr2gkzabaabwwzlzbadxezluojuwk4yfozqwy5lfaeaqi33qmvxacaaikvxhg2lhnzswiaijaecxo2leoruaccasa"
+check "afpowiqtdmql4t5dh72xqar5pp2o6pne4jlydrfet2lgto7avqlmok7"
 
 // file: settings/settings.nan
 //! The settings record and the shape of its first release.
@@ -1221,6 +1221,45 @@ test first_records_load for load {
 ```
 
 ```nan
+// file: settings/package.nan
+//! Settings kept across releases.
+
+package settings {
+    language 1
+    targets any
+} settings
+
+// file: settings/.nan/history.nan
+nan history 1
+name "settings"
+module settings
+schema Settings "agib35pkkvbgllndccsmcj2cjah4xoif2okmhv7ggxbrttxqz7p5kvz" "aecw433emvzvwaqgkjswg33smqat2aqgmzuwk3deomwqcbahmfwgsyltmvzqcaajmrswmylvnr2gkzabaabwwzlzbadxezluojuwk4yfozqwy5lfaeaqi33qmvxacaaikvxhg2lhnzswiaijaecxo2leoruaccasa"
+check "afpowiqtdmql4t5dh72xqar5pp2o6pne4jlydrfet2lgto7avqlmok7"
+
+// file: settings/settings.nan
+//! The settings record, which gained a field its first release lacked.
+
+pub open struct Settings derives Eq, Encode {
+    pub retries: u8
+    pub limit: Option[u16]
+} Settings
+
+struct FirstSettings derives Encode {
+    retries: u8
+} FirstSettings
+
+pub fn load(schema: mem::wire::SchemaHash, raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> Settings fails core::DecodeError {
+    return try mem::wire::Codec[Settings].decode_from(schema, raw, alloc)
+} load
+
+test first_records_load_without_migration for load {
+    let world = testing::world()
+    let loaded = attempt load(mem::wire::Codec[FirstSettings].schema_hash(), raw: Untrusted.of(b"\x01\x07retries\x01\x03"), alloc: world.alloc)
+    expect loaded == Ok(Settings(retries: 3, limit: None))
+} first_records_load_without_migration
+```
+
+```nan
 pub closed struct Settings derives Encode {
     pub retries: u8
     pub backoff: u16
@@ -1248,8 +1287,8 @@ package settings {
 nan history 1
 name "settings"
 module settings
-schema Settings "agib35pkkvbgllndccsmcj2cjah4xoif2okmhv7ggxbrttxqz7p5kvz"
-check "agvy4nj42r4onb7j37h7jgwdeyr2widy7dqy5octinp36kno7rjiaxu"
+schema Settings "agib35pkkvbgllndccsmcj2cjah4xoif2okmhv7ggxbrttxqz7p5kvz" "aecw433emvzvwaqgkjswg33smqat2aqgmzuwk3deomwqcbahmfwgsyltmvzqcaajmrswmylvnr2gkzabaabwwzlzbadxezluojuwk4yfozqwy5lfaeaqi33qmvxacaaikvxhg2lhnzswiaijaecxo2leoruaccasa"
+check "afpowiqtdmql4t5dh72xqar5pp2o6pne4jlydrfet2lgto7avqlmok7"
 
 // file: settings/settings.nan
 //! The settings record and the shape of its first release.
@@ -1281,8 +1320,8 @@ package settings {
 nan history 1
 name "settings"
 module settings
-schema Settings "agib35pkkvbgllndccsmcj2cjah4xoif2okmhv7ggxbrttxqz7p5kvz"
-check "agvy4nj42r4onb7j37h7jgwdeyr2widy7dqy5octinp36kno7rjiaxu"
+schema Settings "agib35pkkvbgllndccsmcj2cjah4xoif2okmhv7ggxbrttxqz7p5kvz" "aecw433emvzvwaqgkjswg33smqat2aqgmzuwk3deomwqcbahmfwgsyltmvzqcaajmrswmylvnr2gkzabaabwwzlzbadxezluojuwk4yfozqwy5lfaeaqi33qmvxacaaikvxhg2lhnzswiaijaecxo2leoruaccasa"
+check "afpowiqtdmql4t5dh72xqar5pp2o6pne4jlydrfet2lgto7avqlmok7"
 
 // file: settings/settings.nan
 //! The settings record and the shape of its first release.
@@ -1330,8 +1369,8 @@ package settings {
 nan history 1
 name "settings"
 module settings
-schema Settings "agib35pkkvbgllndccsmcj2cjah4xoif2okmhv7ggxbrttxqz7p5kvz"
-check "agvy4nj42r4onb7j37h7jgwdeyr2widy7dqy5octinp36kno7rjiaxu"
+schema Settings "agib35pkkvbgllndccsmcj2cjah4xoif2okmhv7ggxbrttxqz7p5kvz" "aecw433emvzvwaqgkjswg33smqat2aqgmzuwk3deomwqcbahmfwgsyltmvzqcaajmrswmylvnr2gkzabaabwwzlzbadxezluojuwk4yfozqwy5lfaeaqi33qmvxacaaikvxhg2lhnzswiaijaecxo2leoruaccasa"
+check "afpowiqtdmql4t5dh72xqar5pp2o6pne4jlydrfet2lgto7avqlmok7"
 
 // file: settings/settings.nan
 //! The settings record and the shape of its first release.
@@ -1367,8 +1406,8 @@ package settings {
 nan history 1
 name "settings"
 module settings
-schema Settings "agib35pkkvbgllndccsmcj2cjah4xoif2okmhv7ggxbrttxqz7p5kvz"
-check "agvy4nj42r4onb7j37h7jgwdeyr2widy7dqy5octinp36kno7rjiaxu"
+schema Settings "agib35pkkvbgllndccsmcj2cjah4xoif2okmhv7ggxbrttxqz7p5kvz" "aecw433emvzvwaqgkjswg33smqat2aqgmzuwk3deomwqcbahmfwgsyltmvzqcaajmrswmylvnr2gkzabaabwwzlzbadxezluojuwk4yfozqwy5lfaeaqi33qmvxacaaikvxhg2lhnzswiaijaecxo2leoruaccasa"
+check "afpowiqtdmql4t5dh72xqar5pp2o6pne4jlydrfet2lgto7avqlmok7"
 
 // file: settings/settings.nan
 //! The settings record and the shape of its first release.

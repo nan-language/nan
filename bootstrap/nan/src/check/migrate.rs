@@ -4,11 +4,13 @@
 use super::Checker;
 use super::db::{ItemId, TypeKey};
 use super::reversibility::Class;
+use super::schema::Node;
 use super::sig::FnSig;
 use super::spec::head_last;
 use super::ty::Ty;
 use crate::diagnostic::{Code, Offer};
 use crate::hash::Hash;
+use crate::machine::history::Recorded;
 use crate::syntax::ast::{self, FnModifier, ItemKind, LimitKind, Mode};
 
 /// A migration of a type: its function, its frozen shape and whether it converts from it.
@@ -151,15 +153,29 @@ impl Checker<'_> {
 
     /// The schema hashes the history of a type's package records for it.
     fn recorded_hashes(&self, item: ItemId) -> Vec<Hash> {
+        self.recorded(item, |schema| Some(schema.hash))
+    }
+
+    /// The schema hashes other than its own that the history of a type without type parameters
+    /// records for it with a tree its own tree accepts.
+    pub fn accepted_schemas(&self, item: ItemId) -> Vec<Hash> {
+        let tree = self.schema(&Ty::item(item, Vec::new()));
+        let own = tree.hash();
+        self.recorded(item, |schema| {
+            let accepted = schema.hash != own && tree.accepts(&Node::read(&schema.tree)?);
+            accepted.then_some(schema.hash)
+        })
+    }
+
+    /// What `pick` gives of each schema the history of a type's package records for it.
+    fn recorded<T>(&self, item: ItemId, pick: impl FnMut(&Recorded) -> Option<T>) -> Vec<T> {
         let package = self.db.package(self.db.package_of(item));
         let module = &self.db.module(self.db.module_of(item)).name;
         let name = self.db.ast(item).name().unwrap_or_default();
-        package
-            .source
-            .machine
-            .history()
-            .map(|history| history.schemas(module, &name))
-            .unwrap_or_default()
+        let Some(history) = package.source.machine.history() else {
+            return Vec::new();
+        };
+        history.schemas(module, &name).filter_map(pick).collect()
     }
 
     /// The fix adding `notrap` and `terminates` to a head in the order `nan fmt` writes limits.

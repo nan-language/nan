@@ -1,0 +1,407 @@
+//! Reading a schema tree from the `mem::wire` encoding of its `mem::wire::Schema`.
+
+/// The tree a `mem::wire::Schema` encoding holds; none when the bytes are not one.
+pkg fn read_schema(bytes: Slice[u8], alloc: mem::Alloc) -> Option[mem::wire::Schema] {
+    var reader = TreeReader(at: 0, end: bytes.len())
+    let Some(listed) = mut reader.record_field(bytes, fields: 1, key: "nodes", alloc) else {
+        return None
+    }
+    var nodes_reader = listed
+    let Some(total) = mut nodes_reader.unsigned(bytes) else {
+        return None
+    }
+    var nodes = mem::List[mem::wire::SchemaNode].empty(alloc)
+    var index: u64 = 0
+    while index < total {
+        let Some(node) = mut nodes_reader.node(bytes, alloc) else {
+            return None
+        }
+        mut nodes.push(take node)
+        index += 1
+    }
+    if not nodes_reader.done() or not reader.done() {
+        return None
+    }
+    return Some(mem::wire::Schema(nodes: take nodes))
+} read_schema
+
+/// The bytes of an encoding left to read: from `at` up to `end`.
+struct TreeReader derives Copy {
+    at: usize
+    end: usize
+} TreeReader
+
+fn TreeReader.done(self) -> bool = self.at == self.end
+
+/// The reader of the bytes a chunk read from these bytes holds.
+fn TreeReader.inner(self, chunk: artefact::Chunk) -> TreeReader = TreeReader(at: chunk.start, end: chunk.next)
+
+fn TreeReader.unsigned(mut self, bytes: Slice[u8]) -> Option[u64] {
+    let Some(read) = artefact::read_uvar(bytes, at: self.at) else {
+        return None
+    }
+    if read.next > self.end {
+        return None
+    }
+    let Some(value) = read.value.to_u64() else {
+        return None
+    }
+    self.at = read.next
+    return Some(value)
+} TreeReader.unsigned
+
+/// The next bytes, whose length a uvar before them gives.
+fn TreeReader.chunk(mut self, bytes: Slice[u8]) -> Option[artefact::Chunk] {
+    let Some(chunk) = artefact::read_bytes(bytes, at: self.at) else {
+        return None
+    }
+    if chunk.next > self.end {
+        return None
+    }
+    self.at = chunk.next
+    return Some(chunk)
+} TreeReader.chunk
+
+fn TreeReader.flag(mut self, bytes: Slice[u8]) -> Option[bool] {
+    if self.at >= self.end {
+        return None
+    }
+    let byte = bytes[self.at]
+    if byte > 1 {
+        return None
+    }
+    self.at += 1
+    return Some(byte == 1)
+} TreeReader.flag
+
+fn TreeReader.text(mut self, bytes: Slice[u8], alloc: mem::Alloc) -> Option[text::String] {
+    let Some(chunk) = mut self.chunk(bytes) else {
+        return None
+    }
+    let Ok(written) = attempt text::String.try_from_utf8(chunk.copy(bytes, alloc).view(), alloc) else {
+        return None
+    }
+    return Some(take written)
+} TreeReader.text
+
+fn TreeReader.texts(mut self, bytes: Slice[u8], alloc: mem::Alloc) -> Option[mem::List[text::String]] {
+    let Some(total) = mut self.unsigned(bytes) else {
+        return None
+    }
+    var texts = mem::List[text::String].empty(alloc)
+    var index: u64 = 0
+    while index < total {
+        let Some(written) = mut self.text(bytes, alloc) else {
+            return None
+        }
+        mut texts.push(take written)
+        index += 1
+    }
+    return Some(take texts)
+} TreeReader.texts
+
+/// The reader of the value of the next record field, when its key is `key`.
+fn TreeReader.field(mut self, bytes: Slice[u8], key: Str, alloc: mem::Alloc) -> Option[TreeReader] {
+    let Some(written) = mut self.text(bytes, alloc) else {
+        return None
+    }
+    if written.as_str() != key {
+        return None
+    }
+    let Some(value) = mut self.chunk(bytes) else {
+        return None
+    }
+    return Some(self.inner(value))
+} TreeReader.field
+
+/// The reader of the value of the first field of a record of `fields` fields, when its key is
+/// `key`.
+fn TreeReader.record_field(mut self, bytes: Slice[u8], fields: u64, key: Str, alloc: mem::Alloc) -> Option[TreeReader] {
+    let Some(count) = mut self.unsigned(bytes) else {
+        return None
+    }
+    if count != fields {
+        return None
+    }
+    return mut self.field(bytes, key, alloc)
+} TreeReader.record_field
+
+/// The unsigned a field of a key holds whole.
+fn TreeReader.whole_unsigned(mut self, bytes: Slice[u8], key: Str, alloc: mem::Alloc) -> Option[u64] {
+    let Some(value) = mut self.field(bytes, key, alloc) else {
+        return None
+    }
+    var held = value
+    let Some(read) = mut held.unsigned(bytes) else {
+        return None
+    }
+    if not held.done() {
+        return None
+    }
+    return Some(read)
+} TreeReader.whole_unsigned
+
+fn TreeReader.whole_index(mut self, bytes: Slice[u8], key: Str, alloc: mem::Alloc) -> Option[usize] {
+    let Some(value) = mut self.whole_unsigned(bytes, key, alloc) else {
+        return None
+    }
+    return Some(usize.widen(value))
+} TreeReader.whole_index
+
+fn TreeReader.whole_flag(mut self, bytes: Slice[u8], key: Str, alloc: mem::Alloc) -> Option[bool] {
+    let Some(value) = mut self.field(bytes, key, alloc) else {
+        return None
+    }
+    var held = value
+    let Some(read) = mut held.flag(bytes) else {
+        return None
+    }
+    if not held.done() {
+        return None
+    }
+    return Some(read)
+} TreeReader.whole_flag
+
+fn TreeReader.whole_text(mut self, bytes: Slice[u8], key: Str, alloc: mem::Alloc) -> Option[text::String] {
+    let Some(value) = mut self.field(bytes, key, alloc) else {
+        return None
+    }
+    var held = value
+    let Some(read) = mut held.text(bytes, alloc) else {
+        return None
+    }
+    if not held.done() {
+        return None
+    }
+    return Some(take read)
+} TreeReader.whole_text
+
+/// An `Option[u64]` or `Option[usize]` a field of a key holds whole; the outer option is none
+/// when it does not hold one.
+fn TreeReader.whole_option(mut self, bytes: Slice[u8], key: Str, alloc: mem::Alloc) -> Option[Option[u64]] {
+    let Some(value) = mut self.field(bytes, key, alloc) else {
+        return None
+    }
+    var held = value
+    let Some(name) = mut held.text(bytes, alloc) else {
+        return None
+    }
+    let Some(has_payload) = mut held.flag(bytes) else {
+        return None
+    }
+    if name.as_str() == "None" and not has_payload and held.done() {
+        return Some(None)
+    }
+    if name.as_str() != "Some" or not has_payload {
+        return None
+    }
+    let Some(chunk) = mut held.chunk(bytes) else {
+        return None
+    }
+    var payload = held.inner(chunk)
+    let Some(read) = mut payload.unsigned(bytes) else {
+        return None
+    }
+    if not payload.done() or not held.done() {
+        return None
+    }
+    return Some(Some(read))
+} TreeReader.whole_option
+
+/// The next `mem::wire::SchemaNode`.
+fn TreeReader.node(mut self, bytes: Slice[u8], alloc: mem::Alloc) -> Option[mem::wire::SchemaNode] {
+    let Some(name) = mut self.text(bytes, alloc) else {
+        return None
+    }
+    let Some(has_payload) = mut self.flag(bytes) else {
+        return None
+    }
+    if not has_payload {
+        return match name.as_str() {
+            "Bool" => Some(mem::wire::SchemaNode.Bool)
+            "Char" => Some(mem::wire::SchemaNode.Char)
+            "Text" => Some(mem::wire::SchemaNode.Text)
+            "Bytes" => Some(mem::wire::SchemaNode.Bytes)
+            else => None
+        }
+    }
+    let Some(chunk) = mut self.chunk(bytes) else {
+        return None
+    }
+    var payload = self.inner(chunk)
+    let Some(node) = mut payload.node_fields(bytes, name: name.as_str(), alloc) else {
+        return None
+    }
+    if not payload.done() {
+        return None
+    }
+    return Some(take node)
+} TreeReader.node
+
+/// The node of a variant key whose payload is the record these bytes hold.
+fn TreeReader.node_fields(mut self, bytes: Slice[u8], name: Str, alloc: mem::Alloc) -> Option[mem::wire::SchemaNode] {
+    let Some(count) = mut self.unsigned(bytes) else {
+        return None
+    }
+    if count == 1 {
+        return mut self.measured_node(bytes, name, alloc)
+    }
+    if name == "Sequence" and count == 4 {
+        let Some(capacity) = mut self.whole_option(bytes, key: "capacity", alloc) else {
+            return None
+        }
+        let Some(element) = mut self.whole_index(bytes, key: "element", alloc) else {
+            return None
+        }
+        let Some(length) = mut self.whole_option(bytes, key: "length", alloc) else {
+            return None
+        }
+        let Some(unique) = mut self.whole_flag(bytes, key: "unique", alloc) else {
+            return None
+        }
+        return Some(mem::wire::SchemaNode.Sequence(element: element, length: length, capacity: capacity, unique: unique))
+    }
+    if count != 2 {
+        return None
+    }
+    if name == "Map" {
+        let Some(key) = mut self.whole_index(bytes, key: "key", alloc) else {
+            return None
+        }
+        let Some(value) = mut self.whole_index(bytes, key: "value", alloc) else {
+            return None
+        }
+        return Some(mem::wire::SchemaNode.Map(key: key, value: value))
+    }
+    if name == "Record" {
+        let Some(listed) = mut self.field(bytes, key: "fields", alloc) else {
+            return None
+        }
+        var fields_reader = listed
+        let Some(fields) = mut fields_reader.schema_fields(bytes, alloc) else {
+            return None
+        }
+        let Some(open) = mut self.whole_flag(bytes, key: "open", alloc) else {
+            return None
+        }
+        return Some(mem::wire::SchemaNode.Record(open: open, fields: take fields))
+    }
+    if name == "Variant" {
+        let Some(open) = mut self.whole_flag(bytes, key: "open", alloc) else {
+            return None
+        }
+        let Some(listed) = mut self.field(bytes, key: "variants", alloc) else {
+            return None
+        }
+        var variants_reader = listed
+        let Some(variants) = mut variants_reader.schema_variants(bytes, alloc) else {
+            return None
+        }
+        return Some(mem::wire::SchemaNode.Variant(open: open, variants: take variants))
+    }
+    return None
+} TreeReader.node_fields
+
+/// The node of a variant key whose payload is a record of one number: a width, a capacity or a
+/// depth.
+fn TreeReader.measured_node(mut self, bytes: Slice[u8], name: Str, alloc: mem::Alloc) -> Option[mem::wire::SchemaNode] {
+    let key = match name {
+        "BoundedText" => "capacity"
+        "Back" => "depth"
+        else => "width"
+    }
+    let Some(read) = mut self.whole_unsigned(bytes, key, alloc) else {
+        return None
+    }
+    if name == "BoundedText" {
+        return Some(mem::wire::SchemaNode.BoundedText(capacity: read))
+    }
+    if name == "Back" {
+        return Some(mem::wire::SchemaNode.Back(depth: read))
+    }
+    let Some(width) = u8.checked_fit(read) else {
+        return None
+    }
+    return match name {
+        "Unsigned" => Some(mem::wire::SchemaNode.Unsigned(width: width))
+        "Signed" => Some(mem::wire::SchemaNode.Signed(width: width))
+        "Float" => Some(mem::wire::SchemaNode.Float(width: width))
+        else => None
+    }
+} TreeReader.measured_node
+
+/// The fields of a `Record` node, all these bytes hold.
+fn TreeReader.schema_fields(mut self, bytes: Slice[u8], alloc: mem::Alloc) -> Option[mem::List[mem::wire::SchemaField]] {
+    let Some(total) = mut self.unsigned(bytes) else {
+        return None
+    }
+    var fields = mem::List[mem::wire::SchemaField].empty(alloc)
+    var index: u64 = 0
+    while index < total {
+        let Some(aliases) = mut self.record_field(bytes, fields: 4, key: "aliases", alloc) else {
+            return None
+        }
+        var aliases_reader = aliases
+        let Some(texts) = mut aliases_reader.texts(bytes, alloc) else {
+            return None
+        }
+        if not aliases_reader.done() {
+            return None
+        }
+        let Some(defaulted) = mut self.whole_flag(bytes, key: "defaulted", alloc) else {
+            return None
+        }
+        let Some(key) = mut self.whole_text(bytes, key: "key", alloc) else {
+            return None
+        }
+        let Some(value) = mut self.whole_index(bytes, key: "value", alloc) else {
+            return None
+        }
+        mut fields.push(mem::wire::SchemaField(key: take key, aliases: take texts, defaulted: defaulted, value: value))
+        index += 1
+    }
+    if not self.done() {
+        return None
+    }
+    return Some(take fields)
+} TreeReader.schema_fields
+
+/// The variants of a `Variant` node, all these bytes hold.
+fn TreeReader.schema_variants(mut self, bytes: Slice[u8], alloc: mem::Alloc) -> Option[mem::List[mem::wire::SchemaVariant]] {
+    let Some(total) = mut self.unsigned(bytes) else {
+        return None
+    }
+    var variants = mem::List[mem::wire::SchemaVariant].empty(alloc)
+    var index: u64 = 0
+    while index < total {
+        let Some(aliases) = mut self.record_field(bytes, fields: 3, key: "aliases", alloc) else {
+            return None
+        }
+        var aliases_reader = aliases
+        let Some(texts) = mut aliases_reader.texts(bytes, alloc) else {
+            return None
+        }
+        if not aliases_reader.done() {
+            return None
+        }
+        let Some(key) = mut self.whole_text(bytes, key: "key", alloc) else {
+            return None
+        }
+        let Some(written) = mut self.whole_option(bytes, key: "payload", alloc) else {
+            return None
+        }
+        var payload: Option[usize] = None
+        match written {
+            Some(position) => {
+                payload = Some(usize.widen(position))
+            }
+            None => {}
+        }
+        mut variants.push(mem::wire::SchemaVariant(key: take key, aliases: take texts, payload: payload))
+        index += 1
+    }
+    if not self.done() {
+        return None
+    }
+    return Some(take variants)
+} TreeReader.schema_variants

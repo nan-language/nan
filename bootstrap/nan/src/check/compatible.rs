@@ -12,8 +12,8 @@ use super::sig::SigKind;
 use super::synthetic::{self, Synthetic};
 use super::ty::Ty;
 use super::{Checker, check_targets, checked};
-use crate::hash::Hash;
 use crate::machine::api::{Accepted, Entry};
+use crate::machine::history::Recorded;
 use crate::store::{self, Class};
 use crate::workspace::Workspace;
 
@@ -291,9 +291,9 @@ pub fn encode_class(workspace: &Workspace, index: usize, parent: Option<&store::
     class
 }
 
-/// The schema hash of each type whose schema tree the code root of the workspace package at
-/// `index` records, with its module's and its own name, as its history records them.
-pub fn schema_records(workspace: &Workspace, index: usize) -> Vec<(String, String, Hash)> {
+/// The schema of each type whose schema tree the code root of the workspace package at `index`
+/// records, with its module's name, as its history records them.
+pub fn schema_records(workspace: &Workspace, index: usize) -> Vec<(String, Recorded)> {
     let package = &workspace.packages[index];
     let (Some(closure), Some(&target)) = (
         workspace.closure_of(package),
@@ -313,8 +313,13 @@ pub fn schema_records(workspace: &Workspace, index: usize) -> Vec<(String, Strin
                 return None;
             };
             let module = checker.db.module(checker.db.module_of(item)).name.clone();
-            let name = checker.db.ast(item).name()?;
-            Some((module, name, checker.schema(&ty).hash()))
+            let tree = checker.schema(&ty);
+            let recorded = Recorded {
+                ty: checker.db.ast(item).name()?,
+                hash: tree.hash(),
+                tree: tree.wire(),
+            };
+            Some((module, recorded))
         })
         .collect()
 }

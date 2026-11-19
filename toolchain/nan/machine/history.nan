@@ -1,4 +1,4 @@
-//! The history `.nan/history.nan`: a package's store name, its history head, and by module the schema hashes its releases recorded and the tombstones publishing moved out of its source.
+//! The history `.nan/history.nan`: a package's store name, its history head, and by module the schemas its releases recorded and the tombstones publishing moved out of its source.
 
 pkg struct History derives Eq {
     pkg name: text::String
@@ -8,27 +8,46 @@ pkg struct History derives Eq {
     pkg modules: mem::List[HistoryModule]
 } History
 
-/// What a history holds of a module: each type's name with a schema hash its releases
-/// recorded, in byte order of name and then of hash, and the tombstones, as their canonical
-/// format writes them, in byte order of text.
+/// What a history holds of a module: the schemas its releases recorded, in byte order of type
+/// name and then of hash, and the tombstones, as their canonical format writes them, in byte
+/// order of text.
 pkg struct HistoryModule derives Eq {
     pkg module: text::String
     pkg schemas: mem::List[TypeSchema]
     pkg tombstones: mem::List[text::String]
 } HistoryModule
 
-/// A type's name with a schema hash.
+/// A schema a release recorded for a type: the type's name, the schema hash and the checksummed
+/// base32 of the `mem::wire` encoding of the schema tree it hashes.
 pkg struct TypeSchema derives Eq, Ord {
     pkg ty: text::String
     pkg hash: hashing::HashValue
+    pkg tree: text::String
 } TypeSchema
 
-/// The schema hash of a type of a module.
+/// The schema of a type of a module.
 pkg struct SchemaRecord {
     pkg module: text::String
-    pkg ty: text::String
-    pkg hash: hashing::HashValue
+    pkg schema: TypeSchema
 } SchemaRecord
+
+/// A copy of a schema drawn through `alloc`.
+pkg fn TypeSchema.copy(self, alloc: mem::Alloc) -> TypeSchema {
+    return TypeSchema(ty: text::String.of(self.ty.as_str(), alloc), hash: self.hash, tree: text::String.of(self.tree.as_str(), alloc))
+} TypeSchema.copy
+
+/// The `mem::wire` encoding of the schema tree.
+pkg fn TypeSchema.tree_bytes(self, alloc: mem::Alloc) -> Option[mem::Bytes] {
+    return tree_bytes(self.tree.as_str(), alloc)
+} TypeSchema.tree_bytes
+
+/// The bytes a checksummed base32 text holds, of the length its characters give.
+fn tree_bytes(written: Str, alloc: mem::Alloc) -> Option[mem::Bytes] {
+    if written.byte_len() < 2 {
+        return None
+    }
+    return hashing::read_checksummed_base32(written, length: (written.byte_len() - 2) * 5 / 8, alloc)
+} tree_bytes
 
 /// Whether it holds a schema record or a tombstone.
 pkg fn HistoryModule.holds(self) -> bool = self.schemas.len() > 0 or self.tombstones.len() > 0
@@ -49,6 +68,8 @@ pkg fn History.bytes(self, grammar: syntax::Grammar, alloc: mem::Alloc) -> Optio
             var line = keyed("schema", value: schema.ty.as_str(), alloc)
             mut line.push(' ')
             mut line.append(escaped(schema.hash.full(alloc).as_str(), grammar, alloc).as_str())
+            mut line.push(' ')
+            mut line.append(escaped(schema.tree.as_str(), grammar, alloc).as_str())
             mut lines.push(take line)
         }
         for tombstone in held.tombstones {
@@ -141,8 +162,17 @@ fn History.held_record(mut self, record: Record, alloc: mem::Alloc) -> Option[In
         let Some(hash) = hash_of(written.as_str(), alloc) else {
             return Some(invalid)
         }
+        let Some(tree) = mut cursor.text() else {
+            return Some(invalid)
+        }
+        let Some(bytes) = tree_bytes(tree.as_str(), alloc) else {
+            return Some(invalid)
+        }
+        if hashing::HashValue.of(bytes.view()) != hash {
+            return Some(invalid)
+        }
         let last_module = self.modules[count - 1]
-        let schema_entry = TypeSchema(ty: take ty, hash: hash)
+        let schema_entry = TypeSchema(ty: take ty, hash: hash, tree: take tree)
         var ordered = last_module.tombstones.len() == 0
         if last_module.schemas.len() > 0 {
             ordered = ordered and last_module.schemas[last_module.schemas.len() - 1] < schema_entry
@@ -166,16 +196,16 @@ fn History.held_record(mut self, record: Record, alloc: mem::Alloc) -> Option[In
     return None
 } History.held_record
 
-/// The schema hashes the history records for a type of a module.
-pkg fn History.schemas(self, module: Str, ty: Str, alloc: mem::Alloc) -> mem::List[hashing::HashValue] {
-    var found = mem::List[hashing::HashValue].empty(alloc)
+/// The schemas the history records for a type of a module.
+pkg fn History.schemas(self, module: Str, ty: Str, alloc: mem::Alloc) -> mem::List[TypeSchema] {
+    var found = mem::List[TypeSchema].empty(alloc)
     for held in self.modules {
         if held.module.as_str() != module {
             continue
         }
         for schema in held.schemas {
             if schema.ty.as_str() == ty {
-                mut found.push(schema.hash)
+                mut found.push(schema.copy(alloc))
             }
         }
     }

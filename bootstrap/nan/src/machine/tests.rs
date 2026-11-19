@@ -1,5 +1,5 @@
 use super::api::{AcceptedTest, ClosureEntry, Doc, DocKey, Entry, Method, Seal, Snapshot};
-use super::history::{History, Module};
+use super::history::{History, Module, Recorded};
 use super::lock::{Entry as Approved, Lock, Locked};
 use super::passes::{Pass, Passes};
 use super::principals::Principals;
@@ -134,7 +134,11 @@ fn a_history_reads_back_as_written() {
         head: Some(Hash::of(b"head")),
         modules: vec![Module {
             name: "meter".to_owned(),
-            schemas: vec![("Counter".to_owned(), Hash::of(b"schema"))],
+            schemas: vec![Recorded {
+                ty: "Counter".to_owned(),
+                hash: Hash::of(b"tree"),
+                tree: b"tree".to_vec(),
+            }],
             tombstones: vec![
                 "retired Counter.bump(mut self) => mut self.record() changes \"saturates\""
                     .to_owned(),

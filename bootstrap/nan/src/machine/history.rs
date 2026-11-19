@@ -1,8 +1,8 @@
 //! The history `.nan/history.nan`: a package's store name, its history head, and by module the
-//! schema hashes its releases recorded and the tombstones publishing moved out of its source.
+//! schemas its releases recorded and the tombstones publishing moved out of its source.
 
 use super::{Cursor, Invalid, Kind, escaped, read, write};
-use crate::hash::Hash;
+use crate::hash::{Hash, checksummed_base32, read_checksummed_base32};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct History {
@@ -16,11 +16,19 @@ pub struct History {
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Module {
     pub name: String,
-    /// Each type's name with a schema hash its releases recorded, in byte order of name and
-    /// then of hash.
-    pub schemas: Vec<(String, Hash)>,
+    /// The schemas its releases recorded, in byte order of type name and then of hash.
+    pub schemas: Vec<Recorded>,
     /// The tombstones, as their canonical format writes them, in byte order of text.
     pub tombstones: Vec<String>,
+}
+
+/// A schema a release recorded for a type: the type's name, the schema hash and the `mem::wire`
+/// encoding of the schema tree it hashes.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Recorded {
+    pub ty: String,
+    pub hash: Hash,
+    pub tree: Vec<u8>,
 }
 
 impl Module {
@@ -38,12 +46,10 @@ impl History {
         );
         for module in self.modules.iter().filter(|module| module.holds()) {
             lines.push(format!("module {}", module.name));
-            lines.extend(
-                module
-                    .schemas
-                    .iter()
-                    .map(|(ty, hash)| format!("schema {ty} {}", escaped(&hash.full()))),
-            );
+            lines.extend(module.schemas.iter().map(|Recorded { ty, hash, tree }| {
+                let tree = checksummed_base32(tree);
+                format!("schema {ty} {} {}", escaped(&hash.full()), escaped(&tree))
+            }));
             lines.extend(module.tombstones.iter().cloned());
         }
         write(Kind::History, &lines)
@@ -99,11 +105,20 @@ impl History {
             if cursor.takes("schema") {
                 let ty = cursor.word();
                 let hash = cursor.text().and_then(super::hash_of);
+                let tree = cursor.text().and_then(|text| {
+                    read_checksummed_base32(text, text.len().saturating_sub(2) * 5 / 8)
+                });
                 let schema = ty
                     .zip(hash)
-                    .map(|(ty, hash)| (ty.to_owned(), hash))
+                    .zip(tree)
+                    .map(|((ty, hash), tree)| Recorded {
+                        ty: ty.to_owned(),
+                        hash,
+                        tree,
+                    })
                     .filter(|schema| {
-                        cursor.done()
+                        Hash::of(&schema.tree) == schema.hash
+                            && cursor.done()
                             && module.tombstones.is_empty()
                             && module.schemas.last().is_none_or(|last| last < schema)
                     })
@@ -127,14 +142,12 @@ impl History {
         parsed.checked(history)
     }
 
-    /// The schema hashes the history records for a type of a module.
-    pub fn schemas(&self, module: &str, ty: &str) -> Vec<Hash> {
+    /// The schemas the history records for a type of a module.
+    pub fn schemas<'a>(&'a self, module: &str, ty: &str) -> impl Iterator<Item = &'a Recorded> {
         self.modules
             .iter()
-            .filter(|held| held.name == module)
+            .filter(move |held| held.name == module)
             .flat_map(|held| &held.schemas)
-            .filter(|(name, _)| name == ty)
-            .map(|(_, hash)| *hash)
-            .collect()
+            .filter(move |schema| schema.ty == ty)
     }
 }

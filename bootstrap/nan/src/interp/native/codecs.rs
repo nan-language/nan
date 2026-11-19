@@ -246,8 +246,9 @@ fn hash_value(interp: &Interpreter, value: &Val) -> Hash {
     Hash(hash)
 }
 
-/// How values of a type convert from or to the schema hash `wanted`: as themselves, through a
-/// forward migration or an inverse with its frozen shape, or not at all.
+/// How values of a type convert from or to the schema hash `wanted`: as themselves, under their
+/// own or, converting from it, an earlier one their tree accepts; through a forward migration or
+/// an inverse with its frozen shape; or not at all.
 fn migrated(
     interp: &Interpreter,
     ty: &Ty,
@@ -257,9 +258,12 @@ fn migrated(
     if interp.ck.schema(ty).hash() == wanted {
         return Some(None);
     }
-    let Ty::Item(item, _) = ty else {
+    let Ty::Item(item, args) = ty else {
         return None;
     };
+    if forward && args.is_empty() && interp.ck.accepted_schemas(*item).contains(&wanted) {
+        return Some(None);
+    }
     interp
         .ck
         .migrations(*item)

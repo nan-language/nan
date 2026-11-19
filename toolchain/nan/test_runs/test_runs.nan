@@ -1,4 +1,4 @@
-//! Test runs: the tests a scope selects, the test image holding each package's tests for each run target, lowered by a checker of that target, each run as a process of that image or a boot of the emulator on it, the failure each failing test reports, and the pass record each passing test leaves in the build cache.
+//! Test runs: the tests a scope selects, the test image holding each package's tests for each run target, lowered by a checker of that target, each run as a process of that image or a boot of the emulator on it, the failure each failing test reports, the pass record each passing test leaves in the build cache, and the recorded passes standing for the runs of a target the machine cannot run.
 
 /// The most runs of a test without parameters: schedules 0 to 63.
 const SCHEDULES: u64 = 64
@@ -20,17 +20,27 @@ pkg struct Failure {
     pkg lines: mem::List[text::String]
 } Failure
 
-/// What the runs of a scope's tests found: how many tests ran on a run target, the failures, and
-/// what building their test images reports.
+/// What the runs of a scope's tests found: how many tests ran on a run target, the failures, what
+/// building their test images reports, and each test whose every run passed.
 pkg struct Report {
     pkg tests: usize
     pkg failures: mem::List[Failure]
     pkg diagnostics: mem::List[diagnostic::Diagnostic]
+    pkg passed: mem::List[Passed]
 } Report
+
+/// A test whose every run on a run target passed: the directory of its package, its canonical
+/// path, the run target and the hash of its reach.
+pkg struct Passed {
+    pkg dir: text::String
+    pkg test_path: text::String
+    pkg target: workspace::Target
+    pkg reach: hashing::HashValue
+} Passed
 
 /// The report of no run.
 pkg fn Report.empty(alloc: mem::Alloc) -> Report {
-    return Report(tests: 0, failures: mem::List[Failure].empty(alloc), diagnostics: mem::List[diagnostic::Diagnostic].empty(alloc))
+    return Report(tests: 0, failures: mem::List[Failure].empty(alloc), diagnostics: mem::List[diagnostic::Diagnostic].empty(alloc), passed: mem::List[Passed].empty(alloc))
 } Report.empty
 
 /// A test selected to run: its item, its target and whether it is a property test.
@@ -368,7 +378,8 @@ fn kept_tests(checker: check::Checker, hashes: ItemHashes, package_id: ty::Packa
                     Ok(found) => found
                     Err(exposed) => return Err(take exposed)
                 }
-                let Some(passed) = pass_record(checker, hashes, test_item: selected_test.item, alloc) else {
+                let reach = reach_of(checker, hashes, test_item: selected_test.item, alloc)
+                let Some(passed) = pass_record(checker, reach: reach.view(), alloc) else {
                     mut kept.push(take selected_test)
                     continue
                 }
@@ -461,28 +472,54 @@ struct Reached {
 } Reached
 
 /// The record of a test passing on a checker's target: the toolchain hash, the target's name,
-/// then the canonical path and item hash of each item of the test's reach, in path order; none
-/// when the toolchain hash cannot be known.
-fn pass_record(checker: check::Checker, hashes: ItemHashes, test_item: ty::ItemId, alloc: mem::Alloc) -> Option[mem::Bytes] {
+/// then the encoding of the test's reach; none when the toolchain hash cannot be known.
+fn pass_record(checker: check::Checker, reach: Slice[u8], alloc: mem::Alloc) -> Option[mem::Bytes] {
     let db = checker.db()
     let Some(tree) = db.session.toolchain_tree() else {
         return None
     }
+    var record = mem::Bytes.empty(alloc)
+    encoding::bytes(mut record, value: toolchain::hash(1, tree, alloc).bytes.view())
+    encoding::bytes(mut record, value: db.target.name().as_bytes())
+    mut record.append(reach)
+    return Some(take record)
+} pass_record
+
+/// The encoding of a test's reach on a checker's target: the list of the canonical path and item
+/// hash of each of its items, in path order.
+fn reach_of(checker: check::Checker, hashes: ItemHashes, test_item: ty::ItemId, alloc: mem::Alloc) -> mem::Bytes {
+    let db = checker.db()
     var reach = mem::List[Reached].empty(alloc)
     for item in checker.test_reach(test_item) {
         mut reach.push(Reached(path: db.canonical(item), hash: hashes.item(checker, item)))
     }
     mut reach.sort_by(fn(left: Reached, right: Reached) => reached_order(left, right))
-    var record = mem::Bytes.empty(alloc)
-    encoding::bytes(mut record, value: toolchain::hash(1, tree, alloc).bytes.view())
-    encoding::bytes(mut record, value: db.target.name().as_bytes())
-    encoding::uvar(mut record, value: u64.widen(reach.len()))
+    var encoded = mem::Bytes.empty(alloc)
+    encoding::uvar(mut encoded, value: u64.widen(reach.len()))
     for reached in reach {
-        encoding::bytes(mut record, value: reached.path.as_bytes())
-        encoding::bytes(mut record, value: reached.hash.bytes.view())
+        encoding::bytes(mut encoded, value: reached.path.as_bytes())
+        encoding::bytes(mut encoded, value: reached.hash.bytes.view())
     }
-    return Some(take record)
-} pass_record
+    return encoded
+} reach_of
+
+/// Whether the passes file of a test's package holds a current pass of it on a checker's target.
+fn recorded(checker: check::Checker, hashes: ItemHashes, test_item: ty::ItemId, alloc: mem::Alloc) -> bool {
+    let db = checker.db()
+    let source = db.source(db.package_of(test_item))
+    let Some(passes) = source.machine.passes() else {
+        return false
+    }
+    let path = db.canonical(test_item)
+    let reach = hashing::HashValue.of(reach_of(checker, hashes, test_item, alloc).view())
+    let principals = source.machine.principals(alloc)
+    for pass in passes.passes {
+        if pass.test_path.as_str() == path.as_str() and pass.target.as_str() == db.target.name() and pass.current(reach, principals, alloc) {
+            return true
+        }
+    }
+    return false
+} recorded
 
 /// The order of reached items by canonical path, then item hash.
 fn reached_order(left: Reached, right: Reached) -> core::Ordering {
@@ -613,8 +650,10 @@ fn run_targets(source: workspace::Package, alloc: mem::Alloc) -> mem::List[works
 } run_targets
 
 /// Runs a package's tests on a checker's target, each run a process of the package's test image
-/// or a boot of the emulator on it, and records in the cache each test whose every run passes,
-/// unless replaying; every run fails on a target whose images cannot run on this machine.
+/// or a boot of the emulator on it, and records in the cache and the report each test whose every
+/// run passes, unless replaying; on a target whose images cannot run on this machine, a test passes
+/// when its package's passes file holds a current pass of it, unless replaying, and every run of
+/// another fails.
 fn run_package(session: check::Session, checker: check::Checker, hashes: ItemHashes, package_id: ty::PackageId, tests: Slice[Selected], runs: Runs, user_cache: cache::Cache, mut report: Report) fails platform::IoError {
     let alloc = session.alloc
     if tests.len() == 0 {
@@ -622,8 +661,14 @@ fn run_package(session: check::Session, checker: check::Checker, hashes: ItemHas
     }
     let target = checker.db().target
     if not emulator::available(target, alloc) {
+        let replaying = match runs {
+            Runs.Replay(_) => true
+            else => false
+        }
         for selected_test in tests {
-            mut report.failures.push(failure(checker, item: selected_test.item, cause: "test.emulator-unavailable", lines: mem::List[text::String].empty(alloc)))
+            if replaying or not recorded(checker, hashes, test_item: selected_test.item, alloc) {
+                mut report.failures.push(failure(checker, item: selected_test.item, cause: "test.emulator-unavailable", lines: mem::List[text::String].empty(alloc)))
+            }
         }
         return
     }
@@ -642,7 +687,8 @@ fn run_package(session: check::Session, checker: check::Checker, hashes: ItemHas
 } run_package
 
 /// Runs the runs of the numbered test of a test image, the first failing one recording the test's
-/// failure, and records the test's passes in the cache when none fails, unless replaying.
+/// failure, and records the test's passes in the report and the cache when none fails, unless
+/// replaying.
 fn run_test_runs(checker: check::Checker, hashes: ItemHashes, test_image: Image, number: usize, selected_test: Selected, runs: Runs, user_cache: cache::Cache, mut report: Report) fails platform::IoError {
     let db = checker.db()
     let alloc = checker.alloc()
@@ -682,8 +728,11 @@ fn run_test_runs(checker: check::Checker, hashes: ItemHashes, test_image: Image,
         else => false
     }
     if report.failures.len() == failures and not replaying {
+        let reach = reach_of(checker, hashes, test_item: selected_test.item, alloc)
+        let dir = text::String.of(db.source(db.package_of(selected_test.item)).dir.as_str(), alloc)
+        mut report.passed.push(Passed(dir: take dir, test_path: take path, target: target, reach: hashing::HashValue.of(reach.view())))
         let name = record_name(checker, test_item: selected_test.item, alloc)
-        let Some(passed) = pass_record(checker, hashes, test_item: selected_test.item, alloc) else {
+        let Some(passed) = pass_record(checker, reach: reach.view(), alloc) else {
             return
         }
         try user_cache.replace(name.as_str(), contents: passed.view())

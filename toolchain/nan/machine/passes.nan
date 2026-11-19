@@ -1,0 +1,150 @@
+//! The passes file `.nan/passes.nan`: the passes of a package's tests that principals recorded on run targets, each signed when the package's principals file gives its principal a key.
+
+pkg struct Pass derives Eq {
+    pkg test_path: text::String
+    pkg target: text::String
+    pkg principal: text::String
+    pkg reach: hashing::HashValue
+    pkg signature: Option[core::crypto::Signature]
+} Pass
+
+pkg struct Passes derives Eq {
+    /// In byte order of test, then of run target, then of principal.
+    pkg passes: mem::List[Pass]
+} Passes
+
+pkg fn Passes.empty(alloc: mem::Alloc) -> Passes = Passes(passes: mem::List[Pass].empty(alloc))
+
+pkg fn Passes.copy(self, alloc: mem::Alloc) -> Passes {
+    var passes = mem::List[Pass].empty(alloc)
+    for pass in self.passes {
+        mut passes.push(Pass(test_path: text::String.of(pass.test_path.as_str(), alloc), target: text::String.of(pass.target.as_str(), alloc), principal: text::String.of(pass.principal.as_str(), alloc), reach: pass.reach, signature: pass.signature))
+    }
+    return Passes(passes: take passes)
+} Passes.copy
+
+/// Whether the pass records a reach hash of `reach` and, when `principals` gives its principal a
+/// key, holds a signature that verifies by that key, or else holds none.
+pkg fn Pass.current(self, reach: hashing::HashValue, principals: Principals, alloc: mem::Alloc) -> bool {
+    if self.reach != reach {
+        return false
+    }
+    return match principals.key(self.principal.as_str()) {
+        Some(key) => match self.signature {
+            Some(signature) => key.verify(sign::pass_message(self.principal.as_str(), test_path: self.test_path.as_str(), target: self.target.as_str(), reach: self.reach, alloc).as_bytes(), signature)
+            None => false
+        }
+        None => self.signature.is_none()
+    }
+} Pass.current
+
+/// The order of two passes by the key a file orders and replaces them by: the test, the run
+/// target and the principal.
+fn Pass.order(self, other: Pass) -> core::Ordering {
+    let by_test = self.test_path.as_str().cmp(other.test_path.as_str())
+    if by_test != core::Ordering.Equal {
+        return by_test
+    }
+    let by_target = self.target.as_str().cmp(other.target.as_str())
+    if by_target != core::Ordering.Equal {
+        return by_target
+    }
+    return self.principal.as_str().cmp(other.principal.as_str())
+} Pass.order
+
+/// Records `pass` in place of the pass of the same key the file held.
+pkg fn Passes.record(mut self, take pass: Pass) {
+    mut self.passes.retain(fn(held: Pass) => held.order(pass) != core::Ordering.Equal)
+    var at: usize = 0
+    while at < self.passes.len() and self.passes[at].order(pass) == core::Ordering.Less {
+        at += 1
+    }
+    mut self.passes.insert(at, value: take pass)
+} Passes.record
+
+pkg fn Passes.bytes(self, grammar: syntax::Grammar, alloc: mem::Alloc) -> Option[mem::Bytes] {
+    var lines = mem::List[text::String].empty(alloc)
+    for pass in self.passes {
+        var line = keyed("pass", value: escaped(pass.test_path.as_str(), grammar, alloc).as_str(), alloc)
+        mut line.push(' ')
+        mut line.append(pass.target.as_str())
+        mut line.push(' ')
+        mut line.append(escaped(pass.principal.as_str(), grammar, alloc).as_str())
+        mut line.push(' ')
+        mut line.append(escaped(pass.reach.full(alloc).as_str(), grammar, alloc).as_str())
+        mut lines.push(take line)
+        match pass.signature {
+            Some(signature) => mut lines.push(keyed("signature", value: escaped(sign::signature_form(signature, alloc).as_str(), grammar, alloc).as_str(), alloc))
+            None => {}
+        }
+    }
+    return write(Kind.Passes, lines: lines.view(), alloc)
+} Passes.bytes
+
+pkg fn Passes.read(bytes: Slice[u8], grammar: syntax::Grammar, alloc: mem::Alloc) -> Result[Passes, Invalid] {
+    let parsed = match read(Kind.Passes, bytes, grammar, alloc) {
+        Ok(found) => found
+        Err(invalid) => return Err(invalid)
+    }
+    var passes = Passes.empty(alloc)
+    for record in parsed.records {
+        let invalid = Invalid.at(record.line)
+        var cursor = record.cursor(alloc)
+        let Some(word) = mut cursor.word() else {
+            return Err(invalid)
+        }
+        let read_pass = match word.as_str() {
+            "pass" => mut passes.read_pass(mut cursor, alloc)
+            "signature" => mut passes.read_signature(mut cursor, alloc)
+            else => false
+        }
+        if not read_pass or not cursor.done() {
+            return Err(invalid)
+        }
+    }
+    return parsed.checked(take passes)
+} Passes.read
+
+/// Reads the fields of a `pass` record after its word, giving whether they hold a pass following
+/// the last the file read.
+fn Passes.read_pass(mut self, mut cursor: Cursor, alloc: mem::Alloc) -> bool {
+    let Some(test_path) = mut cursor.text() else {
+        return false
+    }
+    let Some(target) = mut cursor.target() else {
+        return false
+    }
+    let Some(principal) = mut cursor.text() else {
+        return false
+    }
+    let Some(reach) = mut cursor.hash() else {
+        return false
+    }
+    if not is_principal(principal.as_str()) {
+        return false
+    }
+    let pass = Pass(test_path: take test_path, target: take target, principal: take principal, reach: reach, signature: None)
+    let count = self.passes.len()
+    if count > 0 and self.passes[count - 1].order(pass) != core::Ordering.Less {
+        return false
+    }
+    mut self.passes.push(take pass)
+    return true
+} Passes.read_pass
+
+/// Reads the signature of a `signature` record after its word into the last pass the file read,
+/// giving whether that pass held none.
+fn Passes.read_signature(mut self, mut cursor: Cursor, alloc: mem::Alloc) -> bool {
+    let Some(written) = mut cursor.text() else {
+        return false
+    }
+    let Some(signature) = sign::read_signature(written.as_str(), alloc) else {
+        return false
+    }
+    let count = self.passes.len()
+    if count == 0 or self.passes[count - 1].signature.is_some() {
+        return false
+    }
+    self.passes[count - 1].signature = Some(signature)
+    return true
+} Passes.read_signature

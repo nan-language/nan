@@ -169,7 +169,7 @@ pub closed struct Level derives Copy, Eq, Ord, Hash, Default, Render {
 
 ## Machine files
 
-A **machine file** is one of these files of a package, written only by the toolchain: the [lock](29-identity-versioning.md#lock) `.nan/lock.nan`, the [history](29-identity-versioning.md#history) `.nan/history.nan`, the [API snapshot](31-trust.md#api-snapshots) `.nan/api/<module>.nan` of each module that has one, and the [principals file](31-trust.md#principals) `.nan/principals.nan`. A machine file is not a source file.
+A **machine file** is one of these files of a package, written only by the toolchain: the [lock](29-identity-versioning.md#lock) `.nan/lock.nan`, the [history](29-identity-versioning.md#history) `.nan/history.nan`, the [API snapshot](31-trust.md#api-snapshots) `.nan/api/<module>.nan` of each module that has one, the [principals file](31-trust.md#principals) `.nan/principals.nan`, and the [passes file](22-testing.md#recorded-passes) `.nan/passes.nan`. A machine file is not a source file.
 
 ### Common syntax
 
@@ -395,6 +395,17 @@ principal_record = 'principal' TEXT TEXT ;
 ```
 
 Each `principal P K` record gives the principal P the public key whose [key form](31-trust.md#principals) is K, in byte order of P, P being in the principal form.
+
+### Passes file
+
+```ebnf
+passes_file = COL0 'nan' 'passes' INT NL COL0 passes_tail ;
+passes_tail = pass_record NL COL0 passes_tail | check_record NL EOF ;
+pass_record = 'pass' TEXT target TEXT TEXT
+    | 'signature' TEXT ;
+```
+
+Each [pass](22-testing.md#recorded-passes) is a `pass Q T P H` record, Q being the test's canonical path, T the run target, P the principal, in the principal form, and H the reach hash, followed by `signature S` when the pass holds a signature, S being its [signature form](31-trust.md#signatures), in byte order of Q, then of T, then of P.
 
 ## Diagnostics
 

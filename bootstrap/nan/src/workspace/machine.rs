@@ -1,5 +1,5 @@
 //! The machine files of a package as loaded: its lock, its history, the API snapshots of its
-//! modules and its principals file, each with its bytes and what it reads as.
+//! modules, its principals file and its passes file, each with its bytes and what it reads as.
 
 use std::io;
 
@@ -8,6 +8,7 @@ use crate::machine::Invalid;
 use crate::machine::api::Snapshot;
 use crate::machine::history::History;
 use crate::machine::lock::Lock;
+use crate::machine::passes::Passes;
 use crate::machine::principals::Principals;
 
 /// A machine file: its path relative to the workspace root, its bytes, and what it reads as.
@@ -38,6 +39,7 @@ impl<T> Loaded<T> {
 }
 
 static NO_PRINCIPALS: Principals = Principals { keys: Vec::new() };
+static NO_PASSES: Passes = Passes { passes: Vec::new() };
 
 #[derive(Default)]
 pub struct Machine {
@@ -46,6 +48,7 @@ pub struct Machine {
     /// The API snapshots, by the module name their file is named after, in byte order.
     pub snapshots: Vec<(String, Loaded<Snapshot>)>,
     pub principals: Option<Loaded<Principals>>,
+    pub passes: Option<Loaded<Passes>>,
 }
 
 impl Machine {
@@ -68,6 +71,7 @@ impl Machine {
                 "principals.nan" => {
                     machine.principals = Some(Loaded::load(path, source, Principals::read)?);
                 }
+                "passes.nan" => machine.passes = Some(Loaded::load(path, source, Passes::read)?),
                 _ => {
                     let Some(module) = within
                         .strip_prefix("api/")
@@ -106,6 +110,9 @@ impl Machine {
         if let Some(principals) = &self.principals {
             add(&principals.path, principals.read.as_ref().err());
         }
+        if let Some(passes) = &self.passes {
+            add(&passes.path, passes.read.as_ref().err());
+        }
         found
     }
 
@@ -123,6 +130,14 @@ impl Machine {
             .as_ref()
             .and_then(Loaded::valid)
             .unwrap_or(&NO_PRINCIPALS)
+    }
+
+    /// The passes file, empty when the package has none or it is not valid.
+    pub fn passes(&self) -> &Passes {
+        self.passes
+            .as_ref()
+            .and_then(Loaded::valid)
+            .unwrap_or(&NO_PASSES)
     }
 
     /// The valid API snapshot of a module, by its name.
@@ -148,7 +163,14 @@ impl Machine {
             .principals
             .iter()
             .map(|loaded| (&loaded.path, &loaded.bytes));
-        lock.chain(history).chain(snapshots).chain(principals)
+        let passes = self
+            .passes
+            .iter()
+            .map(|loaded| (&loaded.path, &loaded.bytes));
+        lock.chain(history)
+            .chain(snapshots)
+            .chain(principals)
+            .chain(passes)
     }
 
     /// The bytes of a machine file of the package, by path.

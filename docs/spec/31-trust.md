@@ -257,7 +257,7 @@ The first condition reads the git history:
 
 ### Principals
 
-The **principals file** `.nan/principals.nan` of a package is a [machine file](35-format.md#principals-file) giving principals their public keys: the keys whose signatures the package's seals hold, and those of the publishers and sealers of the releases it reads ([sections](30-artefacts.md#sections)). `nan key trust <principal> <key>` gives the principal the key in the principals file of the current directory's package, in place of any other, `tool.usage` outside every package. A **key form** is the checksummed base32 of a public key's 32 bytes, 54 characters.
+The **principals file** `.nan/principals.nan` of a package is a [machine file](35-format.md#principals-file) giving principals their public keys: the keys whose signatures the package's seals and [recorded passes](22-testing.md#recorded-passes) hold, and those of the publishers and sealers of the releases it reads ([sections](30-artefacts.md#sections)). `nan key trust <principal> <key>` gives the principal the key in the principals file of the current directory's package, in place of any other, `tool.usage` outside every package. A **key form** is the checksummed base32 of a public key's 32 bytes, 54 characters.
 
 The **secret key** of a principal is the 32-byte seed the file `keys/<principal>.key` of the [user directory](36-builds.md#cache) holds; a file of another length holds none. `nan key new <principal>` writes a principal's secret key from random bytes and prints `key <principal> <key>` with its public key's key form, and `nan key show <principal>` prints that record for the principal's secret key. Both read and write only the user directory.
 

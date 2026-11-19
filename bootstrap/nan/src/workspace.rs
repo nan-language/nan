@@ -764,7 +764,7 @@ fn history_files(machine: &Machine, modules: &[Module]) -> Vec<File> {
 }
 
 /// The machine files a package's `.nan` directory holds as regular files: its lock, its history,
-/// its API snapshots and its principals file.
+/// its API snapshots, its principals file and its passes file.
 fn machine_files(root: &Path, path: &str, machine: &mut Vec<String>) -> io::Result<()> {
     let is_file =
         |path: &str| fs::symlink_metadata(root.join(path)).is_ok_and(|metadata| metadata.is_file());
@@ -773,7 +773,7 @@ fn machine_files(root: &Path, path: &str, machine: &mut Vec<String>) -> io::Resu
     if !is_dir(path) {
         return Ok(());
     }
-    for name in ["lock.nan", "history.nan", "principals.nan"] {
+    for name in ["lock.nan", "history.nan", "principals.nan", "passes.nan"] {
         let file = format!("{path}/{name}");
         if is_file(&file) {
             machine.push(file);
@@ -812,7 +812,13 @@ fn links_in_machine_dir(
     if !root.join(path).is_dir() {
         return Ok(());
     }
-    for machine in ["lock.nan", "history.nan", "principals.nan", "api"] {
+    for machine in [
+        "lock.nan",
+        "history.nan",
+        "principals.nan",
+        "passes.nan",
+        "api",
+    ] {
         if is_link(&format!("{path}/{machine}")) {
             links.push(format!("{in_package}/{machine}"));
         }

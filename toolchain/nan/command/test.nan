@@ -1,4 +1,4 @@
-//! `nan test`: checks its scope as `nan check` does and, when no diagnostic is an error, runs the tests the scope selects, the affected ones or the run a replay token names, printing a `fail` record per test failing on a run target.
+//! `nan test`: checks its scope as `nan check` does and, when no diagnostic is an error, runs the tests the scope selects, the affected ones or the run a replay token names, printing a `fail` record per test failing on a run target; with `--as`, records each test's passes in its package's passes file, signed when the package's principals file gives the principal a key.
 
 /// `nan test`.
 fn test_run(invocation: Invocation, session: check::Session, current: Str, trace: Trace, alloc: mem::Alloc) -> output::Output fails platform::IoError {
@@ -40,6 +40,9 @@ fn test_run(invocation: Invocation, session: check::Session, current: Str, trace
     trace.scoped(resolved.written.as_str(), alloc)
     var diagnostics = session.reported(resolved.scope)
     fix::offer(session, current, written: scoped, diagnostics: mut diagnostics)
+    if bad_principal(invocation.value("--as")) {
+        mut diagnostics.push(diagnostic::Diagnostic.new(diagnostic::Code.SealBadPrincipal, alloc))
+    }
     var report = test_runs::Report.empty(alloc)
     if diagnostics.position(fn(reported: diagnostic::Diagnostic) => reported.code.class() == diagnostic::Class.Error).is_none() {
         match try ran_tests(session, scope: resolved.scope, runs, alloc) {
@@ -57,6 +60,7 @@ fn test_run(invocation: Invocation, session: check::Session, current: Str, trace
         mut diagnostics.push(take reported)
     }
     report.diagnostics = mem::List[diagnostic::Diagnostic].empty(alloc)
+    let changes = try written_passes(session, principal: invocation.value("--as"), passed: report.passed.view(), diagnostics: mut diagnostics, alloc)
     let sorted = diagnostic::sorted_diagnostics(take diagnostics, alloc)
     var errors: usize = 0
     var incomplete: usize = 0
@@ -74,8 +78,86 @@ fn test_run(invocation: Invocation, session: check::Session, current: Str, trace
     for failed in take fail_records(held, scope: resolved.scope, failures: report.failures.view(), alloc) {
         mut records.push(take failed)
     }
-    return test_output(invocation, written: resolved.written.as_str(), take records, errors, incomplete, report, alloc)
+    return test_output(invocation, written: resolved.written.as_str(), take records, changes: changes.view(), errors, incomplete, report, alloc)
 } test_run
+
+/// Whether a principal is given outside the principal form.
+fn bad_principal(principal: Option[Str]) -> bool {
+    let Some(named) = principal else {
+        return false
+    }
+    return not machine::is_principal(named)
+} bad_principal
+
+/// The passes files `principal`, when given, records the passes `passed` in, written, adding to
+/// `diagnostics` what recording and writing them reports.
+fn written_passes(session: check::Session, principal: Option[Str], passed: Slice[test_runs::Passed], mut diagnostics: mem::List[diagnostic::Diagnostic], alloc: mem::Alloc) -> mem::List[journal::Change] fails platform::IoError {
+    var changes = mem::List[journal::Change].empty(alloc)
+    let Some(named) = principal else {
+        return changes
+    }
+    try record_passes(session, principal: named, passed, changes: mut changes, diagnostics: mut diagnostics, alloc)
+    let invalid = try apply(session.workspace.contents(), mut changes, alloc)
+    for reported in take invalid {
+        mut diagnostics.push(take reported)
+    }
+    return changes
+} written_passes
+
+/// Adds to `changes` the passes file of each package holding a test that passed, recording its
+/// passes by `principal`, signed by the principal's secret key when the package's principals file
+/// gives the principal a key, leaving out a file left unchanged and adding to `diagnostics` the
+/// diagnostic of a key the user directory lacks in place of the file.
+fn record_passes(session: check::Session, principal: Str, passed: Slice[test_runs::Passed], mut changes: mem::List[journal::Change], mut diagnostics: mem::List[diagnostic::Diagnostic], alloc: mem::Alloc) fails platform::IoError {
+    let held = session.workspace.contents()
+    let grammar = session.grammar.contents()
+    for index in 0..<held.packages.len() {
+        let Some(source) = held.package_at(index) else {
+            continue
+        }
+        var holds = false
+        for recorded in passed {
+            if recorded.dir.as_str() == source.dir.as_str() {
+                holds = true
+            }
+        }
+        if not holds {
+            continue
+        }
+        let signer = match try seal_signer(session, source, principal, alloc) {
+            Ok(found) => found
+            Err(reported) => {
+                mut diagnostics.push(take reported)
+                continue
+            }
+        }
+        var passes = match source.machine.passes() {
+            Some(loaded) => loaded.copy(alloc)
+            None => machine::Passes.empty(alloc)
+        }
+        for recorded in passed {
+            if recorded.dir.as_str() != source.dir.as_str() {
+                continue
+            }
+            let signature = signed(signer, message: sign::pass_message(principal, test_path: recorded.test_path.as_str(), target: recorded.target.name(), reach: recorded.reach, alloc).as_bytes())
+            mut passes.record(machine::Pass(test_path: text::String.of(recorded.test_path.as_str(), alloc), target: text::String.of(recorded.target.name(), alloc), principal: text::String.of(principal, alloc), reach: recorded.reach, signature: signature))
+        }
+        var path = text::String.of(source.dir.as_str(), alloc)
+        mut path.append("/.nan/passes.nan")
+        let content = passes.bytes(grammar, alloc)
+        if not same_bytes(content, held: source.machine.bytes(path.as_str())) {
+            mut changes.push(journal::Change(path: take path, content: take content))
+        }
+    }
+} record_passes
+
+/// The signature of a message by a secret key, none without one.
+fn signed(signer: Option[core::crypto::SecretKey], message: Slice[u8]) -> Option[core::crypto::Signature] {
+    let Some(secret) = signer else {
+        return None
+    }
+    return Some(secret.sign(message))
+} signed
 
 /// The runs of the tests a scope selects, with the build cache of the running user; a part of it
 /// that is exposed ends them before any run.
@@ -91,7 +173,8 @@ fn replay_unknown(invocation: Invocation, session: check::Session, alloc: mem::A
     let reported = diagnostic::Diagnostic.new(diagnostic::Code.TestReplayToken, alloc)
     var records = mem::List[output::Record].empty(alloc)
     mut records.push(record(session.workspace.contents(), std: session.std(), scope: scope::Scope.Workspace, reported, alloc))
-    return test_output(invocation, written: "", take records, errors: 1, incomplete: 0, report: test_runs::Report.empty(alloc), alloc)
+    let none = mem::List[journal::Change].empty(alloc)
+    return test_output(invocation, written: "", take records, changes: none.view(), errors: 1, incomplete: 0, report: test_runs::Report.empty(alloc), alloc)
 } replay_unknown
 
 /// A `fail` record per failing test.
@@ -113,18 +196,25 @@ fn fail_records(workspace: workspace::Workspace, scope: scope::Scope, failures: 
     return records
 } fail_records
 
-/// The output of a test command: its records, its counts of errors and incompleteness, and what
-/// its runs found.
-fn test_output(invocation: Invocation, written: Str, take records: mem::List[output::Record], errors: usize, incomplete: usize, report: test_runs::Report, alloc: mem::Alloc) -> output::Output {
+/// The output of a test command: its records followed by a `wrote` record per file it wrote, its
+/// counts of files written, errors and incompleteness, and what its runs found.
+fn test_output(invocation: Invocation, written: Str, take records: mem::List[output::Record], changes: Slice[journal::Change], errors: usize, incomplete: usize, report: test_runs::Report, alloc: mem::Alloc) -> output::Output {
     let failed = report.failures.len()
     var verdict = output::Verdict.Ok
     if errors > 0 or failed > 0 {
         verdict = output::Verdict.Failed
     }
     var summary = mem::List[output::Count].empty(alloc)
+    mut summary.push(output::Count(name: text::String.of("files", alloc), value: changes.len()))
     mut summary.push(output::Count(name: text::String.of("errors", alloc), value: errors))
     mut summary.push(output::Count(name: text::String.of("incomplete", alloc), value: incomplete))
     mut summary.push(output::Count(name: text::String.of("tests", alloc), value: report.tests))
     mut summary.push(output::Count(name: text::String.of("failed", alloc), value: failed))
-    return output::Output(command: invocation.command(written, skip: true, alloc), elision: invocation.command(written, skip: false, alloc), verdict: verdict, summary: take summary, records: take records)
+    var all = records
+    for change in changes {
+        var fields = mem::List[text::String].empty(alloc)
+        mut fields.push(text::String.of(change.path.as_str(), alloc))
+        mut all.push(output::Record(word: text::String.of("wrote", alloc), fields: take fields, lines: mem::List[text::String].empty(alloc)))
+    }
+    return output::Output(command: invocation.command(written, skip: true, alloc), elision: invocation.command(written, skip: false, alloc), verdict: verdict, summary: take summary, records: take all)
 } test_output

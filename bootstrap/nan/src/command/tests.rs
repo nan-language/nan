@@ -280,16 +280,16 @@ fn affected_tests_are_those_without_a_pass_of_their_reach() {
     };
     assert_eq!(
         verdict("test"),
-        "ok test .: errors 0, incomplete 0, tests 1, failed 0"
+        "ok test .: files 0, errors 0, incomplete 0, tests 1, failed 0"
     );
-    let unchanged = "ok test . --affected: errors 0, incomplete 0, tests 0, failed 0";
+    let unchanged = "ok test . --affected: files 0, errors 0, incomplete 0, tests 0, failed 0";
     assert_eq!(verdict("test --affected"), unchanged);
     fs::write(
         scratch.0.join("app/app.nan"),
         HALVES.replace("/ 2", "/ 2 + 0"),
     )
     .expect("an edit");
-    let changed = "ok test . --affected: errors 0, incomplete 0, tests 1, failed 0";
+    let changed = "ok test . --affected: files 0, errors 0, incomplete 0, tests 1, failed 0";
     assert_eq!(verdict("test --affected"), changed);
 }
 
@@ -303,8 +303,9 @@ fn a_replay_token_reruns_its_run() {
         .find_map(|line| line.strip_prefix("    replay "))
         .expect("a replay token");
     let replayed = run_in(&scratch.0, &format!("test --replay {token}"));
-    let verdict =
-        format!("failed test --replay {token}: errors 0, incomplete 0, tests 1, failed 1\n");
+    let verdict = format!(
+        "failed test --replay {token}: files 0, errors 0, incomplete 0, tests 1, failed 1\n"
+    );
     assert!(replayed.output.starts_with(&verdict), "{}", replayed.output);
     assert!(
         replayed
@@ -421,7 +422,7 @@ fn a_test_reaching_a_rejected_item_reports_its_errors_and_runs_nothing() {
     let run = run_in(&scratch.0, "test app::halves");
     assert!(
         run.output.starts_with(
-            "failed test app::halves: errors 1, incomplete 0, tests 0, failed 0\nerror type.mismatch app/app.nan:4 app::half\n"
+            "failed test app::halves: files 0, errors 1, incomplete 0, tests 0, failed 0\nerror type.mismatch app/app.nan:4 app::half\n"
         ),
         "{}",
         run.output

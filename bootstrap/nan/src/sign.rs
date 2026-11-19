@@ -1,5 +1,5 @@
 //! Ed25519 signatures (RFC 8032) over SHA-512, the text forms of keys and signatures, and the
-//! message a seal signs. Verification accepts exactly the signatures whose public key and point R
+//! messages a seal and a recorded pass sign. Verification accepts exactly the signatures whose public key and point R
 //! are canonical encodings, whose scalar S is below the group order, whose public key does not
 //! have small order, and for which `[S]B - [k]A` encodes as R.
 
@@ -32,6 +32,17 @@ pub fn seal_message(principal: &str, path: &str, sealed: Hash, closure: Hash) ->
         "nan seal 1\n{principal}\n{path}\n{}\n{}\n",
         sealed.full(),
         closure.full()
+    )
+    .into_bytes()
+}
+
+/// The bytes a principal signs to record a test's pass on a run target: `nan pass 1`, the
+/// principal, the test's canonical path, the run target and the full form of the reach hash, each
+/// followed by LF.
+pub fn pass_message(principal: &str, test_path: &str, target: &str, reach: Hash) -> Vec<u8> {
+    format!(
+        "nan pass 1\n{principal}\n{test_path}\n{target}\n{}\n",
+        reach.full()
     )
     .into_bytes()
 }

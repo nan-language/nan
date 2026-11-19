@@ -188,7 +188,9 @@ impl Name {
                 "nan check [<scope>] [--radius] [--agent <name>], nan check --prefix <path>[:<line>]"
             }
             Name::Verify => "nan verify [<scope>]",
-            Name::Test => "nan test [<scope>] [--affected], nan test --replay <token>",
+            Name::Test => {
+                "nan test [<scope>] [--affected] [--as <principal>], nan test --replay <token>"
+            }
             Name::Fix => "nan fix [<scope>] [--propagate]",
             Name::Fmt => "nan fmt [<scope>]",
             Name::Holes => "nan holes [<scope>]",
@@ -249,7 +251,7 @@ impl Name {
             Name::Show => (&["--api"], &[]),
             Name::Find => (&["--contributors"], &[]),
             Name::Fix => (&["--propagate"], &[]),
-            Name::Test => (&["--affected"], &["--replay"]),
+            Name::Test => (&["--affected"], &["--replay", "--as"]),
             Name::ApiUpdate | Name::DepAdd | Name::DepSync | Name::DepApprove | Name::Verify => {
                 (&[], &[])
             }

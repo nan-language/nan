@@ -469,6 +469,10 @@ promise = IDENT ( "[" IDENT ( "," IDENT )* "]" )? ;
 principals_file = COL0 'nan' 'principals' INT NL COL0 principals_tail ;
 principals_tail = principal_record NL COL0 principals_tail | check_record NL EOF ;
 principal_record = 'principal' TEXT TEXT ;
+passes_file = COL0 'nan' 'passes' INT NL COL0 passes_tail ;
+passes_tail = pass_record NL COL0 passes_tail | check_record NL EOF ;
+pass_record = 'pass' TEXT target TEXT TEXT
+    | 'signature' TEXT ;
 ```
 
 ## Start symbols
@@ -476,7 +480,7 @@ principal_record = 'principal' TEXT TEXT ;
 A **start symbol** is a rule deriving a whole token sequence, using exactly the rules it reaches.
 
 - `source_file` derives a source file, `package.nan` included, without the `DOC` and `FILE_DOC` lines that [Items](02-items.md#item-kinds) reads as plain comments.
-- `lock_file`, `history_file`, `api_file` and `principals_file` derive the [machine files](35-format.md#machine-files) `.nan/lock.nan`, `.nan/history.nan`, `.nan/api/<module>.nan` and `.nan/principals.nan`; their single-quoted words match by spelling and are not context words.
+- `lock_file`, `history_file`, `api_file`, `principals_file` and `passes_file` derive the [machine files](35-format.md#machine-files) `.nan/lock.nan`, `.nan/history.nan`, `.nan/api/<module>.nan`, `.nan/principals.nan` and `.nan/passes.nan`; their single-quoted words match by spelling and are not context words.
 - `doc_reference` derives a [doc reference](32-docs.md#references).
 - `construction_expr`, `result_expr` and `old_expr` are **classification rules**: the form of a `postfix_expr` or `path_expr` that [construction](04-types.md#construction) or [ensures](18-contracts.md#ensures) classifies as one. No start symbol reaches them; the keyword table counts them as reached from `source_file`.
 

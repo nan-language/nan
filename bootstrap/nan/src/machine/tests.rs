@@ -1,6 +1,7 @@
 use super::api::{AcceptedTest, ClosureEntry, Doc, DocKey, Entry, Method, Seal, Snapshot};
 use super::history::{History, Module};
 use super::lock::{Entry as Approved, Lock, Locked};
+use super::passes::{Pass, Passes};
 use super::principals::Principals;
 use super::{Invalid, escaped};
 use crate::diagnostic::Code;
@@ -273,4 +274,33 @@ fn a_principals_file_reads_back_as_written_and_keeps_its_principals_ordered() {
 #[test]
 fn a_file_without_records_is_not_written() {
     assert_eq!(Snapshot::default().bytes(), None);
+}
+
+#[test]
+fn a_pass_is_current_with_its_principal_s_signature_or_none_for_a_principal_without_key() {
+    let seed = [7u8; 32];
+    let principals = Principals::default().trusting("tester", crate::sign::public_key(&seed));
+    let reach = Hash::of(b"reach");
+    let unsigned = Pass {
+        test_path: "twice::double_two".to_owned(),
+        target: "x86_64-macos".to_owned(),
+        principal: "tester".to_owned(),
+        reach,
+        signature: None,
+    };
+    let message = crate::sign::pass_message("tester", "twice::double_two", "x86_64-macos", reach);
+    let signed = Pass {
+        signature: Some(crate::sign::sign(&seed, &message)),
+        ..unsigned.clone()
+    };
+    assert!(signed.current(reach, &principals));
+    assert!(!signed.current(Hash::of(b"other"), &principals));
+    assert!(!unsigned.current(reach, &principals));
+    assert!(unsigned.current(reach, &Principals::default()));
+    let file = Passes::default().recording(unsigned).recording(signed);
+    assert_eq!(file.passes.len(), 1);
+    assert_eq!(
+        Passes::read(&file.bytes().expect("a passes file")),
+        Ok(file)
+    );
 }

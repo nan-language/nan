@@ -1,7 +1,8 @@
 //! Test runs: the tests a scope selects, the test image holding each package's tests for each
 //! run target, lowered by a checker of that target, each run as a process of that image or a boot
-//! of the emulator on it, the failure each failing test reports, and the pass record each
-//! passing test leaves in the build cache.
+//! of the emulator on it, the failure each failing test reports, the pass record each passing
+//! test leaves in the build cache, and the recorded passes standing for the runs of a target the
+//! machine cannot run.
 
 mod outcome;
 mod setup;
@@ -48,13 +49,23 @@ pub struct Failure {
     pub lines: Vec<String>,
 }
 
-/// What the runs of a scope's tests found: how many tests ran on a run target, the failures, and
-/// what building their test images reports.
+/// What the runs of a scope's tests found: how many tests ran on a run target, the failures, what
+/// building their test images reports, and each test whose every run passed.
 #[derive(Default)]
 pub struct Report {
     pub tests: usize,
     pub failures: Vec<Failure>,
     pub diagnostics: Vec<Diagnostic>,
+    pub passed: Vec<Passed>,
+}
+
+/// A test whose every run on a run target passed: the directory of its package, its canonical
+/// path, the run target and the hash of its reach.
+pub struct Passed {
+    pub dir: String,
+    pub test_path: String,
+    pub target: Target,
+    pub reach: Hash,
 }
 
 /// A test selected to run: its item, its target and whether it is a property test.
@@ -263,7 +274,8 @@ fn run_target(
                         Ok(record) => record,
                         Err(exposed) => return Ok(Err(exposed)),
                     };
-                    if record != Some(pass_record(checker, &hashes, test.item)) {
+                    let reach = reach(checker, &hashes, test.item);
+                    if record != Some(pass_record(checker, &reach)) {
                         affected.push(test);
                     }
                 }
@@ -346,23 +358,44 @@ impl ItemHashes {
 }
 
 /// The record of a test passing on a checker's target: the toolchain hash, the target's name,
-/// then the canonical path and item hash of each item of the test's reach, in path order.
-fn pass_record(checker: &Checker, hashes: &ItemHashes, test: ItemId) -> Vec<u8> {
+/// then the encoding of the test's reach.
+fn pass_record(checker: &Checker, reach: &[u8]) -> Vec<u8> {
+    let mut record = Vec::new();
+    bytes(&mut record, &toolchain::hash(1).0);
+    bytes(&mut record, checker.db.target.name().as_bytes());
+    record.extend_from_slice(reach);
+    record
+}
+
+/// The encoding of a test's reach on a checker's target: the list of the canonical path and item
+/// hash of each of its items, in path order.
+fn reach(checker: &Checker, hashes: &ItemHashes, test: ItemId) -> Vec<u8> {
     let mut reach: Vec<(String, [u8; 33])> = checker
         .test_reach(test)
         .into_iter()
         .map(|item| (checker.db.canonical(item), hashes.item(checker, item).0))
         .collect();
     reach.sort();
-    let mut record = Vec::new();
-    bytes(&mut record, &toolchain::hash(1).0);
-    bytes(&mut record, checker.db.target.name().as_bytes());
-    uvar(&mut record, reach.len() as u128);
+    let mut encoded = Vec::new();
+    uvar(&mut encoded, reach.len() as u128);
     for (path, hash) in reach {
-        bytes(&mut record, path.as_bytes());
-        bytes(&mut record, &hash);
+        bytes(&mut encoded, path.as_bytes());
+        bytes(&mut encoded, &hash);
     }
-    record
+    encoded
+}
+
+/// Whether the passes file of a test's package holds a current pass of it on a checker's target.
+fn recorded(checker: &Checker, hashes: &ItemHashes, test: ItemId) -> bool {
+    let source = checker.db.package(checker.db.package_of(test)).source;
+    let path = checker.db.canonical(test);
+    let reach = Hash::of(&reach(checker, hashes, test));
+    let principals = source.machine.principals();
+    source.machine.passes().passes.iter().any(|pass| {
+        pass.test_path == path
+            && pass.target == checker.db.target.name()
+            && pass.current(reach, principals)
+    })
 }
 
 /// The tests of a scope that run: of a package, module or file, every test in it; of a test,
@@ -456,8 +489,10 @@ fn run_targets(package: &Package) -> Vec<Target> {
 }
 
 /// Runs a package's tests on a checker's target, each run a process of the package's test image
-/// or a boot of the emulator on it, and records in the cache each test whose every run passes,
-/// unless replaying; every run fails on a target whose images cannot run on this machine.
+/// or a boot of the emulator on it, and records in the cache and the report each test whose every
+/// run passes, unless replaying; on a target whose images cannot run on this machine, a test passes
+/// when its package's passes file holds a current pass of it, unless replaying, and every run of
+/// another fails.
 fn run_package(
     checker: &Checker,
     hashes: &ItemHashes,
@@ -473,10 +508,12 @@ fn run_package(
     let target = checker.db.target;
     if !emulator::available(target) {
         for test in tests {
-            let cause = "test.emulator-unavailable";
-            report
-                .failures
-                .push(failure(checker, test.item, cause, Vec::new()));
+            if matches!(runs, Runs::Replay(_)) || !recorded(checker, hashes, test.item) {
+                let cause = "test.emulator-unavailable";
+                report
+                    .failures
+                    .push(failure(checker, test.item, cause, Vec::new()));
+            }
         }
         return Ok(());
     }
@@ -533,8 +570,15 @@ fn run_package(
             break;
         }
         if report.failures.len() == failures && !matches!(runs, Runs::Replay(_)) {
+            let reach = reach(checker, hashes, test.item);
             let name = record_name(checker, test.item);
-            cache.replace(&name, &pass_record(checker, hashes, test.item))?;
+            cache.replace(&name, &pass_record(checker, &reach))?;
+            report.passed.push(Passed {
+                dir: checker.db.package(package).source.dir.clone(),
+                test_path: path,
+                target,
+                reach: Hash::of(&reach),
+            });
         }
     }
     image.discard()

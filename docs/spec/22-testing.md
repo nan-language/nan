@@ -439,7 +439,7 @@ A package's tests run on each declared [target](27-program-model.md#targets), `a
 - On a nanos target, the toolchain runs as the job of an [isolated space](24-kernel.md#isolated-spaces), and each run is a [test run](14-authority.md#jobs) its kernel serves it: a test image of the test's reach and the support routines, lowered for user mode, runs alone in a new isolated space, writes the outcome, test trace and any trap report to its standard output, then ends its space with status 0.
 - Each boot finds the machine as new: its serial port reads no input, its console port is connected to nothing, its disks are blank, its firmware's variables are the firmware's template and its TPM's state is new, and what it writes to them, or to its boot volume, lasts until the boot ends. Its network reaches no host outside the machine, and a reset ends the run.
 - The run's domain is that boot's kernel domain: a trap halts it, and the report on serial is the run's failure. When no task is ready and no deadline is pending, the processor waits for an interrupt.
-- When the emulator or `swtpm` cannot be started, for a Linux or macOS target when the toolchain runs on another system or the machine running it has another architecture, for a Windows target when the machine has another architecture or, the toolchain running on Linux, Wine cannot be started, and for a nanos target when the toolchain does not run as the job of an isolated space on a machine of its architecture, every run on that target fails (`test.emulator-unavailable`).
+- When the emulator or `swtpm` cannot be started, for a Linux or macOS target when the toolchain runs on another system or the machine running it has another architecture, for a Windows target when the machine has another architecture or, the toolchain running on Linux, Wine cannot be started, and for a nanos target when the toolchain does not run as the job of an isolated space on a machine of its architecture, every run on that target fails (`test.emulator-unavailable`), unless a [recorded pass](#recorded-passes) of the test on that target is current.
 
 ```nan
 // file: checksum/package.nan
@@ -465,6 +465,20 @@ test fold_wraps for fold {
     expect fold(Array[u8, 4].filled(128)) == 0
 } fold_wraps
 ```
+
+## Recorded passes
+
+The **passes file** `.nan/passes.nan` of a package is a [machine file](35-format.md#passes-file) recording passes of its tests on run targets, so that a machine running some of a package's run targets accepts what another machine ran on the others. `nan test --as <principal>` records a **pass** of each test whose every run on a run target passes, holding, in order:
+
+- the test's canonical path;
+- the run target;
+- the [principal](31-trust.md#seals);
+- the **reach hash**: the [hash](29-identity-versioning.md#hash-values) of the list of pairs of the canonical path, as a text, and the [item hash](29-identity-versioning.md#item-hash-and-interface-hash), as its 33 bytes, of each item of the test's reach on that run target, in byte order of path, in the forms of the [canonical NIR encoding](19-nir.md#encoding);
+- its signature, when the package's [principals file](31-trust.md#principals) gives the principal a key: the [signature](31-trust.md#signatures) of its **pass message** by the principal's secret key, the pass message being `nan pass 1`, the principal, the canonical path, the run target and the full form of the reach hash, each followed by LF.
+
+- A pass is **current** while the test's reach hash on its run target equals the one it records and, when the principals file gives its principal a key, it holds a signature that verifies by that key, or else it holds none. A pass binds no toolchain hash.
+- On a run target whose runs fail with `test.emulator-unavailable`, a test that a current pass records there passes without running; a replayed run is never recorded or passed so.
+- `nan test --as` replaces an earlier pass of the same principal for the test on the run target. It writes no pass when it reports `seal.bad-principal` for a principal outside the principal form, nor in a package for which it reports `key.missing`, the principals file giving the principal a key when the user directory holds no secret key of the principal with that public key.
 
 ## Reliance tests
 

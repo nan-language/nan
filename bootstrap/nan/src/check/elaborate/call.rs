@@ -801,15 +801,25 @@ impl Elab<'_, '_> {
     }
 
     /// The predicate checks of the values reachable from a place whose type's defining module
-    /// is the module being elaborated: each predicate's function called on the value, then
-    /// `check predicate`, the value before its fields in declaration order.
+    /// is the module being elaborated.
     pub fn predicate_checks(&mut self, place: Place, ty: &Ty, span: Span) -> Elaborated<()> {
-        let Ty::Item(item, args) = ty else {
+        let Ty::Item(item, _) = ty else {
             return Ok(());
         };
         if self.ck.db.module_of(*item) != self.ck.db.module_of(self.item) {
             return Ok(());
         }
+        self.value_predicate_checks(place, ty, span)
+    }
+
+    /// The predicate checks of a value constructed of a struct type, whatever its defining module,
+    /// and of the values reachable from its fields whose type's defining module is the module
+    /// being elaborated: each predicate's function called on the value, then `check predicate`,
+    /// the value before its fields in declaration order.
+    pub fn value_predicate_checks(&mut self, place: Place, ty: &Ty, span: Span) -> Elaborated<()> {
+        let Ty::Item(item, args) = ty else {
+            return Ok(());
+        };
         if let ItemKind::Struct(_) = &self.ck.db.ast(*item).kind {
             let count = self.ck.predicate_count(*item);
             if count > 0 {

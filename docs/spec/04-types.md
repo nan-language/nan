@@ -641,6 +641,36 @@ pub closed struct Gauge {
 } Gauge
 
 // file: example/example.nan
+//! Builds a gauge from outside its module.
+
+pub fn gauge_at(level: u32) -> gauge::Gauge {
+    return gauge::Gauge(level: level) // traps: trap.predicate
+} gauge_at
+
+test overfull_gauge for gauge_at {
+    expect gauge_at(65).level == 65
+} overfull_gauge
+```
+
+```nan
+// file: example/package.nan
+//! Gauge levels.
+
+package example {
+    language 1
+    targets any
+} example
+
+// file: example/gauge/gauge.nan
+//! A bounded level.
+
+pub const CAPACITY: u32 = 64
+
+pub closed struct Gauge {
+    pub level: u32 where level <= CAPACITY
+} Gauge
+
+// file: example/example.nan
 //! Writes a gauge from outside its module.
 
 pub fn drain(mut meter: gauge::Gauge) {

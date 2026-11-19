@@ -394,7 +394,7 @@ impl Elab<'_, '_> {
             self.wrapped.insert(value);
         }
         if variant.is_none() {
-            self.predicate_checks(Place::of(value), &expr.ty, span)?;
+            self.value_predicate_checks(Place::of(value), &expr.ty, span)?;
         }
         Ok(Out::Operand(Operand::Value(value)))
     }

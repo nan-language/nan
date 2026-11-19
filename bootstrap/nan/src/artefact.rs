@@ -35,6 +35,7 @@ pub struct Parts {
     /// tree's `mem::wire` encoding.
     pub schemas: Vec<(String, Vec<u8>)>,
     pub protocols: Vec<ProtocolRoot>,
+    pub migrations: Vec<MigrationRoot>,
 }
 
 /// A `pub` protocol as a code root records it: its canonical path, its protocol hash, and the
@@ -43,6 +44,14 @@ pub struct ProtocolRoot {
     pub path: String,
     pub hash: Hash,
     pub operations: Vec<(String, Hash)>,
+}
+
+/// A type with forward migrations as a code root records it: its canonical path and, in byte
+/// order of schema hash, the schema hash of each frozen shape a forward migration converts from,
+/// with whether an inverse converts to it.
+pub struct MigrationRoot {
+    pub path: String,
+    pub shapes: Vec<(Hash, bool)>,
 }
 
 /// A list of elements sorted by the bytes of their encodings.
@@ -148,6 +157,25 @@ pub fn code_root(parts: &Parts) -> Vec<u8> {
                         list(&mut out, protocol.operations.iter(), |out, (name, hash)| {
                             out.extend(text(name));
                             out.extend(hash_bytes(hash));
+                        });
+                        out
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    if !parts.migrations.is_empty() {
+        record.field(
+            12,
+            sorted_list(
+                parts
+                    .migrations
+                    .iter()
+                    .map(|migrated| {
+                        let mut out = text(&migrated.path);
+                        list(&mut out, migrated.shapes.iter(), |out, (hash, inverse)| {
+                            out.extend(hash_bytes(hash));
+                            uvar(out, u128::from(*inverse));
                         });
                         out
                     })

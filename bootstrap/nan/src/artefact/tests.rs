@@ -16,6 +16,7 @@ fn parts() -> Parts {
         )],
         schemas: Vec::new(),
         protocols: Vec::new(),
+        migrations: Vec::new(),
     }
 }
 

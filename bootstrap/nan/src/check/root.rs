@@ -1,13 +1,13 @@
 //! Code roots: the artefact of a package's current state in a closure, from its checkers under
 //! each target it declares, with the files its attestation hashes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::db::PackageId;
 use super::requires::Entry as Required;
 use super::snapshot::Items;
 use super::{Checker, check_targets, unchecked};
-use crate::artefact::{self, AttestedSeal, Parts, ProtocolRoot};
+use crate::artefact::{self, AttestedSeal, MigrationRoot, Parts, ProtocolRoot};
 use crate::cache::Cache;
 use crate::diagnostic::{Code, Diagnostic, Reason, Role};
 use crate::encoding::{Record, bytes, list, uvar};
@@ -301,6 +301,7 @@ fn coded(workspace: &Workspace, closure: &Closure, member: Member) -> Coded {
         lines,
         schemas: first.schema_trees(id),
         protocols: first.protocol_roots(id),
+        migrations: first.migration_roots(id),
     };
     let code_root = artefact::code_root(&parts);
     let seals: Vec<AttestedSeal> = computed
@@ -421,6 +422,37 @@ impl Checker<'_> {
                     hash,
                     operations,
                 }
+            })
+            .collect()
+    }
+
+    /// The frozen shapes that the forward migrations of each type of a package convert from, by
+    /// canonical path, each with whether an inverse converts to it.
+    pub(super) fn migration_roots(&self, package: PackageId) -> Vec<MigrationRoot> {
+        self.db
+            .package(package)
+            .modules
+            .iter()
+            .flat_map(|module| self.db.module(*module).items.clone())
+            .filter_map(|item| {
+                let migrations = self.migrations(item);
+                let hashes: Vec<(Hash, bool)> = migrations
+                    .iter()
+                    .map(|migration| (self.shape_hash(migration.shape), migration.forward))
+                    .collect();
+                let forward: BTreeSet<Hash> = hashes
+                    .iter()
+                    .filter(|(_, forward)| *forward)
+                    .map(|(hash, _)| *hash)
+                    .collect();
+                let shapes: Vec<(Hash, bool)> = forward
+                    .into_iter()
+                    .map(|hash| (hash, hashes.contains(&(hash, false))))
+                    .collect();
+                (!shapes.is_empty()).then(|| MigrationRoot {
+                    path: self.db.canonical(item),
+                    shapes,
+                })
             })
             .collect()
     }

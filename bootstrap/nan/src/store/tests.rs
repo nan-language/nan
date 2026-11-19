@@ -15,6 +15,7 @@ fn release(manifest: &str) -> Vec<u8> {
         lines: Vec::new(),
         schemas: Vec::new(),
         protocols: Vec::new(),
+        migrations: Vec::new(),
     };
     artefact(
         &code_root(&parts),

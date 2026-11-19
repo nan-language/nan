@@ -18091,6 +18091,10 @@ const TEXT_NANOS_HELD: Str =
     \\    match request {
     \\        Request.Step => return Ordered(order: Order.Step, stop: None)
     \\        Request.StepEncoded => return Ordered(order: Order.StepEncoded, stop: None)
+    \\        Request.TakeSent => return Ordered(order: Order.TakeSent, stop: None)
+    \\        Request.Held => return Ordered(order: Order.Held, stop: None)
+    \\        Request.StartHeld(key) => return Ordered(order: Order.StartHeld(key), stop: None)
+    \\        Request.DropHeld(key) => return Ordered(order: Order.DropHeld(key), stop: None)
     \\        Request.Incoming(stop) => return Ordered(order: Order.Incoming, stop: Some(take stop))
     \\        Request.Ready(stop) => return Ordered(order: Order.Ready, stop: Some(take stop))
     \\        Request.StartKeyed => return Ordered(order: Order.StartKeyed, stop: None)
@@ -18250,15 +18254,19 @@ const TEXT_NANOS_HELD: Str =
     \\        Sent.Flag(flag) => return Answer.Flag(flag)
     \\        Sent.Stepped(None) => return Answer.Stepped(None)
     \\        Sent.Stepped(Some(Stepping(header: header, operation: operation, call: made))) => {
-    \\            var header_given: Option[sys::Header] = None
-    \\            match header {
-    \\                Some(bytes) => {
-    \\                    header_given = Some(sys::Header(bytes: bytes))
-    \\                }
-    \\                None => {}
-    \\            }
-    \\            let handled = sys::Handled(header: header_given, operation: operation)
+    \\            let handled = sys::Handled(header: header_of(header), operation: operation)
     \\            return Answer.Stepped(Some(Stepped(handled: handled, encoding: encoding_handed(take made, table, alloc))))
+    \\        }
+    \\        Sent.Taken(None) => return Answer.Taken(None)
+    \\        Sent.Taken(Some(Taking(operation: operation, header: header, delay_ns: delay_ns, call: made))) => {
+    \\            return Answer.Taken(Some(SentCall(operation: operation, header: header_of(header), delay_ns: delay_ns, encoding: encoding_handed(take made, table, alloc))))
+    \\        }
+    \\        Sent.HeldTasks(keys) => {
+    \\            var tasks = mem::List[sys::HeldTask].empty(alloc)
+    \\            for held in keys {
+    \\                mut tasks.push(sys::HeldTask(key: held.key, class: held.class))
+    \\            }
+    \\            return Answer.HeldTasks(take tasks)
     \\        }
     \\        Sent.Started(count) => return Answer.Started(usize.widen(count))
     \\        Sent.Checkpointed(checkpoint) => return Answer.Checkpointed(take checkpoint)
@@ -18296,6 +18304,22 @@ const TEXT_NANOS_HELD: Str =
     \\    return encoding
     \\} encoding_handed
     \\
+    \\/// The header whose bytes a space sends.
+    \\fn header_of(bytes: Option[Array[u8, 32]]) -> Option[sys::Header] {
+    \\    let Some(given) = bytes else {
+    \\        return None
+    \\    }
+    \\    return Some(sys::Header(bytes: given))
+    \\} header_of
+    \\
+    \\/// The bytes of a header as a space sends them.
+    \\fn header_bytes(header: Option[sys::Header]) -> Option[Array[u8, 32]] {
+    \\    let Some(given) = header else {
+    \\        return None
+    \\    }
+    \\    return Some(given.bytes)
+    \\} header_bytes
+    \\
     \\/// What a kernel sends the space of an instance it holds: a request of its holder, the end of a
     \\/// wait its holder no longer waits for, a call of an inbox, and that its holder released the
     \\/// instance.
@@ -18317,6 +18341,10 @@ const TEXT_NANOS_HELD: Str =
     \\enum Order derives Copy, Encode {
     \\    Step
     \\    StepEncoded
+    \\    TakeSent
+    \\    Held
+    \\    StartHeld(u64)
+    \\    DropHeld(u64)
     \\    Incoming
     \\    Ready
     \\    StartKeyed
@@ -18386,6 +18414,8 @@ const TEXT_NANOS_HELD: Str =
     \\    Done
     \\    Flag(bool)
     \\    Stepped(Option[Stepping])
+    \\    Taken(Option[Taking])
+    \\    HeldTasks(mem::List[HeldKey])
     \\    Started(u64)
     \\    Checkpointed(Checkpoint)
     \\    Healthy
@@ -18402,6 +18432,21 @@ const TEXT_NANOS_HELD: Str =
     \\    operation: u16
     \\    call: Naming
     \\} Stepping
+    \\
+    \\/// A message an instance's component sent itself as its space sends it: its operation's number,
+    \\/// the bytes of its header, its delay and the call it makes.
+    \\struct Taking derives Encode {
+    \\    operation: u16
+    \\    header: Option[Array[u8, 32]]
+    \\    delay_ns: u64
+    \\    call: Naming
+    \\} Taking
+    \\
+    \\/// A held keyed task as a space sends it: its key and its class.
+    \\struct HeldKey derives Encode {
+    \\    key: u64
+    \\    class: sys::Reversibility
+    \\} HeldKey
     \\
     \\/// An encoding a space sends its kernel: its bytes, and the handle of the entry of the space's table
     \\/// for each of its handles.
@@ -18642,6 +18687,10 @@ const TEXT_NANOS_HELD: Str =
     \\    match order {
     \\        Order.Step => return Request.Step
     \\        Order.StepEncoded => return Request.StepEncoded
+    \\        Order.TakeSent => return Request.TakeSent
+    \\        Order.Held => return Request.Held
+    \\        Order.StartHeld(key) => return Request.StartHeld(key)
+    \\        Order.DropHeld(key) => return Request.DropHeld(key)
     \\        Order.Incoming => return Request.Incoming(stopped_by(id, mut stops, alloc))
     \\        Order.Ready => return Request.Ready(stopped_by(id, mut stops, alloc))
     \\        Order.StartKeyed => return Request.StartKeyed
@@ -18876,14 +18925,18 @@ const TEXT_NANOS_HELD: Str =
     \\        Answer.Flag(flag) => return Sent.Flag(flag)
     \\        Answer.Stepped(None) => return Sent.Stepped(None)
     \\        Answer.Stepped(Some(Stepped(handled: handled, encoding: encoding))) => {
-    \\            var header: Option[Array[u8, 32]] = None
-    \\            match handled.header {
-    \\                Some(given) => {
-    \\                    header = Some(given.bytes)
-    \\                }
-    \\                None => {}
+    \\            return Sent.Stepped(Some(Stepping(header: header_bytes(handled.header), operation: handled.operation, call: naming_of(encoding, base, alloc))))
+    \\        }
+    \\        Answer.Taken(None) => return Sent.Taken(None)
+    \\        Answer.Taken(Some(SentCall(operation: operation, header: header, delay_ns: delay_ns, encoding: encoding))) => {
+    \\            return Sent.Taken(Some(Taking(operation: operation, header: header_bytes(header), delay_ns: delay_ns, call: naming_of(encoding, base, alloc))))
+    \\        }
+    \\        Answer.HeldTasks(tasks) => {
+    \\            var keys = mem::List[HeldKey].empty(alloc)
+    \\            for task in tasks {
+    \\                mut keys.push(HeldKey(key: task.key, class: task.class))
     \\            }
-    \\            return Sent.Stepped(Some(Stepping(header: header, operation: handled.operation, call: naming_of(encoding, base, alloc))))
+    \\            return Sent.HeldTasks(take keys)
     \\        }
     \\        Answer.Started(count) => return Sent.Started(u64.widen(count))
     \\        Answer.Checkpointed(checkpoint) => return Sent.Checkpointed(take checkpoint)
@@ -21175,6 +21228,16 @@ const TEXT_NANOS_NANOS: Str =
     \\    pub encoding: sys::Encoded
     \\} Stepped
     \\
+    \\/// A message an instance's component sent itself, taken before any handler ran for it: its
+    \\/// operation's number, its header, the nanoseconds left before it would enter the intake, and the
+    \\/// encoding of the call it makes.
+    \\pub closed struct SentCall {
+    \\    pub operation: u16
+    \\    pub header: Option[sys::Header]
+    \\    pub delay_ns: u64
+    \\    pub encoding: sys::Encoded
+    \\} SentCall
+    \\
     \\pub closed enum InstanceError derives Render {
     \\    Ended
     \\    Cancelled(task::Cancelled) from
@@ -21226,6 +21289,28 @@ const TEXT_NANOS_NANOS: Str =
     \\    }
     \\    return stepped
     \\} Instance.step_encoded
+    \\
+    \\pub fn Instance.take_sent(mut self) -> Option[SentCall] fails InstanceError uses wait {
+    \\    let Answer.Taken(taken) = try await self.ask(Request.TakeSent) else {
+    \\        fail InstanceError.Ended
+    \\    }
+    \\    return taken
+    \\} Instance.take_sent
+    \\
+    \\pub fn Instance.held(self) -> mem::List[sys::HeldTask] fails InstanceError uses wait {
+    \\    let Answer.HeldTasks(tasks) = try await self.ask(Request.Held) else {
+    \\        fail InstanceError.Ended
+    \\    }
+    \\    return tasks
+    \\} Instance.held
+    \\
+    \\pub fn Instance.start_held(mut self, key: u64) -> bool fails InstanceError uses wait {
+    \\    return try await self.flag(Request.StartHeld(key))
+    \\} Instance.start_held
+    \\
+    \\pub fn Instance.drop_held(mut self, key: u64) -> bool fails InstanceError uses wait {
+    \\    return try await self.flag(Request.DropHeld(key))
+    \\} Instance.drop_held
     \\
     \\pub fn Instance.incoming(self) fails InstanceError uses wait {
     \\    discard try await self.waiting(ready: false)
@@ -21369,6 +21454,10 @@ const TEXT_NANOS_NANOS: Str =
     \\enum Request {
     \\    Step
     \\    StepEncoded
+    \\    TakeSent
+    \\    Held
+    \\    StartHeld(u64)
+    \\    DropHeld(u64)
     \\    Incoming(task::Receiver[u8])
     \\    Ready(task::Receiver[u8])
     \\    StartKeyed
@@ -21385,6 +21474,8 @@ const TEXT_NANOS_NANOS: Str =
     \\    Done
     \\    Flag(bool)
     \\    Stepped(Option[Stepped])
+    \\    Taken(Option[SentCall])
+    \\    HeldTasks(mem::List[sys::HeldTask])
     \\    Started(usize)
     \\    Checkpointed(Checkpoint)
     \\    Health(sys::HealthReply)
@@ -21645,6 +21736,17 @@ const TEXT_NANOS_NANOS: Str =
     \\            }
     \\            return Some(Answer.Stepped(Some(Stepped(handled: handled, encoding: take encoding))))
     \\        }
+    \\        Request.TakeSent => {
+    \\            let Some(sys::Sent(message: message, header: header, delay_ns: delay_ns)) = mut stepper.take_sent() else {
+    \\                return Some(Answer.Taken(None))
+    \\            }
+    \\            var encoding = sys::Encoded.empty(alloc)
+    \\            let operation = sys::Wire[P].encode_any(message, out: mut encoding)
+    \\            return Some(Answer.Taken(Some(SentCall(operation: operation, header: header, delay_ns: delay_ns, encoding: take encoding))))
+    \\        }
+    \\        Request.Held => return Some(Answer.HeldTasks(stepper.held(alloc)))
+    \\        Request.StartHeld(key) => return Some(Answer.Flag(mut stepper.start_held(key)))
+    \\        Request.DropHeld(key) => return Some(Answer.Flag(mut stepper.drop_held(key)))
     \\        Request.Incoming(stop) => return try await waited(stepper, take stop, ready: false, exec)
     \\        Request.Ready(stop) => return try await waited(stepper, take stop, ready: true, exec)
     \\        Request.StartKeyed => return Some(Answer.Started(mut stepper.start_keyed()))

@@ -141,6 +141,10 @@ fn ordered(take request: Request) -> Ordered {
     match request {
         Request.Step => return Ordered(order: Order.Step, stop: None)
         Request.StepEncoded => return Ordered(order: Order.StepEncoded, stop: None)
+        Request.TakeSent => return Ordered(order: Order.TakeSent, stop: None)
+        Request.Held => return Ordered(order: Order.Held, stop: None)
+        Request.StartHeld(key) => return Ordered(order: Order.StartHeld(key), stop: None)
+        Request.DropHeld(key) => return Ordered(order: Order.DropHeld(key), stop: None)
         Request.Incoming(stop) => return Ordered(order: Order.Incoming, stop: Some(take stop))
         Request.Ready(stop) => return Ordered(order: Order.Ready, stop: Some(take stop))
         Request.StartKeyed => return Ordered(order: Order.StartKeyed, stop: None)
@@ -300,15 +304,19 @@ fn answer_of(take sent: Sent, table: Table, alloc: mem::Alloc) -> Answer {
         Sent.Flag(flag) => return Answer.Flag(flag)
         Sent.Stepped(None) => return Answer.Stepped(None)
         Sent.Stepped(Some(Stepping(header: header, operation: operation, call: made))) => {
-            var header_given: Option[sys::Header] = None
-            match header {
-                Some(bytes) => {
-                    header_given = Some(sys::Header(bytes: bytes))
-                }
-                None => {}
-            }
-            let handled = sys::Handled(header: header_given, operation: operation)
+            let handled = sys::Handled(header: header_of(header), operation: operation)
             return Answer.Stepped(Some(Stepped(handled: handled, encoding: encoding_handed(take made, table, alloc))))
+        }
+        Sent.Taken(None) => return Answer.Taken(None)
+        Sent.Taken(Some(Taking(operation: operation, header: header, delay_ns: delay_ns, call: made))) => {
+            return Answer.Taken(Some(SentCall(operation: operation, header: header_of(header), delay_ns: delay_ns, encoding: encoding_handed(take made, table, alloc))))
+        }
+        Sent.HeldTasks(keys) => {
+            var tasks = mem::List[sys::HeldTask].empty(alloc)
+            for held in keys {
+                mut tasks.push(sys::HeldTask(key: held.key, class: held.class))
+            }
+            return Answer.HeldTasks(take tasks)
         }
         Sent.Started(count) => return Answer.Started(usize.widen(count))
         Sent.Checkpointed(checkpoint) => return Answer.Checkpointed(take checkpoint)
@@ -346,6 +354,22 @@ fn encoding_handed(take named: Naming, table: Table, alloc: mem::Alloc) -> sys::
     return encoding
 } encoding_handed
 
+/// The header whose bytes a space sends.
+fn header_of(bytes: Option[Array[u8, 32]]) -> Option[sys::Header] {
+    let Some(given) = bytes else {
+        return None
+    }
+    return Some(sys::Header(bytes: given))
+} header_of
+
+/// The bytes of a header as a space sends them.
+fn header_bytes(header: Option[sys::Header]) -> Option[Array[u8, 32]] {
+    let Some(given) = header else {
+        return None
+    }
+    return Some(given.bytes)
+} header_bytes
+
 /// What a kernel sends the space of an instance it holds: a request of its holder, the end of a
 /// wait its holder no longer waits for, a call of an inbox, and that its holder released the
 /// instance.
@@ -367,6 +391,10 @@ struct Asking derives Encode {
 enum Order derives Copy, Encode {
     Step
     StepEncoded
+    TakeSent
+    Held
+    StartHeld(u64)
+    DropHeld(u64)
     Incoming
     Ready
     StartKeyed
@@ -436,6 +464,8 @@ enum Sent derives Encode {
     Done
     Flag(bool)
     Stepped(Option[Stepping])
+    Taken(Option[Taking])
+    HeldTasks(mem::List[HeldKey])
     Started(u64)
     Checkpointed(Checkpoint)
     Healthy
@@ -452,6 +482,21 @@ struct Stepping derives Encode {
     operation: u16
     call: Naming
 } Stepping
+
+/// A message an instance's component sent itself as its space sends it: its operation's number,
+/// the bytes of its header, its delay and the call it makes.
+struct Taking derives Encode {
+    operation: u16
+    header: Option[Array[u8, 32]]
+    delay_ns: u64
+    call: Naming
+} Taking
+
+/// A held keyed task as a space sends it: its key and its class.
+struct HeldKey derives Encode {
+    key: u64
+    class: sys::Reversibility
+} HeldKey
 
 /// An encoding a space sends its kernel: its bytes, and the handle of the entry of the space's table
 /// for each of its handles.
@@ -692,6 +737,10 @@ fn requested(order: Order, id: u64, mut stops: mem::Map[u64, task::Sender[u8]], 
     match order {
         Order.Step => return Request.Step
         Order.StepEncoded => return Request.StepEncoded
+        Order.TakeSent => return Request.TakeSent
+        Order.Held => return Request.Held
+        Order.StartHeld(key) => return Request.StartHeld(key)
+        Order.DropHeld(key) => return Request.DropHeld(key)
         Order.Incoming => return Request.Incoming(stopped_by(id, mut stops, alloc))
         Order.Ready => return Request.Ready(stopped_by(id, mut stops, alloc))
         Order.StartKeyed => return Request.StartKeyed
@@ -926,14 +975,18 @@ fn sent_of(take answer: Answer, base: Remote, alloc: mem::Alloc) -> Sent {
         Answer.Flag(flag) => return Sent.Flag(flag)
         Answer.Stepped(None) => return Sent.Stepped(None)
         Answer.Stepped(Some(Stepped(handled: handled, encoding: encoding))) => {
-            var header: Option[Array[u8, 32]] = None
-            match handled.header {
-                Some(given) => {
-                    header = Some(given.bytes)
-                }
-                None => {}
+            return Sent.Stepped(Some(Stepping(header: header_bytes(handled.header), operation: handled.operation, call: naming_of(encoding, base, alloc))))
+        }
+        Answer.Taken(None) => return Sent.Taken(None)
+        Answer.Taken(Some(SentCall(operation: operation, header: header, delay_ns: delay_ns, encoding: encoding))) => {
+            return Sent.Taken(Some(Taking(operation: operation, header: header_bytes(header), delay_ns: delay_ns, call: naming_of(encoding, base, alloc))))
+        }
+        Answer.HeldTasks(tasks) => {
+            var keys = mem::List[HeldKey].empty(alloc)
+            for task in tasks {
+                mut keys.push(HeldKey(key: task.key, class: task.class))
             }
-            return Sent.Stepped(Some(Stepping(header: header, operation: handled.operation, call: naming_of(encoding, base, alloc))))
+            return Sent.HeldTasks(take keys)
         }
         Answer.Started(count) => return Sent.Started(u64.widen(count))
         Answer.Checkpointed(checkpoint) => return Sent.Checkpointed(take checkpoint)

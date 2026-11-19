@@ -1,4 +1,4 @@
-//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port, their random source from a counter and their file system from a disk writing each call it serves through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, a job reading kernel memory, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, instances of a component whose calls, a postponed one included, keyed tasks and checkpoints run in their spaces, with logs crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
+//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port, their random source from a counter and their file system from a disk writing each call it serves through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, a job reading kernel memory, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, instances of a component whose calls, a postponed one included, keyed tasks, held ones included, messages sent to themselves and checkpoints run in their spaces, with logs crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -817,7 +817,7 @@ fn booked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: 
 fn started(take instance: nanos::Instance, grants: Grants) -> nanos::Checkpoint fails nanos::InstanceError uses wait {
     var book = instance
     defer take book.abandon()
-    try await ticked(mut book, reason: sys::ResumeReason.Started)
+    try await ticked(mut book, reason: sys::ResumeReason.Started, by_key: false)
     try await added(mut book, amount: 5, grants)
     try await noted(mut book, grants)
     try await borrowed(mut book, grants)
@@ -994,7 +994,7 @@ fn lent(runner: Lending) -> Option[sys::Log] {
 fn restored(take instance: nanos::Instance, grants: Grants) fails nanos::InstanceError uses wait {
     var book = instance
     defer take book.abandon()
-    try await ticked(mut book, reason: sys::ResumeReason.Restored)
+    try await ticked(mut book, reason: sys::ResumeReason.Restored, by_key: true)
     try await added(mut book, amount: 7, grants)
     undefer book
     say(text: "book ")
@@ -1054,13 +1054,31 @@ fn abandoned(take instance: nanos::Instance, grants: Grants) fails nanos::Instan
     say_ended(try await take book.end(), alloc: grants.alloc)
 } abandoned
 
-/// Resumes the book for a reason, then starts the keyed task its resume spawns and steps the tick
-/// that task posts, writing its operation and the length of its encoding.
-fn ticked(mut book: nanos::Instance, reason: sys::ResumeReason) fails nanos::InstanceError uses wait {
+/// Resumes the book for a reason, takes the tick it sends itself and lists the keyed task its
+/// resume spawns, then starts that task, by its key once dropped and spawned again by another
+/// resume when `by_key`, and steps the tick that task posts, writing its operation and the length
+/// of its encoding.
+fn ticked(mut book: nanos::Instance, reason: sys::ResumeReason, by_key: bool) fails nanos::InstanceError uses wait {
     try await mut book.resumed(reason)
-    say(text: "book keyed ")
-    say_number(u64.widen(try await mut book.start_keyed()))
+    try await took_sent(mut book)
+    say(text: "book held")
+    for task in try await book.held() {
+        say(text: " ")
+        say_number(task.key)
+    }
     say(text: "\n")
+    if by_key {
+        say(text: "book dropped ")
+        say_flag(try await mut book.drop_held(1))
+        try await mut book.resumed(reason)
+        try await took_sent(mut book)
+        say(text: "book started ")
+        say_flag(try await mut book.start_held(1))
+    } else {
+        say(text: "book keyed ")
+        say_number(u64.widen(try await mut book.start_keyed()))
+        say(text: "\n")
+    }
     try await book.incoming()
     say(text: "book ticked ")
     let Some(stepped) = try await mut book.step_encoded() else {
@@ -1073,6 +1091,32 @@ fn ticked(mut book: nanos::Instance, reason: sys::ResumeReason) fails nanos::Ins
     say_number(u64.widen(stepped.encoding.bytes.len()))
     say(text: "\n")
 } ticked
+
+/// Takes the message the book sent itself, writing its operation, its delay and the length of its
+/// encoding.
+fn took_sent(mut book: nanos::Instance) fails nanos::InstanceError uses wait {
+    say(text: "book sent ")
+    let Some(taken) = try await mut book.take_sent() else {
+        say(text: "nothing\n")
+        return
+    }
+    say(text: "operation ")
+    say_number(u64.widen(taken.operation))
+    say(text: " delay ")
+    say_number(taken.delay_ns)
+    say(text: " bytes ")
+    say_number(u64.widen(taken.encoding.bytes.len()))
+    say(text: "\n")
+} took_sent
+
+/// Writes whether an operation did what it was asked.
+fn say_flag(flag: bool) {
+    if flag {
+        say(text: "true\n")
+    } else {
+        say(text: "false\n")
+    }
+} say_flag
 
 /// Adds `amount` to the book and writes the total it answers.
 fn added(mut book: nanos::Instance, amount: u32, grants: Grants) fails nanos::InstanceError uses wait {

@@ -143,6 +143,16 @@ pub closed struct Stepped {
     pub encoding: sys::Encoded
 } Stepped
 
+/// A message an instance's component sent itself, taken before any handler ran for it: its
+/// operation's number, its header, the nanoseconds left before it would enter the intake, and the
+/// encoding of the call it makes.
+pub closed struct SentCall {
+    pub operation: u16
+    pub header: Option[sys::Header]
+    pub delay_ns: u64
+    pub encoding: sys::Encoded
+} SentCall
+
 pub closed enum InstanceError derives Render {
     Ended
     Cancelled(task::Cancelled) from
@@ -194,6 +204,28 @@ pub fn Instance.step_encoded(mut self) -> Option[Stepped] fails InstanceError us
     }
     return stepped
 } Instance.step_encoded
+
+pub fn Instance.take_sent(mut self) -> Option[SentCall] fails InstanceError uses wait {
+    let Answer.Taken(taken) = try await self.ask(Request.TakeSent) else {
+        fail InstanceError.Ended
+    }
+    return taken
+} Instance.take_sent
+
+pub fn Instance.held(self) -> mem::List[sys::HeldTask] fails InstanceError uses wait {
+    let Answer.HeldTasks(tasks) = try await self.ask(Request.Held) else {
+        fail InstanceError.Ended
+    }
+    return tasks
+} Instance.held
+
+pub fn Instance.start_held(mut self, key: u64) -> bool fails InstanceError uses wait {
+    return try await self.flag(Request.StartHeld(key))
+} Instance.start_held
+
+pub fn Instance.drop_held(mut self, key: u64) -> bool fails InstanceError uses wait {
+    return try await self.flag(Request.DropHeld(key))
+} Instance.drop_held
 
 pub fn Instance.incoming(self) fails InstanceError uses wait {
     discard try await self.waiting(ready: false)
@@ -337,6 +369,10 @@ struct Asked {
 enum Request {
     Step
     StepEncoded
+    TakeSent
+    Held
+    StartHeld(u64)
+    DropHeld(u64)
     Incoming(task::Receiver[u8])
     Ready(task::Receiver[u8])
     StartKeyed
@@ -353,6 +389,8 @@ enum Answer {
     Done
     Flag(bool)
     Stepped(Option[Stepped])
+    Taken(Option[SentCall])
+    HeldTasks(mem::List[sys::HeldTask])
     Started(usize)
     Checkpointed(Checkpoint)
     Health(sys::HealthReply)
@@ -613,6 +651,17 @@ fn carried[S: sys::Component[Env, P] and Encode, Env: Environment and Send, P: s
             }
             return Some(Answer.Stepped(Some(Stepped(handled: handled, encoding: take encoding))))
         }
+        Request.TakeSent => {
+            let Some(sys::Sent(message: message, header: header, delay_ns: delay_ns)) = mut stepper.take_sent() else {
+                return Some(Answer.Taken(None))
+            }
+            var encoding = sys::Encoded.empty(alloc)
+            let operation = sys::Wire[P].encode_any(message, out: mut encoding)
+            return Some(Answer.Taken(Some(SentCall(operation: operation, header: header, delay_ns: delay_ns, encoding: take encoding))))
+        }
+        Request.Held => return Some(Answer.HeldTasks(stepper.held(alloc)))
+        Request.StartHeld(key) => return Some(Answer.Flag(mut stepper.start_held(key)))
+        Request.DropHeld(key) => return Some(Answer.Flag(mut stepper.drop_held(key)))
         Request.Incoming(stop) => return try await waited(stepper, take stop, ready: false, exec)
         Request.Ready(stop) => return try await waited(stepper, take stop, ready: true, exec)
         Request.StartKeyed => return Some(Answer.Started(mut stepper.start_keyed()))

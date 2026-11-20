@@ -182,6 +182,9 @@ pub fn bundle(
         })
     });
     diagnostics.extend(check::release_errors(&checker, root));
+    if errors(&diagnostics) {
+        return Ok(Build::failed(diagnostics));
+    }
     let artefacts = artefacts(workspace, &checker, root);
     for (name, root) in roots(&artefacts) {
         if read.roots.get(&name).is_some_and(|kernel| *kernel != root) {

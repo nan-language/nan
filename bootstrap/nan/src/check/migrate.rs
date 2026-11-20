@@ -157,12 +157,21 @@ impl Checker<'_> {
     }
 
     /// The schema hashes other than its own that the history of a type without type parameters
-    /// records for it with a tree its own tree accepts.
+    /// records for it with a tree its own tree accepts, and that no forward migration of it
+    /// converts from.
     pub fn accepted_schemas(&self, item: ItemId) -> Vec<Hash> {
         let tree = self.schema(&Ty::item(item, Vec::new()));
         let own = tree.hash();
+        let migrated: Vec<Hash> = self
+            .migrations(item)
+            .iter()
+            .filter(|migration| migration.forward)
+            .map(|migration| self.shape_hash(migration.shape))
+            .collect();
         self.recorded(item, |schema| {
-            let accepted = schema.hash != own && tree.accepts(&Node::read(&schema.tree)?);
+            let accepted = schema.hash != own
+                && !migrated.contains(&schema.hash)
+                && tree.accepts(&Node::read(&schema.tree)?);
             accepted.then_some(schema.hash)
         })
     }

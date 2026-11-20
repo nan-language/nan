@@ -535,8 +535,8 @@ impl Lowering<'_, '_> {
     }
 
     /// The entry a bundle's contribution adds to a loaded registry, lowering its value; a
-    /// `stack N` of a function field's type demands `N` less `GATE_STACK` of its function,
-    /// reported at the contribution.
+    /// `stack N` of a function field's type demands `N` less `GATE_STACK` of the code the entry
+    /// calls, reported at the contribution.
     pub fn contribute(&mut self, contribution: ItemId, registry: ItemId) -> Contributed {
         let SigKind::Registry { entry } = &self.ck.sig(registry).kind else {
             panic!("a registry's entry type");
@@ -551,7 +551,7 @@ impl Lowering<'_, '_> {
             .ck
             .const_value(contribution)
             .expect("a contribution's value");
-        let data = self.const_data(contribution, &entry);
+        let data = self.entry_data(contribution, &entry);
         let layout = self.layout(&entry);
         let field = |lo: &mut Self, name: &str| {
             let field = lo.layouts.field(lo.ck, &entry, None, name);
@@ -583,7 +583,11 @@ impl Lowering<'_, '_> {
             };
             if let Some(stack) = fn_ty.limits.stack {
                 let inner = self.callable_instance(fn_ref, true);
-                let id = self.instance(Instance::Value(Box::new(inner)));
+                let value = Instance::Value(Box::new(inner));
+                let id = self.instance(match self.ck.db.target.is_nanos() {
+                    true => Instance::Entered(Box::new(value)),
+                    false => value,
+                });
                 let span = Span::at(self.ck.db.item(contribution).ast.token);
                 self.demands.push(Demand {
                     judged: Judged::Function(id),

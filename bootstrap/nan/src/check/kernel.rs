@@ -1,9 +1,11 @@
 //! Kernel rules: the anchor reached only from entry contexts, the forms of interrupt fns and
-//! `interrupt fn` types, and float use under a kernel target.
+//! `interrupt fn` types, float use under a kernel target, and the floats a loaded registry's
+//! function fields pass.
 
 use super::Checker;
 use super::db::ItemId;
 use super::digest::Brought;
+use super::sig::SigKind;
 use super::tir::TBody;
 use super::ty::{Arg, FnParam, FnTy, Ty};
 use crate::diagnostic::Code;
@@ -13,6 +15,38 @@ use crate::syntax::ast::{FnModifier, ItemKind, Mode};
 const FRAME_INFOS: [&str; 3] = ["hw::NoCode", "hw::ErrorCode", "hw::PageFault"];
 
 impl Checker<'_> {
+    /// The names of the function fields of a registry's entry type that pass a float: a
+    /// parameter, result or failure type of theirs holds one.
+    pub fn float_fields(&self, registry: ItemId) -> Vec<String> {
+        let SigKind::Registry {
+            entry: Ty::Item(structure, _),
+        } = &self.sig(registry).kind
+        else {
+            return Vec::new();
+        };
+        let SigKind::Struct { fields } = &self.sig(*structure).kind else {
+            return Vec::new();
+        };
+        let float = |ty: &Ty| {
+            self.any_part(
+                ty,
+                &|part| matches!(part, Ty::Scalar(scalar) if scalar.is_float()),
+            )
+        };
+        fields
+            .iter()
+            .filter(|field| match &field.ty {
+                Ty::Fn(fn_ty) => {
+                    fn_ty.params.iter().any(|param| float(&param.ty))
+                        || float(&fn_ty.result)
+                        || fn_ty.fails.as_ref().is_some_and(float)
+                }
+                _ => false,
+            })
+            .map(|field| field.name.clone())
+            .collect()
+    }
+
     /// Whether an item is an entry context: an interrupt or landing fn.
     pub fn is_entry_context(&self, item: ItemId) -> bool {
         matches!(&self.db.ast(item).kind, ItemKind::Fn(function)

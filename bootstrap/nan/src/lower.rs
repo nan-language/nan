@@ -94,6 +94,9 @@ pub enum Instance {
     /// The code of a function value naming a function: the instance called through the ABI of
     /// function values.
     Value(Box<Instance>),
+    /// The code of a function value that code of another target enters, a value instance: owns
+    /// extended state of its own while it calls the value's code.
+    Entered(Box<Instance>),
     /// The code a `Dyn[I]` value calls for method `method` of `interface` on a value of `ty`.
     Dyn {
         ty: Ty,
@@ -809,6 +812,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
             }
             Instance::Release(ty) => release::define(self, fx, ty),
             Instance::Value(inner) => call::value_glue(self, fx, abi, inner),
+            Instance::Entered(value) => call::entered_glue(self, fx, value),
             Instance::Dyn {
                 ty,
                 interface,

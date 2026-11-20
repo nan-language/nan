@@ -1,7 +1,7 @@
 //! Bundle builds: the entries a package adds to the loaded registries of a kernel, lowered against
 //! the kernel's interface file, and that file, which a kernel's final build writes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -201,9 +201,19 @@ pub fn bundle(
         diagnostics.push(interface_error(source, reason));
     }
     let contributions = contributions(&checker, root, &read.roots);
-    if program && !contributions.is_empty() {
-        let reason = "a nanos program adds no entry to a loaded registry";
-        diagnostics.push(interface_error(source, reason));
+    if program {
+        let registries: BTreeSet<ItemId> = contributions
+            .iter()
+            .map(|(_, registry)| *registry)
+            .collect();
+        for registry in registries {
+            for field in checker.float_fields(registry) {
+                let registry = checker.db.canonical(registry);
+                let reason =
+                    format!("the entries it adds to {registry} pass a float through {field}");
+                diagnostics.push(interface_error(source, &reason));
+            }
+        }
     }
     if errors(&diagnostics) {
         return Ok(Build::failed(diagnostics));

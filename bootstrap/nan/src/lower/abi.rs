@@ -253,6 +253,7 @@ impl Lowering<'_, '_> {
                 abi.params[0] = (NTy::Ref(ty.clone()), Repr::Address);
                 abi
             }
+            Instance::Entered(value) => self.abi(value),
             Instance::Sides(inner) => Abi {
                 result: Ty::Unit,
                 returned: Returned::Indirect,

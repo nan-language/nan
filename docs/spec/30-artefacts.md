@@ -215,7 +215,7 @@ A **bundle** is the `.nbun` file that `nan build <package> --against <interface 
 - The bundle build of a nanos program lowers its **job entry**, which [`nanos::run`](14-authority.md#jobs) calls: it decodes the job's input, runs the entry function, and encodes its result, renders its failure or reports its cancellation, through the job adapters of `nanos`. The entry function's `limits stack N`, when it states one, bounds the job entry's stack use, the adapter's and the extended state's included ([floating point](24-kernel.md#floating-point)), reported on the entry function's head; otherwise the job's stack [grows](17-suspension-io.md#grown-stacks).
 - The bundle build of a nanos program listing component entries lowers, for each, its **component entry**, which [`nanos::hold`](14-authority.md#component-instances) and `nanos::hold_isolated` call: it runs the instance task through the component adapter of `nanos`, on a stack that grows.
 
-- A bundle build checks the package's dependency closure and release-checks its releases as a final build does. It is an error (`target.bundle-interface`), reported on the package's `package` line with a `note` reason, when the interface file cannot be read or does not decode, when it records another toolchain hash or a target the package does not declare, when a package of the closure has another code root than the interface file records under its name, when an interrupt fn of a package outside the kernel's final closure states a larger `stack N` than the file's part 5, when the bundle's code reaches a support routine or runtime data the kernel does not export, and when a nanos program's closure contributes to a loaded registry.
+- A bundle build checks the package's dependency closure and release-checks its releases as a final build does. It is an error (`target.bundle-interface`), reported on the package's `package` line with a `note` reason, when the interface file cannot be read or does not decode, when it records another toolchain hash or a target the package does not declare, when a package of the closure has another code root than the interface file records under its name, when an interrupt fn of a package outside the kernel's final closure states a larger `stack N` than the file's part 5, when the bundle's code reaches a support routine or runtime data the kernel does not export, and when a nanos program's closure contributes to a loaded registry an entry with a function field whose parameter, result or failure type holds a float, which kernel code passes otherwise than nanos code does.
 - A `stack N` of the type of a loaded registry's function field demands `N` less 1 KiB of each function a contribution names for it, the rest left to its gate, reported at the contribution, and demands `N` of the gate in the kernel's final build, reported at the registry.
 - The [user-mode runtime](24-kernel.md#isolated-spaces) a kernel's final build holds is an unsigned bundle built against the kernel's own interface file, imports none, and whose job entry is the runtime's start, with the stack that start runs on.
 - A [test image](22-testing.md#emulator-runs) of a nanos target is an unsigned bundle of the same form against no interface file, which imports and exports nothing and holds the support routines its runs need, lowered for user mode; its runtime's start takes the address of the start record of a [test run](14-authority.md#jobs) in place of a job's.
@@ -300,6 +300,127 @@ wrote .nan/images/x86_64-nanos/hello.narts
 wrote .nan/images/x86_64-nanos/hello.nbun
 wrote .nan/images/x86_64-nanos/hello.ntree
 ok build .: files 6, errors 0, incomplete 0
+```
+
+A nanos program adds entries to the loaded registries of the kernel it is built against, its function fields entered as the [floating point](24-kernel.md#floating-point) rules state, unless one of them would pass a float:
+
+```nan
+// file: meters/package.nan
+//! The scalers and gauges a kernel holds and its bundles add.
+
+package meters {
+    language 1
+    targets x86_64-bare, x86_64-nanos
+} meters
+
+// file: meters/meters.nan
+//! The tables of scalers and gauges, keyed by id.
+
+/// A scaler: its id and the value it scales a value to.
+pub closed struct Scaler {
+    pub id: u32
+    pub scale: fn(value: u32) -> u32 limits stack 16_384
+} Scaler
+
+pub loaded registry scalers: Scaler keyed by id
+
+/// A gauge: its id and the reading it gives a level.
+pub closed struct Gauge {
+    pub id: u32
+    pub read: fn(level: f64) -> u32 limits stack 16_384
+} Gauge
+
+pub loaded registry gauges: Gauge keyed by id
+
+// file: kernel/package.nan
+//! A kernel exporting its load ABI.
+
+package kernel {
+    language 1
+    targets x86_64-bare
+    entry main
+    dep meters "../meters"
+} kernel
+
+// file: kernel/kernel.nan
+//! Entry of the kernel.
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    discard k.loader()
+    discard meters::scalers
+    discard meters::gauges
+    loop {
+    }
+} main
+
+// file: scaled/package.nan
+//! A job adding a meter.
+
+package scaled {
+    language 1
+    targets x86_64-nanos
+    entry main
+    dep meters "../meters"
+} scaled
+
+// file: scaled/scaled.nan
+//! Scaler 1, halving through floats, and a job.
+
+contribute meters::scalers halving = meters::Scaler(id: 1, scale: halve)
+
+fn halve(value: u32) -> u32 {
+    return u32.fit(f64.widen(value) * 0.5)
+} halve
+
+fn main(take world: nanos::World, take input: u32) -> u32 fails task::Cancelled uses wait {
+    world.log.info("scaled", value: input)
+    return input
+} main
+
+// file: gauged/package.nan
+//! A job adding a meter.
+
+package gauged {
+    language 1
+    targets x86_64-nanos
+    entry main
+    dep meters "../meters"
+} gauged
+
+// file: gauged/gauged.nan
+//! Gauge 1, doubling a level, and a job.
+
+contribute meters::gauges doubling = meters::Gauge(id: 1, read: double)
+
+fn double(level: f64) -> u32 {
+    return u32.fit(level * 2.0)
+} double
+
+fn main(take world: nanos::World, take input: u32) -> u32 fails task::Cancelled uses wait {
+    world.log.info("gauged", value: input)
+    return input
+} main
+```
+
+```text
+$ nan build kernel
+ok build kernel: files 3, errors 0, incomplete 0
+wrote .nan/images/x86_64-bare/kernel.elf
+wrote .nan/images/x86_64-bare/kernel.narts
+wrote .nan/images/x86_64-bare/kernel.nlif
+ok build kernel: files 3, errors 0, incomplete 0
+$ nan build scaled --against .nan/images/x86_64-bare/kernel.nlif
+ok build scaled --against .nan/images/x86_64-bare/kernel.nlif: files 3, errors 0, incomplete 0
+wrote .nan/images/x86_64-nanos/scaled.narts
+wrote .nan/images/x86_64-nanos/scaled.nbun
+wrote .nan/images/x86_64-nanos/scaled.ntree
+ok build scaled --against .nan/images/x86_64-bare/kernel.nlif: files 3, errors 0, incomplete 0
+$ nan build gauged --against .nan/images/x86_64-bare/kernel.nlif
+failed build gauged --against .nan/images/x86_64-bare/kernel.nlif: files 0, errors 1, incomplete 0
+error target.bundle-interface gauged/package.nan:3 gauged
+    package gauged {
+    because note - - the entries it adds to meters::gauges pass a float through read
+failed build gauged --against .nan/images/x86_64-bare/kernel.nlif: files 0, errors 1, incomplete 0
 ```
 
 ## Host symbol names

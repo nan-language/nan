@@ -1166,6 +1166,19 @@ pub fn value_glue(lo: &mut Lowering, fx: &mut Fx, abi: &Abi, inner: &Instance) {
     forward(lo, fx, abi, &inner_abi, id, true);
 }
 
+/// The code of a function value that code of another target enters: owns extended state of its
+/// own around a call of the value's code, with the parameters it is given.
+pub fn entered_glue(lo: &mut Lowering, fx: &mut Fx, value: &Instance) {
+    let params = fx.entry();
+    let owned = lo.own_extended(fx);
+    let callee = lo.instance(value.clone());
+    let reference = lo.call_ref(fx, callee);
+    let inst = fx.b.ins().call(reference, &params);
+    let returns = fx.b.inst_results(inst).to_vec();
+    lo.disown_extended(fx, owned);
+    fx.b.ins().return_(&returns);
+}
+
 /// The code a `Dyn` value calls for a method: receives the value's address first and calls the
 /// implementing function.
 pub fn dyn_glue(

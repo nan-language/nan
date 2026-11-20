@@ -55,6 +55,7 @@ fn glue_word(instance: &Instance) -> &'static str {
         Instance::Encoding { .. } => "encoding",
         Instance::Release(_) => "release",
         Instance::Value(_) => "value",
+        Instance::Entered(_) => "entered",
         Instance::Dyn { .. } => "dyn",
         Instance::Sides(_) => "sides",
         Instance::Nir { .. } | Instance::Supplied { .. } => "item",

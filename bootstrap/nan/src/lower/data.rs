@@ -219,6 +219,12 @@ impl Lowering<'_, '_> {
 
     /// A data object holding a const value of a type.
     fn value_data(&mut self, value: &Rc<ConstValue>, ty: &Ty) -> DataId {
+        let (image, align) = self.value_image(value, ty);
+        self.define_data("const", image, align)
+    }
+
+    /// The image of a value of a type, and its alignment.
+    fn value_image(&mut self, value: &Rc<ConstValue>, ty: &Ty) -> (Image, u64) {
         let layout = self.layout(ty);
         let mut image = Image {
             bytes: vec![0; layout.size.max(1) as usize],
@@ -227,7 +233,24 @@ impl Lowering<'_, '_> {
         };
         let mut extents = HashMap::new();
         self.write_val(value, &value.value, ty, 0, &mut image, &mut extents);
-        self.define_data("const", image, layout.align)
+        (image, layout.align)
+    }
+
+    /// The entry a contribution adds to a loaded registry: its value, the code of each function
+    /// field entered as code of another target enters a nanos bundle's code.
+    pub(super) fn entry_data(&mut self, contribution: ItemId, ty: &Ty) -> DataId {
+        if !self.ck.db.target.is_nanos() {
+            return self.const_data(contribution, ty);
+        }
+        let value = self
+            .ck
+            .const_value(contribution)
+            .expect("a contribution's value");
+        let (mut image, align) = self.value_image(&value, ty);
+        for (_, function) in &mut image.functions {
+            *function = Instance::Entered(Box::new(function.clone()));
+        }
+        self.define_data("const", image, align)
     }
 
     /// Writes a value of a type at an offset of an image.

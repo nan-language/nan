@@ -907,6 +907,7 @@ marker = failure_marker | "await" | mode ;
 
 - Markers come in the order `try` or `attempt`, then `await`, then a mode, then the expression they mark, each at most once. Any other order or repetition is an error (`expr.marker-order`), whose exact fix writes the canonical order.
 - `try`, `attempt` and `await` apply to the call that ends the postfix expression after the markers: `try await mut conn.read(mut buf.view_mut())` applies all three to `conn.read(...)`. `await` also precedes `when` ([cowns](16-concurrency.md#cowns)). Before a postfix expression that is not a call, a construction included, they are an error (`expr.marker-target`).
+- When `try` and `await` before a method call mark a call that needs neither, while marking a call of its receiver chain with them instead leaves none of them missing or unneeded, they are one error, `effect.await-unneeded` when `await` is among them and `error.marker-unneeded` otherwise, whose exact fix puts them before that call in parentheses: `(try await next(take inbox)).is_some()`. The call they mark is then checked as so fixed.
 - Before a method call, a mode marks the receiver: `mut out.push(value)` passes `out` by `mut`. When the receiver is itself a call of a [projection](07-ownership.md#projections), or a field or index path from one, the mode marks that call's receiver in turn.
 - Before any other expression forming a whole argument, a whole construction value or the iterated operand of `for`, a mode marks that expression, or, when it is a field or index path from a call of a projection, that call's receiver in turn.
 - A mode in any other position, such as before an initialiser or a returned value, is an error (`expr.marker-target`). [Marking](07-ownership.md#marking) states which arguments and receivers are marked and requires each marked one to be a place.
@@ -935,6 +936,17 @@ pub fn has_data(mut conn: sys::net::Conn, alloc: mem::Alloc) -> bool fails PingE
     let count = await try mut conn.read(mut buf.view_mut()) // error: expr.marker-order
     return count > 0
 } has_data
+```
+
+```nan
+pub fn next(take inbox: task::Receiver[u8]) -> Option[u8] fails task::Cancelled uses wait {
+    var receiver = inbox
+    return try await mut receiver.receive()
+} next
+
+pub fn pending(take inbox: task::Receiver[u8]) -> bool fails task::Cancelled uses wait {
+    return try await next(take inbox).is_some() // error: effect.await-unneeded
+} pending
 ```
 
 ```nan

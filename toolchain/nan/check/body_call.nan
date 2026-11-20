@@ -304,6 +304,10 @@ fn Body.marked(mut self, expr: ast::Expr, expected: Option[ty::Ty]) -> TExpr {
         typed.last = expr.last
         return typed
     }
+    match mut self.markers_moved(expr, expected) {
+        Some(moved) => return moved
+        None => {}
+    }
     var markers = Markers.none()
     markers.failure = failure
     markers.awaited = awaited
@@ -313,6 +317,134 @@ fn Body.marked(mut self, expr: ast::Expr, expected: Option[ty::Ty]) -> TExpr {
     typed.last = expr.last
     return typed
 } Body.marked
+
+/// A `try` and `await` before a method call that needs neither, when marking a call of its
+/// receiver chain with them instead leaves no marker missing or unneeded: reports them once,
+/// with the fix putting them before that call in parentheses, and types the expression so
+/// fixed.
+fn Body.markers_moved(mut self, expr: ast::Expr, expected: Option[ty::Ty]) -> Option[TExpr] {
+    let ast::ExprKind.Marked(failure: written, awaited: awaited, mode: None, inner: boxed) = expr.kind else {
+        return None
+    }
+    var failure: Option[ast::Word[ast::FailureMarker]] = None
+    match written {
+        Some(word) => {
+            if word.kind == ast::FailureMarker.Try {
+                failure = Some(word)
+            }
+        }
+        None => {}
+    }
+    if failure.is_none() and awaited.is_none() {
+        return None
+    }
+    let inner = boxed.contents()
+    let alloc = self.ck.alloc()
+    let candidates = receiver_calls(inner, alloc)
+    if candidates.len() == 0 {
+        return None
+    }
+    var markers = Markers.none()
+    markers.failure = failure
+    markers.awaited = awaited
+    let written_probe = mut self.probe(typing: fn(mut body: Body) -> TExpr {
+        return mut body.call(inner, expected, markers: Some(markers))
+    })
+    let Probed(value: _, diagnostics: found) = written_probe
+    if not marker_misplaced(found.view(), missing: false) {
+        return None
+    }
+    for candidate in candidates {
+        let marked = ast::Expr(token: expr.token, last: candidate.last, kind: ast::ExprKind.Marked(failure: failure, awaited: awaited, mode: None, inner: mem::Heap.of(alloc).boxed(candidate.copy(alloc))))
+        let fixed = chain_replaced(inner, call: candidate, with: marked, alloc)
+        let moved_probe = mut self.probe(typing: fn(mut body: Body) -> TExpr {
+            return mut body.call(fixed, expected, markers: None)
+        })
+        let Probed(value: _, diagnostics: moved_found) = moved_probe
+        if marker_misplaced(moved_found.view(), missing: true) {
+            continue
+        }
+        var last_marker = expr.token
+        match failure {
+            Some(word) => {
+                last_marker = word.token
+            }
+            None => {}
+        }
+        var code = diagnostic::Code.ErrorMarkerUnneeded
+        match awaited {
+            Some(token) => {
+                last_marker = token
+                code = diagnostic::Code.EffectAwaitUnneeded
+            }
+            None => {}
+        }
+        let opened = self.ck.fix_inserting(self.item, before: expr.token, text: "(")
+        var fixes = mem::List[diagnostic::Fix].empty(alloc)
+        mut fixes.push(take opened.joined(self.ck.fix_appending(self.item, after: candidate.last, text: ")")))
+        self.report_fixed(construct: nir::Span(head: expr.token, last: last_marker), code, take fixes)
+        var typed = mut self.call(fixed, expected, markers: None)
+        typed.token = expr.token
+        typed.last = expr.last
+        return Some(take typed)
+    }
+    return None
+} Body.markers_moved
+
+/// Whether a marker unneeded, or missing when `missing`, is among the diagnostics `found`.
+fn marker_misplaced(found: Slice[diagnostic::Diagnostic], missing: bool) -> bool {
+    for reported in found {
+        match reported.code {
+            diagnostic::Code.EffectAwaitUnneeded or diagnostic::Code.ErrorMarkerUnneeded => return true
+            diagnostic::Code.EffectAwaitMissing or diagnostic::Code.ErrorUnhandled => {
+                if missing {
+                    return true
+                }
+            }
+            else => {}
+        }
+    }
+    return false
+} marker_misplaced
+
+/// The calls of the receiver chain of a method call, the nearest first.
+fn receiver_calls(call: ast::Expr, alloc: mem::Alloc) -> mem::List[ast::Expr] {
+    var found = mem::List[ast::Expr].empty(alloc)
+    var at = call.copy(alloc)
+    loop {
+        let next = match at.kind {
+            ast::ExprKind.Call(callee: callee, args: _) => match callee.contents().kind {
+                ast::ExprKind.Field(base: base, name: _) => base.contents().copy(alloc)
+                else => return found
+            }
+            ast::ExprKind.Field(base: base, name: _) => base.contents().copy(alloc)
+            else => return found
+        }
+        match next.kind {
+            ast::ExprKind.Call(callee: _, args: _) => mut found.push(next.copy(alloc))
+            else => {}
+        }
+        at = next
+    }
+} receiver_calls
+
+/// A copy of a postfix expression whose receiver chain holds `with` in place of the call `call`.
+fn chain_replaced(expr: ast::Expr, call: ast::Expr, with: ast::Expr, alloc: mem::Alloc) -> ast::Expr {
+    return match expr.kind {
+        ast::ExprKind.Call(callee: callee, args: args) => {
+            if expr.token == call.token and expr.last == call.last {
+                return with.copy(alloc)
+            }
+            let kind = ast::ExprKind.Call(callee: mem::Heap.of(alloc).boxed(chain_replaced(callee.contents(), call, with, alloc)), args: ast::Arg.copies(args.view(), alloc))
+            return ast::Expr(token: expr.token, last: expr.last, kind: take kind)
+        }
+        ast::ExprKind.Field(base: base, name: name) => {
+            let kind = ast::ExprKind.Field(base: mem::Heap.of(alloc).boxed(chain_replaced(base.contents(), call, with, alloc)), name: name.copy(alloc))
+            return ast::Expr(token: expr.token, last: expr.last, kind: take kind)
+        }
+        else => expr.copy(alloc)
+    }
+} chain_replaced
 
 /// `old(e)`: the value of a Copy expression at entry, holding no `result` and no other `old`.
 fn Body.old(mut self, token: u32, value: ast::Expr, expected: Option[ty::Ty]) -> TExpr {

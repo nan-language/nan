@@ -269,6 +269,9 @@ impl Body<'_, '_> {
                 ..typed
             };
         }
+        if let Some(moved) = self.markers_moved(expr, expected) {
+            return moved;
+        }
         let markers = Markers {
             failure: *failure,
             awaited: *awaited,
@@ -281,6 +284,78 @@ impl Body<'_, '_> {
             last: expr.last,
             ..typed
         }
+    }
+
+    /// A `try` and `await` before a method call that needs neither, when marking a call of its
+    /// receiver chain with them instead leaves no marker missing or unneeded: reports them once,
+    /// with the fix putting them before that call in parentheses, and types the expression so
+    /// fixed.
+    fn markers_moved(&mut self, expr: &ast::Expr, expected: Option<&Ty>) -> Option<TExpr> {
+        let ExprKind::Marked {
+            failure,
+            awaited,
+            mode: None,
+            inner,
+        } = &expr.kind
+        else {
+            return None;
+        };
+        let failure = failure.filter(|(marker, _)| *marker == FailureMarker::Try);
+        if failure.is_none() && awaited.is_none() {
+            return None;
+        }
+        let candidates = receiver_calls(inner);
+        if candidates.is_empty() {
+            return None;
+        }
+        let markers = Markers {
+            failure,
+            awaited: *awaited,
+            ..Markers::default()
+        };
+        let (_, found) = self.probe(|body| body.call(inner, expected, Some(markers)));
+        let unneeded = [Code::EffectAwaitUnneeded, Code::ErrorMarkerUnneeded];
+        if !found.iter().any(|found| unneeded.contains(&found.code)) {
+            return None;
+        }
+        let marked = |call: &ast::Expr| ast::Expr {
+            token: expr.token,
+            last: call.last,
+            kind: ExprKind::Marked {
+                failure,
+                awaited: *awaited,
+                mode: None,
+                inner: Box::new(call.clone()),
+            },
+        };
+        let misplaced = [
+            Code::EffectAwaitMissing,
+            Code::EffectAwaitUnneeded,
+            Code::ErrorMarkerUnneeded,
+            Code::ErrorUnhandled,
+        ];
+        let (call, fixed) = candidates.into_iter().find_map(|call| {
+            let fixed = chain_replaced(inner, call, &marked(call));
+            let (_, found) = self.probe(|body| body.call(&fixed, expected, None));
+            let clean = !found.iter().any(|found| misplaced.contains(&found.code));
+            clean.then_some((call, fixed))
+        })?;
+        let last_marker = awaited.or(failure.map(|(_, token)| token))?;
+        let fix = self
+            .ck
+            .fix_inserting(self.item, expr.token, "(")
+            .and(self.ck.fix_appending(self.item, call.last, ")"));
+        let code = match awaited {
+            Some(_) => Code::EffectAwaitUnneeded,
+            None => Code::ErrorMarkerUnneeded,
+        };
+        self.report_fixed((expr.token, last_marker), code, vec![fix]);
+        let typed = self.call(&fixed, expected, None);
+        Some(TExpr {
+            token: expr.token,
+            last: expr.last,
+            ..typed
+        })
     }
 
     /// `old(e)`: the value of a Copy expression at entry, holding no `result` and no other `old`.
@@ -3352,5 +3427,47 @@ fn mode_word(mode: Option<Mode>) -> &'static str {
         Some(Mode::Mut) => "mut ",
         Some(Mode::Take) => "take ",
         _ => "",
+    }
+}
+
+/// The calls of the receiver chain of a method call, the nearest first.
+fn receiver_calls(call: &ast::Expr) -> Vec<&ast::Expr> {
+    let mut found = Vec::new();
+    let mut at = call;
+    loop {
+        at = match &at.kind {
+            ExprKind::Call { callee, .. } => match &callee.kind {
+                ExprKind::Field { base, .. } => base,
+                _ => return found,
+            },
+            ExprKind::Field { base, .. } => base,
+            _ => return found,
+        };
+        if matches!(at.kind, ExprKind::Call { .. }) {
+            found.push(at);
+        }
+    }
+}
+
+/// A copy of a postfix expression whose receiver chain holds `with` in place of `call`.
+fn chain_replaced(expr: &ast::Expr, call: &ast::Expr, with: &ast::Expr) -> ast::Expr {
+    if std::ptr::eq(expr, call) {
+        return with.clone();
+    }
+    let kind = match &expr.kind {
+        ExprKind::Call { callee, args } => ExprKind::Call {
+            callee: Box::new(chain_replaced(callee, call, with)),
+            args: args.clone(),
+        },
+        ExprKind::Field { base, name } => ExprKind::Field {
+            base: Box::new(chain_replaced(base, call, with)),
+            name: name.clone(),
+        },
+        kind => kind.clone(),
+    };
+    ast::Expr {
+        token: expr.token,
+        last: expr.last,
+        kind,
     }
 }

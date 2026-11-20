@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::coded_key;
+use crate::artefact::Earlier;
 use crate::check::unchecked;
 use crate::hash::Hash;
 use crate::workspace::tests::Scratch;
@@ -57,16 +58,13 @@ fn a_code_root_is_kept_under_the_states_its_package_reaches() {
 }
 
 #[test]
-fn a_code_root_records_the_frozen_shapes_of_migrations_and_their_inverses() {
+fn a_code_root_records_the_earlier_schemas_decode_from_reads() {
     let scratch = Scratch::new(&[
         (
             "settings/package.nan",
             "//! Settings.\n\npackage settings {\n    language 1\n    targets any\n} settings\n",
         ),
-        (
-            "settings/.nan/history.nan",
-            "nan history 1\nname \"settings\"\nmodule settings\nschema Settings \"agib35pkkvbgllndccsmcj2cjah4xoif2okmhv7ggxbrttxqz7p5kvz\" \"aecw433emvzvwaqgkjswg33smqat2aqgmzuwk3deomwqcbahmfwgsyltmvzqcaajmrswmylvnr2gkzabaabwwzlzbadxezluojuwk4yfozqwy5lfaeaqi33qmvxacaaikvxhg2lhnzswiaijaecxo2leoruaccasa\"\ncheck \"afpowiqtdmql4t5dh72xqar5pp2o6pne4jlydrfet2lgto7avqlmok7\"\n",
-        ),
+        ("settings/.nan/history.nan", HISTORY),
         ("settings/settings.nan", SETTINGS),
     ]);
     let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
@@ -77,19 +75,33 @@ fn a_code_root_records_the_frozen_shapes_of_migrations_and_their_inverses() {
         Target::Any,
     );
     let package = checker.package_named("settings").expect("the package");
-    let roots = checker.migration_roots(package);
-    let first = Hash(
-        crate::hash::parse_form("agib35pkkvbgllndccsmcj2cjah4xoif2okmhv7ggxbrttxqz7p5kvz")
-            .expect("a hash")
-            .try_into()
-            .expect("33 bytes"),
-    );
-    let recorded: Vec<(&str, &[(Hash, bool)])> = roots
+    let roots = checker.earlier_roots(package);
+    let hash = |form: &str| {
+        Hash(
+            crate::hash::parse_form(form)
+                .expect("a hash")
+                .try_into()
+                .expect("33 bytes"),
+        )
+    };
+    let limits = hash("afwsm4kkvgahmfrknqs5amzv3uj4lryliobcfzemo6czknryqyfgykn");
+    let settings = hash("agib35pkkvbgllndccsmcj2cjah4xoif2okmhv7ggxbrttxqz7p5kvz");
+    let recorded: Vec<(&str, &[(Hash, Earlier)])> = roots
         .iter()
-        .map(|root| (root.path.as_str(), root.shapes.as_slice()))
+        .map(|root| (root.path.as_str(), root.schemas.as_slice()))
         .collect();
-    assert_eq!(recorded, [("settings::Settings", &[(first, true)][..])]);
+    assert_eq!(
+        recorded,
+        [
+            ("settings::Limits", &[(limits, Earlier::Accepted)][..]),
+            ("settings::Settings", &[(settings, Earlier::Reversible)][..])
+        ]
+    );
 }
 
-/// Settings with a migration from the shape of their first release and its inverse.
-const SETTINGS: &str = "//! Settings.\n\npub closed struct Settings derives Encode {\n    pub retries: u8\n    pub backoff: u16\n} Settings\n\nstruct FirstSettings derives Encode {\n    retries: u8\n} FirstSettings\n\nmigrate fn Settings.from_first(take old: FirstSettings) -> Settings limits notrap, terminates {\n    return Settings(retries: old.retries, backoff: 100)\n} Settings.from_first\n\nmigrate fn Settings.to_first(self) -> FirstSettings limits notrap, terminates {\n    return FirstSettings(retries: self.retries)\n} Settings.to_first\n";
+/// The history of the first releases of `Limits` and `Settings`, each holding one field.
+const HISTORY: &str = "nan history 1\nname \"settings\"\nmodule settings\nschema Limits \"afwsm4kkvgahmfrknqs5amzv3uj4lryliobcfzemo6czknryqyfgykn\" \"aecw433emvzvsaqgkjswg33smqatwaqgmzuwk3deomvqcbahmfwgsyltmvzqcaajmrswmylvnr2gkzabaabwwzlzaycwg33vnz2ak5tbnr2wkaibarxxazloaeaaqvloonuwo3tfmqaqsaifo5uwi5diaeeanu\"\nschema Settings \"agib35pkkvbgllndccsmcj2cjah4xoif2okmhv7ggxbrttxqz7p5kvz\" \"aecw433emvzvwaqgkjswg33smqat2aqgmzuwk3deomwqcbahmfwgsyltmvzqcaajmrswmylvnr2gkzabaabwwzlzbadxezluojuwk4yfozqwy5lfaeaqi33qmvxacaaikvxhg2lhnzswiaijaecxo2leoruaccasa\"\ncheck \"ahkk6gbuuwn2jj3ihkdadsxffwnjkttuqn64zx2bel7iem7p7qn7wc3\"\n";
+
+/// Limits that gained a field their first release lacked, and settings with a migration from the
+/// shape of their first release and its inverse.
+const SETTINGS: &str = "//! Settings.\n\npub open struct Limits derives Encode {\n    pub count: u8\n    pub cap: Option[u16]\n} Limits\n\npub closed struct Settings derives Encode {\n    pub retries: u8\n    pub backoff: u16\n} Settings\n\nstruct FirstSettings derives Encode {\n    retries: u8\n} FirstSettings\n\nmigrate fn Settings.from_first(take old: FirstSettings) -> Settings limits notrap, terminates {\n    return Settings(retries: old.retries, backoff: 100)\n} Settings.from_first\n\nmigrate fn Settings.to_first(self) -> FirstSettings limits notrap, terminates {\n    return FirstSettings(retries: self.retries)\n} Settings.to_first\n";

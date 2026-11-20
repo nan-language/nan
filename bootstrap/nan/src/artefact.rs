@@ -35,7 +35,7 @@ pub struct Parts {
     /// tree's `mem::wire` encoding.
     pub schemas: Vec<(String, Vec<u8>)>,
     pub protocols: Vec<ProtocolRoot>,
-    pub migrations: Vec<MigrationRoot>,
+    pub earlier: Vec<EarlierRoot>,
 }
 
 /// A `pub` protocol as a code root records it: its canonical path, its protocol hash, and the
@@ -46,12 +46,20 @@ pub struct ProtocolRoot {
     pub operations: Vec<(String, Hash)>,
 }
 
-/// A type with forward migrations as a code root records it: its canonical path and, in byte
-/// order of schema hash, the schema hash of each frozen shape a forward migration converts from,
-/// with whether an inverse converts to it.
-pub struct MigrationRoot {
+/// The earlier schemas `decode_from` reads for a type as a code root records them: its canonical
+/// path and, in byte order of schema hash, each schema hash with how it reads it.
+pub struct EarlierRoot {
     pub path: String,
-    pub shapes: Vec<(Hash, bool)>,
+    pub schemas: Vec<(Hash, Earlier)>,
+}
+
+/// How `decode_from` reads an earlier schema of a type: as the type's tree accepts its tree, or
+/// through a forward migration, which an inverse may undo; the code root writes its number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Earlier {
+    Accepted = 0,
+    Migrated = 1,
+    Reversible = 2,
 }
 
 /// A list of elements sorted by the bytes of their encodings.
@@ -164,18 +172,18 @@ pub fn code_root(parts: &Parts) -> Vec<u8> {
             ),
         );
     }
-    if !parts.migrations.is_empty() {
+    if !parts.earlier.is_empty() {
         record.field(
             12,
             sorted_list(
                 parts
-                    .migrations
+                    .earlier
                     .iter()
-                    .map(|migrated| {
-                        let mut out = text(&migrated.path);
-                        list(&mut out, migrated.shapes.iter(), |out, (hash, inverse)| {
+                    .map(|earlier| {
+                        let mut out = text(&earlier.path);
+                        list(&mut out, earlier.schemas.iter(), |out, (hash, read)| {
                             out.extend(hash_bytes(hash));
-                            uvar(out, u128::from(*inverse));
+                            uvar(out, *read as u128);
                         });
                         out
                     })

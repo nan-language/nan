@@ -274,7 +274,7 @@ pub fn tally(mut counter: Counter) {
 
 ### History
 
-The **history** of a package is its [machine file](35-format.md#machine-files) `.nan/history.nan`, recording its store name, its [history head](#publishing), the schema hash and [schema tree](13-text-encode.md#schema-hashes) of each type whose schema tree the code root of a release [published](#publishing) from it records, which [migrations](13-text-encode.md#migrations) and `decode_from` read, and every tombstone publishing moved out of source; tombstones keeping an `Encode` [key](13-text-encode.md#keys) stay in source while their type derives `Encode`. A release's [code root](30-artefacts.md#code-roots) holds the history's tombstones, never its history head, store name or schemas. History tombstones forward, match and take old forms exactly as tombstones in source do.
+The **history** of a package is its [machine file](35-format.md#machine-files) `.nan/history.nan`, recording its store name, its [history head](#publishing), the schema hash and [schema tree](13-text-encode.md#schema-hashes) of each type whose schema tree the code root of a release [published](#publishing) from it records, which [migrations](13-text-encode.md#migrations) and `decode_from` read, and every tombstone publishing moved out of source; tombstones keeping an `Encode` [key](13-text-encode.md#keys) stay in source while their type derives `Encode`. A release's [code root](30-artefacts.md#code-roots) holds the history's tombstones and the earlier schema hashes that `decode_from` reads, never its history head or store name. History tombstones forward, match and take old forms exactly as tombstones in source do.
 
 ## Compatibility
 

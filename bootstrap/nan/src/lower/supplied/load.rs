@@ -1,5 +1,5 @@
-//! Loading: `boot::Kernel.loader`, the pinned versions of a loaded registry's table, a loaded
-//! bundle's job entry, its code's address and its stack, the pins counting a load's handles on
+//! Loading: `boot::Kernel.loader`, the versions of a loaded registry's table a read pins or a
+//! prepared bundle's preview holds, a loaded bundle's job entry, its code's address and its stack, the pins counting a load's handles on
 //! its target record, and the export table, runtime memory, window entries, translation
 //! invalidation and instruction visibility the loader of `sys::load` reads, with the user-mode
 //! runtime's image, the entries mapping an isolated space and the running root its tables share.
@@ -50,12 +50,10 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
             let holding = supply.param(1).scalar();
             let readers = fx.load(PTR, holding, holdings::holding::PAYLOAD);
             let version = fx.b.ins().iadd_imm_s(readers, -(READERS as i64));
-            let entries = fx.load(PTR, version, 0);
-            let len = fx.load(PTR, version, 8);
-            let sret = supply.sret.expect("a view's address");
-            fx.store(entries, sret, 0);
-            fx.store(len, sret, 8);
-            supply.done(lo, fx);
+            version_entries(lo, fx, supply, version);
+        }
+        "sys::load::Table.entries_of" => {
+            version_entries(lo, fx, supply, supply.param(1).scalar());
         }
         "sys::load::pin" => {
             let record = supply.param(0).scalar();
@@ -209,4 +207,14 @@ pub fn release(lo: &mut Lowering, fx: &mut Fx, path: &str, address: Value) -> bo
     let holding = fx.load(PTR, address, 0);
     unpin(lo, fx, holding);
     true
+}
+
+/// Returns the view of the entries of the version at `version`: its entry array and length.
+fn version_entries(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, version: Value) {
+    let entries = fx.load(PTR, version, 0);
+    let len = fx.load(PTR, version, 8);
+    let sret = supply.sret.expect("a view's address");
+    fx.store(entries, sret, 0);
+    fx.store(len, sret, 8);
+    supply.done(lo, fx);
 }

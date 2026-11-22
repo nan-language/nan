@@ -1761,6 +1761,8 @@ pub fn Prepared.load(take self) -> Bundle fails LoadError
 
 pub fn Prepared.entries[E: Any, T: Any](self, table: Table[E], body: fn(entries: Slice[E]) -> T) -> T
 
+pub fn Prepared.retire(take self)
+
 pub open linear struct Bundle derives Send {
 } Bundle
 
@@ -1805,6 +1807,7 @@ pub closed enum LoadError derives Copy, Eq, Render {
 - `loader.prepare_unverified(bundle, alloc)` is `prepare` without the signature check. It is a trusted primitive whose soundness condition is that `bundle` is a bundle the toolchain built against the kernel's interface file.
 - `take prepared.load()` publishes the bundle's entries: for each loaded registry it contributes to, a new version holding the current version's entries and the bundle's, each of these inserted, in the bundle's order, before the first entry whose key is greater ([loaded registries](25-registries.md#loaded-registries)). It fails with `DuplicateKey` when two entries of a new version have equal keys and with `DuplicateUnique` when they have equal values of a unique field, publishing nothing and retiring the placement.
 - `prepared.entries(table, body)` gives what `body` returns for copies of the entries the bundle adds to the loaded registry of `table`, in the bundle's order, none when it adds none, so that a kernel judges them, against `table.read` of the current version, before it loads the bundle or without loading it. Each function field of a copy holds a stale gate. It traps (`trap.exhausted`) when runtime memory cannot hold the copies.
+- `take prepared.retire()` retires the placement without publishing anything, as a `load` that fails does.
 - Each function field of an entry a bundle adds holds a **gate**: a function value of the kernel's calling the bundle's function while the gate is live, and trapping (`trap.stale-handle`) once it is stale. While it calls the function, the call **pins** the function's code, a pin its domain's [settlement](11-errors-domains.md#settlement) releases when the call never returns. A call through a gate is the call of its function in every other respect; the gate itself uses at most 1 KiB of the stack ([stack limits](10-effects-digests.md#stack-limits)) that the `stack N` of the field's type bounds.
 - `bundle.domain()` shares the bundle's **domain**, an abandoner ([domain run](11-errors-domains.md#domain-run)) that runs no domain when the bundle is loaded. A kernel contains the calls it makes into a bundle, and what they leave running or installed, by making them in a domain run of that abandoner.
 - `bundle.replace(take next)` publishes in one change versions without the entries of `bundle` and with those of `next`, failing as `load` does and then changing nothing and retiring `next`'s placement. Each gate of `bundle` whose registry, key and field an entry of `next` shares then calls `next`'s function, and every other gate of `bundle` goes stale; `bundle` holds `next` from then on, with the same domain, and retires the placement it held.

@@ -163,6 +163,8 @@ pub fn Slice.len(self) -> usize limits pure, notrap, terminates
 
 pub fn Slice.is_empty(self) -> bool = self.len() == 0
 
+pub fn Slice.position(self, matches: fn(value: T) -> bool) -> Option[usize]
+
 pub proj fn Slice.prefix(self, count: usize) -> Option[Slice[T]] limits pure, notrap, terminates
 
 pub proj fn Slice.split_at(self, at: usize) -> Option[core::Parts[Slice[T]]] limits pure, notrap, terminates
@@ -190,6 +192,7 @@ Each member of this table exists only for the instantiations its row gives, a ty
 
 The facts below are the ensures and requires of these members, available to the [prover](20-prover.md#callee-knowledge):
 
+- `position(matches)` is `Some` of the first index whose element `matches` holds for, calling it on the elements in index order until then, and `None` when it holds for none; an index it gives is below `len`.
 - `len` is the number of elements; `Array.len` is `N`. `view` and `view_mut` cover every element, so their results have the receiver's `len`.
 - `prefix(count)` and `prefix_mut(count)` are `Some` exactly when `count <= self.len()`, holding the first `count` elements. `split_at(at)` and `split_at_mut(at)` are `Some` exactly when `at <= self.len()`; `head` holds the elements before index `at` and `tail` the rest.
 - `filled(value)` holds `N` copies of `value`. `fill` writes `value` to every element.

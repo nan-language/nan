@@ -115,11 +115,11 @@ impl Checker<'_> {
     }
 
     /// Whether a type may be a key or unique field of a loaded registry, which loading compares:
-    /// an integer type, `bool`, `char` or `Str`.
+    /// an integer type, `bool`, `char`, `Str` or `text::Fixed[N]`.
     fn loaded_key(&self, ty: &Ty) -> bool {
         match ty {
             Ty::Scalar(scalar) => !scalar.is_float(),
-            _ => self.is_std(ty, "core::Str"),
+            _ => self.is_std(ty, "core::Str") || self.is_std(ty, "text::Fixed"),
         }
     }
 

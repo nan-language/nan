@@ -24,9 +24,10 @@ use super::machine::{self, Stub};
 use super::runtime::{self, Routine, fetch_add, holdings, report};
 use super::stack::{self, Demand, Judged, Report, Site};
 use super::{Glue, Instance, Lowering, lines};
+use crate::check::Checker;
 use crate::check::db::ItemId;
 use crate::check::sig::SigKind;
-use crate::check::ty::{FnTy, Scalar, Ty};
+use crate::check::ty::{Arg, Const, FnTy, Scalar, Ty};
 use crate::interp::{FnVal, Val};
 use crate::nir::Span;
 use crate::workspace::{Arch, Target};
@@ -233,9 +234,18 @@ pub fn export_names(target: Target, registries: &[String]) -> Vec<String> {
     names
 }
 
-/// The form in which loading compares a key or unique field of a type: 0 for `Str`, otherwise
-/// the integer's width in bytes, with `0x80` set for a signed one.
-fn form(ty: &Ty) -> u64 {
+/// The form in which loading compares a key or unique field of a type: 0 for `Str`, `0x100`
+/// plus `N` for `text::Fixed[N]`, otherwise the integer's width in bytes, with `0x80` set for a
+/// signed one.
+fn form(ck: &Checker, ty: &Ty) -> u64 {
+    if let Ty::Item(_, args) = ty
+        && ck.is_std(ty, "text::Fixed")
+    {
+        let Some(Arg::Const(Const::Int(capacity))) = args.first() else {
+            unreachable!("text::Fixed takes its capacity")
+        };
+        return 0x100 + *capacity as u64;
+    }
     let Ty::Scalar(scalar) = ty else {
         return 0;
     };
@@ -555,7 +565,7 @@ impl Lowering<'_, '_> {
         let layout = self.layout(&entry);
         let field = |lo: &mut Self, name: &str| {
             let field = lo.layouts.field(lo.ck, &entry, None, name);
-            (field.offset, form(&field.ty))
+            (field.offset, form(lo.ck, &field.ty))
         };
         let key = field(self, &declared.key.text);
         let unique = declared

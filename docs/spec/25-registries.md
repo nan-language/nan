@@ -373,7 +373,7 @@ pub const PORT_COUNT: usize = ports.len() // error: const.uninterpretable
 
 A **loaded registry** is a registry whose table a kernel extends while it runs: [loading](24-kernel.md#loading) a bundle adds the entries of its contributions, and unloading it removes them.
 
-- Loading compares key and unique fields itself: the key field of a loaded registry has an integer type, `bool`, `char` or `Str`, any other type being an error (`registry.key-type`), and so has each of its unique fields (`registry.unique-type`). It orders them as `Ord.cmp` of these types does: integers, `bool` and `char` by value, `Str` by its bytes and then its length.
+- Loading compares key and unique fields itself: the key field of a loaded registry has an integer type, `bool`, `char`, `Str` or `text::Fixed[N]`, any other type being an error (`registry.key-type`), and so has each of its unique fields (`registry.unique-type`). It orders integers, `bool`, `char` and `Str` as their `Ord.cmp` does, by value or, for `Str`, by its bytes and then its length, and a `text::Fixed[N]` as the `Str` it holds.
 - Its entry type holds a function type only as the type of one of its fields (`registry.loaded-entry`). Such a field's type states neither `pure` nor `notrap`, since a call through the field of an unloaded bundle's entry traps ([loading](24-kernel.md#loading)); each of its parameter, result and failure types is a **boundary type**; and none of its `mut` parameters has a view type (`registry.loaded-field`). A boundary type is the unit type, `Never`, a type implementing `core::Encode`, a [capability kind](14-authority.md#capability-kinds), `sys::Outbox[P]` or a primitive capability other than `boot::Machine`, `boot::Kernel`, `boot::Services` and `hw::IrqShared[T]`, through which code installs functions that outlive a call.
 - A path naming a loaded registry is an expression of type `sys::load::Table[E]`, where `E` is the entry type, naming the registry's table. It names a value, never a place, and reading it adds no digest fact.
 - The table's **versions** are the successive sequences of its entries: its first is the table that [Tables](#tables) gives the final build, and loading publishes each later one. A version never changes.
@@ -417,6 +417,27 @@ pub fn probed(vendor: u16, device: u32) -> bool {
         return false
     })
 } probed
+```
+
+```nan
+pub closed struct Named {
+    pub name: text::Fixed[20]
+    pub weight: u8
+} Named
+
+pub loaded registry names: Named keyed by name
+
+pub fn weight_of(name: Str) -> u8 {
+    let table = names
+    return table.read(fn(entries: Slice[Named]) -> u8 {
+        for named in entries {
+            if named.name.as_str() == name {
+                return named.weight
+            }
+        }
+        return 0
+    })
+} weight_of
 ```
 
 ```nan

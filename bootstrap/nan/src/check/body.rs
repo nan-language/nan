@@ -1757,12 +1757,15 @@ impl Body<'_, '_> {
         }
     }
 
-    /// An example, typed as the returned expression of a function without parameters.
+    /// An example, typed as the returned expression of a function without parameters, its
+    /// closures numbered after those of the body and the examples before it.
     fn example(&mut self, example: &ast::Expr) -> TBody {
         let mut body = Body::new(self.ck, self.item, Vec::new());
         body.push_frame(Body::function_frame(Ty::Scalar(Scalar::Bool), None));
         body.cx.example = true;
+        body.closures = self.closures;
         let typed = body.check(example, &Ty::Scalar(Scalar::Bool));
+        self.closures = body.closures;
         self.ck
             .check_unused_locals(self.item, &body.locals, &body.usage, &[&typed]);
         body.finish(Some(typed))

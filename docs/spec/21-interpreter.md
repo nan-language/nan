@@ -176,6 +176,19 @@ pub fn filled(value: u8, count: usize, alloc: mem::Alloc) -> mem::List[u8]
     }
     return list
 } filled
+
+pub fn counted(bytes: Slice[u8], matches: fn(byte: u8) -> bool) -> usize
+    example counted(b"aab", matches: fn(byte: u8) => byte == b'a') == 2
+    example counted(b"aab", matches: fn(byte: u8) => byte == b'b') == 1
+{
+    var count: usize = 0
+    for byte in bytes {
+        if matches(byte) {
+            count += 1
+        }
+    }
+    return count
+} counted
 ```
 
 ```nan

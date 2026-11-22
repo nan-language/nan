@@ -300,7 +300,7 @@ pub fn Tally.record(mut self) {
 A **public doc** is the doc comment of a `pub` item, or of a member that enters the [interface form](29-identity-versioning.md#hashes) of a `pub` item. Each public doc is bound to the interface hash of its item, the enclosing item for a member: the module's [API snapshot](31-trust.md#api-snapshots) records, per public doc, its doc text and its **bound hash**.
 
 - A public doc's snapshot entry is the one recorded for its item and its key: empty for the item's own doc; the member's name for a field, variant, interface method, layout field, tag or register; for an invariant line, its position, from 1, among the item's invariant lines entering the interface form.
-- `nan api update` records each public doc with the bound hash of its snapshot entry when that entry holds the same doc text, and with its item's current interface hash otherwise.
+- `nan api update` records each public doc with the bound hash of its snapshot entry when that entry holds the same doc text, and with its item's current interface hash otherwise, the hash its package's check computes, which sees the types of other packages through their [promises](05-properties.md#promises).
 - A **stale doc** is a public doc whose snapshot entry holds the same doc text and a bound hash other than its item's current interface hash. An item with stale docs is incompleteness (`doc.stale`), reported once, on the first line of its first stale doc in file order; the diagnostic lists every stale doc of the item and the command confirming them.
 
 ```nan
@@ -311,6 +311,15 @@ pub fn window_frames(slots: u32) -> u32 {
 ```
 
 Here, changing only the body of `window_frames` leaves its doc current. Adding a parameter `per_slot: u32` without editing the doc makes the doc stale (`doc.stale`) until its text is edited or `nan api update --confirm-docs example::window_frames` runs.
+
+```nan
+/// What a driver is built from.
+pub closed linear enum Claimed {
+    Pci(hw::PciFunction)
+} Claimed
+```
+
+Here `hw::PciFunction`, an open type of std, promises `Send` alone, so `Claimed`'s interface hash holds no `Inert`, and the doc `nan api update` binds is current.
 
 ### Confirming docs
 

@@ -352,6 +352,15 @@ impl<'a> Checker<'a> {
         self.package.get()
     }
 
+    /// What `body` gives with `package` the package being checked, so that facts of other
+    /// packages' types are those its code sees.
+    pub(crate) fn within_package<T>(&self, package: PackageId, body: impl FnOnce() -> T) -> T {
+        let outer = self.package.replace(Some(package));
+        let result = body();
+        self.package.set(outer);
+        result
+    }
+
     /// Reports a diagnostic on a line of an item's file; the carried std's items report nothing.
     pub fn report_line(&self, item: ItemId, line: u32, code: Code) {
         self.report_diagnostic(item, Diagnostic::at(code, "", line));

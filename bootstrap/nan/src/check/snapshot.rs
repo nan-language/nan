@@ -366,8 +366,22 @@ pub fn sealed(
     })
 }
 
-/// The entry of an item and the weakened parts it records as pending, if any.
+/// The entry of an item and the weakened parts it records as pending, if any, as the check of
+/// its package sees them.
 fn entry(
+    items: &Items,
+    path: &str,
+    old: Option<&Entry>,
+    confirm: bool,
+) -> (Option<Entry>, Option<Vec<String>>) {
+    let first = items.first(path).expect("an item with a variant");
+    let (ck, item) = (first.ck, first.item);
+    ck.within_package(ck.db.package_of(item), || {
+        entry_seen(items, path, old, confirm)
+    })
+}
+
+fn entry_seen(
     items: &Items,
     path: &str,
     old: Option<&Entry>,

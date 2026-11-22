@@ -15,7 +15,14 @@ fn a_run_ends_with_the_byte_written_to_the_exit_port_and_otherwise_with_70() {
 
 /// The arguments of a machine run, separated by spaces.
 fn written(arch: Arch, kvm: bool, kept: Option<bool>) -> String {
-    base_args(arch, kvm, kept).join(" ")
+    base_args(arch, kvm, kept, MACHINE_MEMORY).join(" ")
+}
+
+#[test]
+fn a_machine_has_the_memory_its_run_gives() {
+    assert!(written(Arch::Amd64, true, None).contains(" -m 512M "));
+    let large = base_args(Arch::Aarch64, false, Some(false), 4_096).join(" ");
+    assert!(large.contains(" -m 4096M "));
 }
 
 #[test]
@@ -71,7 +78,7 @@ fn a_test_run_drops_its_writes_and_a_run_keeps_them_with_its_monitor() {
 #[test]
 fn every_virtio_pci_device_is_modern_and_behind_the_iommu() {
     for arch in [Arch::Amd64, Arch::Aarch64] {
-        let args = base_args(arch, false, None);
+        let args = base_args(arch, false, None, MACHINE_MEMORY);
         let devices: Vec<&String> = args
             .iter()
             .filter(|arg| arg.starts_with("virtio-"))

@@ -87,12 +87,23 @@ const POLL: i32 = 5
 /// The nanoseconds the TPM emulator may take to open its socket.
 const TPM_WAIT: u64 = 10_000_000_000
 
+/// The MiB of memory of a machine whose run gives none.
+pkg const MACHINE_MEMORY: u64 = 512
+
+/// The emulator's text for `memory` MiB of memory.
+fn memory_text(memory: u64, alloc: mem::Alloc) -> text::String {
+    var written = text::String.empty(alloc)
+    mut written.write(text::fmt("{memory}M", memory), budget: 32)
+    return written
+} memory_text
+
 /// How a launch boots a machine.
 pkg enum Boots {
     /// The boots of a run: the machine's disks, firmware variables and TPM state persist in the
     /// machine directory `dir`, its console port and the emulator's monitor are sockets there,
-    /// and a reset reboots the machine when `resets` holds and ends the run otherwise.
-    Kept(dir: text::String, resets: bool)
+    /// and a reset reboots the machine when `resets` holds and ends the run otherwise; it has
+    /// `memory` MiB of memory.
+    Kept(dir: text::String, resets: bool, memory: u64)
     /// The boots of a test run: each finds the machine as the launch made it, its network
     /// restricted to the machine and its console port unconnected, and a reset ends it.
     Fresh
@@ -105,8 +116,8 @@ pkg enum Boots {
 /// on x86_64 then the NVMe controller, the SATA disk and the empty hot-plug root port, no
 /// display, the serial port on the standard streams then the console port, a run's monitor,
 /// the disks' drives, and an end with the process that starts it. `kept` holds whether a run's
-/// boots keep resets, and is none for a test run's.
-fn base_args(arch: workspace::Arch, kvm: bool, kept: Option[bool], alloc: mem::Alloc) -> mem::List[text::String] {
+/// boots keep resets, and is none for a test run's; the machine has `memory` MiB of memory.
+fn base_args(arch: workspace::Arch, kvm: bool, kept: Option[bool], memory: u64, alloc: mem::Alloc) -> mem::List[text::String] {
     var written = text::String.of("-run-with exit-with-parent=on ", alloc)
     match arch {
         workspace::Arch.Amd64 => {
@@ -118,9 +129,15 @@ fn base_args(arch: workspace::Arch, kvm: bool, kept: Option[bool], alloc: mem::A
             } else {
                 mut written.append("-accel tcg -cpu max,-monitor")
             }
-            mut written.append(" -smp 4 -m 512M -device virtio-rng-pci,iommu_platform=on,disable-legacy=on -device isa-debug-exit,iobase=0xf4,iosize=0x01 -device tpm-crb,tpmdev=tpm")
+            mut written.append(" -smp 4 -m ")
+            mut written.append(memory_text(memory, alloc).as_str())
+            mut written.append(" -device virtio-rng-pci,iommu_platform=on,disable-legacy=on -device isa-debug-exit,iobase=0xf4,iosize=0x01 -device tpm-crb,tpmdev=tpm")
         }
-        workspace::Arch.Aarch64 => mut written.append("-machine virt,gic-version=3,its=on,iommu=smmuv3,highmem-ecam=off,acpi=off -accel tcg -cpu cortex-a72 -smp 4 -m 512M -global virtio-mmio.force-legacy=false -device virtio-rng-device -semihosting-config enable=on,target=native -device tpm-tis-device,tpmdev=tpm")
+        workspace::Arch.Aarch64 => {
+            mut written.append("-machine virt,gic-version=3,its=on,iommu=smmuv3,highmem-ecam=off,acpi=off -accel tcg -cpu cortex-a72 -smp 4 -m ")
+            mut written.append(memory_text(memory, alloc).as_str())
+            mut written.append(" -global virtio-mmio.force-legacy=false -device virtio-rng-device -semihosting-config enable=on,target=native -device tpm-tis-device,tpmdev=tpm")
+        }
     }
     mut written.append(" -chardev socket,id=tpm,path=tpm.sock -tpmdev emulator,id=tpm,chardev=tpm -device i6300esb -device virtio-blk-pci,drive=disk,iommu_platform=on,disable-legacy=on -device virtio-net-pci,netdev=net,romfile=,iommu_platform=on,disable-legacy=on")
     if arch == workspace::Arch.Amd64 {
@@ -366,10 +383,12 @@ pkg fn launch(target: workspace::Target, image: Str, files: Slice[text::String],
     }
     var dir = machine_of(image, alloc)
     var kept: Option[bool] = None
+    var memory = MACHINE_MEMORY
     match boots {
-        Boots.Kept(dir: given, resets: resets) => {
+        Boots.Kept(dir: given, resets: resets, memory: given_memory) => {
             dir = given
             kept = Some(resets)
+            memory = given_memory
         }
         Boots.Fresh => {}
     }
@@ -382,7 +401,7 @@ pkg fn launch(target: workspace::Target, image: Str, files: Slice[text::String],
             try platform::os::write_sized(path.as_str(), bytes: disk.bytes)
         }
     }
-    var args = base_args(arch, kvm: kvm_usable(arch), kept, alloc)
+    var args = base_args(arch, kvm: kvm_usable(arch), kept, memory, alloc)
     if target.kind() == Some(workspace::Kind.Uefi) {
         let pair = firmware(arch, alloc)
         let volume = try boot_volume(arch, image, files, alloc)
@@ -548,7 +567,7 @@ test a_run_ends_with_the_byte_written_to_the_exit_port_and_otherwise_with_70 for
 /// The arguments of a machine run, separated by spaces.
 fn joined(arch: workspace::Arch, kvm: bool, kept: Option[bool], alloc: mem::Alloc) -> text::String {
     var written = text::String.empty(alloc)
-    for arg in base_args(arch, kvm, kept, alloc) {
+    for arg in base_args(arch, kvm, kept, memory: MACHINE_MEMORY, alloc) {
         if written.byte_len() > 0 {
             mut written.append(" ")
         }
@@ -572,3 +591,15 @@ test a_machine_keeps_its_iommu_first_and_a_test_run_drops_its_writes for base_ar
     expect holds(kept.as_bytes(), wanted: b"-machine virt,gic-version=3,its=on,iommu=smmuv3,highmem-ecam=off,acpi=off -accel tcg -cpu cortex-a72 ")
     expect not holds(kept.as_bytes(), wanted: b"-no-reboot")
 } a_machine_keeps_its_iommu_first_and_a_test_run_drops_its_writes
+
+test a_machine_has_the_memory_its_run_gives for base_args {
+    let alloc = testing::world().alloc
+    let default = joined(workspace::Arch.Amd64, kvm: true, kept: None, alloc)
+    expect holds(default.as_bytes(), wanted: b" -m 512M ")
+    var large = text::String.empty(alloc)
+    for arg in base_args(workspace::Arch.Aarch64, kvm: false, kept: Some(false), memory: 4_096, alloc) {
+        mut large.append(arg.as_str())
+        mut large.append(" ")
+    }
+    expect holds(large.as_bytes(), wanted: b" -m 4096M ")
+} a_machine_has_the_memory_its_run_gives

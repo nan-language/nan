@@ -222,7 +222,7 @@ impl Name {
             Name::Build => {
                 "nan build [<scope>] [--compare-with <image>], nan build <package> --against <interface> [--as <principal>]"
             }
-            Name::Run => "nan run [<package>] [--keep-resets] [-- <argument>...]",
+            Name::Run => "nan run [<package>] [--keep-resets] [--memory <MiB>] [-- <argument>...]",
             Name::Primer => "nan primer [<topic> or tools]",
             Name::Lsp => "nan lsp",
         }
@@ -245,7 +245,7 @@ impl Name {
             | Name::KeyShow
             | Name::KeyTrust
             | Name::Lsp => (&[], &[]),
-            Name::Run => (&["--keep-resets"], &[]),
+            Name::Run => (&["--keep-resets"], &["--memory"]),
             Name::Build => (&[], &["--compare-with", "--against", "--as"]),
             Name::EditReplace => (&[], &["--expect", "--from"]),
             Name::Show => (&["--api"], &[]),

@@ -84,6 +84,9 @@ fn program(arch: Arch) -> &'static str {
     }
 }
 
+/// The MiB of memory of a machine whose run gives none.
+pub const MACHINE_MEMORY: u64 = 512;
+
 /// The TPM emulator serving each boot's TPM.
 const TPM_PROGRAM: &str = "swtpm";
 
@@ -135,8 +138,13 @@ const SYSTEM_TIME: usize = 12;
 pub enum Boots {
     /// The boots of a run: the machine's disks, firmware variables and TPM state persist in the
     /// machine directory `dir`, its console port and the emulator's monitor are sockets there,
-    /// and a reset reboots the machine when `resets` holds and ends the run otherwise.
-    Kept { dir: PathBuf, resets: bool },
+    /// and a reset reboots the machine when `resets` holds and ends the run otherwise; it has
+    /// `memory` MiB of memory.
+    Kept {
+        dir: PathBuf,
+        resets: bool,
+        memory: u64,
+    },
     /// The boots of a test run: each finds the machine as the launch made it, its network
     /// restricted to the machine and its console port unconnected, and a reset ends it.
     Fresh,
@@ -149,8 +157,8 @@ pub enum Boots {
 /// on x86_64 then the NVMe controller, the SATA disk and the empty hot-plug root port, no
 /// display, the serial port on the standard streams then the console port, a run's monitor,
 /// the disks' drives, and an end with the process that starts it. `kept` holds whether a run's
-/// boots keep resets, and is none for a test run's.
-fn base_args(arch: Arch, kvm: bool, kept: Option<bool>) -> Vec<String> {
+/// boots keep resets, and is none for a test run's; the machine has `memory` MiB of memory.
+fn base_args(arch: Arch, kvm: bool, kept: Option<bool>, memory: u64) -> Vec<String> {
     let machine: &[&str] = match (arch, kvm) {
         (Arch::Amd64, true) => &[
             "-machine",
@@ -227,7 +235,7 @@ fn base_args(arch: Arch, kvm: bool, kept: Option<bool>) -> Vec<String> {
     let mut args: Vec<String> = ["-run-with", "exit-with-parent=on"]
         .iter()
         .chain(machine)
-        .chain(&["-smp", "4", "-m", "512M"])
+        .chain(&["-smp", "4", "-m", &format!("{memory}M")])
         .chain(devices)
         .chain(&[
             "-chardev",
@@ -453,9 +461,13 @@ impl Drop for Boot {
 /// holding it at the default boot path and each of `files` at `/` followed by its name.
 pub fn launch(target: Target, image: &Path, files: &[PathBuf], boots: Boots) -> io::Result<Launch> {
     let arch = target.arch().expect("a machine target's architecture");
-    let (dir, kept) = match boots {
-        Boots::Kept { dir, resets } => (dir, Some(resets)),
-        Boots::Fresh => (machine_of(image), None),
+    let (dir, kept, memory) = match boots {
+        Boots::Kept {
+            dir,
+            resets,
+            memory,
+        } => (dir, Some(resets), memory),
+        Boots::Fresh => (machine_of(image), None, MACHINE_MEMORY),
     };
     fs::create_dir_all(&dir)?;
     for (id, bytes) in disks(arch) {
@@ -464,7 +476,7 @@ pub fn launch(target: Target, image: &Path, files: &[PathBuf], boots: Boots) -> 
             fs::File::create(&file)?.set_len(*bytes)?;
         }
     }
-    let mut args = base_args(arch, kvm_usable(arch), kept);
+    let mut args = base_args(arch, kvm_usable(arch), kept, memory);
     match target.kind() {
         Some(Kind::Uefi) => {
             let (code, template) = firmware(arch);

@@ -37,7 +37,7 @@ The commands are:
 - `nan publish --local <dir> [--name <store name>] [--as <principal> [--author <principal>...]] [--breaking <item>... <reason>]`
 - `nan upgrade [<package>]`, `nan upgrade --language <N> [<scope>]`
 - `nan build [<scope>] [--compare-with <image>]`, `nan build <package> --against <interface> [--as <principal>]`
-- `nan run [<package>] [--keep-resets] [-- <argument>...]`
+- `nan run [<package>] [--keep-resets] [--memory <MiB>] [-- <argument>...]`
 - `nan primer [<topic> or tools]`
 - `nan lsp`
 
@@ -105,7 +105,7 @@ ok show sys::Handle --api: records 2
 - `nan diff <old> <new>` compares two versions of the workspace, or with `--path` two versions of one file. It prints a record `changed <item> <location>` per changed item, located in the new version or, when removed, the old, followed by its [change classes](31-trust.md#change-classes) in order and by `weakening` or `widening` when the change is one. It holds the old and new texts merged along their longest common subsequence of lines with the least old, then new, line numbers in lexicographic order: kept lines prefixed with 2 spaces, removed ones `- `, added ones `+ `, removals first. For the `package` item of a final-link root, the record also holds the `approved` and `epoch` records its lock gains or loses, merged as texts are. `nan diff --green` prints such a record, merging `api` lines, per item of its scope whose interface hash differs from its [last-green](#last-green) entry.
 - `nan build` performs the [final build](27-program-model.md#final-builds) of each program in its scope, those of nanos programs last, writing its [image](27-program-model.md#images) into `.nan/images/<target>/`; a scope without a program is `tool.usage`. With `--compare-with`, the final build also performs [stage comparison](36-builds.md#stage-comparison) once its checking step reports no error, and writes no image when the comparison reports an error. With `--against`, it builds the [bundle](30-artefacts.md#bundles) of a package declaring no entry or a nanos target, a scope naming no such package being `tool.usage`; `--as` is `tool.usage` without `--against`.
 - `nan run` performs the final build of one program, any other scope being `tool.usage`. When the build fails, it prints as `nan build` does; otherwise it prints nothing, the output contract not applying, and starts the image: on a host target as a process with the arguments after `--` and the command's environment and standard streams, under the descriptor's emulator, Wine, for a Windows target on Linux, unless the target's images cannot run on the machine as [emulator runs](22-testing.md#emulator-runs) state, when it starts nothing and ends with status 70; on a machine target under the [descriptor](27-program-model.md#descriptors)'s emulator, with the boot volume the descriptor gives `nan run`, its serial port on standard input and standard output, its console port on the socket `console.sock` of its **machine directory** `.nan/machine/<target>/`, and the emulator's monitor, speaking QEMU's machine protocol (QMP), on the socket `monitor.sock` there. On the x86_64 machine, a `device_add` request on the monitor with `bus` `plug` plugs a function into the empty root port's slot, which reports the card's presence, and a `device_del` of its `id` presses the slot's attention button, the function leaving once the machine powers the slot off. On a host target it passes a termination request on and ends with the process's exit status, under Wine its low 8 bits. Under the emulator, a write of byte v to the [exit port](27-program-model.md#descriptors) ends the run with status v mod 128; a termination request with signal number n stops the emulator and ends the run with status 128 + n; any other end of the emulator, a reset included, ends it with status 70.
-- The machine directory keeps the machine's state across runs: its disk `disk.raw` and, on x86_64, its NVMe namespace `nvme.raw` and SATA disk `sata.raw`, each made blank when missing; on a UEFI target, the firmware's variables `vars.fd`, made from the firmware's template when missing; and its TPM's state `tpm/`. With `--keep-resets`, a reset reboots the machine, which finds its boot volume, disks, variables and TPM state as the run left them; `--keep-resets` on a host target is `tool.usage`.
+- The machine directory keeps the machine's state across runs: its disk `disk.raw` and, on x86_64, its NVMe namespace `nvme.raw` and SATA disk `sata.raw`, each made blank when missing; on a UEFI target, the firmware's variables `vars.fd`, made from the firmware's template when missing; and its TPM's state `tpm/`. With `--keep-resets`, a reset reboots the machine, which finds its boot volume, disks, variables and TPM state as the run left them. With `--memory <MiB>`, a whole number above 0, the machine has that many MiB of memory in place of the descriptor's 512. `--keep-resets` or `--memory` on a host target, and a `--memory` that is not such a number, are `tool.usage`.
 
 ```nan
 // file: hello/package.nan
@@ -131,10 +131,14 @@ $ nan run hello --keep-resets
 invalid run hello --keep-resets: files 0, errors 1, incomplete 0
 error tool.usage - -
 invalid run hello --keep-resets: files 0, errors 1, incomplete 0
+$ nan run hello --memory 4096
+invalid run hello --memory 4096: files 0, errors 1, incomplete 0
+error tool.usage - -
+invalid run hello --memory 4096: files 0, errors 1, incomplete 0
 $ nan run hello --keep-reset
 invalid run hello --keep-reset: files 0, errors 1, incomplete 0
 error tool.usage - -
-    expected: nan run [<package>] [--keep-resets] [-- <argument>...]
+    expected: nan run [<package>] [--keep-resets] [--memory <MiB>] [-- <argument>...]
     found: --keep-reset
 invalid run hello --keep-reset: files 0, errors 1, incomplete 0
 ```

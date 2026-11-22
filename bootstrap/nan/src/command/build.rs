@@ -64,11 +64,15 @@ pub fn run(
         manifest.is_some_and(|manifest| manifest.targets.iter().any(|target| target.is_host()))
     });
     let resets = invocation.flag("--keep-resets");
+    let memory = invocation
+        .value("--memory")
+        .map(|memory| memory.parse::<u64>().ok().filter(|memory| *memory > 0));
     let unusable = programs.is_empty()
         || invocation.value("--as").is_some()
         || (invocation.name == Name::Run && !single)
         || (compared.is_some() && (!single || !host))
-        || (resets && host);
+        || (resets && host)
+        || memory.is_some_and(|memory| memory.is_none() || host);
     if unusable {
         return Ok(Outcome::Output(
             invocation.tool_error(Code::ToolUsage, &written),
@@ -100,6 +104,7 @@ pub fn run(
         let boots = || Boots::Kept {
             dir: workspace.root.join(".nan/machine").join(target.name()),
             resets,
+            memory: memory.flatten().unwrap_or(emulator::MACHINE_MEMORY),
         };
         let launch = match target.kind() {
             Some(Kind::Uefi) => {

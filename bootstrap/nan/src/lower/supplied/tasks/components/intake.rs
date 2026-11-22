@@ -10,7 +10,7 @@ use super::super::super::super::runtime::regions::WAITING;
 use super::super::super::super::runtime::tables;
 use super::super::super::super::runtime::tasks::{self, kind, operation, task};
 use super::super::super::super::runtime::{Routine, report, settle, timers};
-use super::super::super::super::{Glue, Lowering};
+use super::super::super::super::{Glue, Lowering, transfer};
 use super::super::super::Supply;
 use super::{entry, numbering, reference, runner, status, unreference, wake_waiter};
 use crate::check::ty::Ty;
@@ -140,7 +140,8 @@ pub fn take_posted(lo: &mut Lowering, fx: &mut Fx, message: &Ty, address: Value,
     let domain = tasks::current_domain(lo, fx);
     let other = fx.b.ins().icmp(IntCC::NotEqual, from, domain);
     fx.when(other, |fx| {
-        lo.transfer(fx, message, address, domain, domain)
+        let target = transfer::copying(fx, domain);
+        lo.transfer(fx, message, address, target, domain)
     });
 }
 
@@ -153,7 +154,10 @@ pub fn give_posted(lo: &mut Lowering, fx: &mut Fx, ty: &Ty, address: Value, post
     let to = fx.load(PTR, poster, task::DOMAIN);
     let domain = tasks::current_domain(lo, fx);
     let other = fx.b.ins().icmp(IntCC::NotEqual, to, domain);
-    fx.when(other, |fx| lo.transfer(fx, ty, address, to, to));
+    fx.when(other, |fx| {
+        let target = transfer::copying(fx, to);
+        lo.transfer(fx, ty, address, target, to)
+    });
 }
 
 /// Wakes a runner's component task when it waits for a message. The caller holds the lock.

@@ -632,6 +632,7 @@ A domain owns the stacks of its tasks, the first task's stack of a `sys::Domain`
 - A std operation that moves a value from a task of D into storage another domain O owns passes the chunks D owns that the value occupies, before it completes, to the innermost domain enclosing both D and O. These operations are a channel send or offer, a message sent through a `sys::Cx` or posted through a `sys::Outbox` ([components](26-components.md#components)), an insertion into a std type with interior mutability, `sys::Minter.of`, whose storage the outermost domain owns ([capability kinds](14-authority.md#capability-kinds)), and the end of an `await when` body, for each cown it names whose value lies in chunks that O owns.
 - A std operation that a task of D runs and that draws memory for storage whose chunks another domain O owns, such as growing a container or a channel's buffer, passes each chunk it draws, before it completes, to the innermost domain enclosing both D and O.
 - A chunk passing to a domain O is charged from then on to O's cell instead of the cell it was charged to, when the chains of both cells end at root cells with one supply and O's cell's chain has room for it. The passing subtracts its bytes from the charge of every open cell on the chain of the cell it was charged to; then, when every cell on the chain of O's cell is open and stays at most its limit with the bytes added, it adds them to the charge of each of those cells, and otherwise it adds them back where it subtracted them and the chunk stays charged to its cell. Only the charge stays: the chunk passes to O either way.
+- A value **moves itself** when it is the result or failure a body returns, a value a channel send or offer moves, or a message or reply a `sys::Cx` or `sys::Outbox` carries. Passing the chunks it occupies then copies, instead of passing its chunk, each allocation of at most 64 KiB that the value reaches through no storage that several handles reach (a cown's value, the contents of a `mem::Shared`, a channel's buffer, an arena's or once map's entries, an interner's table or a per-CPU or interrupt-shared value) and whose chunk holds another live allocation: the copy lies in a chunk the receiving domain owns, drawn through its cell when the two cells' chains end at root cells with one supply and that draw succeeds, and otherwise through the cell the original's chunk is charged to, and the original is freed. The chunk passes when no copy can be drawn, or when the allocation is aligned to more than 16 bytes.
 - When D is abandoned, its stacks and chunks are freed. Memory in other domains' chunks that tasks of D owned stays allocated.
 - The value of a cown poisoned by D's abandonment is never released; its memory in chunks of other domains stays allocated.
 
@@ -681,6 +682,49 @@ test receiver_pays_after_handover for sender_charge {
     let charge = try await sender_charge(world.exec, alloc: world.alloc)
     expect charge == 0
 } receiver_pays_after_handover
+```
+
+```nan
+pub fn charge_beside_kept(exec: task::Executor, alloc: mem::Alloc) -> usize fails task::Cancelled uses wait {
+    let budget = alloc.split(16_777_216)
+    let drawn = budget.alloc()
+    let outcome = try await sys::Domain.run(fn[take budget]() -> usize fails task::Cancelled uses wait {
+        defer take budget.close()
+        let channel = task::Channel[mem::List[u64]].bounded(64, alloc: drawn)
+        let sender = channel.sender
+        var receiver = channel.receiver
+        let before = budget.charged()
+        let kept = try await sys::Domain.run(fn[take sender]() -> mem::List[mem::List[u64]] fails task::Cancelled uses wait {
+            var kept = mem::List[mem::List[u64]].empty(drawn)
+            for round in 0..<64u64 {
+                var item = mem::List[u64].empty(drawn)
+                mut item.push(round)
+                mut kept.push(take item)
+                var message = mem::List[u64].empty(drawn)
+                mut message.push(round)
+                discard attempt await sender.send(take message)
+            }
+            return kept
+        }, exec, alloc: drawn)
+        for _ in 0..<64u32 {
+            discard try await mut receiver.receive()
+        }
+        let charge = budget.charged() - before
+        expect kept.is_ok()
+        return charge
+    }, exec, alloc: drawn)
+    let Ok(charge) = outcome else {
+        return 0
+    }
+    return charge
+} charge_beside_kept
+
+test kept_values_stay_behind for charge_beside_kept {
+    let world = testing::world()
+    let charge = try await charge_beside_kept(world.exec, alloc: world.alloc)
+    expect charge > 0
+    expect charge <= 262_144
+} kept_values_stay_behind
 ```
 
 ## Poisoning

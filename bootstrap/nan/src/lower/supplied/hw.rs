@@ -108,6 +108,7 @@ pub fn transfer(
             lo.transfer(fx, &wrapped(), value, lift, owner);
         }
         "hw::IrqShared" => {
+            let lift = super::super::transfer::whole(fx, lift);
             let record = fx.load(PTR, address, 0);
             let holding = fx.offset(record, super::super::machine::device::HOLDING);
             super::super::transfer::rehome(lo, fx, holding, owner);

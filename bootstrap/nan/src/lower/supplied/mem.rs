@@ -159,11 +159,12 @@ pub fn transfer(
             let entry = entry(lo);
             segments::transfer(lo, fx, header, &entry, lift, owner);
             let record = fx.offset(header, segments::INDEX);
+            let lift = transfer::whole(fx, lift);
             index::lift(lo, fx, record, lift);
         }
         "mem::Box" => {
+            transfer::relocate(lo, fx, address, lift);
             let contents = fx.load(PTR, address, 0);
-            transfer::lift(lo, fx, contents, lift);
             lo.transfer(fx, &arg(0), contents, lift, owner);
         }
         "mem::Shared" => stores::transfer_shared(lo, fx, &arg(0), address, lift),

@@ -1,10 +1,14 @@
-//! Transfer: what moving a value into another domain's reach does: the chunks of its memory that domains nested in the target own pass to it, its holdings pass to their new owner, and storage several handles reach records its reach, the innermost domain enclosing every domain reaching it, which a walk enters only when it widens.
+//! Transfer: what moving a value into another domain's reach does: the chunks of its memory that domains nested in the target own pass to it, or, when the value moves itself, the allocations only it points to are copied into the target when others share their chunks, its holdings pass to their new owner, and storage several handles reach records its reach, the innermost domain enclosing every domain reaching it, which a walk enters only when it widens, passing its chunks whole.
 
 /// The owner of holdings that leaves every holding as it is.
 const TRANSFER_KEEP: i64 = -1
 
 /// The bit of an owner that passes only holdings domains nested in it own.
 const TRANSFER_RAISE: i64 = 1
+
+/// The bit of a target that copies an allocation only the moving value points to, when others
+/// share its chunk, rather than passing the chunk.
+const TRANSFER_COPY: i64 = 2
 
 /// The bytes of a task closure's environment before its captures: the address of the walk
 /// moving them, zero when moving them does nothing.
@@ -137,21 +141,36 @@ fn move_captures(mut lo: Lowering, mut fx: Fx, function: clif::Value, lift: clif
     })
 } move_captures
 
-/// Passes the chunks an allocation lies in to `lift` unless it is zero; gives whether they
-/// passed.
-fn transfer_lift(mut lo: Lowering, mut fx: Fx, address: clif::Value, lift: clif::Value) -> clif::Value {
-    let lifting = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: lift, y: 0)
-    let passed = mut fx.choose_in(mut lo, condition: lifting, results: Array[clif::Type, 1].filled(clif::Type.Int8).view(), then: fn(mut cx: Lowering, mut yes_fx: Fx) -> mem::List[clif::Value] {
-        var lift_args = Array[clif::Value, 2].filled(address)
-        lift_args[1] = lift
-        return mut cx.call_routine(mut yes_fx, routine: Routine.Lift, args: lift_args.view())
-    }, otherwise: fn(mut cx: Lowering, mut no_fx: Fx) -> mem::List[clif::Value] {
-        var unlifted = mem::List[clif::Value].empty(no_fx.alloc)
-        mut unlifted.push(mut no_fx.int(clif::Type.Int8, value: 0))
-        return unlifted
+/// Passes the chunks an allocation lies in to the domain `lift` names unless it is zero.
+fn transfer_lift(mut lo: Lowering, mut fx: Fx, address: clif::Value, lift: clif::Value) {
+    let target = transfer_whole(mut fx, lift)
+    let lifting = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: target, y: 0)
+    mut fx.if_true(lifting, then: fn[mut lo](mut fx1: Fx) {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Lift, args: fx1.list2(address, b: target).view())
     })
-    return passed[0]
 } transfer_lift
+
+/// Moves the allocation that the pointer at `at`, and no other, names to `lift` unless it is
+/// zero, the pointer following it when it is copied.
+fn transfer_relocate(mut lo: Lowering, mut fx: Fx, at: clif::Value, lift: clif::Value) {
+    let lifting = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: lift, y: 0)
+    mut fx.if_true(lifting, then: fn[mut lo](mut fx1: Fx) {
+        let address = mut fx1.load(PTR, addr: at, offset: 0)
+        let moved = mut lo.call_routine(mut fx1, routine: Routine.Lift, args: fx1.list2(address, b: lift).view())
+        expect moved.len() > 0
+        mut fx1.store(moved[0], addr: at, offset: 0)
+    })
+} transfer_relocate
+
+/// The target of a value moving itself to a domain.
+fn transfer_copying(mut fx: Fx, domain: clif::Value) -> clif::Value {
+    return mut fx.b.bor_imm_s(domain, y: TRANSFER_COPY)
+} transfer_copying
+
+/// The target of the storage that several handles reach, which passes its chunks whole.
+fn transfer_whole(mut fx: Fx, lift: clif::Value) -> clif::Value {
+    return mut fx.b.band_imm_s(lift, y: ~TRANSFER_COPY)
+} transfer_whole
 
 /// Passes the holding a word at an address names to `owner` unless it is `TRANSFER_KEEP`.
 fn rehome(mut lo: Lowering, mut fx: Fx, address: clif::Value, owner: clif::Value) {

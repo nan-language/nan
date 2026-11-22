@@ -452,7 +452,7 @@ pub fn region_heap(take region: hw::Region) -> mem::Heap {
 
 Every chunk belongs to exactly one domain: the domain whose task draws it, until [domain memory](11-errors-domains.md#domain-memory) passes it to another, charging it to that domain's cell when the two cells draw from one supply and that cell's chain has room for it.
 
-- An allocation lies in chunks of the domain whose task makes it until [domain memory](11-errors-domains.md#domain-memory) passes them, so allocations share a chunk only when tasks of one domain make them through allocators naming one cell.
+- An allocation lies in chunks of the domain whose task makes it until [domain memory](11-errors-domains.md#domain-memory) passes them or copies it into another domain's, so allocations share a chunk only when they lie in chunks of one domain drawn through one cell.
 - When a domain is freed, each chunk it owns returns as [budgets](#budgets) states, whatever allocations it still holds.
 
 ## Shared values

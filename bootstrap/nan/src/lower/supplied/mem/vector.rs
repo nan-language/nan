@@ -163,8 +163,8 @@ pub fn transfer(
     let capacity = fx.load(PTR, address, CAPACITY);
     let allocated = fx.b.ins().icmp_imm_s(IntCC::NotEqual, capacity, 0);
     fx.when(allocated, |fx| {
-        let data = fx.load(PTR, address, DATA);
-        transfer::lift(lo, fx, data, lift);
+        let data = fx.offset(address, DATA);
+        transfer::relocate(lo, fx, data, lift);
     });
     if !lo.transfers(element) {
         return;

@@ -565,6 +565,7 @@ pub fn transfer_per_cpu(
     lift: Value,
     owner: Value,
 ) {
+    let lift = super::super::super::transfer::whole(fx, lift);
     let storage = fx.load(PTR, address, 0);
     super::super::super::transfer::lift(lo, fx, storage, lift);
     each_per_cpu(lo, fx, value_ty, address, |lo, fx, value| {

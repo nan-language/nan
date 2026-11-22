@@ -86,8 +86,8 @@ pub enum Routine {
     /// giving a code, on a new segment drawn through `alloc` when the running stack lacks `need`
     /// bytes above its limit; `OutOfMemory`'s code when the segment cannot be drawn.
     Nested,
-    /// `(address, domain) -> lifted`: passes the chunks an allocation lies in to a domain when
-    /// a domain nested in it owns them; nonzero when they passed.
+    /// `(address, target) -> address`: moves an allocation to the domain a target names when a
+    /// domain nested in it owns the chunks it lies in, giving its address once moved.
     Lift,
     /// `(kind, payload) -> holding`: a new holding the running task's domain owns.
     Hold,
@@ -329,7 +329,7 @@ impl Routine {
             Routine::AllocIn => (&[P, P, P, P], &[P]),
             Routine::Split | Routine::Hold => (&[P, P], &[P]),
             Routine::Derive | Routine::Nested => (&[P, P, P, P, P], &[P]),
-            Routine::Lift => (&[P, P], &[types::I8]),
+            Routine::Lift => (&[P, P], &[P]),
             Routine::Rehome | Routine::KindRevoke | Routine::TrapReport | Routine::TimerArm => {
                 (&[P, P], &[])
             }

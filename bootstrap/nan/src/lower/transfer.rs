@@ -2,12 +2,13 @@
 //! domain. The chunks holding the value's memory that domains nested in a target domain own
 //! pass to it, and the holdings the value owns pass to their new owner.
 //!
-//! A walk gives the target of its chunks, zero for none, and the new owner of holdings: a
-//! domain, zero for none, `KEEP`, or a domain with `RAISE` set, which passes only holdings that
-//! domains nested in it own. Storage that several handles reach, a cown's value, a shared
-//! value's contents and a channel's buffer, records its reach, the innermost domain enclosing
-//! every domain that reaches it: a walk enters it only when its reach widens, and the holdings
-//! inside it are raised to that reach.
+//! A walk gives the target of its chunks, zero for none, with `COPY` set when the value moves
+//! itself, and the new owner of holdings: a domain, zero for none, `KEEP`, or a domain with
+//! `RAISE` set, which passes only holdings that domains nested in it own. Storage that several
+//! handles reach, a cown's value, a shared value's contents and a channel's buffer, records its
+//! reach, the innermost domain enclosing every domain that reaches it: a walk enters it only
+//! when its reach widens, its chunks passing whole, and the holdings inside it are raised to
+//! that reach.
 
 use cranelift_codegen::ir::{
     AbiParam, Inst, InstBuilder, MemFlagsData, Signature, Value, condcodes::IntCC, types,
@@ -27,6 +28,10 @@ pub const KEEP: i64 = -1;
 
 /// The bit of an owner that passes only holdings domains nested in it own.
 pub const RAISE: i64 = 1;
+
+/// The bit of a target that copies an allocation only the moving value points to, when others
+/// share its chunk, rather than passing the chunk.
+pub const COPY: i64 = 2;
 
 /// The bytes of a task closure's environment before its captures: the address of the walk
 /// moving them, zero when moving them does nothing.
@@ -152,17 +157,34 @@ pub fn move_captures(
     });
 }
 
-/// Passes the chunks an allocation lies in to `lift` unless it is zero; gives whether they
-/// passed.
-pub fn lift(lo: &mut Lowering, fx: &mut Fx, address: Value, lift: Value) -> Value {
+/// Passes the chunks an allocation lies in to the domain `lift` names unless it is zero.
+pub fn lift(lo: &mut Lowering, fx: &mut Fx, address: Value, lift: Value) {
+    let target = whole(fx, lift);
+    let lifting = fx.b.ins().icmp_imm_s(IntCC::NotEqual, target, 0);
+    fx.when(lifting, |fx| {
+        lo.call_routine(fx, Routine::Lift, &[address, target]);
+    });
+}
+
+/// Moves the allocation that the pointer at `at`, and no other, names to `lift` unless it is
+/// zero, the pointer following it when it is copied.
+pub fn relocate(lo: &mut Lowering, fx: &mut Fx, at: Value, lift: Value) {
     let lifting = fx.b.ins().icmp_imm_s(IntCC::NotEqual, lift, 0);
-    fx.choose_in(
-        lo,
-        lifting,
-        &[types::I8],
-        |lo, fx| lo.call_routine(fx, Routine::Lift, &[address, lift]),
-        |_, fx| vec![fx.int(types::I8, 0)],
-    )[0]
+    fx.when(lifting, |fx| {
+        let address = fx.load(PTR, at, 0);
+        let moved = lo.call_routine(fx, Routine::Lift, &[address, lift])[0];
+        fx.store(moved, at, 0);
+    });
+}
+
+/// The target of a value moving itself to a domain.
+pub fn copying(fx: &mut Fx, domain: Value) -> Value {
+    fx.b.ins().bor_imm_s(domain, COPY)
+}
+
+/// The target of the storage that several handles reach, which passes its chunks whole.
+pub fn whole(fx: &mut Fx, lift: Value) -> Value {
+    fx.b.ins().band_imm_s(lift, !COPY)
 }
 
 /// Passes the holding a word at an address names to `owner` unless it is `KEEP`.

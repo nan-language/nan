@@ -220,6 +220,7 @@ fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, sized: bool, through: bo
     let returned = fx.b.ins().icmp_imm_s(IntCC::Equal, outcome, 1);
     let target = supply.failure.expect("a failure address");
     let (result_ty, fails_ty) = (result_ty.clone(), fails.clone());
+    let lift = transfer::copying(fx, caller_domain);
     fx.choose_in(
         lo,
         returned,
@@ -229,14 +230,14 @@ fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, sized: bool, through: bo
             let held = lo.held_at(fx, &result_ty, result);
             let ok = lo.variant_value(fx, &option, "Ok", &[held], None);
             lo.store_held(fx, slot, ok, &option);
-            lo.transfer(fx, &option, slot, caller_domain, caller_domain);
+            lo.transfer(fx, &option, slot, lift, caller_domain);
             Vec::new()
         },
         |lo, fx| {
             let failure = fx.load(PTR, first, task::FAILURE);
             let held = lo.held_at(fx, &fails_ty, failure);
             lo.store_held(fx, target, held, &fails_ty);
-            lo.transfer(fx, &fails_ty, target, caller_domain, caller_domain);
+            lo.transfer(fx, &fails_ty, target, lift, caller_domain);
             Vec::new()
         },
     );

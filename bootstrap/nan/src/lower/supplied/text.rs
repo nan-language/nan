@@ -81,6 +81,7 @@ pub fn transfer(lo: &mut Lowering, fx: &mut Fx, path: &str, address: Value, lift
             vector::transfer(lo, fx, address, &lists::byte(), None, lift, none);
         }
         "text::Interner" => {
+            let lift = transfer::whole(fx, lift);
             let record = fx.load(PTR, address, 0);
             let lifting = fx.b.ins().icmp_imm_s(IntCC::NotEqual, lift, 0);
             fx.when(lifting, |fx| fx.store(lift, record, interner::REACH));

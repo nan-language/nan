@@ -132,10 +132,7 @@ pub fn transfer(
         "task::Sender" | "task::Receiver" => {
             channels::transfer(lo, fx, path, ty, address, lift, owner)
         }
-        "sys::Trap" => {
-            let record = fx.load(PTR, address, 0);
-            super::super::transfer::lift(lo, fx, record, lift);
-        }
+        "sys::Trap" => super::super::transfer::relocate(lo, fx, address, lift),
         _ => return false,
     }
     true

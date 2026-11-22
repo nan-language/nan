@@ -323,6 +323,7 @@ pub fn release_shared(lo: &mut Lowering, fx: &mut Fx, value_ty: &Ty, address: Va
 /// Moves a shared value into another domain's reach: when its reach widens, its record and
 /// contents follow, the contents' holdings raised to the new reach.
 pub fn transfer_shared(lo: &mut Lowering, fx: &mut Fx, value_ty: &Ty, address: Value, lift: Value) {
+    let lift = transfer::whole(fx, lift);
     let lifting = fx.b.ins().icmp_imm_s(IntCC::NotEqual, lift, 0);
     fx.when(lifting, |fx| {
         let record = fx.load(PTR, address, 0);
@@ -351,8 +352,8 @@ pub fn transfer_pool(
     let capacity = fx.load(PTR, address, vector::CAPACITY);
     let allocated = fx.b.ins().icmp_imm_s(IntCC::NotEqual, capacity, 0);
     fx.when(allocated, |fx| {
-        let data = fx.load(PTR, address, vector::DATA);
-        transfer::lift(lo, fx, data, lift);
+        let data = fx.offset(address, vector::DATA);
+        transfer::relocate(lo, fx, data, lift);
     });
     if !lo.transfers(element) {
         return;

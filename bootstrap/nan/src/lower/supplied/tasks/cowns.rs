@@ -201,6 +201,7 @@ pub fn poison(lo: &mut Lowering, fx: &mut Fx, held: Value, domain: Value) {
 /// is not poisoned; an `await when` holding it moves the value as it releases the cown.
 pub fn transfer(lo: &mut Lowering, fx: &mut Fx, ty: &Ty, address: Value, lift: Value) {
     let value_ty = ty.type_arg(0).cloned().expect("a cown's value type");
+    let lift = transfer::whole(fx, lift);
     let lifting = fx.b.ins().icmp_imm_s(IntCC::NotEqual, lift, 0);
     fx.when(lifting, |fx| {
         let record = fx.load(PTR, address, 0);

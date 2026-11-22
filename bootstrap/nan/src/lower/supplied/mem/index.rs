@@ -268,8 +268,8 @@ pub fn lift(lo: &mut Lowering, fx: &mut Fx, record: Value, lift: Value) {
     let slots = fx.load(PTR, record, SLOTS);
     let drawn = fx.b.ins().icmp_imm_s(IntCC::NotEqual, slots, 0);
     fx.when(drawn, |fx| {
-        let table = fx.load(PTR, record, TABLE);
-        transfer::lift(lo, fx, table, lift);
+        let table = fx.offset(record, TABLE);
+        transfer::relocate(lo, fx, table, lift);
     });
 }
 

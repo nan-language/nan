@@ -245,7 +245,8 @@ fn send(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, element: &Ty) {
                 lo.call_routine(fx, Routine::Unlock, &[lock]);
                 if moves {
                     let keep = fx.int(PTR, transfer::KEEP);
-                    lo.transfer(fx, element, value.address(), reach, keep);
+                    let target = transfer::copying(fx, reach);
+                    lo.transfer(fx, element, value.address(), target, keep);
                 }
                 vec![reach]
             },
@@ -360,7 +361,8 @@ fn offer(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, element: &Ty) {
         lo.call_routine(fx, Routine::Unlock, &[lock]);
         if moves {
             let keep = fx.int(PTR, transfer::KEEP);
-            lo.transfer(fx, element, value.address(), reach, keep);
+            let target = transfer::copying(fx, reach);
+            lo.transfer(fx, element, value.address(), target, keep);
         }
         let again = fx.int(types::I8, 1);
         (again, vec![reach])
@@ -686,6 +688,7 @@ pub fn transfer(
     transfer::rehome(lo, fx, address, owner);
     let element = ty.type_arg(0).cloned().expect("a channel's value type");
     let buffered = path == "task::Receiver" && lo.transfers(&element);
+    let lift = transfer::whole(fx, lift);
     let lifting = fx.b.ins().icmp_imm_s(IntCC::NotEqual, lift, 0);
     fx.when(lifting, |fx| {
         let record = holdings::payload(fx, address);

@@ -154,6 +154,7 @@ pub fn transfer(
     lift: Value,
     owner: Value,
 ) {
+    let lift = transfer::whole(fx, lift);
     let lifting = fx.b.ins().icmp_imm_s(IntCC::NotEqual, lift, 0);
     fx.when(lifting, |fx| fx.store(lift, header, REACH));
     let shape = Element::of(lo, element);

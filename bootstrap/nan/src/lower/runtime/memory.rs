@@ -15,7 +15,9 @@
 //! tasks a routine changing charges wakes once it has released the lock. A
 //! run passes to an enclosing domain when a value it holds leaves the domain owning it, charged
 //! from then on to that domain's cell when both cells' chains draw from one supply and the new
-//! chain has room for it, and the runs a domain still owns are freed when it ends.
+//! chain has room for it, and the runs a domain still owns are freed when it ends. A carved
+//! allocation that only the moving value points to is copied into the enclosing domain instead
+//! when other allocations share its chunk, carved for the cell the run would be charged to.
 //!
 //! A carved allocation starts at a granule and rounds up to a size class; the mark of its first
 //! granule names its class, with the freed bit once it is freed. A freed allocation joins its
@@ -29,6 +31,7 @@ use super::super::Lowering;
 use super::super::fx::{Fx, PTR};
 use super::super::machine::Stub;
 use super::super::machine::heap;
+use super::super::transfer::COPY;
 use super::{Routine, state, system, tasks};
 
 pub const CHUNK: u64 = 65_536;
@@ -1213,33 +1216,142 @@ pub fn cell_of(lo: &mut Lowering, fx: &mut Fx, address: Value) -> Value {
     cell
 }
 
-/// `Lift(address, domain) -> lifted`: passes the run of chunks an allocation lies in to a
-/// domain when a domain nested in it owns the run; nonzero when it passed.
-fn lift(lo: &mut Lowering, fx: &mut Fx, address: Value, to: Value) -> Value {
+/// `Lift(address, target) -> address`: moves an allocation to the domain a target names when a
+/// domain nested in it owns the run of chunks it lies in: with `COPY` set in the target, a copy
+/// replaces a carved allocation that shares its chunk; otherwise, or when no copy is carved, the
+/// run passes to the domain.
+fn lift(lo: &mut Lowering, fx: &mut Fx, address: Value, target: Value) -> Value {
+    let to = fx.b.ins().band_imm_s(target, !COPY);
     let record = chunk_of(lo, fx, address);
     let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record, 0);
-    fx.choose(
+    fx.choose_in(
+        lo,
         present,
-        &[types::I8],
-        |fx| {
+        &[PTR],
+        |lo, fx| {
             let owner = fx.load(PTR, record, chunk::DOMAIN);
             let inside = tasks::nested_in(fx, owner, to);
-            fx.when(inside, |fx| {
-                detach(fx, record);
-                fx.store(to, record, chunk::DOMAIN);
-                let zero = fx.ptr(0);
-                fx.store(zero, record, chunk::PREVIOUS);
-                let head = fx.load(PTR, to, tasks::domain::CHUNKS);
-                fx.store(head, record, chunk::NEXT);
-                let has_head = fx.b.ins().icmp_imm_s(IntCC::NotEqual, head, 0);
-                fx.when(has_head, |fx| fx.store(record, head, chunk::PREVIOUS));
-                fx.store(record, to, tasks::domain::CHUNKS);
-                recharge(lo, fx, record, to);
-            });
-            vec![inside]
+            fx.choose_in(
+                lo,
+                inside,
+                &[PTR],
+                |lo, fx| {
+                    let copy = copy_out(lo, fx, record, address, target, to);
+                    let kept = fx.b.ins().icmp_imm_s(IntCC::Equal, copy, 0);
+                    fx.when(kept, |fx| pass_run(lo, fx, record, to));
+                    vec![fx.b.ins().select(kept, address, copy)]
+                },
+                |_, _| vec![address],
+            )
         },
-        |fx| vec![fx.int(types::I8, 0)],
+        |_, _| vec![address],
     )[0]
+}
+
+/// The copy of a carved allocation of a run that `COPY` in the target asks for and that other
+/// allocations share, carved in the domain for the cell the run would be charged to, else for
+/// the run's own; the original is freed. Zero when none is carved.
+fn copy_out(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    record: Value,
+    address: Value,
+    target: Value,
+    to: Value,
+) -> Value {
+    let copying = fx.b.ins().band_imm_s(target, COPY);
+    let copying = fx.b.ins().icmp_imm_s(IntCC::NotEqual, copying, 0);
+    let marks = fx.load(PTR, record, chunk::MARKS);
+    let marked = fx.b.ins().icmp_imm_s(IntCC::NotEqual, marks, 0);
+    let live = fx.load(PTR, record, chunk::LIVE);
+    let shared = fx.b.ins().icmp_imm_s(IntCC::UnsignedGreaterThan, live, 1);
+    let wanted = fx.b.ins().band(copying, marked);
+    let wanted = fx.b.ins().band(wanted, shared);
+    fx.choose_in(
+        lo,
+        wanted,
+        &[PTR],
+        |lo, fx| {
+            let mark = mark_at(fx, record, address);
+            let named = fx.load(types::I8, mark, 0);
+            let named = fx.b.ins().uextend(PTR, named);
+            let index = fx.b.ins().iadd_imm_s(named, -1);
+            let classed =
+                fx.b.ins()
+                    .icmp_imm_s(IntCC::UnsignedLessThan, index, CLASSES as i64);
+            fx.choose_in(
+                lo,
+                classed,
+                &[PTR],
+                |lo, fx| {
+                    let bytes = class_bytes(fx, index);
+                    let old = fx.load(PTR, record, chunk::CELL);
+                    let new = fx.load(PTR, to, tasks::domain::CELL);
+                    let from = cell_record(lo, fx, old);
+                    let into = cell_record(lo, fx, new);
+                    let supply = fx.load(PTR, from, cell::SUPPLY);
+                    let wanted = fx.load(PTR, into, cell::SUPPLY);
+                    let joins = fx.b.ins().icmp(IntCC::Equal, supply, wanted);
+                    let first = fx.b.ins().select(joins, new, old);
+                    let align = fx.ptr(GRANULE);
+                    let copy = carve(lo, fx, first, bytes, align, to);
+                    let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, copy, 0);
+                    let other = fx.b.ins().icmp(IntCC::NotEqual, first, old);
+                    let retry = fx.b.ins().band(missing, other);
+                    let copy = fx.choose_in(
+                        lo,
+                        retry,
+                        &[PTR],
+                        |lo, fx| vec![carve(lo, fx, old, bytes, align, to)],
+                        |_, _| vec![copy],
+                    )[0];
+                    let carved = fx.b.ins().icmp_imm_s(IntCC::NotEqual, copy, 0);
+                    fx.when(carved, |fx| {
+                        lo.call_routine(fx, Routine::Copy, &[copy, address, bytes]);
+                        release(lo, fx, address);
+                    });
+                    vec![copy]
+                },
+                |_, fx| vec![fx.ptr(0)],
+            )
+        },
+        |_, fx| vec![fx.ptr(0)],
+    )[0]
+}
+
+/// The bytes of a size class by index, as `class_of` gives them.
+fn class_bytes(fx: &mut Fx, index: Value) -> Value {
+    let small = fx.b.ins().icmp_imm_s(IntCC::UnsignedLessThan, index, 8);
+    fx.choose(
+        small,
+        &[PTR],
+        |fx| {
+            let granules = fx.b.ins().iadd_imm_s(index, 1);
+            vec![fx.b.ins().ishl_imm_s(granules, 4)]
+        },
+        |fx| {
+            let above = fx.b.ins().iadd_imm_s(index, -8);
+            let quarter = fx.b.ins().band_imm_s(above, 3);
+            let quarters = fx.b.ins().iadd_imm_s(quarter, 5);
+            let doublings = fx.b.ins().ushr_imm_s(above, 2);
+            let shift = fx.b.ins().iadd_imm_s(doublings, 5);
+            vec![fx.b.ins().ishl(quarters, shift)]
+        },
+    )[0]
+}
+
+/// Passes a run of chunks to a domain, out of its pool, charged as `recharge` charges it.
+fn pass_run(lo: &mut Lowering, fx: &mut Fx, record: Value, to: Value) {
+    detach(fx, record);
+    fx.store(to, record, chunk::DOMAIN);
+    let zero = fx.ptr(0);
+    fx.store(zero, record, chunk::PREVIOUS);
+    let head = fx.load(PTR, to, tasks::domain::CHUNKS);
+    fx.store(head, record, chunk::NEXT);
+    let has_head = fx.b.ins().icmp_imm_s(IntCC::NotEqual, head, 0);
+    fx.when(has_head, |fx| fx.store(record, head, chunk::PREVIOUS));
+    fx.store(record, to, tasks::domain::CHUNKS);
+    recharge(lo, fx, record, to);
 }
 
 /// Charges a run of chunks passed to a domain to the domain's cell instead of the cell it is

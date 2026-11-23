@@ -68,7 +68,7 @@ var_stmt = "var" IDENT ( ":" type_expr )? "=" expr NL ;
 - A `let` statement whose pattern is `_` is an error (`stmt.wildcard-binding`); its exact fix replaces `let _ = e`, with any type after `_`, by `discard e`, or by `e` alone when `e` has type `Unit` or `Never`.
 - A binding is in scope from the statement after its own to the end of its block. The names of a `for` pattern are in scope in its loop block, those of an arm's patterns in its guard and body, and the parameters of a function or closure in its whole body.
 
-No name is shadowed. A binding, a parameter (closure parameters included) or a [quantifier](18-contracts.md#quantifiers) variable spelt like another binding, parameter or quantifier variable whose scope overlaps its own, like a name of its module's values namespace ([naming conventions](03-packages-modules.md#naming-conventions)), or like a [core vocabulary](03-packages-modules.md#core-vocabulary) name, is an error (`stmt.shadowing`), reported on the later of two locals and otherwise on the local. A loop label spelt like the label of an enclosing loop is also an error (`stmt.shadowing`).
+No name is shadowed. A binding, a parameter (closure parameters included) or a [quantifier](18-contracts.md#quantifiers) variable spelt like another binding, parameter or quantifier variable whose scope overlaps its own, like a name of its module's values namespace ([naming conventions](03-packages-modules.md#naming-conventions)), or like a [core vocabulary](03-packages-modules.md#core-vocabulary) name, is an error (`stmt.shadowing`), reported on the later of two locals and otherwise on the local. Its because-chain holds a `declared` reason at the other local's or the value's declaration, the name its subject, or a `note` reason whose subject is the core vocabulary name. A loop label spelt like the label of an enclosing loop is also an error (`stmt.shadowing`).
 
 ```nan
 pub fn mean(samples: Slice[u32]) -> Option[u32] {
@@ -91,6 +91,25 @@ pub fn scaled(value: u32, factor: u32) -> u32 {
     let value = value * factor // error: stmt.shadowing
     return value
 } scaled
+```
+
+```nan
+pub fn width() -> u32 = 8
+
+pub fn area(height: u32) -> u64 {
+    let width: u32 = 4 // error: stmt.shadowing
+    return u64.widen(width) * u64.widen(height)
+} area
+```
+
+```text
+$ nan check example
+failed check example: errors 1, incomplete 0
+error stmt.shadowing example/example.nan:5 example::area
+        let width: u32 = 4 // error: stmt.shadowing
+    because declared example/example.nan:2 example::width width
+    pub fn width() -> u32 = 8
+failed check example: errors 1, incomplete 0
 ```
 
 ```nan

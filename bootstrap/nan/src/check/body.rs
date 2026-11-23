@@ -490,15 +490,9 @@ impl<'c, 'a> Body<'c, 'a> {
             .flatten()
             .map(|id| &self.locals[id.0 as usize])
             .collect();
-        if visible.iter().any(|local| local.name == name.text)
-            || self
-                .ck
-                .db
-                .lookup(self.module, &name.text)
-                .is_some_and(|item| super::decl::in_values_namespace(self.ck.db.declaration(item)))
-            || super::resolve::is_core_vocabulary(&name.text)
-        {
-            self.report(name.token, Code::StmtShadowing);
+        if let Some(spelt) = self.spelt_like(&visible, name) {
+            self.ck
+                .report_because(self.item, name.token, Code::StmtShadowing, vec![spelt]);
             return;
         }
         let folded = fold(&name.text);
@@ -519,6 +513,40 @@ impl<'c, 'a> Body<'c, 'a> {
             self.ck
                 .report_clash(self.item, name.token, (value, declared));
         }
+    }
+
+    /// The reason a local's name shadows another: the declaration of the local whose scope
+    /// overlaps or of the module value it is spelt like, or a note naming the core vocabulary
+    /// name; none when it shadows nothing.
+    fn spelt_like(
+        &self,
+        visible: &[&Local],
+        name: &ast::Name,
+    ) -> Option<crate::diagnostic::Reason> {
+        if let Some(local) = visible.iter().find(|local| local.name == name.text) {
+            return Some(self.ck.reason(
+                self.item,
+                local.token,
+                Role::Declared,
+                local.name.clone(),
+            ));
+        }
+        let value = self
+            .ck
+            .db
+            .lookup(self.module, &name.text)
+            .filter(|item| super::decl::in_values_namespace(self.ck.db.declaration(*item)));
+        if let Some(value) = value {
+            let declared = declared_name(self.ck.db.declaration(value)).expect("a named value");
+            return Some(self.ck.reason(
+                value,
+                declared.token,
+                Role::Declared,
+                declared.text.clone(),
+            ));
+        }
+        super::resolve::is_core_vocabulary(&name.text)
+            .then(|| crate::diagnostic::Reason::note(&name.text))
     }
 
     pub fn push_scope(&mut self) {

@@ -548,12 +548,14 @@ pub fn prefixes(artefacts: &BTreeMap<String, Vec<u8>>) -> HashMap<String, String
 }
 
 /// The content of an image's `.nan.tree` section: the hash of the list of the code roots of its
-/// `.nan` section's artefacts, in that section's order.
+/// `.nan` section's artefacts, in that section's order, each without its manifest's `targets`
+/// directive.
 fn tree(artefacts: &BTreeMap<String, Vec<u8>>) -> Hash {
     let mut out = Vec::new();
     list(&mut out, artefacts.values(), |out, artefact| {
         let decoded = artefact::decode(artefact).expect("an artefact of the final closure");
-        bytes(out, &decoded.code_root)
+        let root = artefact::untargeted(&decoded.code_root).expect("a code root");
+        bytes(out, &root)
     });
     Hash::of(&out)
 }

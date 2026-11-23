@@ -72,12 +72,13 @@ const CONTROL_C_EXIT: i64 = 0xC000_013A;
 /// The size of each thread's stack for stack overflow reports.
 const TRAP_STACK: u64 = 65_536;
 
-/// A task stack's guard region: a page no access reaches, the stack's floor, then room for a
-/// stack overflow's handler, then the page the system guards. A touch of the guarded page while
-/// the stack is the running thread's makes the system raise a stack overflow, whose exception
-/// frame, with the processor's extended state, and the handler's frames then fill that page and
-/// the room below, which no guarded page interrupts.
-pub const GUARD: u64 = 16_384;
+/// A task stack's guard region: a page no access reaches, the stack's floor, then 16 KiB of room
+/// for a stack overflow's handler, then the page the system guards. A touch of the guarded page
+/// while the stack is the running thread's makes the system raise a stack overflow, whose
+/// exception frame, with the processor's extended state, and the handler's frames then fill that
+/// page and the room below, which no guarded page interrupts: about 14 KiB on a processor whose
+/// extended state holds AMX tiles.
+pub const GUARD: u64 = 24_576;
 const FLOOR: u64 = 4_096;
 const GUARDED: u64 = 4_096;
 const PAGE_GUARD: i64 = 0x100;

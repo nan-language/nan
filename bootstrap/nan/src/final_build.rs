@@ -27,7 +27,7 @@ const LANDING: &str = "enter";
 
 /// What a final build reports and the image it writes, relative to the workspace root, with the
 /// files it writes beside the image: a machine image's artefacts and a kernel's interface file,
-/// or a bundle's artefacts and the hash of their code roots.
+/// or a bundle's artefacts and their tree hash.
 pub struct Build {
     pub diagnostics: Vec<Diagnostic>,
     pub image: Option<String>,
@@ -82,14 +82,19 @@ pub fn build(
         return Ok(Build::failed(diagnostics));
     }
     let name = checker.db.package(root).name.clone();
-    let artefacts = artefacts(workspace, &checker, root);
+    let packed = closure_files(workspace, &checker, root);
     if let Some((image, written)) = compared {
-        diagnostics.extend(crate::stage::compare(&checker, &artefacts, image, written));
+        diagnostics.extend(crate::stage::compare(
+            &checker,
+            &packed.artefacts,
+            image,
+            written,
+        ));
         if errors(&diagnostics) {
             return Ok(Build::failed(diagnostics));
         }
     }
-    let (lowered, interface, runtime) = lower_program(&checker, source, root, &artefacts);
+    let (lowered, interface, runtime) = lower_program(&checker, source, root, &packed);
     diagnostics.extend(collisions(source, &lowered.collisions));
     for lowered in std::iter::once(&lowered).chain(&runtime) {
         diagnostics.extend(lower::stack::judge(
@@ -117,7 +122,7 @@ pub fn build(
     let mut companions = Vec::new();
     if target.is_machine() {
         let path = format!(".nan/images/{}/{name}.narts", target.name());
-        write_file(&workspace.root.join(&path), &section(&artefacts))?;
+        write_file(&workspace.root.join(&path), &section(&packed.artefacts))?;
         companions.push(path);
     }
     if let Some(file) = interface {
@@ -146,15 +151,15 @@ fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// The lowering of the program of `source`, whose package is `root`, for the checker's target at
-/// the codegen level its manifest gives for the target's architecture, with the artefacts of its
-/// final closure, the interface file of a kernel exporting the load ABI, and the lowering of the
+/// the codegen level its manifest gives for the target's architecture, with its final closure, the interface file of a kernel exporting the load ABI, and the lowering of the
 /// user-mode runtime of a kernel running nanos jobs in isolated spaces, whose image it holds.
 fn lower_program(
     checker: &check::Checker,
     source: &Package,
     root: PackageId,
-    artefacts: &BTreeMap<String, Vec<u8>>,
+    packed: &ClosureFiles,
 ) -> (lower::Lowered, Option<Vec<u8>>, Option<lower::Lowered>) {
+    let artefacts = &packed.artefacts;
     let target = checker.db.target;
     let level = source.manifest.as_ref().and_then(|manifest| {
         manifest
@@ -183,7 +188,7 @@ fn lower_program(
         roots: vec![root],
         prefixes: prefixes(artefacts),
         section: section(artefacts),
-        tree: tree(artefacts),
+        tree: packed.tree,
         level,
         interface: kernel.as_ref().map(|kernel| kernel.interface.clone()),
         loaded: kernel
@@ -341,8 +346,8 @@ pub fn lowered_functions(workspace: &Workspace, program: usize) -> Vec<(String, 
     };
     let checker = check::checked(workspace, checked, std, source.program_target());
     let root = package_id(&checker, source);
-    let artefacts = artefacts(workspace, &checker, root);
-    lower::dumping(|| lower_program(&checker, source, root, &artefacts).0).1
+    let packed = closure_files(workspace, &checker, root);
+    lower::dumping(|| lower_program(&checker, source, root, &packed).0).1
 }
 
 /// A task a program or test image starts, as the measurements of the freeze read it: where its
@@ -395,10 +400,10 @@ pub fn program_tasks(workspace: &Workspace) -> Vec<TaskStack> {
         };
         let checker = check::checked(workspace, checked, std, source.program_target());
         let root = package_id(&checker, source);
-        let artefacts = artefacts(workspace, &checker, root);
+        let packed = closure_files(workspace, &checker, root);
         found.extend(tasks(
             &checker,
-            &lower_program(&checker, source, root, &artefacts).0,
+            &lower_program(&checker, source, root, &packed).0,
         ));
     }
     found
@@ -489,14 +494,21 @@ fn package_id(checker: &check::Checker, package: &crate::workspace::Package) -> 
     PackageId(index as u32)
 }
 
-/// The artefact of each package lowered with the workspace package `root` of a checker's
-/// closure, by package name: of the packages `root` reaches, a workspace package's of its current
-/// state and a release's from the local store, and of each std package the toolchain's.
-pub fn artefacts(
+/// The packages lowered with a program or bundle: the artefact of each, by package name, and the
+/// tree hash of their sources.
+pub struct ClosureFiles {
+    pub artefacts: BTreeMap<String, Vec<u8>>,
+    pub tree: Hash,
+}
+
+/// The packages lowered with the workspace package `root` of a checker's closure: of the packages
+/// `root` reaches, a workspace package's current state and a release from the local store, and
+/// each std package the toolchain carries.
+pub fn closure_files(
     workspace: &Workspace,
     checker: &check::Checker,
     root: PackageId,
-) -> BTreeMap<String, Vec<u8>> {
+) -> ClosureFiles {
     let mut packages = checker.reached(root);
     packages.extend(
         (0..checker.db.packages.len())
@@ -504,12 +516,17 @@ pub fn artefacts(
             .filter(|id| checker.db.package(*id).std),
     );
     let mut found = BTreeMap::new();
+    let mut trees = BTreeMap::new();
     for id in packages {
         let data = checker.db.package(id);
         let (workspace, index) = match data.member {
             Some(Member::Release(index)) => {
-                let artefact = workspace.releases[index].entry.artefact.clone();
-                found.insert(data.name.clone(), artefact);
+                let entry = &workspace.releases[index].entry;
+                found.insert(data.name.clone(), entry.artefact.clone());
+                trees.insert(
+                    data.name.clone(),
+                    artefact::untargeted_tree_hash(&entry.sources),
+                );
                 continue;
             }
             Some(Member::Source(index)) => (workspace, index),
@@ -528,8 +545,15 @@ pub fn artefacts(
         };
         let built = check::root::build(workspace, closure, Member::Source(index));
         found.insert(data.name.clone(), built.artefact);
+        trees.insert(
+            data.name.clone(),
+            artefact::untargeted_tree_hash(&built.sources),
+        );
     }
-    found
+    ClosureFiles {
+        artefacts: found,
+        tree: tree(&trees),
+    }
 }
 
 /// The prefix the symbols of each package carry, by package name: the first 12 characters of the
@@ -547,16 +571,12 @@ pub fn prefixes(artefacts: &BTreeMap<String, Vec<u8>>) -> HashMap<String, String
         .collect()
 }
 
-/// The content of an image's `.nan.tree` section: the hash of the list of the code roots of its
-/// `.nan` section's artefacts, in that section's order, each without its manifest's `targets`
-/// directive.
-fn tree(artefacts: &BTreeMap<String, Vec<u8>>) -> Hash {
+/// The tree hash of the packages of a closure: the hash of the list of the source tree hashes of
+/// their files, each without its `package.nan`'s `targets` directive, in byte order of package
+/// name.
+fn tree(trees: &BTreeMap<String, Hash>) -> Hash {
     let mut out = Vec::new();
-    list(&mut out, artefacts.values(), |out, artefact| {
-        let decoded = artefact::decode(artefact).expect("an artefact of the final closure");
-        let root = artefact::untargeted(&decoded.code_root).expect("a code root");
-        bytes(out, &root)
-    });
+    list(&mut out, trees.values(), |out, tree| bytes(out, &tree.0));
     Hash::of(&out)
 }
 

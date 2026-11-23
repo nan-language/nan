@@ -8,8 +8,8 @@ use std::path::Path;
 use std::rc::Rc;
 
 use super::{
-    Build, artefacts, collisions, errors, final_closure, items, package_id, prefixes, roots,
-    section, tree, write_file,
+    Build, closure_files, collisions, errors, final_closure, items, package_id, prefixes, roots,
+    section, write_file,
 };
 use crate::artefact::{read_bytes, read_uvar};
 use crate::check::db::{ItemId, PackageId};
@@ -185,8 +185,9 @@ pub fn bundle(
     if errors(&diagnostics) {
         return Ok(Build::failed(diagnostics));
     }
-    let artefacts = artefacts(workspace, &checker, root);
-    for (name, root) in roots(&artefacts) {
+    let packed = closure_files(workspace, &checker, root);
+    let artefacts = &packed.artefacts;
+    for (name, root) in roots(artefacts) {
         if read.roots.get(&name).is_some_and(|kernel| *kernel != root) {
             let reason = format!("{name} differs from the kernel's release of it");
             diagnostics.push(interface_error(source, &reason));
@@ -242,7 +243,7 @@ pub fn bundle(
         entry,
         components,
         roots: vec![root],
-        prefixes: prefixes(&artefacts),
+        prefixes: prefixes(artefacts),
         level: read.level,
     };
     let lowered = lower::lower_bundle(&checker, &bundle);
@@ -276,9 +277,9 @@ pub fn bundle(
     write_file(&workspace.root.join(&path), &written)?;
     let images = format!(".nan/images/{}/{name}", target.name());
     let artefacts_path = format!("{images}.narts");
-    write_file(&workspace.root.join(&artefacts_path), &section(&artefacts))?;
+    write_file(&workspace.root.join(&artefacts_path), &section(artefacts))?;
     let tree_path = format!("{images}.ntree");
-    write_file(&workspace.root.join(&tree_path), &tree(&artefacts).0)?;
+    write_file(&workspace.root.join(&tree_path), &packed.tree.0)?;
     Ok(Build {
         diagnostics,
         image: Some(path),

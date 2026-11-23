@@ -208,28 +208,6 @@ pub struct AttestedSeal {
 
 /// The source tree hash of a package's files: the hash of the encoding of a list of pairs of
 /// each file's path within the package and its content.
-/// A code root with the `targets` directive left out of its manifest, as an image's tree hash
-/// lists it, so that the builds of one source tree for each of its targets share that hash; none
-/// when the bytes hold no code root.
-pub fn untargeted(code_root: &[u8]) -> Option<Vec<u8>> {
-    let mut record = Record::default();
-    for (key, content) in owned_record(code_root)? {
-        let content = match key {
-            2 => {
-                let manifest = held_text(&content)?;
-                let kept: String = manifest
-                    .split_inclusive('\n')
-                    .filter(|line| !line.starts_with("    targets "))
-                    .collect();
-                text(&kept)
-            }
-            _ => content,
-        };
-        record.field(key, content);
-    }
-    Some(record.finish())
-}
-
 pub fn source_tree_hash(files: &[(String, Vec<u8>)]) -> Hash {
     let elements = files
         .iter()
@@ -240,6 +218,27 @@ pub fn source_tree_hash(files: &[(String, Vec<u8>)]) -> Hash {
         })
         .collect();
     Hash::of(&sorted_list(elements))
+}
+
+/// The source tree hash of a package's files with the `targets` directive left out of its
+/// `package.nan`, which the builds of one source tree for each of its targets share.
+pub fn untargeted_tree_hash(files: &[(String, Vec<u8>)]) -> Hash {
+    let files: Vec<(String, Vec<u8>)> = files
+        .iter()
+        .map(|(path, content)| {
+            let content = match path.as_str() {
+                "package.nan" => content
+                    .split_inclusive(|byte| *byte == b'\n')
+                    .filter(|line| !line.trim_ascii_start().starts_with(b"targets "))
+                    .flatten()
+                    .copied()
+                    .collect(),
+                _ => content.clone(),
+            };
+            (path.clone(), content)
+        })
+        .collect();
+    source_tree_hash(&files)
 }
 
 /// The bytes of an attestation file, `seals` being its seals as `seal_list` encodes them.

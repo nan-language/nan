@@ -650,9 +650,9 @@ fn lower(
                 })
                 .collect(),
             roots: vec![package],
-            prefixes: crate::final_build::prefixes(&crate::final_build::artefacts(
-                workspace, checker, package,
-            )),
+            prefixes: crate::final_build::prefixes(
+                &crate::final_build::closure_files(workspace, checker, package).artefacts,
+            ),
         },
     )
 }

@@ -340,8 +340,8 @@ pub struct Program {
     pub prefixes: HashMap<String, String>,
     /// The content of the image's `.nan` section.
     pub section: Vec<u8>,
-    /// The content of its `.nan.tree` section: the hash of the code roots of the artefacts of
-    /// `.nan`, in order.
+    /// The content of its `.nan.tree` section: the tree hash of the sources of the packages of
+    /// `.nan`.
     pub tree: crate::hash::Hash,
     /// The codegen level of the program's manifest for the target's architecture.
     pub level: Option<Level>,

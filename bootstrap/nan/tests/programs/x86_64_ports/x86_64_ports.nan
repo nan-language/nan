@@ -1,4 +1,4 @@
-//! Lists the PCI functions and ports behind root ports and a PCI bridge with their bus paths, attaches them to an I/O domain, then, for each empty hot-plug slot, signalling through MSI-X or MSI alone, attaches the device the harness plugs into it and cuts it off once the harness unplugs it.
+//! Lists the PCI functions and ports behind root ports and a PCI bridge with their bus paths, attaches them to an I/O domain, then, for each empty hot-plug slot, signalling through MSI-X or MSI alone, attaches the device the harness plugs into it and cuts it off once the harness unplugs it. The ports of occupied slots are released before the first rescan, and the link power management of the functions below them is turned on once the functions it found are cut off.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -31,36 +31,14 @@ fn main(take k: boot::Kernel) -> Never limits stack 32_768 {
     var functions = mut k.pci_functions()
     var ports = mut k.pci_ports()
     var hot_plug = mem::List[hw::PciPort].empty(alloc)
+    var occupied = mem::List[hw::PciPort].empty(alloc)
     for port in take ports {
-        var line = mem::Bytes.empty(alloc)
-        mut line.append(b"port ")
-        address(mut line, at: port.address())
-        let buses = port.buses()
-        match port.kind() {
-            hw::PortKind.Root => mut line.append(b" root")
-            hw::PortKind.Upstream => mut line.append(b" upstream")
-            hw::PortKind.Downstream => mut line.append(b" downstream")
-            hw::PortKind.Bridge => mut line.append(b" bridge")
-        }
-        mut line.append(b" buses ")
-        hex(mut line, value: u32.widen(buses.secondary), digits: 2)
-        mut line.append(b"-")
-        hex(mut line, value: u32.widen(buses.subordinate), digits: 2)
-        match port.slot() {
-            Some(slot) => {
-                mut line.append(b" slot ")
-                hex(mut line, value: u32.widen(slot.number), digits: 1)
-                if slot.hot_plug {
-                    mut line.append(b" hot plug")
-                }
-            }
-            None => {}
-        }
-        mut line.append(b"\n")
-        say(line.view())
+        described(port, alloc)
         let events = mut port.slot_events()
         if port.slot().is_some() and not events.present {
             mut hot_plug.push(take port)
+        } else if events.present {
+            mut occupied.push(take port)
         } else {
             take port.release()
         }
@@ -88,22 +66,63 @@ fn main(take k: boot::Kernel) -> Never limits stack 32_768 {
             }
         }
     }
+    var linked = mem::List[hw::PciFunction].empty(alloc)
     for function in take behind {
         var attached = function
         attach(mut attached, domain, alloc)
-        take attached.release()
+        mut linked.push(take attached)
     }
-    take k.anchor(take iommu, run: fn[take hot_plug, take domain](exec: task::Executor) limits stack 65_536 {
+    take k.anchor(take iommu, run: fn[take hot_plug, take occupied, take linked, take domain](exec: task::Executor) limits stack 65_536 {
+        var released = occupied
+        var below = linked
         for port in take hot_plug {
-            plugged(take port, domain, alloc)
+            plugged(take port, mut released, mut below, domain, alloc)
+        }
+        for port in take released {
+            take port.release()
+        }
+        for function in take below {
+            take function.release()
         }
         take domain.close()
     })
 } main
 
+/// Writes a port's bus path, kind, buses and slot.
+fn described(port: hw::PciPort, alloc: mem::Alloc) {
+    var line = mem::Bytes.empty(alloc)
+    mut line.append(b"port ")
+    address(mut line, at: port.address())
+    let buses = port.buses()
+    match port.kind() {
+        hw::PortKind.Root => mut line.append(b" root")
+        hw::PortKind.Upstream => mut line.append(b" upstream")
+        hw::PortKind.Downstream => mut line.append(b" downstream")
+        hw::PortKind.Bridge => mut line.append(b" bridge")
+    }
+    mut line.append(b" buses ")
+    hex(mut line, value: u32.widen(buses.secondary), digits: 2)
+    mut line.append(b"-")
+    hex(mut line, value: u32.widen(buses.subordinate), digits: 2)
+    match port.slot() {
+        Some(slot) => {
+            mut line.append(b" slot ")
+            hex(mut line, value: u32.widen(slot.number), digits: 1)
+            if slot.hot_plug {
+                mut line.append(b" hot plug")
+            }
+        }
+        None => {}
+    }
+    mut line.append(b"\n")
+    say(line.view())
+} described
+
 /// Installs the slot's interrupt, lists and attaches the device a rescan finds once the slot
-/// reports a card, then powers the slot off once its attention button is pressed.
-fn plugged(take port: hw::PciPort, domain: hw::IoDomain, alloc: mem::Alloc) {
+/// reports a card, then powers the slot off once its attention button is pressed. The ports
+/// `released` are released just before the rescan, whose functions may take their memory, and
+/// the functions `below` them turn their link power management on once those are cut off.
+fn plugged(take port: hw::PciPort, mut released: mem::List[hw::PciPort], mut below: mem::List[hw::PciFunction], domain: hw::IoDomain, alloc: mem::Alloc) {
     var slot = port
     let shared = match mut slot.slot_irq(cpu: 0, dev: 0u64, on_irq: count) {
         Ok(installed) => installed
@@ -123,6 +142,12 @@ fn plugged(take port: hw::PciPort, domain: hw::IoDomain, alloc: mem::Alloc) {
         say(b"hot plug: a card arrived\n")
     }
     mut slot.power(on: true)
+    loop {
+        let Some(given_up) = mut released.pop() else {
+            break
+        }
+        take given_up.release()
+    }
     var found = mut slot.rescan(alloc)
     var hot = mem::List[hw::PciFunction].empty(alloc)
     for function in take found {
@@ -151,6 +176,7 @@ fn plugged(take port: hw::PciPort, domain: hw::IoDomain, alloc: mem::Alloc) {
         }
         take left.release()
     }
+    link_powered(mut below, alloc)
     discard interrupted(shared, seen)
     let left = mut slot.slot_events()
     if left.presence_changed and not left.present {
@@ -219,6 +245,34 @@ fn attach(mut function: hw::PciFunction, domain: hw::IoDomain, alloc: mem::Alloc
     mut line.append(b"\n")
     say(line.view())
 } attach
+
+/// Turns on the link power management of the functions `below` the ports released before a
+/// rescan, then releases them, writing what each gave.
+fn link_powered(mut below: mem::List[hw::PciFunction], alloc: mem::Alloc) {
+    loop {
+        let Some(function) = mut below.pop() else {
+            break
+        }
+        var powered = function
+        var line = mem::Bytes.empty(alloc)
+        mut line.append(b"link power ")
+        address(mut line, at: powered.address())
+        match attempt mut powered.link_power(true) {
+            Ok(_) => mut line.append(b": ok\n")
+            Err(error) => {
+                if error == hw::PciError.Removed {
+                    mut line.append(b": removed\n")
+                } else if error == hw::PciError.Unsupported {
+                    mut line.append(b": unsupported\n")
+                } else {
+                    mut line.append(b": failed\n")
+                }
+            }
+        }
+        say(line.view())
+        take powered.release()
+    }
+} link_powered
 
 /// Writes a function's bus path and ids after a prefix.
 fn listed(function: hw::PciFunction, prefix: Slice[u8], alloc: mem::Alloc) {

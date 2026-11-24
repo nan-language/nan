@@ -1,22 +1,26 @@
-//! Component instances in isolated spaces: the kernel's side, which holds an instance whose task runs in a space, sending its holder's requests and its inboxes' calls down the first channel of the space's link, routing the answers the space sends back and calling its holder's runner for it, and the space's side, which runs the instance task, relays between that channel and the instance and forwards the operations of the instance's runner capability to the kernel.
+//! Component instances in isolated spaces: the kernel's side, which holds an instance whose task runs in the space of an isolation, sending its holder's requests and its inboxes' calls down the first channel of the space's link, routing the answers the space sends back and calling its holder's runner for it, and the space's side, which runs the instance task, relays between that channel and the instance and forwards the operations of the instance's runner capability to the kernel.
 
 /// The bytes of a frame's head, which holds the length of the encoding following it.
 const FRAME_HEAD: usize = 4
 
-pub fn hold_isolated[T, E](cpu: hw::Ring0, job: sys::load::Isolated, component: Str, tenant: u64, services: Services, link: Link, take checkpoint: Option[Checkpoint], runner: sys::Runner, mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState], exec: task::Executor, alloc: mem::Alloc, body: fn(take instance: Instance) -> T fails E uses wait limits stack 65_536) -> Option[T] fails E uses wait {
-    let Some(entry) = job.component(component) else {
+pub fn hold_isolated[T, E](space: Isolation, job: sys::load::Isolated, component: Str, link: Link, take checkpoint: Option[Checkpoint], runner: sys::Runner, alloc: mem::Alloc, body: fn(take instance: Instance) -> T fails E uses wait limits stack 65_536) -> Option[T] fails E uses wait {
+    if job.component(component).is_none() {
         return None
     }
     var given = Some(take checkpoint)
+    var named = Some(text::String.of(component, alloc))
     var result: Option[T] = None
-    try await task::scope(exec, body: fn[mut given, mut frames, mut extended, mut result](s: task::Scope) fails E uses wait {
+    try await task::scope(space.exec, body: fn[mut given, mut named, mut result](s: task::Scope) fails E uses wait {
         let Some(from) = mut given.extract() else {
+            return
+        }
+        let Some(name) = mut named.extract() else {
             return
         }
         let Opened(instance: instance, launch: launch, ending: ending, last: last) = opened(s, checkpoint: None, runner: sys::Runner.denied(), alloc)
         let watched = instance.abandoner.share()
-        discard s.spawn(fn[take from, take launch, take ending, take last, take watched, mut frames, mut extended]() fails task::Cancelled uses wait {
-            let ended = match attempt await held_in(cpu, job, entry, tenant, services, runner, link, checkpoint: take from, take launch, abandoner: take watched, mut frames, mut extended, exec, alloc) {
+        discard s.spawn(fn[take from, take name, take launch, take ending, take last, take watched]() fails task::Cancelled uses wait {
+            let ended = match attempt await held_in(space, job, component: take name, runner, link, checkpoint: take from, take launch, abandoner: take watched, alloc) {
                 Ok(how) => how
                 Err(cancelled) => failed(take cancelled, alloc)
             }
@@ -28,25 +32,16 @@ pub fn hold_isolated[T, E](cpu: hw::Ring0, job: sys::load::Isolated, component: 
     return result
 } hold_isolated
 
-/// Runs the instance of the component entry `entry` in a space of `job` for `tenant` made from
-/// `frames`, resuming from `checkpoint` and acting through `runner`, until it ends, and gives how
-/// it ended: failed with the rendering of an `IsolatedError` when `link` has no channel or no
-/// space can be made.
-fn held_in(cpu: hw::Ring0, job: sys::load::Isolated, entry: sys::load::Job, tenant: u64, services: Services, runner: sys::Runner, link: Link, take checkpoint: Option[Checkpoint], take launch: Launch, take abandoner: mem::Shared[sys::Abandoner], mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState], exec: task::Executor, alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
+/// Has the space of `isolation` run the instance of the component entry `component` of `job`,
+/// resuming from `checkpoint` and acting through `runner`, until it ends, and gives how it ended:
+/// failed with the rendering of an `IsolatedError` when `link` has no channel or the instance
+/// cannot be placed.
+fn held_in(isolation: Isolation, job: sys::load::Isolated, take component: text::String, runner: sys::Runner, link: Link, take checkpoint: Option[Checkpoint], take launch: Launch, take abandoner: mem::Shared[sys::Abandoner], alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
     if link.channels.len() == 0 {
         return failed(IsolatedError.NoChannel, alloc)
     }
-    match attempt placed(cpu, job, entry, tenant, services, runner, link, held: true, input: encoded(checkpoint, alloc), mut frames, alloc) {
-        Ok(Placed(space: made, state: started, table: table)) => {
-            var space = made
-            var state = started
-            let outcome = attempt await relayed(cpu, mut space, mut state, mut extended, served: Serving(services: services, tenant: tenant, table: take table), runner, link, take launch, take abandoner, mut frames, exec, alloc)
-            take space.release(mut frames)
-            match outcome {
-                Ok(how) => return how
-                Err(cancelled) => fail cancelled
-            }
-        }
+    match try await relayed(isolation, job, take component, runner, link, input: encoded(checkpoint, alloc), take launch, take abandoner, alloc) {
+        Ok(how) => return how
         Err(error) => return failed(IsolatedError.Unplaced(error), alloc)
     }
 } held_in
@@ -62,20 +57,32 @@ struct Relays {
     abandoner: mem::Shared[sys::Abandoner]
 } Relays
 
-/// Runs an instance's space until it ends, sending its holder's requests and its inboxes' calls
-/// down the first channel of `link` and routing the answers the space sends up it, calling through
-/// `runner` the ports the instance calls, and gives how it ended; once `abandoner` abandons, the
-/// space runs no more and the instance ends abandoned.
-fn relayed(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserState, mut extended: Option[hw::ExtendedState], take served: Serving, runner: sys::Runner, link: Link, take launch: Launch, take abandoner: mem::Shared[sys::Abandoner], mut frames: mem::List[hw::PhysFrame[4_096]], exec: task::Executor, alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
+/// Has the space of `isolation` run an instance of the component entry `component` of `job` on
+/// `input`, sending its holder's requests and its inboxes' calls down the first channel of `link`
+/// and routing the answers the space sends up it, calling through `runner` the ports the instance
+/// calls, and gives how it ended or why it could not be placed; once `abandoner` abandons, the
+/// space abandons the instance, which ends abandoned.
+fn relayed(isolation: Isolation, job: sys::load::Isolated, take component: text::String, runner: sys::Runner, link: Link, take input: mem::Bytes, take launch: Launch, take abandoner: mem::Shared[sys::Abandoner], alloc: mem::Alloc) -> Result[Ended, sys::load::LoadError] fails task::Cancelled uses wait {
+    let exec = isolation.exec
+    let id = isolation.number()
+    let table = isolation.table
     let Launch(checkpoint: _, runner: _, requests: requests, calls: calls, answers: answers) = launch
     let task::Channel(sender: down, receiver: outgoing) = task::Channel[mem::Bytes].bounded(QUEUED_CALLS, alloc)
     let task::Channel(sender: parking, receiver: parked) = task::Channel[u8].bounded(1, alloc)
     let allocs = task::Cown.of(mem::Map[u64, mem::Alloc].empty(alloc), alloc)
-    let halted = core::atomic::AtomicBool.of(false)
+    let halted = mem::Shared.of(core::atomic::AtomicBool.of(false), alloc)
     var relays = Some(Relays(requests: take requests, calls: take calls, outgoing: take outgoing, parked: take parked, abandoner: take abandoner))
-    var ended = Ended.Cancelled
-    try await task::scope(exec, body: fn[mut space, mut state, mut extended, mut frames, mut relays, mut ended](s: task::Scope) fails task::Cancelled uses wait {
+    var given = Some(take component)
+    var feeding = Some(take input)
+    var outcome: Result[Ended, sys::load::LoadError] = Err(sys::load::LoadError.Unplaceable)
+    try await task::scope(exec, body: fn[mut relays, mut given, mut feeding, mut outcome](s: task::Scope) fails task::Cancelled uses wait {
         let Some(Relays(requests: asked, calls: called, outgoing: sending, parked: waiting, abandoner: domain)) = mut relays.extract() else {
+            return
+        }
+        let Some(name) = mut given.extract() else {
+            return
+        }
+        let Some(fed) = mut feeding.extract() else {
             return
         }
         let requests_down = down.split()
@@ -85,6 +92,7 @@ fn relayed(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserState
         let answered = answers.split()
         let routing = allocs.share()
         let drawing = allocs.share()
+        let watching = halted.share()
         discard s.spawn(fn[take sending]() fails task::Cancelled uses wait {
             try await sent_down(link, outgoing: take sending)
         })
@@ -92,12 +100,12 @@ fn relayed(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserState
             try await asked_down(take asked, out: requests_down, exec, alloc)
         })
         discard s.spawn(fn[take called, take calls_down, take replies, take drawing]() fails task::Cancelled uses wait {
-            try await called_down(take called, out: calls_down, answers: replies, allocs: drawing, table: served.table, alloc)
+            try await called_down(take called, out: calls_down, answers: replies, allocs: drawing, table, job: id, alloc)
         })
         discard s.spawn(fn[take answered, take routing, take ports_down]() fails task::Cancelled uses wait {
-            try await answered_up(link, answers: answered, allocs: routing, table: served.table, runner, out: ports_down, exec, alloc)
+            try await answered_up(link, answers: answered, allocs: routing, table, job: id, runner, out: ports_down, exec, alloc)
         })
-        discard s.spawn(fn[take waiting, take domain]() fails task::Cancelled uses wait {
+        discard s.spawn(fn[take waiting, take domain, take watching]() fails task::Cancelled uses wait {
             let watched = attempt await domain.contents().run(fn[take waiting]() fails task::Cancelled uses wait {
                 var held = waiting
                 discard try await mut held.receive()
@@ -105,14 +113,15 @@ fn relayed(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserState
             let Ok(Err(_)) = watched else {
                 return
             }
-            halted.store(true)
-            link.ring(0)
+            watching.contents().store(true)
+            isolation.wake(WOKE_ORDERS)
         })
-        ended = try await run_space(cpu, mut space, mut state, mut extended, served, link, halted: fn() => halted.load(), mut frames, alloc)
+        let Joined(outcome: how, cancelled: _) = try await joined(isolation, id, job, component: Some(take name), link, input: take fed, runner, halted, alloc)
+        outcome = how
         s.cancel()
     })
     discard parking
-    return ended
+    return outcome
 } relayed
 
 /// Sends each frame `outgoing` carries down the first channel of `link`.
@@ -189,14 +198,14 @@ fn asked_down(take requests: task::Receiver[Asked], out: task::Sender[mem::Bytes
 /// Sends `out` the frame of each call of an instance's inboxes, its handles added to the space's
 /// `table`, keeping in `allocs` the allocator its reply is drawn through; a call carrying a handle
 /// the space cannot hold is answered at once as malformed.
-fn called_down(take calls: task::Receiver[Called], out: task::Sender[mem::Bytes], answers: task::Sender[Routed], allocs: task::Cown[mem::Map[u64, mem::Alloc]], table: Table, alloc: mem::Alloc) fails task::Cancelled uses wait {
+fn called_down(take calls: task::Receiver[Called], out: task::Sender[mem::Bytes], answers: task::Sender[Routed], allocs: task::Cown[mem::Map[u64, mem::Alloc]], table: Table, job: u64, alloc: mem::Alloc) fails task::Cancelled uses wait {
     var receiver = calls
     loop {
         let Some(called) = try await mut receiver.receive() else {
             return
         }
         let Called(id: id, hash: hash, request: request, encoding: encoding, alloc: drawn) = called
-        let Some(crossing) = table.admitted(encoding.handles.view(), alloc) else {
+        let Some(crossing) = table.admitted(job, handles: encoding.handles.view(), alloc) else {
             discard attempt await answers.send(Routed.Answered(Replied(id: id, answer: Answer.Served(Err(sys::CallError.Malformed(core::DecodeError.Invalid))))))
             continue
         }
@@ -213,7 +222,7 @@ fn called_down(take calls: task::Receiver[Called], out: task::Sender[mem::Bytes]
 /// the space's `table` it names, and calls through `runner` each port the instance calls, on a task
 /// of its own sending `out` the frame of the reply; it stops hearing a space that frames a message
 /// it cannot decode or longer than `MOST_BYTES`.
-fn answered_up(link: Link, answers: task::Sender[Routed], allocs: task::Cown[mem::Map[u64, mem::Alloc]], table: Table, runner: sys::Runner, out: task::Sender[mem::Bytes], exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
+fn answered_up(link: Link, answers: task::Sender[Routed], allocs: task::Cown[mem::Map[u64, mem::Alloc]], table: Table, job: u64, runner: sys::Runner, out: task::Sender[mem::Bytes], exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
     var pending = mem::Bytes.empty(alloc)
     try await task::scope(exec, body: fn[mut pending](s: task::Scope) fails task::Cancelled uses wait {
         loop {
@@ -228,7 +237,7 @@ fn answered_up(link: Link, answers: task::Sender[Routed], allocs: task::Cown[mem
                 Up.Called(called) => {
                     let replying = out.split()
                     discard s.spawn(fn[take called, take replying]() fails task::Cancelled uses wait {
-                        try await ported(take called, runner, table, out: replying, alloc)
+                        try await ported(take called, runner, table, job, out: replying, alloc)
                     })
                 }
             }
@@ -272,14 +281,14 @@ fn up_of(frame: mem::Bytes, alloc: mem::Alloc) -> Option[Up] {
 /// Calls through `runner` the port an instance's space calls, its handles those of the entries of
 /// the space's `table` it names, and sends `out` the frame of the reply, its handles added to
 /// `table`.
-fn ported(take called: PortCall, runner: sys::Runner, table: Table, out: task::Sender[mem::Bytes], alloc: mem::Alloc) fails task::Cancelled uses wait {
+fn ported(take called: PortCall, runner: sys::Runner, table: Table, job: u64, out: task::Sender[mem::Bytes], alloc: mem::Alloc) fails task::Cancelled uses wait {
     let PortCall(id: id, port: port, hash: hash, call: request) = called
-    let answer = try await port_answer(port, hash, take request, runner, table, alloc)
+    let answer = try await port_answer(port, hash, take request, runner, table, job, alloc)
     discard attempt await out.send(framed(Down.Ported(PortReply(id: id, answer: take answer)), alloc))
 } ported
 
 /// What crosses down of the reply to a call through the port `port` of `runner`.
-fn port_answer(port: u64, hash: sys::ProtocolHash, take request: Naming, runner: sys::Runner, table: Table, alloc: mem::Alloc) -> PortAnswer fails task::Cancelled uses wait {
+fn port_answer(port: u64, hash: sys::ProtocolHash, take request: Naming, runner: sys::Runner, table: Table, job: u64, alloc: mem::Alloc) -> PortAnswer fails task::Cancelled uses wait {
     let Naming(bytes: bytes, handles: handles) = request
     let Some(handed) = table.handed(handles, alloc) else {
         return PortAnswer.Unknown
@@ -290,7 +299,7 @@ fn port_answer(port: u64, hash: sys::ProtocolHash, take request: Naming, runner:
         Err(sys::RunnerError.Revoked(_)) => return PortAnswer.Revoked
         Err(sys::RunnerError.Unknown) => return PortAnswer.Unknown
     }
-    let Some(crossing) = table.admitted(reply.handles.view(), alloc) else {
+    let Some(crossing) = table.admitted(job, handles: reply.handles.view(), alloc) else {
         return PortAnswer.Unknown
     }
     return PortAnswer.Replied(Carrying(bytes: take reply.bytes, handles: take crossing))
@@ -607,13 +616,13 @@ struct Relaying {
 } Relaying
 
 /// Holds the instance of the component entry `job` in a space for its kernel: runs the instance
-/// task in a domain of the space's runtime on `world`, resuming from the checkpoint whose
+/// task in a domain run of `domain` on `world`, resuming from the checkpoint whose
 /// `mem::wire` encoding `input` is and acting through the runner capability of the space's table
 /// whose handle is `runner`, while relaying the requests and calls the kernel sends over the
 /// channel `port` serves to the instance and its answers and calls through ports back, their
 /// handles those the runtime holds through `base` for the entries of the space's table, and gives
 /// how the domain ended.
-fn served_instance(job: sys::load::Job, port: Port, base: Remote, runner: u64, take world: World, take input: mem::Bytes) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
+fn served_instance(job: sys::load::Job, port: Port, base: Remote, runner: u64, domain: mem::Shared[sys::Abandoner], take world: World, take input: mem::Bytes) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
     let alloc = world.alloc
     let exec = world.exec
     let Ok(checkpoint) = attempt mem::wire::Codec[Option[Checkpoint]].decode(Untrusted.of(input.view()), alloc) else {
@@ -652,7 +661,7 @@ fn served_instance(job: sys::load::Job, port: Port, base: Remote, runner: u64, t
         discard s.spawn(fn[take sending]() fails task::Cancelled uses wait {
             try await written_up(port, outgoing: take sending)
         })
-        outcome = try await sys::Domain.run_sized(fn[take granted, take launched]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
+        outcome = try await domain.contents().run_sized(fn[take granted, take launched]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
             return try await call(job, world: take granted, input: take launched)
         }, stack: job.stack() + CALL_STACK, exec, alloc)
         s.cancel()

@@ -1,4 +1,4 @@
-//! Jobs in isolated spaces: the kernel's side, which runs a job's space in user mode and serves its system calls through the space's table of handles, running the test images it asks for in spaces of their own, and the first task of the space's runtime, which runs the job on a world whose log, standard streams, random source and link's channels reach the kernel through those calls.
+//! Jobs in isolated spaces: the kernel's side, which places the jobs and instances its tasks ask for in one space, runs that space in user mode while it runs any and serves its system calls through the space's table of handles, running the test images it asks for in spaces of their own; and the first task of the space's runtime, which starts each job and instance its kernel orders in a domain of its own, on a world whose log, standard streams, random source and link's channels reach the kernel through those calls, and abandons each its kernel orders abandoned.
 
 /// The system calls of an isolated space: waiting until a deadline of the kernel's clock, drawing
 /// and releasing pages of its boot area, reading that clock, invoking an operation of a capability
@@ -133,7 +133,7 @@ const MOST_BYTES: u64 = 1_048_576
 const REPORT_BYTES: usize = 4_096
 
 /// The bytes of a start record and of the record of a port.
-const START_BYTES: usize = 104
+const START_BYTES: usize = 88
 
 const PORT_BYTES: usize = 40
 
@@ -147,8 +147,8 @@ pub closed enum IsolatedError derives Render {
     Cancelled(task::Cancelled) from
 } IsolatedError
 
-/// What the kernel serves a job in an isolated space: the clock of its waits, and the capabilities
-/// its world's log, standard streams, random source and file system reach.
+/// What the kernel serves the jobs of an isolated space: the clock of their waits, and the
+/// capabilities their worlds' log, standard streams, random source and file system reach.
 pub closed struct Services derives Copy {
     pub clock: sys::Clock
     pub log: sys::Log
@@ -157,20 +157,32 @@ pub closed struct Services derives Copy {
     pub fs: sys::Fs
 } Services
 
-/// The record from which a space's runtime starts: the entry, where its input lies and its
-/// length, the address of the doorbell, the handles of the log, standard streams, random source
-/// and file system, where the records of the link's channels lie and their count, 1 when the
-/// entry is a component entry whose instance the link's first channel carries, 0 for a job, and
-/// the handle of the runner capability.
+/// An isolated space that jobs and instances join as tasks ask: its table of handles, the jobs
+/// and instances asking to join it, the signal waking the task running it, the number of the next
+/// job or instance, whether its tasks may ask no more, and the executor and allocator of its
+/// kernel's tasks.
+pub open struct Isolation derives Send {
+    table: Table
+    joins: task::Cown[mem::List[Joining]]
+    woken: hw::Signal[u64]
+    next: core::atomic::AtomicU64
+    closed: core::atomic::AtomicBool
+    exec: task::Executor
+    alloc: mem::Alloc
+} Isolation
+
+/// The record from which a space's runtime starts a job or instance, or abandons one: what it
+/// orders, the number of the job or instance, its entry, where its input lies and its length, the
+/// address of its link's doorbell, where the records of its link's channels lie and their count,
+/// 1 when it is the instance of a component entry that the link's first channel carries, 0 for a
+/// job, and the handle of its runner capability.
 struct Start derives Copy {
+    order: u64
+    id: u64
     job: sys::load::Job
     input: u64
     input_len: u64
     bell: u64
-    log: u64
-    stdio: u64
-    random: u64
-    fs: u64
     ports: u64
     port_count: u64
     held: u64
@@ -184,13 +196,21 @@ enum Holding derives Copy {
     Random(sys::Random)
     Fs(sys::Fs)
     Tests
+    Orders
     Channel(usize)
-    Runner(sys::Runner)
+    Runner
 } Holding
 
-/// A space's table of handles: the capability each handle names, and the count of handles given.
+/// An entry of a space's table: the number of the job or instance it was added for, 0 for the
+/// space's own, and the capability it holds.
+struct Entry derives Copy {
+    job: u64
+    holding: Holding
+} Entry
+
+/// A space's table of handles: the entry each handle names, and the count of handles given.
 struct Table {
-    held: mem::OnceMap[u64, Holding]
+    held: mem::OnceMap[u64, Entry]
     count: core::atomic::AtomicU64
 } Table
 
@@ -257,110 +277,824 @@ struct Replying derives Encode {
     reply: Naming
 } Replying
 
-pub fn run_isolated(cpu: hw::Ring0, job: sys::load::Isolated, tenant: u64, services: Services, link: Link, take input: mem::Bytes, mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState], alloc: mem::Alloc) -> Ended fails IsolatedError uses wait {
-    let Some(entry) = job.job() else {
+pub fn isolate[E](cpu: hw::Ring0, tenant: u64, services: Services, mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState], exec: task::Executor, alloc: mem::Alloc, body: fn(space: Isolation) fails E uses wait limits stack 131_072) fails E uses wait {
+    let isolation = Isolation(table: Table.of(services, alloc), joins: task::Cown.of(mem::List[Joining].empty(alloc), alloc), woken: hw::Signal[u64].empty(), next: core::atomic::AtomicU64.of(1), closed: core::atomic::AtomicBool.of(false), exec: exec, alloc: alloc)
+    try await task::scope(exec, body: fn[mut frames, mut extended](s: task::Scope) fails E uses wait {
+        let driving = s.spawn(fn[mut frames, mut extended]() fails task::Cancelled uses wait {
+            try await driven(cpu, tenant, services, isolation, mut frames, mut extended)
+        })
+        let outcome = attempt await body(isolation)
+        isolation.closed.store(true)
+        isolation.wake(WOKE_ORDERS)
+        discard attempt await take driving.join()
+        match outcome {
+            Ok(_) => {}
+            Err(failure) => fail failure
+        }
+    })
+} isolate
+
+pub fn run_isolated(space: Isolation, job: sys::load::Isolated, link: Link, take input: mem::Bytes, alloc: mem::Alloc) -> Ended fails IsolatedError uses wait {
+    if job.job().is_none() {
         fail IsolatedError.NoJob
     }
-    let Placed(space: made, state: started, table: table) = try placed(cpu, job, entry, tenant, services, runner: sys::Runner.denied(), link, held: false, take input, mut frames, alloc)
-    var space = made
-    var state = started
-    let outcome = attempt await run_space(cpu, mut space, mut state, mut extended, served: Serving(services: services, tenant: tenant, table: take table), link, halted: fn() => false, mut frames, alloc)
-    take space.release(mut frames)
+    let halted = mem::Shared.of(core::atomic::AtomicBool.of(false), alloc)
+    let Joined(outcome: outcome, cancelled: cancelled) = try await joined(space, id: space.number(), job, component: None, link, take input, runner: sys::Runner.denied(), halted, alloc)
+    match cancelled {
+        Some(cancellation) => fail IsolatedError.Cancelled(take cancellation)
+        None => {}
+    }
     match outcome {
         Ok(how) => return how
-        Err(cancelled) => fail IsolatedError.Cancelled(take cancelled)
+        Err(error) => fail IsolatedError.Unplaced(error)
     }
 } run_isolated
 
-/// A space made to run an entry: the space, the thread state starting its runtime, and its table
-/// of handles.
+/// The number of the next job or instance to join the space; 0, which names none, once numbers
+/// run out.
+fn Isolation.number(self) -> u64 {
+    return self.next.fetch_add(1).value_or(0)
+} Isolation.number
+
+/// Wakes the task running the space of an isolation.
+fn Isolation.wake(self, why: u64) {
+    hw::without_irqs(fn(t: hw::IrqsDisabled) {
+        self.woken.post(t, value: why)
+    })
+} Isolation.wake
+
+/// What a `CALL_WAIT` call gives: that a doorbell rang, and that the kernel has orders for the
+/// runtime.
+const WOKE_RUNG: u64 = 1
+
+const WOKE_ORDERS: u64 = 2
+
+/// The operation of the orders handle, which takes the kernel's next order, and the orders it
+/// gives: starting a job or instance, and abandoning one.
+const TAKE: u64 = 0
+
+const ORDER_START: u64 = 0
+
+const ORDER_ABANDON: u64 = 1
+
+/// The handles of a space's table holding its services, its test runs and its kernel's orders.
+const LOG_HANDLE: u64 = 0
+
+const STDIO_HANDLE: u64 = 1
+
+const RANDOM_HANDLE: u64 = 2
+
+const FS_HANDLE: u64 = 3
+
+const TESTS_HANDLE: u64 = 4
+
+const ORDERS_HANDLE: u64 = 5
+
+/// A job or instance a task asks its isolation to place: its number, its bundle, the name of its
+/// component entry, none for a job, its input, the runner it acts through, the keys of its link's
+/// channels, whether its holder abandoned it, and the senders through which the task running the
+/// space lends it the space to map its link, tells it through which of its channels the space moved
+/// bytes, and tells it how it ended or why it could not be placed.
+struct Joining {
+    id: u64
+    bundle: sys::load::Isolated
+    component: Option[text::String]
+    input: mem::Bytes
+    runner: sys::Runner
+    keys: mem::List[text::String]
+    halted: mem::Shared[core::atomic::AtomicBool]
+    lend: task::Sender[Lending]
+    notices: task::Sender[usize]
+    ended: task::Sender[Outcome]
+} Joining
+
+/// A space lent to a task to map its link's frames, and the sender giving it back.
+linear struct Lending {
+    space: sys::load::Space
+    back: task::Sender[Lent]
+} Lending
+
+/// A space given back with the addresses at which it maps a link's frames: its doorbell, then each
+/// channel's inbound and outbound frames; none when it could not map them all.
+linear struct Lent {
+    space: sys::load::Space
+    frames: mem::List[u64]
+} Lent
+
+/// How a job or instance its space ran ended: as it says, or with a trap; or why it could not be
+/// placed.
+enum Outcome {
+    Ended(Ended)
+    Trapped(Trapping)
+    Unplaced(sys::load::LoadError)
+} Outcome
+
+/// A trap ending a job or instance: the number of its kind, and its report, empty to locate the
+/// call ending it.
+struct Trapping {
+    kind: u64
+    report: text::String
+} Trapping
+
+/// How a job or instance a task asked to place ended, or why it could not be placed, and the
+/// cancellation that had its task abandon it.
+struct Joined {
+    outcome: Result[Ended, sys::load::LoadError]
+    cancelled: Option[task::Cancelled]
+} Joined
+
+/// Has the space of `isolation` run the entry of `job`, its component entry `component`'s or its
+/// job's, as the job or instance numbered `id`, on `input` with `link`, acting through `runner`,
+/// and gives how it ended once the space no longer maps `link`'s frames, or why it could not be
+/// placed. While it runs, each ring of `link` wakes the task running the space and the channels the
+/// space moved bytes through are heard from; once `halted` holds true, or this call is cancelled,
+/// the space abandons it.
+fn joined(isolation: Isolation, id: u64, job: sys::load::Isolated, take component: Option[text::String], link: Link, take input: mem::Bytes, runner: sys::Runner, halted: mem::Shared[core::atomic::AtomicBool], alloc: mem::Alloc) -> Joined fails task::Cancelled uses wait {
+    if id == 0 {
+        return Joined(outcome: Err(sys::load::LoadError.Unplaceable), cancelled: None)
+    }
+    let task::Channel(sender: lend, receiver: lent) = task::Channel[Lending].bounded(1, alloc)
+    let task::Channel(sender: notices, receiver: noticed) = task::Channel[usize].bounded(QUEUED_CALLS, alloc)
+    let task::Channel(sender: ended, receiver: ending) = task::Channel[Outcome].bounded(1, alloc)
+    let task::Channel(sender: stop, receiver: stopping) = task::Channel[u8].bounded(1, alloc)
+    var keys = mem::List[text::String].empty(alloc)
+    for channel in link.channels {
+        mut keys.push(text::String.of(channel.key.as_str(), alloc))
+    }
+    let joining = Joining(id: id, bundle: job.share(), component: take component, input: take input, runner: runner, keys: take keys, halted: halted.share(), lend: take lend, notices: take notices, ended: take ended)
+    await when mut isolation.joins {
+        mut isolation.joins.push(take joining)
+    }
+    isolation.wake(WOKE_ORDERS)
+    var lendings = mem::List[Lending].empty(alloc)
+    discard attempt await take lent.drain(visit: fn[mut lendings](take value: Lending) {
+        mut lendings.push(take value)
+    })
+    for lending in take lendings {
+        let Lending(space: given, back: back) = lending
+        var space = given
+        let frames = mapped(mut space, link, alloc)
+        discard attempt await back.send(Lent(space: take space, frames: take frames))
+    }
+    var outcome: Result[Ended, sys::load::LoadError] = Err(sys::load::LoadError.Unplaceable)
+    var cancelled: Option[task::Cancelled] = None
+    var receivers = Some(Receivers(noticed: take noticed, stopping: take stopping, ending: take ending))
+    try await task::scope(isolation.exec, body: fn[mut outcome, mut cancelled, mut receivers](s: task::Scope) fails task::Cancelled uses wait {
+        let Some(Receivers(noticed: heard, stopping: watched, ending: told)) = mut receivers.extract() else {
+            return
+        }
+        discard s.spawn(fn() fails task::Cancelled uses wait {
+            loop {
+                discard try await link.rung.wait()
+                isolation.wake(WOKE_RUNG)
+            }
+        })
+        discard s.spawn(fn[take heard]() fails task::Cancelled uses wait {
+            var hearing = heard
+            loop {
+                let Some(channel) = try await mut hearing.receive() else {
+                    return
+                }
+                link.heard_from(channel)
+            }
+        })
+        let watching = s.spawn(fn[take watched]() -> Option[task::Cancelled] fails task::Cancelled uses wait {
+            var held = watched
+            match attempt await mut held.receive() {
+                Ok(_) => return None
+                Err(cancellation) => {
+                    halted.contents().store(true)
+                    isolation.wake(WOKE_ORDERS)
+                    return Some(take cancellation)
+                }
+            }
+        })
+        try await take told.drain(visit: fn[mut outcome](take result: Outcome) {
+            outcome = match result {
+                Outcome.Ended(how) => Ok(take how)
+                Outcome.Trapped(Trapping(kind: kind, report: report)) => Ok(Ended.Trapped(trap_of(kind, report: report.as_str(), alloc)))
+                Outcome.Unplaced(error) => Err(error)
+            }
+        })
+        discard stop.offer(0)
+        cancelled = try await take watching.join()
+        s.cancel()
+    })
+    return Joined(outcome: take outcome, cancelled: take cancelled)
+} joined
+
+/// The receivers through which a job's or instance's task hears which of its link's channels the
+/// space moved bytes through, that it is no longer cancellable, and how it ended.
+struct Receivers {
+    noticed: task::Receiver[usize]
+    stopping: task::Receiver[u8]
+    ending: task::Receiver[Outcome]
+} Receivers
+
+/// Maps a link's doorbell, then each of its channels' inbound and outbound frames, into a space,
+/// giving their addresses there, or none, mapping nothing, when the space has too few pages for
+/// user frames left.
+fn mapped(mut space: sys::load::Space, link: Link, alloc: mem::Alloc) -> mem::List[u64] {
+    var addresses = mem::List[u64].empty(alloc)
+    var whole = shared_into(mut space, frame: link.bell, mut addresses)
+    for channel in link.channels {
+        whole = whole and shared_into(mut space, frame: channel.inbound, mut addresses) and shared_into(mut space, frame: channel.outbound, mut addresses)
+    }
+    if whole {
+        return addresses
+    }
+    for address in addresses {
+        mut space.unshare(address)
+    }
+    return mem::List[u64].empty(alloc)
+} mapped
+
+/// Maps a user frame into a space, adding its address there to `addresses`; false when the space
+/// has no page for it left.
+fn shared_into(mut space: sys::load::Space, frame: hw::UserFrame, mut addresses: mem::List[u64]) -> bool {
+    match attempt mut space.share(frame) {
+        Ok(address) => {
+            mut addresses.push(address)
+            return true
+        }
+        Err(_) => return false
+    }
+} shared_into
+
+/// A job or instance its space runs: its entry, the runner it acts through, what crossed into the
+/// space's table for each capability that runner holds by number, the addresses at which the space
+/// maps its link's frames, whether its holder abandoned it and whether the space's runtime was
+/// ordered to abandon it, and the senders telling its task through which of its channels the space
+/// moved bytes and how it ended.
+struct Running {
+    job: sys::load::Job
+    runner: sys::Runner
+    ids: mem::Map[u64, Carried]
+    frames: mem::List[u64]
+    halted: mem::Shared[core::atomic::AtomicBool]
+    abandoning: bool
+    notices: task::Sender[usize]
+    ended: task::Sender[Outcome]
+} Running
+
+/// A job or instance placed in its space that the space's runtime has not taken yet: its number,
+/// entry and input, whether it is an instance, the addresses of its link's frames, the keys and
+/// handles of its link's channels, and the handle of its runner capability.
+struct Pending {
+    id: u64
+    job: sys::load::Job
+    input: mem::Bytes
+    held: bool
+    frames: mem::List[u64]
+    keys: mem::List[text::String]
+    channels: mem::List[u64]
+    runner: u64
+} Pending
+
+/// What the task running an isolation's space keeps of it: the state of its thread, the routine
+/// its runtime named to be resumed in at an exception, whether the thread waits for the answer to
+/// a `CALL_WAIT` call and whether that call woke by a ring, the jobs and instances it runs by
+/// number, those its runtime has not taken, those its runtime is ordered to abandon, and the files
+/// they opened.
+struct Driven {
+    state: hw::UserState
+    fault_routine: u64
+    waiting: Option[u64]
+    jobs: mem::Map[u64, Running]
+    pending: mem::List[Pending]
+    abandons: mem::List[u64]
+    files: Files
+} Driven
+
+/// What is kept of a space that has just been made, its thread starting its runtime.
+fn Driven.of(space: sys::load::Space, alloc: mem::Alloc) -> Driven {
+    var state = hw::UserState(regs: Array[Untrusted[u64], 31].filled(Untrusted.of(0)), sp: Untrusted.of(space.stack()), ip: Untrusted.of(space.start()), flags: Untrusted.of(0))
+    state.regs[register(1)] = Untrusted.of(space.boot_area())
+    return Driven(state: state, fault_routine: 0, waiting: None, jobs: mem::Map[u64, Running].empty(alloc), pending: mem::List[Pending].empty(alloc), abandons: mem::List[u64].empty(alloc), files: Files(open: mem::Map[u64, sys::fs::File].empty(alloc), next: 0))
+} Driven.of
+
+/// A space running jobs or instances, and what the task running it keeps of it.
 linear struct Placed {
     space: sys::load::Space
-    state: hw::UserState
-    table: Table
+    driving: Driven
 } Placed
 
-/// Makes a space of `job` for `tenant` from `frames` that runs `entry` on `input`, the instance of
-/// a component entry acting through `runner` when `held`, sharing `link`'s frames with it and
-/// laying out its start record.
-fn placed(cpu: hw::Ring0, job: sys::load::Isolated, entry: sys::load::Job, tenant: u64, services: Services, runner: sys::Runner, link: Link, held: bool, take input: mem::Bytes, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Placed fails sys::load::LoadError {
-    var keys: usize = 0
-    for channel in link.channels {
-        keys += channel.key.as_str().as_bytes().len()
-    }
-    let ports_len = PORT_BYTES * link.channels.len()
-    let table = Table(held: mem::OnceMap[u64, Holding].empty(0, alloc), count: core::atomic::AtomicU64.of(0))
-    let log = held_by(table, holding: Holding.Log(services.log))
-    let stdio = held_by(table, holding: Holding.Stdio(services.stdio))
-    let random = held_by(table, holding: Holding.Random(services.random))
-    let fs = held_by(table, holding: Holding.Fs(services.fs))
-    discard held_by(table, holding: Holding.Tests)
-    let channels = table.count.load()
-    for index in 0..<link.channels.len() {
-        discard held_by(table, holding: Holding.Channel(index))
-    }
-    let acting = held_by(table, holding: Holding.Runner(runner))
-    var space = try job.space(cpu, data: u64.widen(START_BYTES + ports_len + keys + input.len()), tenant, mut frames, alloc)
-    let start = space.data()
-    match attempt shared(mut space, link, start, channels, alloc) {
-        Ok(ports) => {
-            let input_at = start + u64.widen(START_BYTES + ports_len + keys)
-            let instance: u64 = match held {
-                true => 1
-                false => 0
+/// A space that has just been made, its thread starting its runtime.
+fn placed_of(take space: sys::load::Space, alloc: mem::Alloc) -> Placed {
+    let driving = Driven.of(space, alloc)
+    return Placed(space: take space, driving: take driving)
+} placed_of
+
+/// Runs the space of `isolation` for `tenant` on `cpu`, with the extended state `extended` holds,
+/// while it runs jobs or instances, placing each that a task asks to join it: makes the space from
+/// `frames` for the first, maps the bundle of each into it, and gives its frames back to `frames`
+/// once the last has ended; returns once `isolation` is closed and the space runs none.
+fn driven(cpu: hw::Ring0, tenant: u64, services: Services, isolation: Isolation, mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState]) fails task::Cancelled uses wait {
+    let alloc = isolation.alloc
+    var placing = mem::List[Placed].empty(alloc)
+    loop {
+        var asked = mem::List[Joining].empty(alloc)
+        await when mut isolation.joins {
+            while isolation.joins.len() > 0 {
+                mut asked.push(mut isolation.joins.remove(0))
             }
-            let record = Start(job: entry, input: input_at, input_len: u64.widen(input.len()), bell: ports.bell, log: log, stdio: stdio, random: random, fs: fs, ports: start + u64.widen(START_BYTES), port_count: u64.widen(link.channels.len()), held: instance, runner: acting)
-            discard attempt mut space.write(start, bytes: record_bytes(record, count: START_BYTES, alloc).view())
-            discard attempt mut space.write(record.ports, bytes: ports.records.view())
-            discard attempt mut space.write(input_at, bytes: input.view())
-            var state = hw::UserState(regs: Array[Untrusted[u64], 31].filled(Untrusted.of(0)), sp: Untrusted.of(space.stack()), ip: Untrusted.of(space.start()), flags: Untrusted.of(0))
-            state.regs[register(0)] = Untrusted.of(start)
-            state.regs[register(1)] = Untrusted.of(space.boot_area())
-            return Placed(space: take space, state: state, table: take table)
         }
-        Err(error) => {
-            take space.release(mut frames)
-            fail error
+        for joining in take asked {
+            discard attempt await admitted(cpu, tenant, isolation, take joining, mut placing, mut frames)
+        }
+        let Some(placed) = mut placing.pop() else {
+            if isolation.closed.load() {
+                spaces_released(take placing, mut frames)
+                return
+            }
+            match attempt await isolation.woken.wait() {
+                Ok(_) => {}
+                Err(cancelled) => {
+                    spaces_released(take placing, mut frames)
+                    discard attempt await forgotten(isolation)
+                    fail cancelled
+                }
+            }
+            continue
+        }
+        let Placed(space: made, driving: kept) = placed
+        var running = made
+        var held = kept
+        if mut held.halts(mut running, alloc) {
+            mut held.ended_all(mut running, kind: ABANDONED, report: "", alloc)
+            take running.release(mut frames)
+            continue
+        }
+        if held.jobs.len() == 0 {
+            take running.release(mut frames)
+            continue
+        }
+        match held.waiting {
+            Some(woke) => {
+                held.state.regs[register(ROLE_RESULT)] = Untrusted.of(woke | held.orders())
+                held.waiting = None
+            }
+            None => {}
+        }
+        match attempt await mut held.served(cpu, tenant, services, isolation, space: mut running, mut frames, mut extended) {
+            Ok(_) => kept_placed(take running, driving: take held, mut placing, mut frames)
+            Err(cancelled) => {
+                mut held.ended_all(mut running, kind: ABANDONED, report: "", alloc)
+                take running.release(mut frames)
+                spaces_released(take placing, mut frames)
+                discard attempt await forgotten(isolation)
+                fail cancelled
+            }
         }
     }
-} placed
+} driven
 
-/// What a space's kernel serves it: its services, the tenant its threads run for, and its table of
-/// handles.
-struct Serving {
-    services: Services
-    tenant: u64
-    table: Table
-} Serving
+/// Gives back to `frames` the frames of each space of a list.
+fn spaces_released(take placing: mem::List[Placed], mut frames: mem::List[hw::PhysFrame[4_096]]) {
+    for placed in take placing {
+        let Placed(space: space, driving: _) = placed
+        take space.release(mut frames)
+    }
+} spaces_released
 
-/// A link's frames as a space maps them: the doorbell's address, and the records of the
-/// channels with their keys after them, which the start record names.
-struct Shared {
-    bell: u64
-    records: mem::Bytes
-} Shared
+/// Keeps in `placing` a space while it runs jobs or instances, giving its frames back to `frames`
+/// otherwise.
+fn kept_placed(take running: sys::load::Space, take driving: Driven, mut placing: mem::List[Placed], mut frames: mem::List[hw::PhysFrame[4_096]]) {
+    if driving.jobs.len() == 0 {
+        take running.release(mut frames)
+        return
+    }
+    mut placing.push(Placed(space: take running, driving: take driving))
+} kept_placed
 
-/// The handle of a capability a space's table holds from now on, `MOST_HELD`, which names none,
-/// once it is full.
-fn held_by(table: Table, holding: Holding) -> u64 {
-    return table.add(holding).value_or(MOST_HELD)
-} held_by
+/// Drops what every task asks of an isolation that no space will run, so that each hears that its
+/// job or instance could not be placed.
+fn forgotten(isolation: Isolation) fails task::Cancelled uses wait {
+    var unplaced = mem::List[Joining].empty(isolation.alloc)
+    await when mut isolation.joins {
+        while isolation.joins.len() > 0 {
+            mut unplaced.push(mut isolation.joins.remove(0))
+        }
+    }
+    discard unplaced
+} forgotten
 
-/// The handle of a capability the table holds from now on, none once it holds `MOST_HELD`.
-fn Table.add(self, holding: Holding) -> Option[u64] {
+/// Places the job or instance `joining` asks for in the space `placing` holds, making a space when
+/// it holds none: maps its bundle, lends the space to its task to map its link, adds its link's
+/// channels and its runner to the table, and queues its start; or tells its task why it could not
+/// be placed. `placing` keeps the space while it runs jobs or instances, its frames given back to
+/// `frames` otherwise.
+fn admitted(cpu: hw::Ring0, tenant: u64, isolation: Isolation, take joining: Joining, mut placing: mem::List[Placed], mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
+    let alloc = isolation.alloc
+    let Joining(id: id, bundle: bundle, component: component, input: input, runner: runner, keys: keys, halted: halted, lend: lend, notices: notices, ended: ended) = joining
+    let placed = match mut placing.pop() {
+        Some(held) => held
+        None => match attempt bundle.space(cpu, data: 0, tenant, mut frames, alloc) {
+            Ok(fresh) => placed_of(take fresh, alloc)
+            Err(error) => {
+                discard ended.offer(Outcome.Unplaced(error))
+                return
+            }
+        }
+    }
+    let Placed(space: made, driving: kept) = placed
+    var running = made
+    var held = kept
+    let instance = component.is_some()
+    let entry = match attempt bundle.join(mut running, mut frames, alloc) {
+        Ok(view) => match component {
+            Some(name) => view.component(name.as_str())
+            None => view.job()
+        }
+        Err(_) => None
+    }
+    let Some(job) = entry else {
+        discard ended.offer(Outcome.Unplaced(sys::load::LoadError.Unplaceable))
+        kept_placed(take running, driving: take held, mut placing, mut frames)
+        return
+    }
+    let task::Channel(sender: back, receiver: giving) = task::Channel[Lent].bounded(1, alloc)
+    discard attempt await lend.send(Lending(space: take running, back: take back))
+    discard lend
+    var given = mem::List[Lent].empty(alloc)
+    discard attempt await take giving.drain(visit: fn[mut given](take value: Lent) {
+        mut given.push(take value)
+    })
+    let Some(lent) = mut given.pop() else {
+        discard ended.offer(Outcome.Unplaced(sys::load::LoadError.Unplaceable))
+        lents_released(take given, mut frames)
+        return
+    }
+    lents_released(take given, mut frames)
+    let Lent(space: returned_space, frames: addresses) = lent
+    if addresses.len() != 1 + 2 * keys.len() {
+        discard ended.offer(Outcome.Unplaced(sys::load::LoadError.Unplaceable))
+        kept_placed(take returned_space, driving: take held, mut placing, mut frames)
+        return
+    }
+    var channels = mem::List[u64].empty(alloc)
+    for index in 0..<keys.len() {
+        mut channels.push(isolation.table.held_by(job: id, holding: Holding.Channel(index)))
+    }
+    let acting = isolation.table.held_by(job: id, holding: Holding.Runner)
+    var unmapping = mem::List[u64].empty(alloc)
+    for address in addresses {
+        mut unmapping.push(address)
+    }
+    discard mut held.jobs.insert(id, value: Running(job: job, runner: runner, ids: mem::Map[u64, Carried].empty(alloc), frames: take unmapping, halted: take halted, abandoning: false, notices: take notices, ended: take ended))
+    mut held.pending.push(Pending(id: id, job: job, input: take input, held: instance, frames: take addresses, keys: take keys, channels: take channels, runner: acting))
+    mut placing.push(Placed(space: take returned_space, driving: take held))
+} admitted
+
+/// Gives back to `frames` the frames of each space a list of spaces given back holds.
+fn lents_released(take lents: mem::List[Lent], mut frames: mem::List[hw::PhysFrame[4_096]]) {
+    for lent in take lents {
+        let Lent(space: space, frames: _) = lent
+        take space.release(mut frames)
+    }
+} lents_released
+
+/// Whether every job and instance the space runs was abandoned by its holder; otherwise ends each
+/// its holder abandoned before its runtime started it, unmapping its link's frames, and orders the
+/// runtime to abandon each other.
+fn Driven.halts(mut self, mut space: sys::load::Space, alloc: mem::Alloc) -> bool {
+    var every = self.jobs.len() > 0
+    var halted = mem::List[u64].empty(alloc)
+    for entry in mut self.jobs {
+        var running = mut entry.value_mut()
+        if not running.halted.contents().load() {
+            every = false
+        } else if not running.abandoning {
+            running.abandoning = true
+            mut halted.push(entry.key())
+        }
+    }
+    if every {
+        return true
+    }
+    for id in halted {
+        var waiting = false
+        mut self.pending.retain(keep: fn[mut waiting](start: Pending) -> bool {
+            if start.id == id {
+                waiting = true
+                return false
+            }
+            return true
+        })
+        if not waiting {
+            mut self.abandons.push(id)
+            continue
+        }
+        match mut self.jobs.remove(id) {
+            Some(running) => {
+                for address in running.frames {
+                    mut space.unshare(address)
+                }
+                discard running.ended.offer(Outcome.Ended(Ended.Abandoned))
+            }
+            None => {}
+        }
+    }
+    return false
+} Driven.halts
+
+/// `WOKE_ORDERS` when the kernel has orders for the space's runtime, 0 otherwise.
+fn Driven.orders(self) -> u64 {
+    if self.pending.len() > 0 or self.abandons.len() > 0 {
+        return WOKE_ORDERS
+    }
+    return 0
+} Driven.orders
+
+/// Ends every job and instance the space runs, unmapping their links' frames: each its holder
+/// abandoned `Abandoned`, each other `Trapped` with a trap of the kind `kind` numbers whose report
+/// is `report`.
+fn Driven.ended_all(mut self, mut space: sys::load::Space, kind: u64, report: Str, alloc: mem::Alloc) {
+    for entry in self.jobs {
+        let running = entry.value()
+        for address in running.frames {
+            mut space.unshare(address)
+        }
+        let how = match running.halted.contents().load() {
+            true => Outcome.Ended(Ended.Abandoned)
+            false => Outcome.Trapped(Trapping(kind: kind, report: text::String.of(report, alloc)))
+        }
+        discard running.ended.offer(take how)
+    }
+    self.jobs = mem::Map[u64, Running].empty(alloc)
+    self.pending = mem::List[Pending].empty(alloc)
+    self.abandons = mem::List[u64].empty(alloc)
+} Driven.ended_all
+
+/// Runs the space's thread until its next exit and serves it, drawing from `frames` the pages it
+/// draws: a fault on a page of the boot area it does not map draws that page, and another exception
+/// resumes the thread in the fault routine its runtime named, which it names again once it runs, or
+/// ends every job and instance as a trap of `trap.exception` while it names none.
+fn Driven.served(mut self, cpu: hw::Ring0, tenant: u64, services: Services, isolation: Isolation, mut space: sys::load::Space, mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState]) fails task::Cancelled uses wait {
+    let alloc = isolation.alloc
+    match space.run(cpu, state: mut self.state, mut extended) {
+        hw::UserExit.Interrupted => {}
+        hw::UserExit.Fault(fault) => {
+            match attempt mut space.draw(fault.address, len: 1, mut frames) {
+                Ok(1) => {}
+                Err(sys::load::DrawError.Exhausted) => mut self.ended_all(mut space, kind: EXHAUSTED, report: "", alloc)
+                else => {
+                    if self.fault_routine == 0 {
+                        mut self.ended_all(mut space, kind: EXCEPTION, report: "", alloc)
+                        return
+                    }
+                    faulted(mut self.state, fault, routine: self.fault_routine)
+                    self.fault_routine = 0
+                }
+            }
+        }
+        hw::UserExit.Syscall => {
+            let number = user_word(self.state.regs[register(ROLE_NUMBER)])
+            var answer = INVALID
+            if number == CALL_END {
+                mut self.ended_by(mut space, alloc)
+                answer = 0
+            } else if number == CALL_WAIT {
+                let deadline = user_word(self.state.regs[register(0)])
+                if self.orders() != 0 {
+                    answer = WOKE_ORDERS
+                } else if deadline == 0 {
+                    mut self.ended_all(mut space, kind: ABANDONED, report: "", alloc)
+                    return
+                } else {
+                    self.waiting = Some(try await slept_until(services.clock, deadline, rang: isolation.woken))
+                    return
+                }
+            } else if number == CALL_DRAW {
+                answer = match attempt mut space.draw(user_word(self.state.regs[register(0)]), len: user_word(self.state.regs[register(1)]), mut frames) {
+                    Ok(_) => 0
+                    Err(_) => INVALID
+                }
+            } else if number == CALL_RELEASE {
+                answer = match attempt mut space.give_back(user_word(self.state.regs[register(0)]), len: user_word(self.state.regs[register(1)]), mut frames) {
+                    Ok(_) => 0
+                    Err(_) => INVALID
+                }
+            } else if number == CALL_NOW {
+                answer = match attempt services.clock.elapsed_ns() {
+                    Ok(ns) => ns
+                    Err(_) => INVALID
+                }
+            } else if number == CALL_INVOKE {
+                answer = try await mut self.invoked(cpu, tenant, services, isolation, mut space, mut frames)
+            } else if number == CALL_FAULT {
+                self.fault_routine = user_word(self.state.regs[register(0)])
+                answer = 0
+            }
+            self.state.regs[register(ROLE_RESULT)] = Untrusted.of(answer)
+        }
+    }
+} Driven.served
+
+/// Ends the job or instance whose number a `CALL_END` call gives, unmapping its link's frames, as
+/// the call says, `Abandoned` once its holder abandoned it; a call naming none ends every job and
+/// instance as a trap of the kind it names, with its report, or of `trap.abandoned`.
+fn Driven.ended_by(mut self, mut space: sys::load::Space, alloc: mem::Alloc) {
+    let id = user_word(self.state.regs[register(4)])
+    let Some(running) = mut self.jobs.remove(id) else {
+        if id != 0 {
+            return
+        }
+        var kind = ABANDONED
+        var report = text::String.empty(alloc)
+        if user_word(self.state.regs[register(0)]) == ENDS_TRAPPED {
+            kind = user_word(self.state.regs[register(1)])
+            report = match attempt copied(space, state: self.state, at: 2, alloc) {
+                Ok(bytes) => text_of(bytes.view(), alloc)
+                Err(_) => text::String.empty(alloc)
+            }
+        }
+        mut self.ended_all(mut space, kind, report: report.as_str(), alloc)
+        return
+    }
+    for address in running.frames {
+        mut space.unshare(address)
+    }
+    let how = match running.halted.contents().load() {
+        true => Outcome.Ended(Ended.Abandoned)
+        false => ended_of(space, state: self.state, alloc)
+    }
+    discard running.ended.offer(take how)
+} Driven.ended_by
+
+/// Serves an `CALL_INVOKE` call: the handle of an entry of the space's table, the operation, the
+/// address and length of its arguments and the address and capacity of its result; an entry added
+/// for a job or instance that has ended is stale. A test run's space draws from `frames` and stops
+/// once every job and instance of this space is abandoned.
+fn Driven.invoked(mut self, cpu: hw::Ring0, tenant: u64, services: Services, isolation: Isolation, mut space: sys::load::Space, mut frames: mem::List[hw::PhysFrame[4_096]]) -> u64 fails task::Cancelled uses wait {
+    let alloc = isolation.alloc
+    let state = self.state
+    let handle = user_word(state.regs[register(0)])
+    let operation = user_word(state.regs[register(1)])
+    let target = user_word(state.regs[register(4)])
+    let capacity = user_word(state.regs[register(5)])
+    let Ok(args) = attempt copied(space, state, at: 2, alloc) else {
+        return INVALID
+    }
+    if capacity > MOST_BYTES {
+        return INVALID
+    }
+    let Some(entry) = isolation.table.held.get(handle) else {
+        return STALE
+    }
+    if entry.job != 0 and not self.jobs.contains(entry.job) {
+        return STALE
+    }
+    match entry.holding {
+        Holding.Log(log) => {
+            if operation == LOG_LINE {
+                return logged(log, args, alloc)
+            }
+        }
+        Holding.Stdio(stdio) => return try await streamed(mut space, stdio, operation, args, target, capacity, alloc)
+        Holding.Random(random) => {
+            if operation == FILL {
+                var bytes = mem::Bytes.zeroed(usize.widen(capacity), alloc)
+                let Ok(_) = attempt random.fill(mut bytes.view_mut()) else {
+                    return STALE
+                }
+                return written_back(mut space, address: target, bytes: bytes, count: capacity)
+            }
+        }
+        Holding.Fs(fs) => return try await filed(mut space, fs, operation, args, target, capacity, files: mut self.files, alloc)
+        Holding.Tests => {
+            if operation == TEST_RUN {
+                let jobs = self.jobs
+                return try await test_served(cpu, services, tenant, args, halted: fn() => every_halted(jobs), mut frames, alloc)
+            }
+        }
+        Holding.Orders => {
+            if operation == TAKE {
+                return mut self.order_taken(mut space, target, capacity, alloc)
+            }
+        }
+        Holding.Channel(index) => {
+            if operation == NOTIFY {
+                match self.jobs.get(entry.job) {
+                    Some(running) => {
+                        discard attempt await running.notices.send(index)
+                    }
+                    None => {}
+                }
+                return 0
+            }
+        }
+        Holding.Runner => {
+            let Some(found) = mut self.jobs.get_mut(entry.job) else {
+                return STALE
+            }
+            var running = found
+            return runner_served(mut space, runner: running.runner, job: entry.job, operation, args, target, capacity, table: isolation.table, ids: mut running.ids, alloc)
+        }
+    }
+    return INVALID
+} Driven.invoked
+
+/// Whether every job and instance of a map was abandoned by its holder.
+fn every_halted(jobs: mem::Map[u64, Running]) -> bool {
+    for entry in jobs {
+        if not entry.value().halted.contents().load() {
+            return false
+        }
+    }
+    return true
+} every_halted
+
+/// Serves the taking of the kernel's next order: writes at `target` the record ordering the space's
+/// runtime to abandon a job or instance, or to start one with its link's records, their keys and
+/// its input after it, and gives its length, which is past `capacity` when the order does not fit,
+/// then writing nothing; `INVALID` when there is no order.
+fn Driven.order_taken(mut self, mut space: sys::load::Space, target: u64, capacity: u64, alloc: mem::Alloc) -> u64 {
+    if self.abandons.len() > 0 {
+        let id = self.abandons[0]
+        let Some(running) = self.jobs.get(id) else {
+            discard mut self.abandons.remove(0)
+            return INVALID
+        }
+        let record = Start(order: ORDER_ABANDON, id: id, job: running.job, input: 0, input_len: 0, bell: 0, ports: 0, port_count: 0, held: 0, runner: 0)
+        if u64.widen(START_BYTES) > capacity {
+            return u64.widen(START_BYTES)
+        }
+        discard mut self.abandons.remove(0)
+        return written_back(mut space, address: target, bytes: record_bytes(record, count: START_BYTES, alloc), count: u64.widen(START_BYTES))
+    }
+    if self.pending.len() == 0 {
+        return INVALID
+    }
+    let bytes = self.pending[0].laid_out(at: target, alloc)
+    let len = u64.widen(bytes.len())
+    if len > capacity {
+        return len
+    }
+    discard mut self.pending.remove(0)
+    return written_back(mut space, address: target, bytes, count: len)
+} Driven.order_taken
+
+/// The record starting a job or instance laid out at `at`, its link's records, their keys and its
+/// input following it.
+fn Pending.laid_out(self, at: u64, alloc: mem::Alloc) -> mem::Bytes {
+    let ports_at = at + u64.widen(START_BYTES)
+    var keys = mem::Bytes.empty(alloc)
+    var ports = mem::Bytes.empty(alloc)
+    let keys_at = ports_at + u64.widen(PORT_BYTES * self.keys.len())
+    for index in 0..<self.keys.len() {
+        let key = self.keys[index].as_str().as_bytes()
+        let port = PortRecord(handle: self.channels[index], inbound: self.frames[1 + 2 * index], outbound: self.frames[2 + 2 * index], key: keys_at + u64.widen(keys.len()), key_len: u64.widen(key.len()))
+        mut ports.append(record_bytes(port, count: PORT_BYTES, alloc).view())
+        mut keys.append(key)
+    }
+    let held: u64 = match self.held {
+        true => 1
+        false => 0
+    }
+    let record = Start(order: ORDER_START, id: self.id, job: self.job, input: keys_at + u64.widen(keys.len()), input_len: u64.widen(self.input.len()), bell: self.frames[0], ports: ports_at, port_count: u64.widen(self.keys.len()), held: held, runner: self.runner)
+    var bytes = record_bytes(record, count: START_BYTES, alloc)
+    mut bytes.append(ports.view())
+    mut bytes.append(keys.view())
+    mut bytes.append(self.input.view())
+    return bytes
+} Pending.laid_out
+
+/// A table holding the capabilities of `services`, the space's test runs and its kernel's orders
+/// by their handles.
+fn Table.of(services: Services, alloc: mem::Alloc) -> Table {
+    let table = Table(held: mem::OnceMap[u64, Entry].empty(0, alloc), count: core::atomic::AtomicU64.of(0))
+    discard table.held_by(job: 0, holding: Holding.Log(services.log))
+    discard table.held_by(job: 0, holding: Holding.Stdio(services.stdio))
+    discard table.held_by(job: 0, holding: Holding.Random(services.random))
+    discard table.held_by(job: 0, holding: Holding.Fs(services.fs))
+    discard table.held_by(job: 0, holding: Holding.Tests)
+    discard table.held_by(job: 0, holding: Holding.Orders)
+    return table
+} Table.of
+
+/// The handle of a capability the table holds from now on for the job or instance numbered `job`,
+/// `MOST_HELD`, which names none, once it is full.
+fn Table.held_by(self, job: u64, holding: Holding) -> u64 {
+    return self.add(job, holding).value_or(MOST_HELD)
+} Table.held_by
+
+/// The handle of a capability the table holds from now on for the job or instance numbered `job`,
+/// none once it holds `MOST_HELD`.
+fn Table.add(self, job: u64, holding: Holding) -> Option[u64] {
     let Some(handle) = self.count.fetch_add(1) else {
         return None
     }
     if handle >= MOST_HELD {
         return None
     }
-    discard self.held.insert(handle, value: holding)
+    discard self.held.insert(handle, value: Entry(job: job, holding: holding))
     return Some(handle)
 } Table.add
 
-/// What a space receives of the capabilities `handles` hold, each added to the table, none when no
-/// space holds one's type or the table is full.
-fn Table.admitted(self, handles: Slice[sys::Handle], alloc: mem::Alloc) -> Option[mem::List[Carried]] {
+/// What a space receives of the capabilities `handles` hold, each added to the table for the job
+/// or instance numbered `job`, none when no space holds one's type or the table is full.
+fn Table.admitted(self, job: u64, handles: Slice[sys::Handle], alloc: mem::Alloc) -> Option[mem::List[Carried]] {
     var holdings = mem::List[Holding].empty(alloc)
     for handle in handles {
         let Some(holding) = holding_of(handle) else {
@@ -370,7 +1104,7 @@ fn Table.admitted(self, handles: Slice[sys::Handle], alloc: mem::Alloc) -> Optio
     }
     var crossing = mem::List[Carried].empty(alloc)
     for holding in holdings {
-        let Some(handle) = self.add(holding) else {
+        let Some(handle) = self.add(job, holding) else {
             return None
         }
         match holding {
@@ -406,10 +1140,10 @@ fn holding_of(handle: sys::Handle) -> Option[Holding] {
 fn Table.handed(self, handles: mem::List[u64], alloc: mem::Alloc) -> Option[mem::List[sys::Handle]] {
     var given = mem::List[sys::Handle].empty(alloc)
     for handle in handles {
-        let Some(holding) = self.held.get(handle) else {
+        let Some(entry) = self.held.get(handle) else {
             return None
         }
-        match holding {
+        match entry.holding {
             Holding.Log(log) => mut given.push(sys::Handle.of(log))
             Holding.Stdio(stdio) => mut given.push(sys::Handle.of(stdio))
             Holding.Random(random) => mut given.push(sys::Handle.of(random))
@@ -419,25 +1153,6 @@ fn Table.handed(self, handles: mem::List[u64], alloc: mem::Alloc) -> Option[mem:
     return Some(take given)
 } Table.handed
 
-/// Maps a link's doorbell and channel frames into a space whose start record lies at `start`,
-/// the channels' handles following one another from `channels`.
-fn shared(mut space: sys::load::Space, link: Link, start: u64, channels: u64, alloc: mem::Alloc) -> Shared fails sys::load::LoadError {
-    let bell = try mut space.share(link.bell)
-    var records = mem::Bytes.empty(alloc)
-    var keys = mem::Bytes.empty(alloc)
-    let keys_at = start + u64.widen(START_BYTES + PORT_BYTES * link.channels.len())
-    for channel in link.channels {
-        let inbound = try mut space.share(channel.inbound)
-        let outbound = try mut space.share(channel.outbound)
-        let key = channel.key.as_str().as_bytes()
-        let port = PortRecord(handle: channels + u64.widen(records.len() / PORT_BYTES), inbound: inbound, outbound: outbound, key: keys_at + u64.widen(keys.len()), key_len: u64.widen(key.len()))
-        mut records.append(record_bytes(port, count: PORT_BYTES, alloc).view())
-        mut keys.append(key)
-    }
-    mut records.append(keys.view())
-    return Shared(bell: bell, records: take records)
-} shared
-
 /// The `count` bytes of a record.
 fn record_bytes[T: Copy](record: T, count: usize, alloc: mem::Alloc) -> mem::Bytes {
     var bytes = mem::Bytes.zeroed(count, alloc)
@@ -446,74 +1161,6 @@ fn record_bytes[T: Copy](record: T, count: usize, alloc: mem::Alloc) -> mem::Byt
     }
     return bytes
 } record_bytes
-
-/// Runs a space's thread until its job ends, serving its system calls and drawing from `frames`
-/// the pages it draws; a fault on a page of the boot area it does not map draws that page, and
-/// another exception resumes the thread in the fault routine its runtime named, which it names
-/// again once it runs, or ends the job as a trap of `trap.exception` while it names none. Once
-/// `halted` gives true, the space runs no more and its job ends abandoned.
-fn run_space(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserState, mut extended: Option[hw::ExtendedState], served: Serving, link: Link, halted: fn() -> bool, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
-    let services = served.services
-    var ids = mem::Map[u64, Carried].empty(alloc)
-    var files = Files(open: mem::Map[u64, sys::fs::File].empty(alloc), next: 0)
-    var fault_routine: u64 = 0
-    loop {
-        if halted() {
-            return Ended.Abandoned
-        }
-        match space.run(cpu, mut state, mut extended) {
-            hw::UserExit.Interrupted => {}
-            hw::UserExit.Fault(fault) => {
-                match attempt mut space.draw(fault.address, len: 1, mut frames) {
-                    Ok(1) => {}
-                    Err(sys::load::DrawError.Exhausted) => return Ended.Trapped(trap_of(EXHAUSTED, report: "", alloc))
-                    else => {
-                        if fault_routine == 0 {
-                            return Ended.Trapped(trap_of(EXCEPTION, report: "", alloc))
-                        }
-                        faulted(mut state, fault, routine: fault_routine)
-                        fault_routine = 0
-                    }
-                }
-            }
-            hw::UserExit.Syscall => {
-                let number = user_word(state.regs[register(ROLE_NUMBER)])
-                if number == CALL_END {
-                    return ended_by(mut space, state, alloc)
-                }
-                var answer = INVALID
-                if number == CALL_WAIT {
-                    let deadline = user_word(state.regs[register(0)])
-                    if deadline == 0 {
-                        return Ended.Trapped(trap_of(ABANDONED, report: "", alloc))
-                    }
-                    answer = try await slept_until(services.clock, deadline, link)
-                } else if number == CALL_DRAW {
-                    answer = match attempt mut space.draw(user_word(state.regs[register(0)]), len: user_word(state.regs[register(1)]), mut frames) {
-                        Ok(_) => 0
-                        Err(_) => INVALID
-                    }
-                } else if number == CALL_RELEASE {
-                    answer = match attempt mut space.give_back(user_word(state.regs[register(0)]), len: user_word(state.regs[register(1)]), mut frames) {
-                        Ok(_) => 0
-                        Err(_) => INVALID
-                    }
-                } else if number == CALL_NOW {
-                    answer = match attempt services.clock.elapsed_ns() {
-                        Ok(ns) => ns
-                        Err(_) => INVALID
-                    }
-                } else if number == CALL_INVOKE {
-                    answer = try await invoked(cpu, mut space, state, served, link, halted, mut ids, mut files, mut frames, alloc)
-                } else if number == CALL_FAULT {
-                    fault_routine = user_word(state.regs[register(0)])
-                    answer = 0
-                }
-                state.regs[register(ROLE_RESULT)] = Untrusted.of(answer)
-            }
-        }
-    }
-} run_space
 
 /// Resumes a thread that faulted with `fault` in the routine at `routine`, as if the faulting
 /// instruction called it with the fault's vector, code and address and that instruction's
@@ -527,9 +1174,9 @@ fn faulted(mut state: hw::UserState, fault: hw::UserFault, routine: u64) {
     state.ip = Untrusted.of(routine)
 } faulted
 
-/// Waits until a deadline of the clock or until the link's doorbell rings, giving 1 when it rang
+/// Waits until a deadline of the clock or until `rang` is posted, giving `WOKE_RUNG` when it was
 /// and 0 otherwise.
-fn slept_until(clock: sys::Clock, deadline: u64, link: Link) -> u64 fails task::Cancelled uses wait {
+fn slept_until(clock: sys::Clock, deadline: u64, rang: hw::Signal[u64]) -> u64 fails task::Cancelled uses wait {
     let elapsed = match attempt clock.elapsed_ns() {
         Ok(ns) => ns
         Err(_) => deadline
@@ -538,16 +1185,16 @@ fn slept_until(clock: sys::Clock, deadline: u64, link: Link) -> u64 fails task::
         return 0
     }
     let woken = try await task::within_ns(clock, ns: deadline - elapsed, body: fn() -> u64 fails task::Cancelled uses wait {
-        return try await link.rung.wait()
+        return try await rang.wait()
     })
     return match woken {
-        Some(_) => 1
+        Some(_) => WOKE_RUNG
         None => 0
     }
 } slept_until
 
-/// How the job of an `CALL_END` call ended, a trap's report being the space's text.
-fn ended_by(mut space: sys::load::Space, state: hw::UserState, alloc: mem::Alloc) -> Ended {
+/// How the job or instance of a `CALL_END` call ended, a trap's report being the space's text.
+fn ended_of(space: sys::load::Space, state: hw::UserState, alloc: mem::Alloc) -> Outcome {
     let how = user_word(state.regs[register(0)])
     let detail = user_word(state.regs[register(1)])
     if how == ENDS_TRAPPED {
@@ -555,23 +1202,23 @@ fn ended_by(mut space: sys::load::Space, state: hw::UserState, alloc: mem::Alloc
             Ok(bytes) => text_of(bytes.view(), alloc)
             Err(_) => text::String.empty(alloc)
         }
-        return Ended.Trapped(trap_of(detail, report: report.as_str(), alloc))
+        return Outcome.Trapped(Trapping(kind: detail, report: take report))
     }
     if how == ENDS_UNDECODABLE {
-        return Ended.Undecodable
+        return Outcome.Ended(Ended.Undecodable)
     }
     if how == ENDS_CANCELLED {
-        return Ended.Cancelled
+        return Outcome.Ended(Ended.Cancelled)
     }
     let Ok(bytes) = attempt copied(space, state, at: 2, alloc) else {
-        return Ended.Trapped(trap_of(EXCEPTION, report: "", alloc))
+        return Outcome.Trapped(Trapping(kind: EXCEPTION, report: text::String.empty(alloc)))
     }
     match how {
-        ENDS_RETURNED => return Ended.Returned(bytes_of(bytes.view(), alloc))
-        ENDS_FAILED => return Ended.Failed(text_of(bytes.view(), alloc))
-        else => return Ended.Trapped(trap_of(ABANDONED, report: "", alloc))
+        ENDS_RETURNED => return Outcome.Ended(Ended.Returned(bytes_of(bytes.view(), alloc)))
+        ENDS_FAILED => return Outcome.Ended(Ended.Failed(text_of(bytes.view(), alloc)))
+        else => return Outcome.Trapped(Trapping(kind: ABANDONED, report: text::String.empty(alloc)))
     }
-} ended_by
+} ended_of
 
 /// The bytes the address and length of a call's arguments from `at` name in the space, at most
 /// `MOST_BYTES`.
@@ -586,62 +1233,10 @@ fn copied(space: sys::load::Space, state: hw::UserState, at: usize, alloc: mem::
     return try space.read(user_word(state.regs[register(u64.widen(at))]), len, alloc)
 } copied
 
-/// Serves an `CALL_INVOKE` call: the handle of an entry of the space's table, the operation, the
-/// address and length of its arguments and the address and capacity of its result; `ids` keeps
-/// what crossed into the table for each capability the runner capability holds by number, and
-/// `files` the files the space opened. A test run's space draws from `frames` and stops once
-/// `halted` gives true.
-fn invoked(cpu: hw::Ring0, mut space: sys::load::Space, state: hw::UserState, served: Serving, link: Link, halted: fn() -> bool, mut ids: mem::Map[u64, Carried], mut files: Files, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
-    let handle = user_word(state.regs[register(0)])
-    let operation = user_word(state.regs[register(1)])
-    let target = user_word(state.regs[register(4)])
-    let capacity = user_word(state.regs[register(5)])
-    let Ok(args) = attempt copied(space, state, at: 2, alloc) else {
-        return INVALID
-    }
-    if capacity > MOST_BYTES {
-        return INVALID
-    }
-    let Some(holding) = served.table.held.get(handle) else {
-        return STALE
-    }
-    match holding {
-        Holding.Log(log) => {
-            if operation == LOG_LINE {
-                return logged(log, args, alloc)
-            }
-        }
-        Holding.Stdio(stdio) => return try await streamed(mut space, stdio, operation, args, target, capacity, alloc)
-        Holding.Random(random) => {
-            if operation == FILL {
-                var bytes = mem::Bytes.zeroed(usize.widen(capacity), alloc)
-                let Ok(_) = attempt random.fill(mut bytes.view_mut()) else {
-                    return STALE
-                }
-                return written_back(mut space, address: target, bytes: bytes, count: capacity)
-            }
-        }
-        Holding.Fs(fs) => return try await filed(mut space, fs, operation, args, target, capacity, mut files, alloc)
-        Holding.Tests => {
-            if operation == TEST_RUN {
-                return try await test_served(cpu, services: served.services, tenant: served.tenant, args, halted, mut frames, alloc)
-            }
-        }
-        Holding.Channel(index) => {
-            if operation == NOTIFY {
-                link.heard_from(index)
-                return 0
-            }
-        }
-        Holding.Runner(runner) => return runner_served(mut space, runner, operation, args, target, capacity, table: served.table, mut ids, alloc)
-    }
-    return INVALID
-} invoked
-
-/// Serves an operation of the runner capability of an instance's space through `runner`, the
-/// handles crossing through `table`; `ids` keeps what crossed into the table for each capability
-/// `runner` holds by number until it is dropped.
-fn runner_served(mut space: sys::load::Space, runner: sys::Runner, operation: u64, args: Untrusted[mem::Bytes], target: u64, capacity: u64, table: Table, mut ids: mem::Map[u64, Carried], alloc: mem::Alloc) -> u64 {
+/// Serves an operation of the runner capability of the instance numbered `job` through `runner`,
+/// the handles crossing through `table`; `ids` keeps what crossed into the table for each
+/// capability `runner` holds by number until it is dropped.
+fn runner_served(mut space: sys::load::Space, runner: sys::Runner, job: u64, operation: u64, args: Untrusted[mem::Bytes], target: u64, capacity: u64, table: Table, mut ids: mem::Map[u64, Carried], alloc: mem::Alloc) -> u64 {
     if operation == RUN_SEND_TO {
         let Ok(Sending(port: port, hash: hash, call: Naming(bytes: bytes, handles: handles))) = attempt mem::wire::Codec[Sending].decode(args.view(), alloc) else {
             return INVALID
@@ -683,7 +1278,7 @@ fn runner_served(mut space: sys::load::Space, runner: sys::Runner, operation: u6
         Ok(given) => given
         Err(failure) => return outcome_of(Err(take failure))
     }
-    let Some(crossed) = kept_for(id, handle, table, mut ids, alloc) else {
+    let Some(crossed) = kept_for(id, handle, job, table, mut ids, alloc) else {
         return INVALID
     }
     let bytes = encoded(crossed, alloc)
@@ -693,16 +1288,16 @@ fn runner_served(mut space: sys::load::Space, runner: sys::Runner, operation: u6
     return written_back(mut space, address: target, bytes, count: u64.widen(bytes.len()))
 } runner_served
 
-/// What crossed into the table for the capability a runner holds by the number `id`: what `ids`
-/// keeps for `id`, or, added to `ids`, the capability `handle` holds crossing; none when it cannot
-/// cross.
-fn kept_for(id: u64, handle: sys::Handle, table: Table, mut ids: mem::Map[u64, Carried], alloc: mem::Alloc) -> Option[Carried] {
+/// What crossed into the table for the capability the runner of the instance numbered `job` holds
+/// by the number `id`: what `ids` keeps for `id`, or, added to `ids`, the capability `handle` holds
+/// crossing; none when it cannot cross.
+fn kept_for(id: u64, handle: sys::Handle, job: u64, table: Table, mut ids: mem::Map[u64, Carried], alloc: mem::Alloc) -> Option[Carried] {
     match ids.get(id) {
         Some(kept) => return Some(kept)
         None => {}
     }
     let held = Array[sys::Handle, 1].filled(handle)
-    let Some(crossing) = table.admitted(held.view(), alloc) else {
+    let Some(crossing) = table.admitted(job, handles: held.view(), alloc) else {
         return None
     }
     discard mut ids.insert(id, value: crossing[0])
@@ -1120,18 +1715,83 @@ fn register(role: u64) -> usize limits pure, notrap, terminates
 /// report.
 fn trap_of(kind: u64, report: Str, alloc: mem::Alloc) -> sys::Trap
 
-/// The first task of a space's runtime: runs the job its start record names, or holds the
-/// instance of the component entry it names for the kernel over its link's first channel, on a
-/// world whose log, standard streams, random source and file system the kernel serves, with its
-/// link's other channels in its table, its network denied, and ends the space with how the job or
-/// instance ended.
-pkg fn isolated(start: u64) fails task::Cancelled uses wait limits stack 16_384 {
-    let record = trusted "the kernel writes the start record at `start` before the space starts" { hw::Ptr[Start].of_addr(usize.widen(start)).read() }
+/// The first task of a space's runtime: takes each order of its kernel, waiting for its kernel to
+/// have orders, starting each job or instance it orders on a task of its own, in a domain of its own
+/// run, and abandoning the domain of each it orders abandoned.
+pkg fn isolated() fails task::Cancelled uses wait limits stack 16_384 {
     let granted = space_base()
     let alloc = granted.alloc
-    var input = mem::Bytes.zeroed(usize.widen(record.input_len), alloc)
-    trusted "the kernel writes the job's input of `input_len` bytes at `input`" {
-        hw::Ptr[u8].of_addr(usize.widen(record.input)).copy(hw::Ptr.of_view_mut(mut input.view_mut()), count: usize.widen(record.input_len))
+    let domains = task::Cown.of(mem::Map[u64, mem::Shared[sys::Abandoner]].empty(alloc), alloc)
+    try await task::scope(granted.exec, body: fn(s: task::Scope) fails task::Cancelled uses wait {
+        loop {
+            let Some(order) = taken_order(alloc) else {
+                try await wait_orders()
+                continue
+            }
+            let record = order.record
+            if record.order == ORDER_ABANDON {
+                let found = await when mut domains => mut domains.remove(record.id)
+                match found {
+                    Some(domain) => domain.contents().trigger()
+                    None => {}
+                }
+                continue
+            }
+            let domain = mem::Shared.of(sys::Abandoner.new(), alloc)
+            let held = domain.share()
+            await when mut domains {
+                discard mut domains.insert(record.id, value: take held)
+            }
+            let forgetting = domains.share()
+            discard s.spawn(fn[take order, take domain, take forgetting]() fails task::Cancelled uses wait limits stack 16_384 {
+                try await begun(order, domain, granted)
+                await when mut forgetting {
+                    discard mut forgetting.remove(record.id)
+                }
+            })
+        }
+    })
+} isolated
+
+/// An order of a space's kernel: its record, and the bytes holding it with what follows it.
+struct Taken {
+    record: Start
+    bytes: mem::Bytes
+} Taken
+
+/// The kernel's next order, drawn through `alloc`; none when it has none.
+fn taken_order(alloc: mem::Alloc) -> Option[Taken] {
+    var capacity: usize = 4_096
+    loop {
+        var bytes = mem::Bytes.zeroed(capacity, alloc)
+        let len = invoke(ORDERS_HANDLE, operation: TAKE, args: b"", result: mut bytes.view_mut())
+        if len >= FAILURES or len < u64.widen(START_BYTES) {
+            return None
+        }
+        if len > u64.widen(capacity) {
+            capacity = usize.widen(len)
+            continue
+        }
+        let record = trusted "the kernel writes the order's record at the start of `bytes`" { hw::Ptr[Start].cast(hw::Ptr.of_view(bytes.view())).read() }
+        return Some(Taken(record: record, bytes: take bytes))
+    }
+} taken_order
+
+/// Runs the job or instance an order starts, in a domain run of `domain`, on a world whose log,
+/// standard streams, random source and file system the kernel serves, with its link's channels in
+/// its table, holding the instance of a component entry for the kernel over its link's first
+/// channel, and ends it with the kernel as it ended.
+fn begun(order: Taken, domain: mem::Shared[sys::Abandoner], granted: Base) fails task::Cancelled uses wait {
+    let record = order.record
+    let alloc = granted.alloc
+    var input = mem::Bytes.empty(alloc)
+    let from = usize.widen(record.input).wrapping_sub(hw::Ptr.of_view(order.bytes.view()).addr())
+    match order.bytes.view().split_at(from) {
+        Some(parts) => match parts.tail.prefix(usize.widen(record.input_len)) {
+            Some(given) => mut input.append(given)
+            None => {}
+        }
+        None => {}
     }
     var list = mem::List[PortRecord].empty(alloc)
     for index in 0u64..<record.port_count {
@@ -1142,39 +1802,40 @@ pkg fn isolated(start: u64) fails task::Cancelled uses wait limits stack 16_384 
     let ports = sys::Minter[Port, Ports, u64].of(Ports(bell: record.bell, list: take list), alloc)
     let world = attempt remote_world(granted, record, base, ports, channels_from: record.held)
     let job = record.job
+    let id = record.id
     match world {
         Ok(given) => {
             let outcome = match record.held {
-                0 => attempt await sys::Domain.run_sized(fn[take given, take input]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
+                0 => attempt await domain.contents().run_sized(fn[take given, take input]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
                     return try await call(job, world: take given, take input)
                 }, stack: job.stack() + CALL_STACK, exec: granted.exec, alloc)
-                else => attempt await served_instance(job, port: ports.mint(0), base, runner: record.runner, world: take given, take input)
+                else => attempt await served_instance(job, port: ports.mint(0), base, runner: record.runner, domain, world: take given, take input)
             }
             take remotes.close()
             take ports.close()
             match outcome {
-                Ok(Ok(how)) => end_with(how, alloc)
-                Ok(Err(trap)) => end_trapped(trap, alloc)
-                Err(_) => end(ENDS_TRAPPED, detail: ABANDONED, bytes: b"")
+                Ok(Ok(how)) => end_with(how, job: id, alloc)
+                Ok(Err(trap)) => end_trapped(trap, job: id, alloc)
+                Err(_) => end(ENDS_TRAPPED, detail: ABANDONED, bytes: b"", job: id)
             }
         }
         Err(_) => {
             take remotes.close()
             take ports.close()
-            end(ENDS_TRAPPED, detail: ABANDONED, bytes: b"")
+            end(ENDS_TRAPPED, detail: ABANDONED, bytes: b"", job: id)
         }
     }
-} isolated
+} begun
 
-/// The world of a space: its runtime's allocator, executor and clock, its log, standard streams,
-/// random source and file system served by the kernel by the handles its start record gives, its
-/// network denied, and its table holding each channel of its link from the index
-/// `channels_from` as a standard stream under the channel's key.
+/// The world of a job or instance of a space: its runtime's allocator, executor and clock, its log,
+/// standard streams, random source and file system served by the kernel, its network denied, and
+/// its table holding each channel of its link from the index `channels_from` as a standard stream
+/// under the channel's key.
 fn remote_world(granted: Base, record: Start, base: Remote, ports: sys::Minter[Port, Ports, u64], channels_from: u64) -> World fails sys::Revoked {
-    let logs = try Cap[sys::Log].held(base, handle: record.log, serve: served_log)
-    let streams = try Cap[sys::Stdio].held(base, handle: record.stdio, serve: served_stdio)
-    let source = try Cap[sys::Random].held(base, handle: record.random, serve: served_random)
-    let files = try Cap[sys::Fs].held(base, handle: record.fs, serve: served_fs)
+    let logs = try Cap[sys::Log].held(base, handle: LOG_HANDLE, serve: served_log)
+    let streams = try Cap[sys::Stdio].held(base, handle: STDIO_HANDLE, serve: served_stdio)
+    let source = try Cap[sys::Random].held(base, handle: RANDOM_HANDLE, serve: served_random)
+    let files = try Cap[sys::Fs].held(base, handle: FS_HANDLE, serve: served_fs)
     var caps = Caps.empty(granted.alloc)
     for index in channels_from..<record.port_count {
         let port = port_at(record, index)
@@ -1197,24 +1858,25 @@ fn port_at(record: Start, index: u64) -> PortRecord {
     return trusted "the kernel writes the records of the link's channels at `ports`" { hw::Ptr[PortRecord].of_addr(usize.widen(record.ports + index * u64.widen(PORT_BYTES))).read() }
 } port_at
 
-/// Ends the space with how its job ended.
-fn end_with(how: Ended, alloc: mem::Alloc) {
+/// Tells the kernel how the job or instance numbered `job` ended.
+fn end_with(how: Ended, job: u64, alloc: mem::Alloc) {
     match how {
-        Ended.Returned(bytes) => end(ENDS_RETURNED, detail: 0, bytes: bytes.view())
-        Ended.Failed(text) => end(ENDS_FAILED, detail: 0, bytes: text.as_str().as_bytes())
-        Ended.Cancelled => end(ENDS_CANCELLED, detail: 0, bytes: b"")
-        Ended.Abandoned => end(ENDS_TRAPPED, detail: ABANDONED, bytes: b"")
-        Ended.Trapped(trap) => end_trapped(trap, alloc)
-        Ended.Undecodable => end(ENDS_UNDECODABLE, detail: 0, bytes: b"")
+        Ended.Returned(bytes) => end(ENDS_RETURNED, detail: 0, bytes: bytes.view(), job)
+        Ended.Failed(text) => end(ENDS_FAILED, detail: 0, bytes: text.as_str().as_bytes(), job)
+        Ended.Cancelled => end(ENDS_CANCELLED, detail: 0, bytes: b"", job)
+        Ended.Abandoned => end(ENDS_TRAPPED, detail: ABANDONED, bytes: b"", job)
+        Ended.Trapped(trap) => end_trapped(trap, job, alloc)
+        Ended.Undecodable => end(ENDS_UNDECODABLE, detail: 0, bytes: b"", job)
     }
 } end_with
 
-/// Ends the space with a trap of its job, giving its kind and its report.
-fn end_trapped(trap: sys::Trap, alloc: mem::Alloc) {
+/// Tells the kernel that a trap ended the job or instance numbered `job`, giving its kind and its
+/// report.
+fn end_trapped(trap: sys::Trap, job: u64, alloc: mem::Alloc) {
     var report = mem::Bytes.zeroed(REPORT_BYTES, alloc)
     let len = render_into(trap, into: mut report.view_mut())
     mut report.truncate(len)
-    end(ENDS_TRAPPED, detail: trap_number(trap), bytes: report.view())
+    end(ENDS_TRAPPED, detail: trap_number(trap), bytes: report.view(), job)
 } end_trapped
 
 /// What the capabilities a space's runtime holds by the kernel's handles share: the runtime's
@@ -1412,13 +2074,6 @@ fn streamed_out(handle: u64, operation: u64, data: Slice[u8]) fails sys::StdioEr
         done += chunk.len()
     }
 } streamed_out
-
-/// The handles a space's table holds its standard streams and its file system by.
-const STDIO_HANDLE: u64 = 1
-
-const FS_HANDLE: u64 = 3
-
-const TESTS_HANDLE: u64 = 4
 
 pub open struct SpaceCalls derives Copy {
 } SpaceCalls
@@ -1811,8 +2466,12 @@ fn invoke(handle: u64, operation: u64, args: Slice[u8], mut result: SliceMut[u8]
 /// Makes a `CALL_NOW` call, giving the nanoseconds of the kernel's clock.
 fn now() -> u64
 
-/// Makes an `CALL_END` call, after which the space runs no more.
-fn end(how: u64, detail: u64, bytes: Slice[u8])
+/// Makes a `CALL_END` call, telling the kernel how the job or instance numbered `job` ended.
+fn end(how: u64, detail: u64, bytes: Slice[u8], job: u64)
+
+/// Waits until the kernel has orders for the runtime. No cancellation ends the wait once it has
+/// started.
+fn wait_orders() fails task::Cancelled uses wait
 
 /// The number of a trap's kind.
 fn trap_number(trap: sys::Trap) -> u64 limits pure, notrap, terminates

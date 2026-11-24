@@ -1,4 +1,4 @@
-//! Jobs a kernel runs from the bundles of nanos programs: the call of a loaded bundle's job entry, the rendering of a job's failure into a buffer, and the `host::World` a host-compatible entry receives; in an isolated space, the runtime's own grants, the system calls through which it reaches its kernel and the wait on its doorbell; and for its kernel, the registers of those calls and the traps a space reports.
+//! Jobs a kernel runs from the bundles of nanos programs: the call of a loaded bundle's job entry, the rendering of a job's failure into a buffer, and the `host::World` a host-compatible entry receives; in an isolated space, the runtime's own grants, the system calls through which it reaches its kernel and the waits on its doorbell and on its kernel's orders; and for its kernel, the registers of those calls and the traps a space reports.
 
 fn jobs_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
     match supply.path.as_str() {
@@ -85,24 +85,13 @@ fn jobs_space_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
         }
         "nanos::end" => {
             let bytes = sys_view(mut fx, held: supply.param(2))
-            let call = fx.list4(supply.param(0).scalar_value(), b: supply.param(1).scalar_value(), c: bytes.start, d: bytes.len)
+            var call = fx.list4(supply.param(0).scalar_value(), b: supply.param(1).scalar_value(), c: bytes.start, d: bytes.len)
+            mut call.push(supply.param(3).scalar_value())
             discard space_call(mut lo, mut fx, number: SPACE_END, args: call.view())
             supply.done(mut lo, mut fx)
         }
-        "nanos::rung" => {
-            let ns = supply.param(0).scalar_value()
-            let slot = mut lo.reserved(mut fx, data_name: SPACE_BELL, size: 8, align: 8)
-            let cancelled = sims_wait(mut lo, mut fx, slot: None, enqueue: fn(mut lo1: Lowering, mut fx1: Fx, op: clif::Value) {
-                mut fx1.store(op, addr: slot, offset: 0)
-                mut lo1.kernel_arm(mut fx1, op, ns)
-            })
-            let zero = mut fx.ptr(0)
-            mut fx.store(zero, addr: slot, offset: 0)
-            mut fx.if_true(cancelled, then: fn[mut lo](mut fx1: Fx) {
-                sims_fail_cancelled(mut lo, fx: mut fx1, supply)
-            })
-            supply.done(mut lo, mut fx)
-        }
+        "nanos::wait_orders" => jobs_space_wait(mut lo, mut fx, supply, data_name: SPACE_ORDERS, timer: None)
+        "nanos::rung" => jobs_space_wait(mut lo, mut fx, supply, data_name: SPACE_BELL, timer: Some(supply.param(0).scalar_value()))
         "nanos::trap_number" => {
             let record = trap_record(mut fx, trap: supply.param(0))
             let kind = mut fx.load(PTR, addr: record, offset: TRAP_RECORD_KIND)
@@ -127,6 +116,25 @@ fn jobs_space_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
     }
     return true
 } jobs_space_lower
+
+/// Waits with the operation in the reserved data `data_name` while it waits, arming a timer due
+/// `timer` nanoseconds from now when given one, and fails as cancelled when the wait was.
+fn jobs_space_wait(mut lo: Lowering, mut fx: Fx, supply: Supply, data_name: Str, timer: Option[clif::Value]) {
+    let slot = mut lo.reserved(mut fx, data_name, size: 8, align: 8)
+    let cancelled = sims_wait(mut lo, mut fx, slot: None, enqueue: fn(mut lo1: Lowering, mut fx1: Fx, op: clif::Value) {
+        mut fx1.store(op, addr: slot, offset: 0)
+        match timer {
+            Some(ns) => mut lo1.kernel_arm(mut fx1, op, ns)
+            None => {}
+        }
+    })
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: slot, offset: 0)
+    mut fx.if_true(cancelled, then: fn[mut lo](mut fx1: Fx) {
+        sims_fail_cancelled(mut lo, fx: mut fx1, supply)
+    })
+    supply.done(mut lo, mut fx)
+} jobs_space_wait
 
 /// The index in an `hw::UserState`'s registers of each argument of a system call, of its number,
 /// of its result and of the fourth argument of a call: on x86_64 `rdi`, `rsi`, `rdx`, `r10`, `r8`,

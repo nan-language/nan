@@ -1,13 +1,15 @@
 //! Jobs a kernel runs from the bundles of nanos programs: the call of a loaded bundle's job entry,
 //! the rendering of a job's failure into a buffer, and the `host::World` a host-compatible entry
 //! receives; in an isolated space, the runtime's own grants, its calls of the job entry, the
-//! system calls through which it reaches its kernel and the wait on its doorbell; and for its
-//! kernel, the registers of those calls and the traps a space reports.
+//! system calls through which it reaches its kernel and the waits on its doorbell and on its
+//! kernel's orders; and for its kernel, the registers of those calls and the traps a space
+//! reports.
 
 use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value, condcodes::IntCC};
 
 use super::super::Lowering;
 use super::super::body::Held;
+use super::super::data::Reserved;
 use super::super::fx::{Fx, PTR};
 use super::super::runtime::tables::mint_base;
 use super::super::runtime::tasks::trap_record;
@@ -84,21 +86,15 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
                 supply.param(1).scalar(),
                 bytes,
                 len,
+                supply.param(3).scalar(),
             ];
             space::call(lo, fx, space::END, &call);
             supply.done(lo, fx);
         }
+        "nanos::wait_orders" => space_wait(lo, fx, supply, space::ORDERS, None),
         "nanos::rung" => {
             let ns = supply.param(0).scalar();
-            let slot = lo.reserved(fx, space::BELL);
-            let cancelled = sims::wait(lo, fx, None, |lo, fx, op| {
-                fx.store(op, slot, 0);
-                lo.kernel_arm(fx, op, ns);
-            });
-            let zero = fx.ptr(0);
-            fx.store(zero, slot, 0);
-            fx.when(cancelled, |fx| sims::fail_cancelled(lo, fx, supply));
-            supply.done(lo, fx);
+            space_wait(lo, fx, supply, space::BELL, Some(ns));
         }
         "nanos::trap_number" => {
             let record = word_of(fx, supply.param(0));
@@ -133,6 +129,28 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         _ => return false,
     }
     true
+}
+
+/// Waits with the operation in the reserved data `slot` while it waits, arming a timer due `timer`
+/// nanoseconds from now when given one, and fails as cancelled when the wait was.
+fn space_wait(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    slot: Reserved,
+    timer: Option<Value>,
+) {
+    let slot = lo.reserved(fx, slot);
+    let cancelled = sims::wait(lo, fx, None, |lo, fx, op| {
+        fx.store(op, slot, 0);
+        if let Some(ns) = timer {
+            lo.kernel_arm(fx, op, ns);
+        }
+    });
+    let zero = fx.ptr(0);
+    fx.store(zero, slot, 0);
+    fx.when(cancelled, |fx| sims::fail_cancelled(lo, fx, supply));
+    supply.done(lo, fx);
 }
 
 /// The index in an `hw::UserState`'s registers of each argument of a system call, of its number,

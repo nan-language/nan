@@ -1,7 +1,7 @@
 //! An isolated space's runtime: its one executor thread, which runs in user mode over a boot
 //! area its kernel maps as it is used, the system calls through which it reads its kernel's
-//! clock, waits for its first timer or its doorbell and ends, its start, which runs
-//! `nanos::isolated` as its first task, and its fault routine, in which its kernel resumes its
+//! clock, waits for its first timer, its doorbell or its kernel's orders and ends its jobs, its
+//! start, which runs `nanos::isolated` as its first task, and its fault routine, in which its kernel resumes its
 //! thread at an exception. A test image running alone in a space runs on such a runtime too,
 //! writing its standard streams and ending with its exit status through its kernel.
 
@@ -10,7 +10,6 @@ use cranelift_codegen::ir::{
 };
 use cranelift_module::{FuncId, Linkage, Module};
 
-use super::super::body::Held;
 use super::super::call::Invoked;
 use super::super::data::Reserved;
 use super::super::fx::{Fx, PTR};
@@ -19,14 +18,14 @@ use super::super::stack::{At, Demand, Judged, Report};
 use super::super::trap::{OPERAND_RECORD, kind_number};
 use super::super::{CALL_CONV, Instance, Lowering, lines};
 use super::system::unavailable_unless;
-use super::tasks::{self, EXPIRED, task, thread};
+use super::tasks::{self, EXPIRED, thread};
 use super::{Routine, state};
 use crate::check::ty::no_args;
 use crate::nir::{Role, Span};
 
 /// The numbers of the system calls the runtime makes: waiting until a deadline of the kernel's
 /// clock, drawing and releasing pages of the boot area, reading the clock, invoking a capability
-/// its kernel serves, ending the space with how its job ended, and naming the fault routine.
+/// its kernel serves, telling how a job ended, and naming the fault routine.
 pub const WAIT: u64 = 1;
 pub const DRAW: u64 = 2;
 pub const RELEASE: u64 = 3;
@@ -54,6 +53,17 @@ pub const BELL: Reserved = Reserved {
     size: 8,
     align: 8,
 };
+
+/// The operation of the task waiting for its kernel's orders, zero when none waits.
+pub const ORDERS: Reserved = Reserved {
+    name: "_NSspace_orders",
+    size: 8,
+    align: 8,
+};
+
+/// What a `WAIT` call gives: that the doorbell rang, and that the kernel has orders.
+const RUNG: i64 = 1;
+const ORDERED: i64 = 2;
 
 /// The stack the start routine and the scheduler run on, and the boot area: the boot heap, then
 /// the runtime tables, to a whole page.
@@ -105,7 +115,8 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
 }
 
 /// Waits until the first timer is due, or for good without one, or until the kernel rings the
-/// doorbell, which wakes the task waiting on it; then expires the timers due.
+/// doorbell, which wakes the task waiting on it, or has orders, which wakes the task waiting for
+/// them; then expires the timers due.
 pub fn idle(lo: &mut Lowering, fx: &mut Fx) {
     let state_address = lo.state(fx);
     let lock = fx.offset(state_address, state::TIMER_LOCK);
@@ -123,7 +134,21 @@ pub fn idle(lo: &mut Lowering, fx: &mut Fx) {
         |fx| vec![fx.ptr(0)],
     )[0];
     lo.call_routine(fx, Routine::Unlock, &[lock]);
-    let rung = call(lo, fx, WAIT, &[deadline]);
+    let woke = call(lo, fx, WAIT, &[deadline]);
+    let ordered = fx.b.ins().band_imm_s(woke, ORDERED);
+    let ordered = fx.b.ins().icmp_imm_s(IntCC::NotEqual, ordered, 0);
+    fx.when(ordered, |fx| {
+        let slot = lo.reserved(fx, ORDERS);
+        let op = fx.load(PTR, slot, 0);
+        let waiting = fx.b.ins().icmp_imm_s(IntCC::NotEqual, op, 0);
+        fx.when(waiting, |fx| {
+            let zero = fx.ptr(0);
+            fx.store(zero, slot, 0);
+            let done = fx.int(types::I32, 0);
+            tasks::deliver(lo, fx, op, done);
+        });
+    });
+    let rung = fx.b.ins().band_imm_s(woke, RUNG);
     let rung = fx.b.ins().icmp_imm_s(IntCC::NotEqual, rung, 0);
     fx.when(rung, |fx| {
         let slot = lo.reserved(fx, BELL);
@@ -189,9 +214,10 @@ pub fn write_stream(lo: &mut Lowering, fx: &mut Fx, fd: i64, text: Value, len: V
 }
 
 impl Lowering<'_, '_> {
-    /// Defines the start routine: it sets up the runtime over the boot area, names the fault
-    /// routine to the kernel, starts `nanos::isolated` on the record as the first task, with the
-    /// stack its own `limits stack N` demands, and runs the scheduler.
+    /// Defines the start routine, which the kernel enters with the boot area's address in its
+    /// second argument: it sets up the runtime over the boot area, names the fault routine to the
+    /// kernel, starts `nanos::isolated` as the first task, with the stack its own `limits stack N`
+    /// demands, and runs the scheduler.
     pub fn space_start(&mut self) {
         let isolated = self
             .ck
@@ -212,8 +238,7 @@ impl Lowering<'_, '_> {
             .declare_function(START, Linkage::Local, &signature)
             .expect("the start routine");
         self.define(id, signature, lines::HIDDEN, |lo, fx| {
-            let params = fx.entry();
-            let (start, area) = (params[0], params[1]);
+            let area = fx.entry()[1];
             let state_address = lo.state(fx);
             fx.store(area, state_address, state::BOOT_AREA);
             super::system::start(lo, fx);
@@ -231,7 +256,6 @@ impl Lowering<'_, '_> {
             )[0];
             let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
             fx.when(missing, |fx| abandon(lo, fx));
-            fx.store(start, record, task::ARGUMENT);
             fx.store(record, state_address, state::ENTRY_TASK);
             lo.call_routine(fx, Routine::Wake, &[record]);
             lo.call_routine(fx, Routine::Schedule, &[]);
@@ -269,8 +293,8 @@ impl Lowering<'_, '_> {
         id
     }
 
-    /// The glue of the first task, which calls `nanos::isolated` on the start record its task
-    /// record holds, its stack demanded at the function's head.
+    /// The glue of the first task, which calls `nanos::isolated`, its stack demanded at the
+    /// function's head.
     fn space_main(&mut self, isolated: crate::check::db::ItemId, stack: u64) -> FuncId {
         let instance = Instance::Nir {
             item: isolated,
@@ -285,11 +309,10 @@ impl Lowering<'_, '_> {
             .declare_function(MAIN, Linkage::Local, &signature)
             .expect("the first task's glue");
         self.define(id, signature, lines::HIDDEN, |lo, fx| {
-            let record = fx.entry()[0];
-            let start = fx.load(PTR, record, task::ARGUMENT);
+            fx.entry();
             let abi = lo.abi(&instance);
             let callee = lo.instance(instance.clone());
-            lo.invoke(fx, Invoked::Direct(callee), &abi, &[Held::Scalar(start)]);
+            lo.invoke(fx, Invoked::Direct(callee), &abi, &[]);
             fx.b.ins().return_(&[]);
         });
         let head = At {

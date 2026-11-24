@@ -1,4 +1,4 @@
-//! Isolated spaces: bundles verified for them, test images running alone in them, and spaces of 4 KiB frames mapped for user mode at the user window, where the kernel's user-mode runtime runs a bundle's job with the runtime's exports bound to its imports.
+//! Isolated spaces: bundles verified for them, test images running alone in them, and spaces of 4 KiB frames mapped for user mode at the user window, where the kernel's user-mode runtime runs the jobs of the bundles a space maps with the runtime's exports bound to their imports.
 
 /// The user window: its first address, the top-level entry mapping it, and the most pages a space
 /// maps there, those 512 tables of pages map.
@@ -24,35 +24,51 @@ const CHUNK_PAGES: u64 = 16
 /// shares.
 const SHARED_PAGES: u64 = 32
 
-/// A bundle verified for isolated spaces: its bytes and their parts, its component entries as
-/// every space places them, and the image of the kernel's user-mode runtime and its parts; or a
-/// test image, which runs alone in its spaces in place of that runtime, the bundle empty.
+/// A bundle verified for isolated spaces: its bytes and their parts, the address at which spaces
+/// map its image, its component entries there, and the image of the kernel's user-mode runtime and
+/// its parts; or a test image, which runs alone in its spaces in place of that runtime, the bundle
+/// empty. Its shares share its copies.
 pub open struct Isolated derives Send {
-    bundle: mem::Bytes
+    bundle: mem::Shared[mem::Bytes]
     parts: Parts
-    components: mem::List[Exported]
-    runtime_image: mem::Bytes
+    window: u64
+    components: mem::Shared[mem::List[Exported]]
+    runtime_image: mem::Shared[mem::Bytes]
     runtime: Parts
 } Isolated
 
 /// An isolated space: the tenant its threads run for, its root, its other tables, the pages it
 /// maps from the start of the user window up to the user frames it shares, laid out as `plan`
-/// gives, the pages of its boot area it has drawn and the tables of pages it took for them, each
-/// in order of index, and how many user frames it shares; the tables mapping the entry area
-/// follow those of the window.
+/// gives, the pages of its boot area it has drawn and those of the images it joined after its boot
+/// area, and the tables of pages it took for them, each in order of index, a bit per page for user
+/// frames, set while it maps one there, the bundles whose images it maps, and the first page past
+/// those images; the tables mapping the entry area follow those of the window.
 pub open linear struct Space derives Send {
     tenant: u64
     root: hw::PageTableRoot
     tables: mem::List[hw::PhysFrame[4_096]]
     pages: mem::List[hw::PhysFrame[4_096]]
     drawn: mem::List[Drawn]
-    boot_tables: mem::List[Drawn]
+    taken_tables: mem::List[Drawn]
     shared: u64
     plan: Plan
+    images: mem::List[Image]
+    top: u64
 } Space
 
-/// A page of a space's boot area it has drawn, or a table of pages it took for them: its index
-/// from the window's start, or the table's from the first, and its frame.
+/// The image of a bundle a space maps: the bundle's bytes, its first page and the first page past
+/// it, the first pages of its read-only and of its writable data from its start, and the address
+/// of its line tables.
+struct Image {
+    bundle: mem::Shared[mem::Bytes]
+    page: u64
+    end: u64
+    sections: Sections
+    lines: u64
+} Image
+
+/// A page a space has drawn or joined, or a table of pages it took for them: its index from the
+/// window's start, or the table's from the first, and its frame.
 linear struct Drawn {
     index: u64
     frame: hw::PhysFrame[4_096]
@@ -117,37 +133,43 @@ fn Loader.isolated_of(self, bundle: Slice[u8], body: Span, alloc: mem::Alloc) ->
     if not runtime.job or runtime.exports.len == 0 {
         fail LoadError.Interface
     }
-    let components = try components_of(bundle, parts, window: image_window(runtime), alloc)
-    var copy = mem::Bytes.empty(alloc)
-    mut copy.append(bundle)
-    var runtime_copy = mem::Bytes.empty(alloc)
-    mut runtime_copy.append(image)
-    return Isolated(bundle: take copy, parts: parts, components: take components, runtime_image: take runtime_copy, runtime: runtime)
+    let window = image_window(runtime)
+    let components = try components_of(bundle, parts, window, alloc)
+    return Isolated(bundle: shared_copy(bundle, alloc), parts: parts, window: window, components: mem::Shared.of(take components, alloc), runtime_image: shared_copy(image, alloc), runtime: runtime)
 } Loader.isolated_of
+
+/// A copy of bytes drawn through `alloc`, to share.
+fn shared_copy(bytes: Slice[u8], alloc: mem::Alloc) -> mem::Shared[mem::Bytes] {
+    var copy = mem::Bytes.empty(alloc)
+    mut copy.append(bytes)
+    return mem::Shared.of(take copy, alloc)
+} shared_copy
 
 pub fn Isolated.of_test(image: Slice[u8], alloc: mem::Alloc) -> Isolated fails LoadError {
     let runtime = try shaped(try parts_of(image, body: try body_of(image)))
     if not runtime.job or runtime.imports.len != 0 or runtime.hash.len != 0 or runtime.boot == 0 {
         fail LoadError.Malformed
     }
-    var copy = mem::Bytes.empty(alloc)
-    mut copy.append(image)
-    return Isolated(bundle: mem::Bytes.empty(alloc), parts: no_parts(), components: mem::List[Exported].empty(alloc), runtime_image: take copy, runtime: runtime)
+    return Isolated(bundle: shared_copy(b"", alloc), parts: no_parts(), window: image_window(runtime), components: mem::Shared.of(mem::List[Exported].empty(alloc), alloc), runtime_image: shared_copy(image, alloc), runtime: runtime)
 } Isolated.of_test
+
+pub fn Isolated.share(self) -> Isolated {
+    return Isolated(bundle: self.bundle.share(), parts: self.parts, window: self.window, components: self.components.share(), runtime_image: self.runtime_image.share(), runtime: self.runtime)
+} Isolated.share
 
 pub fn Isolated.job(self) -> Option[Job] {
     if not self.parts.job {
         return None
     }
-    return Some(Job.at(image_window(self.runtime) + self.parts.entry, stack: self.parts.stack))
+    return Some(Job.at(self.window + self.parts.entry, stack: self.parts.stack))
 } Isolated.job
 
 pub fn Isolated.component(self, name: Str) -> Option[Job] {
-    return component_in(self.components, name)
+    return component_in(self.components.contents(), name)
 } Isolated.component
 
 pub fn Isolated.schema(self, name: Str, alloc: mem::Alloc) -> Option[sys::ProtocolSchema] {
-    return schema_in(self.components, name, alloc)
+    return schema_in(self.components.contents(), name, alloc)
 } Isolated.schema
 
 /// Where a space places the image of a bundle, after the runtime's of these parts.
@@ -159,14 +181,14 @@ pub fn Isolated.space(self, cpu: hw::Ring0, data: u64, tenant: u64, mut frames: 
     let plan = plan_of(self.runtime, image: self.parts, data)
     let area = cpu.entry_area()
     let reach = Reach(low: area.base / PAGE, high: (area.base + area.len - 1) / PAGE)
-    if area.len == 0 or plan.end > USER_PAGES or u64.widen(frames.len()) < 3 + tables_of(plan) + plan.shared + reach.tables() {
+    let image_base = image_window(self.runtime)
+    if self.window != image_base or area.len == 0 or plan.end > USER_PAGES or u64.widen(frames.len()) < 3 + tables_of(plan) + plan.shared + reach.tables() {
         fail LoadError.Unplaceable
     }
     if reach.low / level_pages(0) <= USER_SLOT and reach.high / level_pages(0) >= USER_SLOT {
         fail LoadError.Unplaceable
     }
-    let image_base = image_window(self.runtime)
-    var runtime_copy = try relocated_copy(self.runtime_image.view(), parts: self.runtime, window: USER_WINDOW, alloc)
+    var runtime_copy = try relocated_copy(self.runtime_image.contents().view(), parts: self.runtime, window: USER_WINDOW, alloc)
     let runtime_base = address_of(mut runtime_copy)
     var image_copy = mem::Bytes.empty(alloc)
     if self.parts.size > 0 {
@@ -177,10 +199,73 @@ pub fn Isolated.space(self, cpu: hw::Ring0, data: u64, tenant: u64, mut frames: 
     mut space.fill(at_page: 0, from: runtime_base, len: self.runtime.size)
     if self.parts.size > 0 {
         mut space.fill(at_page: plan.image, from: address_of(mut image_copy), len: self.parts.size)
+        mut space.images.push(Image(bundle: self.bundle.share(), page: plan.image, end: plan.stack, sections: plan.image_sections, lines: image_base + self.parts.lines))
     }
     sync(space.pages[0].base(), len: plan.stack * PAGE)
     return space
 } Isolated.space
+
+pub fn Isolated.join(self, mut space: Space, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Isolated fails LoadError {
+    let count = space.images.len()
+    if count == 0 or self.parts.size == 0 or space.plan.image != pages_of(self.runtime.size) or space.plan.start != self.runtime.entry {
+        fail LoadError.Interface
+    }
+    for image in space.images {
+        if same_bytes(image.bundle, right: self.bundle) {
+            return try self.placed_at(at: image.page, alloc)
+        }
+    }
+    let start = space.top
+    let end = start + pages_of(self.parts.size)
+    var needed = end - start
+    for index in start..<end {
+        if (index == start or index % TABLE_ENTRIES == 0) and not space.holds_table(index / TABLE_ENTRIES) {
+            needed += 1
+        }
+    }
+    if end > USER_PAGES or u64.widen(frames.len()) < needed {
+        fail LoadError.Unplaceable
+    }
+    let placed = try self.placed_at(at: start, alloc)
+    var copy = try self.bound_copy(window: placed.window, alloc)
+    let sections = sections_of(self.parts)
+    for index in start..<end {
+        match attempt mut space.table_for(index, mut frames) {
+            Ok(_) => {}
+            Err(_) => fail LoadError.Unplaceable
+        }
+        let Some(frame) = mut frames.pop() else {
+            fail LoadError.Unplaceable
+        }
+        clear(frame.base())
+        write_entry(space.entry_of(index), value: user_entry(frame.base(), kind: image_kind(index - start, sections)))
+        mut space.drawn.insert(space.drawn_from(index), value: Drawn(index: index, frame: take frame))
+    }
+    mut space.fill(at_page: start, from: address_of(mut copy), len: self.parts.size)
+    for index in start..<end {
+        sync(space.frame_of(index).value_or(0), len: PAGE)
+    }
+    mut space.poke(space.images[count - 1].lines + LINES_NEXT, value: placed.window + self.parts.lines)
+    mut space.images.push(Image(bundle: self.bundle.share(), page: start, end: end, sections: sections, lines: placed.window + self.parts.lines))
+    space.top = end
+    return placed
+} Isolated.join
+
+/// The bundle as a space whose image of it starts at the page of index `at` places it, sharing
+/// its copies.
+fn Isolated.placed_at(self, at: u64, alloc: mem::Alloc) -> Isolated fails LoadError {
+    let window = USER_WINDOW + at * PAGE
+    if window == self.window {
+        return self.share()
+    }
+    let components = try components_of(self.bundle.contents().view(), parts: self.parts, window, alloc)
+    return Isolated(bundle: self.bundle.share(), parts: self.parts, window: window, components: mem::Shared.of(take components, alloc), runtime_image: self.runtime_image.share(), runtime: self.runtime)
+} Isolated.placed_at
+
+/// Whether two shared copies of bytes are one copy.
+fn same_bytes(left: mem::Shared[mem::Bytes], right: mem::Shared[mem::Bytes]) -> bool {
+    return hw::Ptr.of_view(left.contents().view()).addr() == hw::Ptr.of_view(right.contents().view()).addr()
+} same_bytes
 
 /// The address at which the runtime starts, with the address of a start record and the boot
 /// area's.
@@ -204,14 +289,31 @@ pub fn Space.boot_area(self) -> u64 {
 } Space.boot_area
 
 pub fn Space.share(mut self, frame: hw::UserFrame) -> u64 fails LoadError {
-    let index = self.plan.shared + self.shared
-    if index >= self.plan.boot {
-        fail LoadError.Unplaceable
+    for slot in 0u64..<SHARED_PAGES {
+        let bit = 1u64 << u32.fit(slot)
+        if (self.shared & bit) == 0 {
+            let index = self.plan.shared + slot
+            write_entry(self.entry_of(index), value: user_entry(frame.base(), kind: USER_WRITABLE))
+            self.shared |= bit
+            return USER_WINDOW + index * PAGE
+        }
     }
-    write_entry(self.entry_of(index), value: user_entry(frame.base(), kind: USER_WRITABLE))
-    self.shared += 1
-    return USER_WINDOW + index * PAGE
+    fail LoadError.Unplaceable
 } Space.share
+
+pub fn Space.unshare(mut self, address: u64) {
+    let low = USER_WINDOW + self.plan.shared * PAGE
+    if address < low or (address - low) % PAGE != 0 or (address - low) / PAGE >= SHARED_PAGES {
+        return
+    }
+    let slot = (address - low) / PAGE
+    let bit = 1u64 << u32.fit(slot)
+    if (self.shared & bit) != 0 {
+        write_entry(self.entry_of(self.plan.shared + slot), value: 0)
+        self.shared &= ~bit
+        untag(self.root)
+    }
+} Space.unshare
 
 pub fn Space.run(self, cpu: hw::Ring0, mut state: hw::UserState, mut extended: Option[hw::ExtendedState]) -> hw::UserExit {
     return trusted "the root maps the entry area page by page with the attributes the running root's walk gives it, and for user mode only the window, whose pages are frames the space owns, holding no value of the kernel, and user frames; the space untags its root once it unmaps a page, so a CPU's tag for it holds only what the root maps" { cpu.run_user_split(mut state, mut extended, root: self.root, tenant: self.tenant) }
@@ -294,7 +396,7 @@ pub fn Space.give_back(mut self, address: u64, len: u64, mut frames: mem::List[h
 
 /// Gives back every frame the space took.
 pub fn Space.release(take self, mut frames: mem::List[hw::PhysFrame[4_096]]) {
-    let Space(tenant: _, root: root, tables: tables, pages: pages, drawn: drawn, boot_tables: boot_tables, shared: _, plan: _) = self
+    let Space(tenant: _, root: root, tables: tables, pages: pages, drawn: drawn, taken_tables: taken_tables, shared: _, plan: _, images: _, top: _) = self
     untag(root)
     mut frames.push(take root.into_frame())
     given_back(take tables, mut frames)
@@ -303,7 +405,7 @@ pub fn Space.release(take self, mut frames: mem::List[hw::PhysFrame[4_096]]) {
         let Drawn(index: _, frame: frame) = held
         mut frames.push(take frame)
     }
-    for held in take boot_tables {
+    for held in take taken_tables {
         let Drawn(index: _, frame: frame) = held
         mut frames.push(take frame)
     }
@@ -329,7 +431,7 @@ fn Space.entry_of(self, index: u64) -> u64 {
     if table < tables_of(self.plan) {
         return self.tables[usize.widen(table) + 2].base() + offset
     }
-    return self.boot_tables[self.table_from(table)].frame.base() + offset
+    return self.taken_tables[self.table_from(table)].frame.base() + offset
 } Space.entry_of
 
 /// Whether the space holds the table of pages of an index.
@@ -338,7 +440,7 @@ fn Space.holds_table(self, table: u64) -> bool {
         return true
     }
     let at = self.table_from(table)
-    return at < self.boot_tables.len() and self.boot_tables[at].index == table
+    return at < self.taken_tables.len() and self.taken_tables[at].index == table
 } Space.holds_table
 
 /// Takes from the end of `frames` the table of pages mapping the page of an index when the space
@@ -353,16 +455,16 @@ fn Space.table_for(mut self, index: u64, mut frames: mem::List[hw::PhysFrame[4_0
     }
     clear(frame.base())
     write_entry(self.tables[1].base() + table * 8, value: user_entry(frame.base(), kind: USER_TABLE))
-    mut self.boot_tables.insert(self.table_from(table), value: Drawn(index: table, frame: take frame))
+    mut self.taken_tables.insert(self.table_from(table), value: Drawn(index: table, frame: take frame))
 } Space.table_for
 
-/// The position in `boot_tables` of the first table whose index is not below `table`.
+/// The position in `taken_tables` of the first table whose index is not below `table`.
 fn Space.table_from(self, table: u64) -> usize {
     var low: usize = 0
-    var high = self.boot_tables.len()
+    var high = self.taken_tables.len()
     while low < high {
         let middle = low + (high - low) / 2
-        if self.boot_tables[middle].index < table {
+        if self.taken_tables[middle].index < table {
             low = middle + 1
         } else {
             high = middle
@@ -457,9 +559,9 @@ fn tables_of(plan: Plan) -> u64 {
 /// A relocated copy of the bundle's image for its address `window`, its imports bound to the
 /// runtime's exports, drawn through `alloc`.
 fn Isolated.bound_copy(self, window: u64, alloc: mem::Alloc) -> mem::Bytes fails LoadError {
-    var copy = try relocated_copy(self.bundle.view(), parts: self.parts, window, alloc)
-    let image = self.runtime_image.view()
-    try bind(self.bundle.view(), parts: self.parts, base: address_of(mut copy), address: fn(index: u64) -> u64 fails LoadError {
+    var copy = try relocated_copy(self.bundle.contents().view(), parts: self.parts, window, alloc)
+    let image = self.runtime_image.contents().view()
+    try bind(self.bundle.contents().view(), parts: self.parts, base: address_of(mut copy), address: fn(index: u64) -> u64 fails LoadError {
         return try runtime_export(image, runtime: self.runtime, index)
     })
     return copy
@@ -485,7 +587,7 @@ fn mapped(plan: Plan, reach: Reach, tenant: u64, mut frames: mem::List[hw::PhysF
     for index in 0u64..<count {
         write_entry(tables[1].base() + index * 8, value: user_entry(tables[usize.widen(index) + 2].base(), kind: USER_TABLE))
     }
-    let space = Space(tenant: tenant, root: hw::PageTableRoot.of(take root), tables: take tables, pages: take pages, drawn: mem::List[Drawn].empty(alloc), boot_tables: mem::List[Drawn].empty(alloc), shared: 0, plan: plan)
+    let space = Space(tenant: tenant, root: hw::PageTableRoot.of(take root), tables: take tables, pages: take pages, drawn: mem::List[Drawn].empty(alloc), taken_tables: mem::List[Drawn].empty(alloc), shared: 0, plan: plan, images: mem::List[Image].empty(alloc), top: plan.end)
     for index in 0u64..<plan.shared {
         write_entry(space.entry_of(index), value: user_entry(space.pages[usize.widen(index)].base(), kind: space.kind_of(index)))
     }
@@ -617,6 +719,13 @@ fn Space.kind_of(self, index: u64) -> u64 {
     if index < plan.stack {
         return image_kind(index - plan.image, sections: plan.image_sections)
     }
+    if index >= plan.end {
+        for image in self.images {
+            if index >= image.page and index < image.end {
+                return image_kind(index - image.page, sections: image.sections)
+            }
+        }
+    }
     return USER_WRITABLE
 } Space.kind_of
 
@@ -633,7 +742,7 @@ fn image_kind(index: u64, sections: Sections) -> u64 {
 
 /// Whether `len` bytes from `address` lie in pages the space maps, each writable for `writing`.
 fn Space.covers(self, address: u64, len: u64, writing: bool) -> bool {
-    let end = USER_WINDOW + self.plan.end * PAGE
+    let end = USER_WINDOW + self.top * PAGE
     if address < USER_WINDOW or address > end or end - address < len {
         return false
     }
@@ -661,6 +770,15 @@ fn Space.each_part(self, address: u64, len: u64, body: fn(physical: u64, at: u64
         at += count
     }
 } Space.each_part
+
+/// Writes a word at an address of a page the space owns, whatever the page's kind.
+fn Space.poke(mut self, address: u64, value: u64) {
+    let word = Array[u64, 1].filled(value)
+    let from = u64.widen(hw::Ptr.of_view(word.view()).addr())
+    self.each_part(address, len: 8, body: fn(physical: u64, at: u64, count: u64) {
+        copy_memory(from + at, to: physical, len: count)
+    })
+} Space.poke
 
 /// Copies `len` bytes of runtime memory at `from` into the space's pages from `at_page`.
 fn Space.fill(mut self, at_page: u64, from: u64, len: u64) {

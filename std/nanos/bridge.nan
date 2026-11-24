@@ -1085,6 +1085,14 @@ fn payload_of(handle: u64, take bytes: mem::Bytes, crossed: u64, alloc: mem::All
     if bytes.len() < MOVED_FROM {
         return Payload(bytes: take bytes, carried: crossed, moved: 0)
     }
+    let token = try pages_moved(handle, operation: BRIDGE_MOVE, bytes: bytes.view(), alloc)
+    return Payload(bytes: mem::Bytes.empty(alloc), carried: crossed, moved: token)
+} payload_of
+
+/// Copies `bytes` into pages of their own and moves those pages out of the space through the
+/// operation `operation` of the capability of the space's table whose handle is `handle`, giving
+/// the token they moved under; fails with `RunnerError.Unknown` when the kernel moves none.
+fn pages_moved(handle: u64, operation: u64, bytes: Slice[u8], alloc: mem::Alloc) -> u64 fails sys::RunnerError {
     let len = u64.widen(bytes.len())
     var pages = mem::Bytes.zeroed(usize.widen(paged(len) + PAGE_BYTES), alloc)
     let start = u64.widen(hw::Ptr.of_view(pages.view()).addr())
@@ -1097,14 +1105,14 @@ fn payload_of(handle: u64, take bytes: mem::Bytes, crossed: u64, alloc: mem::All
         fail sys::RunnerError.Unknown
     }
     var into = held
-    mut into.copy_from(bytes.view())
+    mut into.copy_from(bytes)
     var nothing = Array[u8, 1].filled(0)
-    let token = invoke(handle, operation: BRIDGE_MOVE, args: encoded(Span(address: start + offset, len: len), alloc).view(), result: mut nothing.view_mut())
+    let token = invoke(handle, operation, args: encoded(Span(address: start + offset, len: len), alloc).view(), result: mut nothing.view_mut())
     if token >= FAILURES {
         fail sys::RunnerError.Unknown
     }
-    return Payload(bytes: mem::Bytes.empty(alloc), carried: crossed, moved: token)
-} payload_of
+    return token
+} pages_moved
 
 /// The bytes a payload carries over the end of a bridge whose handle is `handle`: its own, or those
 /// of the frames that moved into the space for it, which the space maps in place of pages of its
@@ -1154,16 +1162,18 @@ struct Accepting derives Copy, Encode {
     address: u64
 } Accepting
 
-/// What the task keeping the frames moving into an isolation's space is given: frames that moved,
-/// an ask for the length of what moved under a token, or an ask for those frames.
+/// What the task keeping the frames moving into an isolation's space, or to its kernel, is given:
+/// frames that moved, an ask for the length of what moved under a token, or an ask for those
+/// frames.
 linear enum Moving {
     Parked(Moved)
     Sized(Sizing)
     Claimed(Claiming)
 } Moving
 
-/// Frames that moved into an isolation's space for the end of a bridge whose handle is `handle`,
-/// under `token`, holding `len` bytes.
+/// Frames that moved into an isolation's space for the end of a bridge whose handle is `handle`, or
+/// to its kernel through the runner capability whose handle it is, under `token`, holding `len`
+/// bytes.
 linear struct Moved {
     token: u64
     handle: u64
@@ -1187,8 +1197,9 @@ struct Claiming {
     reply: task::Sender[Moved]
 } Claiming
 
-/// Keeps the frames moving into an isolation's space until the end of a bridge they moved for
-/// claims them, and gives every frame left once no sender of `moving` is left.
+/// Keeps the frames moving into an isolation's space, or to its kernel, until the end of a bridge
+/// or the runner capability they moved for claims them, and gives every frame left once no sender
+/// of `moving` is left.
 fn moves_kept(take moving: task::Receiver[Moving], alloc: mem::Alloc) -> mem::List[hw::PhysFrame[4_096]] fails task::Cancelled uses wait {
     var parked = mem::List[Moved].empty(alloc)
     discard attempt await take moving.drain(visit: fn[mut parked](take message: Moving) {
@@ -1262,10 +1273,10 @@ fn Door.moves_ended(self) fails task::Cancelled uses wait {
     }
 } Door.moves_ended
 
-/// Moves the pages `span` names out of `space` into the space of the other end `peer` reaches of a
-/// bridge, for the end whose handle is `handle` there, giving the token they moved under; gives
-/// `INVALID`, the frames it took going to `frames`, when `space` does not map each of those pages or
-/// that end's isolation takes no more.
+/// Moves the pages `span` names out of `space` to the isolation `peer` reaches, for the end of a
+/// bridge or the runner capability whose handle is `handle` there, giving the token they moved
+/// under; gives `INVALID`, the frames it took going to `frames`, when `space` does not map each of
+/// those pages or that isolation takes no more.
 fn moved_out(peer: Doorway, handle: u64, span: Span, mut space: sys::load::Space, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
     if span.len == 0 or span.len > MOST_MOVED or span.address % PAGE_BYTES != 0 {
         return INVALID
@@ -1327,17 +1338,9 @@ fn Door.moved_len(self, handle: u64, token: u64, alloc: mem::Alloc) -> u64 fails
 /// giving the length of what moved; `INVALID` when nothing did or the space cannot map them there,
 /// which gives them to `frames`.
 fn Door.accepted(self, handle: u64, accepting: Accepting, mut space: sys::load::Space, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
-    let Some(mover) = try await self.mover() else {
-        return INVALID
-    }
-    let task::Channel(sender: reply, receiver: replies) = task::Channel[Moved].bounded(1, alloc)
-    discard attempt await mover.send(Moving.Claimed(Claiming(token: accepting.token, handle: handle, reply: take reply)))
-    var answered = mem::List[Moved].empty(alloc)
-    discard attempt await take replies.drain(visit: fn[mut answered](take moved: Moved) {
-        mut answered.push(take moved)
-    })
+    let claims = try await self.moves_claimed(handle, token: accepting.token, alloc)
     var len = INVALID
-    for moved in take answered {
+    for moved in take claims {
         let Moved(token: _, handle: _, len: held, frames: given) = moved
         match attempt mut space.adopt(accepting.address, moved: take given, mut frames) {
             Ok(_) => {
@@ -1348,3 +1351,19 @@ fn Door.accepted(self, handle: u64, accepting: Accepting, mut space: sys::load::
     }
     return len
 } Door.accepted
+
+/// What moved into the space of a door's isolation, or to its kernel, under `token` for the end of
+/// a bridge or the runner capability whose handle is `handle`, claimed from the task keeping it;
+/// empty when nothing did.
+fn Door.moves_claimed(self, handle: u64, token: u64, alloc: mem::Alloc) -> mem::List[Moved] fails task::Cancelled uses wait {
+    let Some(mover) = try await self.mover() else {
+        return mem::List[Moved].empty(alloc)
+    }
+    let task::Channel(sender: reply, receiver: replies) = task::Channel[Moved].bounded(1, alloc)
+    discard attempt await mover.send(Moving.Claimed(Claiming(token: token, handle: handle, reply: take reply)))
+    var claims = mem::List[Moved].empty(alloc)
+    discard attempt await take replies.drain(visit: fn[mut claims](take moved: Moved) {
+        mut claims.push(take moved)
+    })
+    return claims
+} Door.moves_claimed

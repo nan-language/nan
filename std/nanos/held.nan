@@ -218,18 +218,20 @@ fn called_down(take calls: task::Receiver[Called], out: task::Sender[mem::Bytes]
     }
 } called_down
 
-/// Routes through `answers` each answer the space sends up the first channel of `link`, a call's
-/// reply drawn through the allocator `allocs` keeps for it and its handles those of the entries of
-/// the space's `table` it names, and calls through `runner` each port the instance calls, and each
-/// waiting operation of a capability of a crossing kind the instance holds in `table`, on a task of
-/// its own sending `out` the frame of the reply; once the space frames a message it cannot decode
-/// or longer than `MOST_BYTES`, it stops hearing it and has `isolation` end the instance numbered
-/// `job` as breaching the channel.
+/// Routes through `answers` each answer the space sends up the first channel of `link`, or moves to
+/// the kernel when too long for it, a call's reply drawn through the allocator `allocs` keeps for it
+/// and its handles those of the entries of the space's `table` it names, and calls through `runner`
+/// each port the instance calls, and each waiting operation of a capability of a crossing kind the
+/// instance holds in `table`, on a task of its own sending `out` the frame of the reply; once the
+/// space frames a message it cannot decode or longer than `MOST_BYTES`, or names wrongly where one
+/// moved, it stops hearing it and has `isolation` end the instance numbered `job` as breaching the
+/// channel.
 fn answered_up(isolation: Isolation, link: Link, answers: task::Sender[Routed], allocs: task::Cown[mem::Map[u64, mem::Alloc]], table: Table, job: u64, runner: sys::Runner, out: task::Sender[mem::Bytes], alloc: mem::Alloc) fails task::Cancelled uses wait {
     var pending = mem::Bytes.empty(alloc)
     try await task::scope(isolation.exec, body: fn[mut pending](s: task::Scope) fails task::Cancelled uses wait {
         loop {
-            let up = match try await next_up(link, mut pending, alloc) {
+            let heard = try await next_up(link, mut pending, alloc)
+            let up = match try await moved_heard(isolation, take heard, table, job, alloc) {
                 Heard.Up(up) => up
                 Heard.Breach => {
                     try await isolation.door.contents().asked(Ask.Breach(job))
@@ -253,6 +255,10 @@ fn answered_up(isolation: Isolation, link: Link, answers: task::Sender[Routed], 
                     discard s.spawn(fn[take operation, take replying]() fails task::Cancelled uses wait {
                         try await kind_awaited(take operation, table, job, out: replying, alloc)
                     })
+                }
+                Up.Moved(_) => {
+                    try await isolation.door.contents().asked(Ask.Breach(job))
+                    return
                 }
             }
         }
@@ -290,6 +296,69 @@ fn next_up(link: Link, mut pending: mem::Bytes, alloc: mem::Alloc) -> Heard fail
         mut pending.append(bytes_of(received.view(), alloc).view())
     }
 } next_up
+
+/// What the kernel hears of a message the space sends: when it names where the encoding of another
+/// moved through the runner capability the space's `table` holds for the instance numbered `job`,
+/// that other message, read from the frames it moved in by the task running the space of
+/// `isolation`; a breach when it names another capability, nothing moved under its token or what
+/// moved does not decode; what it heard otherwise.
+fn moved_heard(isolation: Isolation, take heard: Heard, table: Table, job: u64, alloc: mem::Alloc) -> Heard fails task::Cancelled uses wait {
+    let Heard.Up(Up.Moved(movement)) = heard else {
+        return heard
+    }
+    let Some(entry) = table.held.get(movement.handle) else {
+        return Heard.Breach
+    }
+    let Holding.Runner = entry.holding else {
+        return Heard.Breach
+    }
+    if entry.job != job {
+        return Heard.Breach
+    }
+    let task::Channel(sender: reply, receiver: replies) = task::Channel[mem::Bytes].bounded(1, alloc)
+    try await isolation.door.contents().asked(Ask.Read(Reading(handle: movement.handle, token: movement.token, reply: take reply)))
+    var receiver = replies
+    let Some(bytes) = try await mut receiver.receive() else {
+        return Heard.Breach
+    }
+    return up_of(bytes, alloc)
+} moved_heard
+
+/// Gives through its reply the bytes that moved to the kernel of a door's isolation under the token
+/// `reading` names, through the runner capability whose handle it names, read from the frames
+/// holding them, which go back to `frames`; drops the ask when nothing moved so.
+fn Door.read(self, take reading: Reading, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let Reading(handle: handle, token: token, reply: reply) = reading
+    let claims = try await self.moves_claimed(handle, token, alloc)
+    for moved in take claims {
+        let Moved(token: _, handle: _, len: len, frames: held) = moved
+        discard reply.offer(frames_read(held, len, alloc))
+        for frame in take held {
+            mut frames.push(take frame)
+        }
+    }
+} Door.read
+
+/// The first `len` bytes the frames of `held` hold, in order.
+fn frames_read(held: mem::List[hw::PhysFrame[4_096]], len: u64, alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.zeroed(usize.widen(len), alloc)
+    let into = hw::Ptr.of_view_mut(mut bytes.view_mut())
+    var at: u64 = 0
+    for frame in held {
+        if at == len {
+            break
+        }
+        var count = PAGE_BYTES
+        if len - at < count {
+            count = len - at
+        }
+        trusted "the frame is one the kernel took out of a space, which the shared space maps at its physical address, and `bytes` holds `len` bytes" {
+            hw::Ptr[u8].of_addr(usize.widen(frame.base())).copy(into.offset(isize.fit(at)), count: usize.widen(count))
+        }
+        at += count
+    }
+    return bytes
+} frames_read
 
 /// What the kernel hears of a frame: the message it holds, a breach when it does not decode.
 fn up_of(frame: mem::Bytes, alloc: mem::Alloc) -> Heard {
@@ -480,13 +549,23 @@ struct Calling derives Encode {
 } Calling
 
 /// What the space of an instance sends its kernel: an answer of its instance, a call its instance
-/// makes through a port of its runner capability, or a waiting operation it calls of a capability
-/// of a crossing kind.
+/// makes through a port of its runner capability, a waiting operation it calls of a capability of a
+/// crossing kind, or where the encoding of one of those too long for the first channel of its link
+/// moved.
 enum Up derives Encode {
     Answered(Answering)
     Called(PortCall)
     Awaited(Awaiting)
+    Moved(Movement)
 } Up
+
+/// Where the encoding of a message too long for the first channel of a link moved to the kernel:
+/// the handle of the runner capability of the space's table it moved through, and the token it
+/// moved under.
+struct Movement derives Copy, Encode {
+    handle: u64
+    token: u64
+} Movement
 
 /// An answer of an instance and the number of the wait it ends.
 struct Answering derives Encode {
@@ -593,32 +672,40 @@ enum Refusal derives Encode {
     Closed
 } Refusal
 
-/// The frame of the `mem::wire` encoding of a value: the encoding's length as four little-endian
-/// bytes, then the encoding.
+/// The frame of the `mem::wire` encoding of a value.
 fn framed[V: Encode](value: V, alloc: mem::Alloc) -> mem::Bytes {
-    let body = encoded(value, alloc)
+    return headed(encoded(value, alloc), alloc)
+} framed
+
+/// The frame of an encoding: its length as four little-endian bytes, then the encoding.
+fn headed(body: mem::Bytes, alloc: mem::Alloc) -> mem::Bytes {
     var frame = mem::Bytes.zeroed(FRAME_HEAD, alloc)
     mut frame.view_mut().write_u32_le(0, value: u32.truncate(body.len()))
     mut frame.append(body.view())
     return frame
-} framed
+} headed
 
-/// The frame of what an instance's space sends up the first channel of its link, none when its
-/// encoding is longer than `MOST_BYTES`, which the kernel takes as a breach.
-fn up_framed(up: Up, alloc: mem::Alloc) -> Option[mem::Bytes] {
-    let frame = framed(up, alloc)
-    if u64.widen(frame.len() - FRAME_HEAD) > MOST_BYTES {
+/// The frame of what an instance's space sends up the first channel of its link: of `up`, or, when
+/// its encoding is longer than `MOST_BYTES`, which the kernel takes as a breach, of where the pages
+/// holding that encoding moved to the kernel through the runner capability of the space's table
+/// whose handle is `runner`; none when the kernel moves none.
+fn up_framed(up: Up, runner: u64, alloc: mem::Alloc) -> Option[mem::Bytes] {
+    let body = encoded(up, alloc)
+    if u64.widen(body.len()) <= MOST_BYTES {
+        return Some(headed(body, alloc))
+    }
+    let Ok(token) = attempt pages_moved(runner, operation: RUN_MOVE, bytes: body.view(), alloc) else {
         return None
     }
-    return Some(take frame)
+    return Some(framed(Up.Moved(Movement(handle: runner, token: token)), alloc))
 } up_framed
 
-/// The frame of the answer numbered `id` of an instance's space; when it is longer than
-/// `MOST_BYTES`, a call's reply is refused as malformed and an encoding is sent without its bytes
-/// and handles.
-fn answer_framed(id: u64, take sent: Sent, alloc: mem::Alloc) -> mem::Bytes {
+/// The frame of the answer numbered `id` of an instance's space, as `up_framed` frames it through
+/// the runner capability whose handle is `runner`; when the kernel moves none, a call's reply is
+/// refused as malformed and an encoding is sent without its bytes and handles.
+fn answer_framed(id: u64, runner: u64, take sent: Sent, alloc: mem::Alloc) -> mem::Bytes {
     let up = Up.Answered(Answering(id: id, answer: take sent))
-    match up_framed(up, alloc) {
+    match up_framed(up, runner, alloc) {
         Some(frame) => return frame
         None => {}
     }
@@ -628,8 +715,9 @@ fn answer_framed(id: u64, take sent: Sent, alloc: mem::Alloc) -> mem::Bytes {
     return framed(Up.Answered(Answering(id: id, answer: trimmed(take oversized, alloc))), alloc)
 } answer_framed
 
-/// An answer too long for the first channel of a link as its space sends it instead: a call's reply
-/// refused as malformed, an encoding without its bytes and handles.
+/// An answer whose encoding neither the first channel of a link carries nor the kernel moves as its
+/// space sends it instead: a call's reply refused as malformed, an encoding without its bytes and
+/// handles.
 fn trimmed(take sent: Sent, alloc: mem::Alloc) -> Sent {
     match sent {
         Sent.Served(_) => return Sent.Refused(Refusal.Malformed(decode_code(core::DecodeError.Invalid)))
@@ -774,7 +862,7 @@ fn served_instance(job: sys::load::Job, port: Port, base: Remote, runner: u64, d
             try await relayed_in(port, requests: take down, calls: take inbox, base, waits: replies, exec, alloc)
         })
         discard s.spawn(fn[take answering, take framing, take answering_across]() fails task::Cancelled uses wait {
-            try await relayed_out(answered: take answering, up: framing, base, bridges: answering_across, alloc)
+            try await relayed_out(answered: take answering, up: framing, base, runner, bridges: answering_across, alloc)
         })
         discard s.spawn(fn[take noticing, take replying, take bridging]() fails task::Cancelled uses wait {
             try await bridges_served(notices: take noticing, late: take replying, bridges, calls: bridging, exec)
@@ -896,10 +984,11 @@ fn stopped_by(id: u64, mut stops: mem::Map[u64, task::Sender[u8]], alloc: mem::A
     return receiver
 } stopped_by
 
-/// Sends `up` the frame of each answer of the instance, its handles named through `base`, and over
-/// its bridge each answer to a call that came over one, until every sender of `answered` is
-/// released.
-fn relayed_out(take answered: task::Receiver[Routed], up: task::Sender[mem::Bytes], base: Remote, bridges: Bridges, alloc: mem::Alloc) fails task::Cancelled uses wait {
+/// Sends `up` the frame of each answer of the instance, its handles named through `base`, one too
+/// long for the first channel of the link moving through the runner capability whose handle is
+/// `runner`, and over its bridge each answer to a call that came over one, until every sender of
+/// `answered` is released.
+fn relayed_out(take answered: task::Receiver[Routed], up: task::Sender[mem::Bytes], base: Remote, runner: u64, bridges: Bridges, alloc: mem::Alloc) fails task::Cancelled uses wait {
     var receiver = answered
     loop {
         let Some(Routed.Answered(Replied(id: id, answer: answer))) = try await mut receiver.receive() else {
@@ -909,7 +998,7 @@ fn relayed_out(take answered: task::Receiver[Routed], up: task::Sender[mem::Byte
             try await answered_across(id, take answer, bridges)
             continue
         }
-        let frame = answer_framed(id, sent: sent_of(take answer, base, alloc), alloc)
+        let frame = answer_framed(id, runner, sent: sent_of(take answer, base, alloc), alloc)
         let Ok(_) = attempt await up.send(take frame) else {
             return
         }
@@ -964,10 +1053,11 @@ struct Forward derives Copy {
     alloc: mem::Alloc
 } Forward
 
-/// What reaching the runner capability of an instance's space gives for a call through a port: the
-/// ends of bridges it calls ports through among it.
+/// What reaching the runner capability of an instance's space gives for a call through a port: its
+/// handle, and the ends of bridges it calls ports through among it.
 struct Calls {
     base: Remote
+    runner: u64
     up: task::Sender[mem::Bytes]
     waits: task::Cown[PortWaits]
     ports: task::Cown[mem::Map[u64, Pump]]
@@ -1018,10 +1108,10 @@ fn Forwarder.send_to(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8],
 } Forwarder.send_to
 
 fn Forwarder.call(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], handles: Slice[sys::Handle], alloc: mem::Alloc) -> sys::Encoded fails sys::RunnerError uses wait limits stack 4_096 {
-    let Some(calls) = sys::reach(self, body: fn(state: Forwarding, handle: u64) => Calls(base: state.base, up: state.up.split(), waits: state.waits.share(), ports: state.bridges.ports.share())) else {
+    let Some(calls) = sys::reach(self, body: fn(state: Forwarding, handle: u64) => Calls(base: state.base, runner: handle, up: state.up.split(), waits: state.waits.share(), ports: state.bridges.ports.share())) else {
         fail sys::RunnerError.Revoked(sys::Revoked.Stale)
     }
-    let Calls(base: base, up: up, waits: waits, ports: ports) = calls
+    let Calls(base: base, runner: runner, up: up, waits: waits, ports: ports) = calls
     let sent = try naming(base, bytes, handles, alloc)
     var across: Option[Pump] = None
     await when mut ports {
@@ -1037,7 +1127,7 @@ fn Forwarder.call(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], ha
         None => {}
     }
     let Waiting(id: id, answers: answers) = try await wait_added(waits, alloc)
-    let frame = up_framed(Up.Called(PortCall(id: id, port: port, hash: hash, call: take sent)), alloc)
+    let frame = up_framed(Up.Called(PortCall(id: id, port: port, hash: hash, call: take sent)), runner, alloc)
     let Some(answered) = try await answer_awaited(up, waits, id, take frame, take answers) else {
         fail sys::RunnerError.Unknown
     }

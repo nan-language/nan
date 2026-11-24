@@ -1,4 +1,4 @@
-//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port, their random source from a counter and their file system from a disk writing each call it serves through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, with the reports of their traps, a job reading kernel memory, in a domain of its own and outside it, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, instances of a component whose calls, a postponed one included, keyed tasks, held ones included, messages sent to themselves and checkpoints run in their spaces, with logs and gauges crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, an instance sharing its space with a job that traps and divides, with another instance that is abandoned and with one whose space breaches its link, a book and tellers in two spaces calling it over a bridge, a log crossing there and back, payloads streamed and moved through frames of their own, a breach ending the book, and calls and replies past what a link carries failing, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
+//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port, their random source from a counter and their file system from a disk writing each call it serves through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, with the reports of their traps, a job reading kernel memory, in a domain of its own and outside it, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, instances of a component whose calls, a postponed one included, keyed tasks, held ones included, messages sent to themselves and checkpoints run in their spaces, with logs and gauges crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, an instance sharing its space with a job that traps and divides, with another instance that is abandoned and with one whose space breaches its link, a book and tellers in two spaces calling it over a bridge, a log crossing there and back, payloads streamed and moved through frames of their own, a breach ending the book, and calls, replies, states and a job's result past what a link carries leaving their spaces, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -39,11 +39,13 @@ pub closed enum Ask derives Encode {
     Hold(u32)
     Echo
     Probe
+    Fill(u32)
 } Ask
 
 pub closed enum Answer derives Encode {
     Summary(Summary)
     Number(u64)
+    Bytes(mem::Bytes)
 } Answer
 
 /// The book's protocol and state, as the kernel declares them.
@@ -72,6 +74,15 @@ pub closed struct Book derives Encode {
     pub ticks: u64
     pub pending: u64
 } Book
+
+/// The hoard's protocol and state, as the kernel declares them.
+pub protocol Hoarding {
+    pub fn grow(kibibytes: u32) -> u64 limits recorded
+} Hoarding
+
+pub closed struct Hoard derives Encode {
+    pub bytes: mem::Bytes
+} Hoard
 
 /// The serial port serving a job's log and standard streams, its state counting the bytes of
 /// standard input it has given and its record 1 for the log the book notes through.
@@ -679,8 +690,10 @@ fn serve(cpu: hw::Ring0, loader: sys::load::Loader, grants: Grants, mut frames: 
     var holdings = mem::List[mem::Bytes].empty(grants.alloc)
     mut holdings.push(encoded(Ask.Hold(4), alloc: grants.alloc))
     mut holdings.push(encoded(Ask.Hold(64), alloc: grants.alloc))
+    mut holdings.push(encoded(Ask.Fill(1_100), alloc: grants.alloc))
     var holds = try await ran(cpu, job: typed, name: "hold", grants, inputs: take holdings, mut frames)
     say_answer(text: "held pages ", bytes: mut holds.remove(0), alloc: grants.alloc)
+    say_filled(mut holds.remove(1), alloc: grants.alloc)
     drew(cpu, job: typed, grants, mut frames)
     try await linked(cpu, job: typed, grants, mut frames)
     let ledger = isolated(loader, bytes: fw_file(name: "opt/nan/ledger", alloc: grants.alloc).view(), alloc: grants.alloc)
@@ -793,12 +806,12 @@ fn linked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: 
     take link.release(mut frames)
 } linked
 
-/// Reads the protocol schema of the ledger's book, then holds instances of the book in spaces over
-/// the first channel of a link, with a gauge in their worlds, acting through a runner the kernel
-/// serves: started, called, given a log it notes through, publishing its total, and gives back,
-/// lent logs through its runner, gauged, refused a call carrying a clock, checkpointed and ended,
-/// then restored from that checkpoint, a handler that traps and a handler that never returns until
-/// the instance is abandoned.
+/// Reads the protocol schema of the ledger's book, then holds in a space over the first channel of
+/// a link a hoard, then instances of the book, with a gauge in their worlds, acting through a runner
+/// the kernel serves: started, called, given a log it notes through, publishing its total, and
+/// gives back, lent logs through its runner, gauged, refused a call carrying a clock, checkpointed
+/// and ended, then restored from that checkpoint, a handler that traps and a handler that never
+/// returns until the instance is abandoned.
 fn booked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
     let Some(schema) = job.schema("Book", alloc: grants.alloc) else {
         stop(text: "no schema\n")
@@ -827,6 +840,7 @@ fn booked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: 
     var pool = frames_for_space(mut frames, alloc: grants.alloc)
     var extended = Some(hw::ExtendedState.of(next_frame(mut frames)))
     discard attempt await nanos::isolate(cpu, tenant: 4, services: services(grants), frames: mut pool, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn(space: nanos::Isolation) fails task::Cancelled uses wait {
+        try await hoarded(space, job, link, grants)
         let opened = attempt await nanos::hold_isolated(space, job, component: "Book", link, caps, checkpoint: None, runner, alloc: grants.alloc, body: fn(take instance: nanos::Instance) -> nanos::Checkpoint fails nanos::InstanceError uses wait {
             return try await started(take instance, grants, gauging, gauges: Gauges(world: gauge, given: given))
         })
@@ -921,16 +935,22 @@ fn shared(cpu: hw::Ring0, book: sys::load::Isolated, job: sys::load::Isolated, g
     take malformed.release(mut frames)
 } shared
 
-/// Has the book fill 2 MiB, a reply longer than the first channel of its link carries, and writes
-/// how the call failed.
+/// Has the book fill 1,100 KiB, a reply longer than the first channel of its link carries, and
+/// writes the bytes it replies.
 fn filled(mut book: nanos::Instance, grants: Grants) fails nanos::InstanceError uses wait {
     var request = sys::Encoded.empty(grants.alloc)
-    discard sys::Wire[Ledger].fill(mut request, kibibytes: 2_048)
+    let fill = sys::Wire[Ledger].fill(mut request, kibibytes: 1_100)
     say(text: "book filled ")
-    match try await called(mut book, take request, grants) {
-        Ok(_) => say(text: "2 MiB\n")
-        Err(sys::CallError.Malformed(core::DecodeError.Invalid)) => say(text: "malformed\n")
-        else => say(text: "otherwise\n")
+    let Ok(given) = try await called(mut book, take request, grants) else {
+        say(text: "nothing\n")
+        return
+    }
+    match attempt fill.decode(Untrusted.of(given.bytes.view()), handles: given.handles.view(), alloc: grants.alloc) {
+        Ok(bytes) => {
+            say_number(u64.widen(bytes.len()))
+            say(text: "\n")
+        }
+        Err(_) => say(text: "nothing\n")
     }
 } filled
 
@@ -1100,7 +1120,7 @@ fn breaching(take instance: nanos::Instance, link: nanos::Link, port: usize, mut
     sys::Wire[Till].relay(mut relay, amount: 1)
     try await till_done(mut teller, request: take relay, grants)
     var weighed = sys::Encoded.empty(grants.alloc)
-    sys::Wire[Till].weigh(mut weighed, kibibytes: 2_048)
+    sys::Wire[Till].weigh(mut weighed, kibibytes: 1_100)
     try await till_done(mut teller, request: take weighed, grants)
     undefer teller
     say(text: "second teller ")
@@ -1236,7 +1256,7 @@ fn gauged(mut book: nanos::Instance, grants: Grants, gauging: sys::Minter[gauges
 fn postponed(mut book: nanos::Instance, grants: Grants) fails nanos::InstanceError uses wait {
     var waiting = sys::Encoded.empty(grants.alloc)
     discard sys::Wire[Ledger].wait(mut waiting)
-    match try await answered(mut book, number: 4, request: take waiting, grants) {
+    match try await answered(mut book, hash: sys::Wire[Ledger].hash(), number: 4, request: take waiting, grants) {
         Ok(None) => say(text: "book postponed a wait\n")
         else => say(text: "book answered a wait\n")
     }
@@ -1511,16 +1531,16 @@ fn added(mut book: nanos::Instance, amount: u32, grants: Grants) fails nanos::In
 /// The reply of the book to a call, which the instance handles in the next step its holder takes,
 /// closed when the book postpones it.
 fn called(mut book: nanos::Instance, take request: sys::Encoded, grants: Grants) -> Result[sys::Encoded, sys::CallError[Never]] fails nanos::InstanceError uses wait {
-    match try await answered(mut book, number: 0, take request, grants) {
+    match try await answered(mut book, hash: sys::Wire[Ledger].hash(), number: 0, take request, grants) {
         Ok(Some(reply)) => return Ok(take reply)
         Ok(None) => return Err(sys::CallError.Closed(task::SendError.Closed))
         Err(failure) => return Err(take failure)
     }
 } called
 
-/// The reply of the book to a call numbered `number`, which the instance handles in the next step
-/// its holder takes, none when the book postpones it.
-fn answered(mut book: nanos::Instance, number: u64, take request: sys::Encoded, grants: Grants) -> Result[Option[sys::Encoded], sys::CallError[Never]] fails nanos::InstanceError uses wait {
+/// The reply of an instance to a call of the protocol whose hash is `hash`, numbered `number`, which
+/// the instance handles in the next step its holder takes, none when the instance postpones it.
+fn answered(mut book: nanos::Instance, hash: sys::ProtocolHash, number: u64, take request: sys::Encoded, grants: Grants) -> Result[Option[sys::Encoded], sys::CallError[Never]] fails nanos::InstanceError uses wait {
     var pending = Some(take request)
     var reply: Result[Option[sys::Encoded], sys::CallError[Never]] = Err(sys::CallError.Closed(task::SendError.Closed))
     try await task::scope(grants.exec, body: fn[mut book, mut pending, mut reply](s: task::Scope) fails nanos::InstanceError uses wait {
@@ -1529,7 +1549,7 @@ fn answered(mut book: nanos::Instance, number: u64, take request: sys::Encoded, 
         }
         let inbox = book.inbox()
         let replied = s.spawn(fn[take inbox, take call]() -> Result[Option[sys::Encoded], sys::CallError[Never]] fails task::Cancelled uses wait limits stack 16_384 {
-            return attempt await inbox.call(sys::Wire[Ledger].hash(), request: number, encoding: take call, alloc: grants.alloc)
+            return attempt await inbox.call(hash, request: number, encoding: take call, alloc: grants.alloc)
         })
         try await book.incoming()
         discard try await mut book.step()
@@ -1537,6 +1557,97 @@ fn answered(mut book: nanos::Instance, number: u64, take request: sys::Encoded, 
     })
     return reply
 } answered
+
+/// Grows a hoard past what the first channel of its link carries, checkpoints it and ends it, then
+/// restores it from that checkpoint and ends it, writing the bytes each state holds.
+fn hoarded(space: nanos::Isolation, job: sys::load::Isolated, link: nanos::Link, grants: Grants) fails task::Cancelled uses wait {
+    let held = attempt await nanos::hold_isolated(space, job, component: "Hoard", link, caps: nanos::Caps.empty(grants.alloc), checkpoint: None, runner: sys::Runner.denied(), alloc: grants.alloc, body: fn(take instance: nanos::Instance) -> nanos::Checkpoint fails nanos::InstanceError uses wait {
+        var hoard = instance
+        defer take hoard.abandon()
+        say(text: "hoard grew ")
+        try await grown(mut hoard, kibibytes: 1_100, grants)
+        let checkpoint = try await hoard.checkpoint()
+        say(text: "hoard checkpoint ")
+        say_hoard(checkpoint.bytes, alloc: grants.alloc)
+        say(text: "hoard checkpoint as its own ")
+        match try await hoard.checkpoint_as(checkpoint.schema) {
+            Some(own) => say_hoard(own.bytes, alloc: grants.alloc)
+            None => say(text: "none\n")
+        }
+        undefer hoard
+        say(text: "hoard ")
+        say_hoard_ended(try await take hoard.end(), alloc: grants.alloc)
+        return checkpoint
+    })
+    let Ok(Some(checkpoint)) = held else {
+        say(text: "hoard unheld\n")
+        return
+    }
+    discard attempt await nanos::hold_isolated(space, job, component: "Hoard", link, caps: nanos::Caps.empty(grants.alloc), checkpoint: Some(take checkpoint), runner: sys::Runner.denied(), alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+        var hoard = instance
+        defer take hoard.abandon()
+        say(text: "hoard restored ")
+        try await grown(mut hoard, kibibytes: 0, grants)
+        undefer hoard
+        say(text: "hoard restored and ")
+        say_hoard_ended(try await take hoard.end(), alloc: grants.alloc)
+    })
+} hoarded
+
+/// Grows a hoard by `kibibytes` and writes the bytes it answers it holds.
+fn grown(mut hoard: nanos::Instance, kibibytes: u32, grants: Grants) fails nanos::InstanceError uses wait {
+    var request = sys::Encoded.empty(grants.alloc)
+    let grow = sys::Wire[Hoarding].grow(mut request, kibibytes)
+    let Ok(Some(given)) = try await answered(mut hoard, hash: sys::Wire[Hoarding].hash(), number: 0, take request, grants) else {
+        say(text: "nothing\n")
+        return
+    }
+    match attempt grow.decode(Untrusted.of(given.bytes.view()), handles: given.handles.view(), alloc: grants.alloc) {
+        Ok(held) => {
+            say_number(held)
+            say(text: "\n")
+        }
+        Err(_) => say(text: "nothing\n")
+    }
+} grown
+
+/// Writes the bytes the hoard whose state `bytes` encodes holds.
+fn say_hoard(bytes: mem::Bytes, alloc: mem::Alloc) {
+    match attempt mem::wire::Codec[Hoard].decode(Untrusted.of(bytes.view()), alloc) {
+        Ok(state) => {
+            say_number(u64.widen(state.bytes.len()))
+            say(text: "\n")
+        }
+        Err(_) => say(text: "undecodable\n")
+    }
+} say_hoard
+
+/// Writes how an instance of the hoard ended.
+fn say_hoard_ended(take ended: nanos::Ended, alloc: mem::Alloc) {
+    match ended {
+        nanos::Ended.Returned(bytes) => {
+            say(text: "returned ")
+            say_hoard(bytes, alloc)
+        }
+        nanos::Ended.Trapped(trap) => {
+            say(text: "trapped\n")
+            say_trap(trap, alloc)
+        }
+        else => say(text: "ended otherwise\n")
+    }
+} say_hoard_ended
+
+/// Writes the bytes a typed job answered.
+fn say_filled(take bytes: mem::Bytes, alloc: mem::Alloc) {
+    say(text: "filled ")
+    match attempt mem::wire::Codec[Answer].decode(Untrusted.of(bytes.view()), alloc) {
+        Ok(Answer.Bytes(given)) => {
+            say_number(u64.widen(given.len()))
+            say(text: "\n")
+        }
+        else => say(text: "nothing\n")
+    }
+} say_filled
 
 /// Writes the total and ticks of the book whose state `bytes` encodes.
 fn say_book(bytes: mem::Bytes, alloc: mem::Alloc) {

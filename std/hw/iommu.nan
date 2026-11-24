@@ -34,7 +34,8 @@ const SLOTS: u64 = 256
 const SLOT_BYTES: u64 = 16
 
 /// The unit's flags: interrupt remapping in extended mode, reads and writes drained by an
-/// invalidation, table walks that miss the caches, and pass-through translation.
+/// invalidation, table walks that miss the caches, pass-through translation, and 2 MiB pages in
+/// a domain's tables.
 const EXTENDED_MODE: u64 = 1
 
 const DRAIN_READS: u64 = 2
@@ -44,6 +45,8 @@ const DRAIN_WRITES: u64 = 4
 const UNCOHERENT: u64 = 8
 
 const PASS_THROUGH: u64 = 16
+
+const LARGE_PAGES: u64 = 32
 
 /// The tags of the records settlement receives, at offset 8 of each: a domain, a PCI function,
 /// a mapping, a PCI port, a register window over a BAR and a PCI function's keeper. Every such
@@ -86,9 +89,11 @@ const MAPPING_BYTES: u64 = 32
 
 const MAPPING_RECORD: u64 = 40
 
-/// The bytes of a page, of a chunk, and of a cache line; the entries of a table and the bits of
-/// an entry holding the next table or page.
+/// The bytes of a page, of a 2 MiB page, of a chunk, and of a cache line; the entries of a table
+/// and the bits of an entry holding the next table or page.
 const PAGE_BYTES: u64 = 4_096
+
+const LARGE_BYTES: u64 = 2_097_152
 
 const CHUNK: u64 = 65_536
 
@@ -109,6 +114,12 @@ const SMMU_PAGE: u64 = 0xF43
 
 const SMMU_DEVICE_PAGE: u64 = 0xF47
 
+/// The bit of a level-2 entry telling a 2 MiB page from a table: VT-d's page size bit, set in the
+/// page's entry; SMMUv3's table bit, clear in a block's.
+const VTD_LARGE: u64 = 0x80
+
+const SMMU_TABLE: u64 = 0x2
+
 /// The key of the physical space.
 const PHYSICAL_KEY: u64 = 0
 
@@ -120,7 +131,7 @@ const FIRST_DOMAIN: u64 = 2
 /// The registers of VT-d that the runtime reads and writes, with the global command bits it
 /// sets: translation, the root table pointer, queued invalidation, interrupt remapping and the
 /// remapping table pointer; the status bits that stay set across a command; and the
-/// capability and extended capability bits it needs.
+/// capability and extended capability bits it reads.
 registers VtdRegisters {
     capability: u64 at 0x08 read
     extended: u64 at 0x10 read
@@ -145,6 +156,8 @@ const SET_REMAPPING: u32 = 0x0100_0000
 const KEPT_STATUS: u32 = 0x96FF_FFFF
 
 const FOUR_LEVELS: u64 = 0x400
+
+const PAGES_2M: u64 = 0x4_0000_0000
 
 const DRAINS_READS: u64 = 0x80_0000_0000_0000
 
@@ -633,24 +646,45 @@ fn clear_at(unit: u64, entry: u64) {
 } clear_at
 
 /// Maps the pages of a range at their own addresses in a domain's tables, as device memory on
-/// SMMUv3 when `device` holds, under the unit's lock; false when no table page is left.
+/// SMMUv3 when `device` holds, under the unit's lock, each 2 MiB-aligned 2 MiB of it through one
+/// 2 MiB page where the unit has them, the table its level-2 entry held freed once the unit no
+/// longer caches it; false when no table page is left.
 fn map_range(unit: u64, domain: u64, address: u64, bytes: u64, device: bool) -> bool {
     var leaf = VTD_PAGE
-    if peek(unit + UNIT_KIND) == SMMU and device {
-        leaf = SMMU_DEVICE_PAGE
-    } else if peek(unit + UNIT_KIND) == SMMU {
+    var large = VTD_PAGE | VTD_LARGE
+    if peek(unit + UNIT_KIND) == SMMU {
         leaf = SMMU_PAGE
+        if device {
+            leaf = SMMU_DEVICE_PAGE
+        }
+        large = leaf & ~SMMU_TABLE
     }
     let root = peek(domain + DOMAIN_ROOT)
+    let end = address + bytes
     var page = address & ~(PAGE_BYTES - 1)
-    while page < address + bytes {
-        let entry = leaf_entry(unit, root, address: page, create: true)
-        if entry == 0 {
-            return false
+    while page < end {
+        if large_span(unit, page, end) {
+            let entry = entry_at(unit, root, address: page, depth: 2, create: true)
+            if entry == 0 {
+                return false
+            }
+            let former = peek(entry)
+            poke(entry, value: page | large)
+            publish(unit, address: entry, bytes: 8)
+            if (former & 1) != 0 {
+                iommu_flush()
+                free_page(unit, page: former & FRAME_MASK)
+            }
+            page += LARGE_BYTES
+        } else {
+            let entry = entry_at(unit, root, address: page, depth: 3, create: true)
+            if entry == 0 {
+                return false
+            }
+            poke(entry, value: page | leaf)
+            publish(unit, address: entry, bytes: 8)
+            page += PAGE_BYTES
         }
-        poke(entry, value: page | leaf)
-        publish(unit, address: entry, bytes: 8)
-        page += PAGE_BYTES
     }
     return true
 } map_range
@@ -658,22 +692,48 @@ fn map_range(unit: u64, domain: u64, address: u64, bytes: u64, device: bool) -> 
 /// Unmaps the pages of a range in a domain's tables, under the unit's lock.
 fn unmap_range(unit: u64, domain: u64, address: u64, bytes: u64) {
     let root = peek(domain + DOMAIN_ROOT)
+    let end = address + bytes
     var page = address & ~(PAGE_BYTES - 1)
-    while page < address + bytes {
-        let entry = leaf_entry(unit, root, address: page, create: false)
-        if entry != 0 {
-            poke(entry, value: 0)
-            publish(unit, address: entry, bytes: 8)
+    while page < end {
+        if large_span(unit, page, end) {
+            let entry = entry_at(unit, root, address: page, depth: 2, create: false)
+            if entry != 0 and large_entry(unit, value: peek(entry)) {
+                poke(entry, value: 0)
+                publish(unit, address: entry, bytes: 8)
+            }
+            page += LARGE_BYTES
+        } else {
+            let entry = entry_at(unit, root, address: page, depth: 3, create: false)
+            if entry != 0 {
+                poke(entry, value: 0)
+                publish(unit, address: entry, bytes: 8)
+            }
+            page += PAGE_BYTES
         }
-        page += PAGE_BYTES
     }
 } unmap_range
 
-/// The address of the last-level entry of a page in a four-level table from `root`, adding the
-/// missing tables when `create` holds; zero when one is missing or no table page is left.
-fn leaf_entry(unit: u64, root: u64, address: u64, create: bool) -> u64 {
+/// Whether the 2 MiB from a page start at a 2 MiB boundary, lie before `end` and map through one
+/// 2 MiB page of the unit.
+fn large_span(unit: u64, page: u64, end: u64) -> bool {
+    return (peek(unit + UNIT_FLAGS) & LARGE_PAGES) != 0 and (page & (LARGE_BYTES - 1)) == 0 and end - page >= LARGE_BYTES
+} large_span
+
+/// Whether a present level-2 entry maps a 2 MiB page rather than a table.
+fn large_entry(unit: u64, value: u64) -> bool {
+    if peek(unit + UNIT_KIND) == VTD {
+        return (value & VTD_LARGE) != 0
+    }
+    return (value & SMMU_TABLE) == 0
+} large_entry
+
+/// The address of the entry at `depth` of a four-level table from `root` for an address, the
+/// last-level entry of its page at depth 3 and the level-2 entry of its 2 MiB at depth 2,
+/// adding the missing tables above it when `create` holds; zero when one is missing or no table
+/// page is left.
+fn entry_at(unit: u64, root: u64, address: u64, depth: u32, create: bool) -> u64 {
     var table = root
-    for level in 0u32..<3 {
+    for level in 0u32..<depth {
         let entry = table + ((address >> (39 - 9 * level)) & (ENTRIES - 1)) * 8
         var next = peek(entry)
         if (next & 1) == 0 {
@@ -689,8 +749,8 @@ fn leaf_entry(unit: u64, root: u64, address: u64, create: bool) -> u64 {
         }
         table = next & FRAME_MASK
     }
-    return table + ((address >> 12) & (ENTRIES - 1)) * 8
-} leaf_entry
+    return table + ((address >> (39 - 9 * depth)) & (ENTRIES - 1)) * 8
+} entry_at
 
 /// Frees the tables of a four-level table from `root`, under the unit's lock.
 fn free_tables(unit: u64, root: u64) {
@@ -720,7 +780,7 @@ fn free_leaves(unit: u64, table: u64, levels: u64) {
     if levels != 0 {
         for index in 0..<ENTRIES {
             let entry = peek(table + index * 8)
-            if (entry & 1) != 0 {
+            if (entry & 1) != 0 and not large_entry(unit, value: entry) {
                 free_page(unit, page: entry & FRAME_MASK)
             }
         }
@@ -810,6 +870,9 @@ fn started_vtd() -> Option[Iommu] {
     }
     if (features & PASSES) != 0 {
         flags |= PASS_THROUGH
+    }
+    if (caps & PAGES_2M) != 0 {
+        flags |= LARGE_PAGES
     }
     poke(unit + UNIT_KIND, value: VTD)
     poke(unit + UNIT_REGISTERS, value: base)
@@ -974,7 +1037,7 @@ fn started_smmu() -> Option[Iommu] {
     }
     poke(unit + UNIT_KIND, value: SMMU)
     poke(unit + UNIT_REGISTERS, value: base)
-    poke(unit + UNIT_FLAGS, value: u64.widen(sizes & 0x7) << 8)
+    poke(unit + UNIT_FLAGS, value: LARGE_PAGES | (u64.widen(sizes & 0x7) << 8))
     poke(unit + UNIT_STREAMS, value: streams)
     poke(unit + UNIT_COVERS, value: buses * BUS_STREAMS)
     var table = streams

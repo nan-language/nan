@@ -1,4 +1,4 @@
-//! Draws entropy through a confined driver, counts its MSI-X interrupts, aims its device at an unmapped bus address, then abandons a second driver mid-request and reuses its memory.
+//! Draws entropy through a confined driver, into a pool its domain maps through a 2 MiB page too, counts its MSI-X interrupts, aims its device at an unmapped bus address, then abandons a second driver mid-request and reuses its memory.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -11,6 +11,9 @@ const FILL: u8 = 0x5A
 const PAUSE_NS: u64 = 20_000_000
 
 const INTERRUPT_POLLS: u32 = 1_000_000
+
+/// The bytes of a 2 MiB page.
+const LARGE: u64 = 2_097_152
 
 /// A block of memory of the size the abandoned driver's buffers took.
 layout Block: bytes 4096 le {
@@ -41,7 +44,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     say(text: "iommu: enabled\n")
     let drawing = new_domain(iommu)
     let abandoning = new_domain(iommu)
-    take k.anchor(take iommu, run: fn[take functions, take drawing, take abandoning](exec: task::Executor) fails task::Cancelled uses wait limits stack 65_536 {
+    take k.anchor(take iommu, run: fn[take functions, take drawing, take abandoning](exec: task::Executor) fails task::Cancelled uses wait limits stack 2_228_224 {
         var entropy = mem::List[hw::PciFunction].empty(alloc)
         for function in take functions {
             if rng::is_entropy(function) {
@@ -97,6 +100,7 @@ fn confined(take function: hw::PciFunction, take domain: hw::IoDomain, alloc: me
             if (attempt mut device.draw(space, alloc)).is_ok() {
                 say(text: "rng: drew 32 bytes through a domain buffer\n")
             }
+            pooled(mut device, space, alloc)
             interrupted(mut device, space, alloc)
             outside(mut device, alloc)
             let stopped = take device.stop()
@@ -109,6 +113,34 @@ fn confined(take function: hw::PciFunction, take domain: hw::IoDomain, alloc: me
     }
     take domain.close()
 } confined
+
+/// Draws entropy into a pool of the domain at the end of its first 2 MiB and the start of the
+/// page after them, then into its start once the pool is unmapped, and restarts the device.
+fn pooled(mut device: rng::Rng, space: hw::IoSpace, alloc: mem::Alloc) {
+    let heap = mem::Heap.of(alloc)
+    let pool = hw::Dma.of(heap.boxed(Array[u8, 2_101_248].filled(FILL)), space)
+    let bus = pool.bus_addr().value
+    let ends = (attempt mut device.request(bus + LARGE - u64.widen(rng::DRAWN))).is_ok() and (attempt mut device.request(bus + LARGE)).is_ok()
+    let kept = take pool.into_box()
+    let bytes = kept.contents().view()
+    if bus % LARGE == 0 and ends and drawn(bytes, at: LARGE - u64.widen(rng::DRAWN)) and drawn(bytes, at: LARGE) {
+        say(text: "pool: drew into both sides of the 2 MiB boundary of a 2 MiB-aligned domain buffer\n")
+    }
+    if (attempt mut device.request(bus)).is_ok() and not drawn(bytes, at: 0) {
+        say(text: "pool: the device's write to the unmapped pool changed nothing\n")
+    }
+    discard attempt mut device.reset()
+} pooled
+
+/// Whether the device wrote any of the `rng::DRAWN` bytes from `at`.
+fn drawn(bytes: Slice[u8], at: u64) -> bool {
+    for index in 0..<u64.widen(rng::DRAWN) {
+        if bytes[usize.widen(at + index)] != FILL {
+            return true
+        }
+    }
+    return false
+} drawn
 
 /// Draws entropy with the queue's completions raising MSI-X entry 0, and reports whether the
 /// interrupt arrived within `INTERRUPT_POLLS` polls of its count.

@@ -43,6 +43,9 @@ const CHUNK_CLASS: i64 = 16;
 /// The size classes, from 2^0 to 2^63 bytes, of which `MIN_CLASS` up are used.
 const CLASSES: u64 = 64;
 
+/// The chunks of 2 MiB.
+const LARGE_RUN: i64 = 32;
+
 /// The offsets of the allocators' state: their spin lock, the next free byte and the end of the
 /// chunk blocks are carved from, the bytes of the chunks the map hands out and the most it has
 /// handed out, the bytes of the live records, of the live task stacks among them, which change
@@ -336,11 +339,18 @@ pub fn give_chunks(fx: &mut Fx, supply: ChunkSupply, base: Value, count: Value) 
     fx.each(first, end, |fx, index| mark(fx, supply.map, index, free));
 }
 
-/// Takes the first run of `count` chunks a supply has free, or gives zero when none is free. The
-/// caller holds the supply's lock and clears the chunks.
+/// Takes the first run of `count` chunks a supply has free, a run of 2 MiB or more starting at a
+/// 2 MiB boundary, or gives zero when none is free. The caller holds the supply's lock and clears
+/// the chunks.
 pub fn take_chunks(fx: &mut Fx, supply: ChunkSupply, count: Value) -> Value {
     let zero = fx.ptr(0);
     let end = supply.count;
+    let large =
+        fx.b.ins()
+            .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, count, LARGE_RUN);
+    let within = fx.ptr(LARGE_RUN as u64 - 1);
+    let within = fx.b.ins().select(large, within, zero);
+    let first_chunk = fx.b.ins().ushr_imm_s(supply.base, CHUNK_CLASS);
     let found = fx.repeat(&[zero, zero, zero], |fx, held| {
         let (index, run, first) = (held[0], held[1], held[2]);
         let inside = fx.b.ins().icmp(IntCC::UnsignedLessThan, index, end);
@@ -352,6 +362,12 @@ pub fn take_chunks(fx: &mut Fx, supply: ChunkSupply, count: Value) -> Value {
                 let bits = fx.load(PTR, word, 0);
                 let taken = fx.b.ins().band(bits, mask);
                 let free = fx.b.ins().icmp_imm_s(IntCC::Equal, taken, 0);
+                let chunk = fx.b.ins().iadd(first_chunk, index);
+                let offset = fx.b.ins().band(chunk, within);
+                let aligned = fx.b.ins().icmp_imm_s(IntCC::Equal, offset, 0);
+                let open = fx.b.ins().icmp_imm_s(IntCC::NotEqual, run, 0);
+                let starts = fx.b.ins().bor(aligned, open);
+                let free = fx.b.ins().band(free, starts);
                 let grown = fx.b.ins().iadd_imm_s(run, 1);
                 let none = fx.ptr(0);
                 let run = fx.b.ins().select(free, grown, none);

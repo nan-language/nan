@@ -27,6 +27,9 @@ const CHUNK_CLASS: i64 = 16
 /// The size classes, from 2^0 to 2^63 bytes, of which `MIN_CLASS` up are used.
 const HEAP_CLASSES: u64 = 64
 
+/// The chunks of 2 MiB.
+const LARGE_RUN: i64 = 32
+
 /// The offsets of the allocators' state: their spin lock, the next free byte and the end of the
 /// chunk blocks are carved from, the bytes of the chunks the map hands out and the most it has
 /// handed out, the bytes of the live records, of the live task stacks among them, which change
@@ -355,11 +358,16 @@ fn give_chunks(mut fx: Fx, supply: ChunkSupply, base: clif::Value, count: clif::
     })
 } give_chunks
 
-/// Takes the first run of `count` chunks a supply has free, or gives zero when none is free. The
-/// caller holds the supply's lock and clears the chunks.
+/// Takes the first run of `count` chunks a supply has free, a run of 2 MiB or more starting at a
+/// 2 MiB boundary, or gives zero when none is free. The caller holds the supply's lock and clears
+/// the chunks.
 fn take_chunks(mut fx: Fx, supply: ChunkSupply, count: clif::Value) -> clif::Value {
     let zero_value = mut fx.ptr(0)
     let end = supply.count
+    let large = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: count, y: LARGE_RUN)
+    let below = mut fx.ptr(u64.fit(LARGE_RUN - 1))
+    let within = mut fx.b.select(large, x: below, y: zero_value)
+    let first_chunk = mut fx.b.ushr_imm_s(supply.base, y: CHUNK_CLASS)
     let found = mut fx.repeat(Array[clif::Value, 3].filled(zero_value).view(), body: fn(mut fx1: Fx, current: Slice[clif::Value]) -> Pass {
         expect current.len() > 2
         let index = current[0]
@@ -372,7 +380,13 @@ fn take_chunks(mut fx: Fx, supply: ChunkSupply, count: clif::Value) -> clif::Val
             let chunk_bit = map_bit(mut fx2, map: supply.map, index)
             let bits = mut fx2.load(PTR, addr: chunk_bit.word, offset: 0)
             let taken = mut fx2.b.band(bits, y: chunk_bit.mask)
-            let free = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: taken, y: 0)
+            let unmarked = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: taken, y: 0)
+            let chunk = mut fx2.b.iadd(first_chunk, y: index)
+            let offset = mut fx2.b.band(chunk, y: within)
+            let aligned = mut fx2.b.icmp_imm_s(clif::IntCC.Equal, x: offset, y: 0)
+            let open = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: run, y: 0)
+            let starts = mut fx2.b.bor(aligned, y: open)
+            let free = mut fx2.b.band(unmarked, y: starts)
             let grown = mut fx2.b.iadd_imm_s(run, y: 1)
             let none = mut fx2.ptr(0)
             let next_run = mut fx2.b.select(free, x: grown, y: none)

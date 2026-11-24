@@ -1,6 +1,6 @@
 # 0135. Handles crossing isolated spaces
 
-Status: accepted
+Status: accepted; only logs, standard streams and random sources crossing superseded by 0224
 
 ## Context
 

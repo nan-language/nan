@@ -1,4 +1,4 @@
-//! Capability kinds: minters, reaches and derivations, and the handles and type tags of the capabilities a `nanos::Caps` holds. A minter is the holding of its state's record, which is a shared value's whose count holds one for the minter and one for each reach or derivation in flight, and which the outermost domain reaches. An entry of a kind holds that record and its own record, which the capability table keeps given its address and size; a reach pins the state under the table lock, which copies the record out, and calls its body outside it.
+//! Capability kinds: minters, reaches and derivations, the operations of crossing kinds through the handles holding their capabilities, and the handles of the capabilities a space's runtime holds for its kernel's. A minter is the holding of its state's record, which is a shared value's whose count holds one for the minter and one for each reach or derivation in flight, and which the outermost domain reaches. An entry of a kind holds that record, its own record, which the capability table keeps given its address and size, and the kind's method table for `sys::Crossing`; a reach pins the state under the table lock, which copies the record out, and calls its body outside it.
 
 /// The fewest bytes of the slot a pin copies a record into: the two words a record its entry's
 /// state words hold fills.
@@ -10,7 +10,10 @@ fn kinds_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
         "sys::Minter.mint" => {
             let minter = holdings_payload(mut fx, address: supply.param(0).address_value())
             let given = kinds_record_at(mut lo, mut fx, record: supply.param(1), record_ty: supply.type_arg(lo, index: 2))
-            let minted = mut lo.call_routine(mut fx, routine: Routine.KindMint, args: fx.list3(minter, b: given.address, c: given.size).view())
+            let table = kinds_crossing_table(mut lo, mut fx, kind: supply.type_arg(lo, index: 0))
+            var args = fx.list3(minter, b: given.address, c: given.size)
+            mut args.push(table)
+            let minted = mut lo.call_routine(mut fx, routine: Routine.KindMint, args: args.view())
             expect minted.len() == 1
             let Some(sret) = supply.sret else {
                 expect false
@@ -35,40 +38,86 @@ fn kinds_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
         }
         "sys::reach" => kinds_reach(mut lo, mut fx, supply)
         "sys::derive" => kinds_derive(mut lo, mut fx, supply)
-        "nanos::Cap.tag" => {
-            let tag = mut fx.int(clif::Type.Int64, value: i64.from_bits(kinds_tag(lo, ty: supply.type_arg(lo, index: 0))))
-            supply.ret(mut lo, mut fx, held: Held.Scalar(tag))
+        "sys::Handle.crosses" => {
+            let word = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: HANDLE_HANDLE)
+            let crossing = tables_crossing(mut lo, mut fx, handle: word)
+            let crosses_table = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: crossing.table, y: 0)
+            let crosses = mut fx.b.band(crossing.live, y: crosses_table)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(crosses))
         }
-        "nanos::Cap.handle" => {
-            let handle = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
-            supply.ret(mut lo, mut fx, held: Held.Scalar(handle))
+        "sys::Handle.invoke" or "sys::Handle.call" => kinds_crossed_operation(mut lo, mut fx, supply)
+        "nanos::crossing_handle" => kinds_crossing_handle(mut lo, mut fx, supply)
+        "nanos::handle_word" => {
+            let word = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: HANDLE_HANDLE)
+            supply.ret(mut lo, mut fx, held: Held.Scalar(word))
         }
-        "nanos::Cap.of_handle" => {
-            let Some(sret) = supply.sret else {
-                expect false
-                return true
-            }
-            mut fx.store(supply.param(0).scalar_value(), addr: sret, offset: 0)
-            supply.done(mut lo, mut fx)
+        "nanos::handle_hash" => {
+            let hash = mut fx.offset(supply.param(0).address_value(), offset: HANDLE_HASH)
+            supply.ret(mut lo, mut fx, held: Held.Address(hash))
         }
         else => return false
     }
     return true
 } kinds_lower
 
-/// The tag of a capability type: the first 8 bytes, little-endian, of the digest of the hash of
-/// its normalised text.
-fn kinds_tag(lo: Lowering, ty: ty::Ty) -> u64 {
-    var hashed = text::String.of("capability\n", alloc: lo.alloc)
-    mut hashed.append(ty_text(lo, ty).as_str())
-    mut hashed.push('\n')
-    let digest = hashing::HashValue.of(hashed.as_bytes()).bytes
-    var tag: u64 = 0
-    for at in 0..<8u32 {
-        tag = tag | (u64.widen(digest[usize.widen(at) + 1]) << (8 * at))
+/// The method table of a kind for `sys::Crossing`, zero for a kind that does not cross.
+fn kinds_crossing_table(mut lo: Lowering, mut fx: Fx, kind: ty::Ty) -> clif::Value {
+    let crossing = served_interface(lo, name: "Crossing")
+    if not lo.ck.implements(kind, interface_item: crossing) {
+        return mut fx.ptr(0)
     }
-    return tag
-} kinds_tag
+    let DynTable(id: table_id, methods: _) = mut lo.dyn_table(kind, interface_item: crossing, args: ty::Args.none())
+    let table_global = mut lo.data_ref(mut fx, id: table_id)
+    return mut fx.b.symbol_value(PTR, global_value: table_global)
+} kinds_crossing_table
+
+/// `handle.invoke(operation, args, alloc)` or `call`: the method of its name of the kind through
+/// which the capability `handle` holds crosses, its failure becoming the operation's;
+/// `Revoked.Stale` for a stale capability and `Refused` for one that does not cross.
+fn kinds_crossed_operation(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let word = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: HANDLE_HANDLE)
+    let crossing = tables_crossing(mut lo, mut fx, handle: word)
+    let stale = mut fx.b.bxor_imm_s(crossing.live, y: 1)
+    mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
+    })
+    let refused = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: crossing.table, y: 0)
+    mut fx.if_true(refused, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Refused")
+    })
+    var args = mem::List[Held].empty(lo.alloc)
+    for position in 1..<supply.params.len() {
+        mut args.push(supply.params[position])
+    }
+    let called = served_call(mut lo, mut fx, interface_name: "Crossing", method: supply.member(), kind: ServingKind(service: crossing.service, table: crossing.table), args: args.view())
+    supply.forward_failure(mut lo, mut fx, called)
+    supply.ret(mut lo, mut fx, held: called.result)
+} kinds_crossed_operation
+
+/// `nanos::crossing_handle(service, hash)`: a handle holding a capability of the crossing kind
+/// whose handle hash is `hash`, served by the kind `service` through `sys::Crossing`, its entry
+/// deriving from `service`'s; `Revoked.Stale` when `service` is stale.
+fn kinds_crossing_handle(mut lo: Lowering, mut fx: Fx, supply: Supply) {
+    let service_ty = supply.type_arg(lo, index: 0)
+    let service = mut fx.load(PTR, addr: supply.param(0).address_value(), offset: 0)
+    let crossing = served_interface(lo, name: "Crossing")
+    let DynTable(id: table_id, methods: _) = mut lo.dyn_table(service_ty, interface_item: crossing, args: ty::Args.none())
+    let table_global = mut lo.data_ref(mut fx, id: table_id)
+    let table = mut fx.b.symbol_value(PTR, global_value: table_global)
+    let derived = tables_served(mut lo, mut fx, kind: TABLES_KIND_CROSSED, service, table)
+    let stale = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: derived, y: -1)
+    mut fx.if_true(stale, then: fn[mut lo](mut fx1: Fx) {
+        fail_with(mut lo, fx: mut fx1, supply, variant: "Revoked")
+    })
+    let Some(sret) = supply.sret else {
+        expect false
+        return
+    }
+    mut fx.store(derived, addr: sret, offset: HANDLE_HANDLE)
+    let at = mut fx.offset(sret, offset: HANDLE_HASH)
+    mut lo.copy(mut fx, dst: at, src: supply.param(1).address_value(), size: 33, align: 1)
+    supply.done(mut lo, mut fx)
+} kinds_crossing_handle
 
 /// `sys::Minter.of(state, alloc)`: the state moves into a shared record drawn through `alloc`,
 /// which passes to the outermost domain, and the minter holds it.

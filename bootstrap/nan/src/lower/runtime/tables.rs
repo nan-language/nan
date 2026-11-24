@@ -21,10 +21,12 @@
 //! that delays count, which a host's wall clock reads from the platform instead, then its
 //! resolution. An entry of a capability kind holds its minter's state record, then its record
 //! when it fits two words, else the address of a block it owns holding the record, then the
-//! record's size in its fourth word, zero for one held in place. A served `Log`, `Random` or `Stdio` entry derives from an entry of the kind
-//! serving it and holds that entry's handle, then the method table of the kind for its service
-//! interface. A served `Fs` or `Net` entry holds that handle in place of its directory or
-//! network, and the method table after its state words, zero for an entry no kind serves.
+//! record's size in its fourth word, zero for one held in place, and after its state words the
+//! kind's method table for `sys::Crossing`, zero for a kind that does not cross. A served `Log`,
+//! `Random`, `Stdio` or crossed entry derives from an entry of the kind serving it and holds that
+//! entry's handle, then the method table of the kind for its service interface. A served `Fs` or
+//! `Net` entry holds that handle in place of its directory or network, and the method table after
+//! its state words, zero for an entry no kind serves.
 
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC, types};
 
@@ -84,6 +86,8 @@ pub mod kind {
     /// An entry revoked as it is minted.
     pub const DENIED: i64 = 11;
     pub const RUNNER: i64 = 12;
+    /// A capability of a crossing kind that another kind serves through `sys::Crossing`.
+    pub const CROSSED: i64 = 13;
 }
 
 /// The state word of a `Clock` or `WallClock` entry holding its resolution, and that of an
@@ -148,11 +152,13 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
                     let value = fx.b.ins().umax(value, params[2]);
                     fx.store(value, raised, 0);
                     let owns = owns_text(fx, record);
-                    fx.when(owns, |fx| {
+                    let kind_entry = of_kind(fx, record);
+                    let tabled = fx.b.ins().bor(owns, kind_entry);
+                    fx.when(tabled, |fx| {
                         let table = fx.load(PTR, source, entry::TABLE);
                         fx.store(table, record, entry::TABLE);
-                        derive_text(lo, fx, record, params[3], params[4]);
                     });
+                    fx.when(owns, |fx| derive_text(lo, fx, record, params[3], params[4]));
                     let boxed = owns_record(fx, record);
                     fx.when(boxed, |fx| {
                         let block = fx.load(PTR, source, entry::STATE + 8);
@@ -183,6 +189,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
             let record = entry_at(lo, fx, handle);
             fx.store(params[0], record, entry::STATE);
             store_record(lo, fx, record, params[1], params[2]);
+            fx.store(params[3], record, entry::TABLE);
             lo.call_routine(fx, Routine::Unlock, &[lock]);
             fx.b.ins().return_(&[handle]);
         }
@@ -190,7 +197,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
             let state_address = lo.state(fx);
             let lock = fx.offset(state_address, state::LOCK);
             lo.call_routine(fx, Routine::Lock, &[lock]);
-            let record = live_entry(lo, fx, params[0]);
+            let record = live_kind_entry(lo, fx, params[0]);
             let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record, 0);
             let minter = fx.choose(
                 live,
@@ -230,6 +237,8 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
                     let minter = fx.load(PTR, source, entry::STATE);
                     fx.store(minter, record, entry::STATE);
                     store_record(lo, fx, record, params[1], params[2]);
+                    let table = fx.load(PTR, source, entry::TABLE);
+                    fx.store(table, record, entry::TABLE);
                     let index = fx.b.ins().band_imm_s(params[0], 0xFFFF_FFFF);
                     let index = fx.b.ins().iadd_imm_s(index, 1);
                     let index = fx.b.ins().ireduce(types::I32, index);
@@ -245,7 +254,7 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
             let state_address = lo.state(fx);
             let lock = fx.offset(state_address, state::LOCK);
             lo.call_routine(fx, Routine::Lock, &[lock]);
-            let record = live_entry(lo, fx, params[0]);
+            let record = live_kind_entry(lo, fx, params[0]);
             let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, record, 0);
             fx.when(live, |fx| {
                 let minter = fx.load(PTR, record, entry::STATE);
@@ -340,10 +349,15 @@ fn owns_text(fx: &mut Fx, record: Value) -> Value {
     fx.b.ins().bor(fs, net)
 }
 
+/// Whether an entry is a capability kind's.
+fn of_kind(fx: &mut Fx, record: Value) -> Value {
+    let kind = fx.load(types::I32, record, entry::KIND);
+    fx.b.ins().icmp_imm_s(IntCC::Equal, kind, kind::KIND)
+}
+
 /// Whether an entry is a kind's whose record lies in a block it owns.
 fn owns_record(fx: &mut Fx, record: Value) -> Value {
-    let kind = fx.load(types::I32, record, entry::KIND);
-    let of_kind = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, kind::KIND);
+    let of_kind = of_kind(fx, record);
     let size = fx.load(PTR, record, RECORD_SIZE);
     let boxed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, size, 0);
     fx.b.ins().band(of_kind, boxed)
@@ -697,6 +711,37 @@ pub fn live_entry(lo: &mut Lowering, fx: &mut Fx, handle: Value) -> Value {
     let ok = fx.b.ins().band(same, live);
     let zero = fx.ptr(0);
     fx.b.ins().select(ok, record, zero)
+}
+
+/// The record of a capability kind's entry whose handle is live, zero for a stale one or one of
+/// another kind.
+fn live_kind_entry(lo: &mut Lowering, fx: &mut Fx, handle: Value) -> Value {
+    let at = entry_at(lo, fx, handle);
+    let of_kind = of_kind(fx, at);
+    let record = live_entry(lo, fx, handle);
+    let zero = fx.ptr(0);
+    fx.b.ins().select(of_kind, record, zero)
+}
+
+/// The kind through which the capability a handle names crosses and that kind's method table
+/// for `sys::Crossing`, read without the lock: its own for a crossing kind's entry, the serving
+/// kind's for a crossed entry, a zero table for any other; and whether the handle was still live
+/// once they were read.
+pub fn crossing(lo: &mut Lowering, fx: &mut Fx, handle: Value) -> (Value, Value, Value) {
+    let record = entry_at(lo, fx, handle);
+    let at = fx.offset(record, entry::KIND);
+    let kind =
+        fx.b.ins()
+            .atomic_load(types::I32, MemFlagsData::trusted(), at);
+    let (live, words, table) = read_live(lo, fx, handle, true);
+    let table = table.expect("a method table");
+    let of_kind = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, kind::KIND);
+    let crossed = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, kind::CROSSED);
+    let zero = fx.ptr(0);
+    let own = fx.b.ins().select(of_kind, table, zero);
+    let table = fx.b.ins().select(crossed, words[1], own);
+    let service = fx.b.ins().select(crossed, words[0], handle);
+    (live, service, table)
 }
 
 /// The state words of the entry a handle names, read without the lock, and whether the handle

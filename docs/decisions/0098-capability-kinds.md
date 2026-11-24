@@ -1,6 +1,6 @@
 # 0098. Capability kinds
 
-Status: accepted
+Status: accepted; a kind's handle working only within one image superseded, for kinds that cross, by 0224
 
 ## Context
 

@@ -95,12 +95,13 @@ The table names every pub std type, interface, free function and registry with t
 | `sys` | `sys::LogLevel`, `sys::LogService`, `sys::RandomService`, `sys::StdioService`, `sys::FsService`, `sys::NetService`, `sys::Runner`, `sys::RunnerError`, `sys::RunnerService` | [Served capabilities](14-authority.md#served-capabilities) |
 | `sys` | `sys::Revoked`, `sys::Capability`, `sys::revocable`, `sys::Revoker` | [Revocation](14-authority.md#revocation) |
 | `sys` | `sys::Kind`, `sys::Minter`, `sys::reach`, `sys::derive` | [Capability kinds](14-authority.md#capability-kinds) |
+| `sys` | `sys::Crossing`, `sys::CrossError` | [Crossing kinds](14-authority.md#crossing-kinds) |
 | `sys` | `sys::Domain`, `sys::Abandoner`, `sys::Trap`, `sys::TrapKind` | [Domain run](11-errors-domains.md#domain-run) |
 | `sys` | `sys::Component` | [Components](26-components.md#components) |
 | `sys` | `sys::Cx` | [Component context](26-components.md#component-context); `spawn` and `cancel` in [Keyed tasks](26-components.md#keyed-tasks); `send_to`, `postpone`, `reply`, `publish` and `sync` in [Runner capabilities](26-components.md#runner-capabilities) |
 | `sys` | `sys::Outbox` | [Keyed tasks](26-components.md#keyed-tasks) |
 | `sys` | `sys::CallError` | [Operation calls](26-components.md#operation-calls) |
-| `sys` | `sys::Protocol`, `sys::ProtocolHash`, `sys::Handle`, `sys::Encoded`, `sys::Wire`, `sys::Reply` | [Wire encoding](26-components.md#wire-encoding) |
+| `sys` | `sys::Protocol`, `sys::ProtocolHash`, `sys::Handle`, `sys::Encoded`, `sys::Wire`, `sys::Reply` | [Wire encoding](26-components.md#wire-encoding); `crosses`, `invoke` and `call` in [Crossing kinds](14-authority.md#crossing-kinds) |
 | `sys` | `sys::ProtocolSchema`, `sys::OperationSchema`, `sys::ParameterSchema`, `sys::TypeSchema` | [Protocol schemas](26-components.md#protocol-schemas) |
 | `sys` | `sys::Stepper`, `sys::Stopped` | [Steppers](26-components.md#steppers); `attach` in [Runner capabilities](26-components.md#runner-capabilities) |
 | `sys` | `sys::Port`, `sys::CapabilityId`, `sys::Resource`, `sys::Held`, `sys::ResourceId`, `sys::Resources` | [Runner capabilities](26-components.md#runner-capabilities) |

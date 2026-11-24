@@ -1,9 +1,9 @@
-//! Component instances in isolated spaces: the kernel's side, which holds an instance whose task runs in the space of an isolation, sending its holder's requests and its inboxes' calls down the first channel of the space's link, routing the answers the space sends back and calling its holder's runner for it, and the space's side, which runs the instance task, relays between that channel and the instance and forwards the operations of the instance's runner capability to the kernel.
+//! Component instances in isolated spaces: the kernel's side, which holds an instance whose task runs in the space of an isolation, sending its holder's requests and its inboxes' calls down the first channel of the space's link, routing the answers the space sends back and calling its holder's runner and the capabilities of crossing kinds it holds for it, and the space's side, which runs the instance task, relays between that channel and the instance and forwards the operations of the instance's runner capability to the kernel.
 
 /// The bytes of a frame's head, which holds the length of the encoding following it.
 const FRAME_HEAD: usize = 4
 
-pub fn hold_isolated[T, E](space: Isolation, job: sys::load::Isolated, component: Str, link: Link, take checkpoint: Option[Checkpoint], runner: sys::Runner, alloc: mem::Alloc, body: fn(take instance: Instance) -> T fails E uses wait limits stack 65_536) -> Option[T] fails E uses wait {
+pub fn hold_isolated[T, E](space: Isolation, job: sys::load::Isolated, component: Str, link: Link, caps: Caps, take checkpoint: Option[Checkpoint], runner: sys::Runner, alloc: mem::Alloc, body: fn(take instance: Instance) -> T fails E uses wait limits stack 65_536) -> Option[T] fails E uses wait {
     if job.component(component).is_none() {
         return None
     }
@@ -20,7 +20,7 @@ pub fn hold_isolated[T, E](space: Isolation, job: sys::load::Isolated, component
         let Opened(instance: instance, launch: launch, ending: ending, last: last) = opened(s, checkpoint: None, runner: sys::Runner.denied(), alloc)
         let watched = instance.abandoner.share()
         discard s.spawn(fn[take from, take name, take launch, take ending, take last, take watched]() fails task::Cancelled uses wait {
-            let ended = match attempt await held_in(space, job, component: take name, runner, link, checkpoint: take from, take launch, abandoner: take watched, alloc) {
+            let ended = match attempt await held_in(space, job, component: take name, runner, link, caps, checkpoint: take from, take launch, abandoner: take watched, alloc) {
                 Ok(how) => how
                 Err(cancelled) => failed(take cancelled, alloc)
             }
@@ -33,14 +33,14 @@ pub fn hold_isolated[T, E](space: Isolation, job: sys::load::Isolated, component
 } hold_isolated
 
 /// Has the space of `isolation` run the instance of the component entry `component` of `job`,
-/// resuming from `checkpoint` and acting through `runner`, until it ends, and gives how it ended:
-/// failed with the rendering of an `IsolatedError` when `link` has no channel or the instance
-/// cannot be placed.
-fn held_in(isolation: Isolation, job: sys::load::Isolated, take component: text::String, runner: sys::Runner, link: Link, take checkpoint: Option[Checkpoint], take launch: Launch, take abandoner: mem::Shared[sys::Abandoner], alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
+/// resuming from `checkpoint`, holding the capabilities of `caps` that cross and acting through
+/// `runner`, until it ends, and gives how it ended: failed with the rendering of an
+/// `IsolatedError` when `link` has no channel or the instance cannot be placed.
+fn held_in(isolation: Isolation, job: sys::load::Isolated, take component: text::String, runner: sys::Runner, link: Link, caps: Caps, take checkpoint: Option[Checkpoint], take launch: Launch, take abandoner: mem::Shared[sys::Abandoner], alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
     if link.channels.len() == 0 {
         return failed(IsolatedError.NoChannel, alloc)
     }
-    match try await relayed(isolation, job, take component, runner, link, input: encoded(checkpoint, alloc), take launch, take abandoner, alloc) {
+    match try await relayed(isolation, job, take component, runner, link, caps, input: encoded(checkpoint, alloc), take launch, take abandoner, alloc) {
         Ok(how) => return how
         Err(error) => return failed(IsolatedError.Unplaced(error), alloc)
     }
@@ -58,11 +58,12 @@ struct Relays {
 } Relays
 
 /// Has the space of `isolation` run an instance of the component entry `component` of `job` on
-/// `input`, sending its holder's requests and its inboxes' calls down the first channel of `link`
-/// and routing the answers the space sends up it, calling through `runner` the ports the instance
-/// calls, and gives how it ended or why it could not be placed; once `abandoner` abandons, the
-/// space abandons the instance, which ends abandoned.
-fn relayed(isolation: Isolation, job: sys::load::Isolated, take component: text::String, runner: sys::Runner, link: Link, take input: mem::Bytes, take launch: Launch, take abandoner: mem::Shared[sys::Abandoner], alloc: mem::Alloc) -> Result[Ended, sys::load::LoadError] fails task::Cancelled uses wait {
+/// `input` with the capabilities of `caps` that cross, sending its holder's requests and its
+/// inboxes' calls down the first channel of `link` and routing the answers the space sends up it,
+/// calling through `runner` the ports the instance calls and the capabilities of crossing kinds
+/// whose waiting operations it calls, and gives how it ended or why it could not be placed; once
+/// `abandoner` abandons, the space abandons the instance, which ends abandoned.
+fn relayed(isolation: Isolation, job: sys::load::Isolated, take component: text::String, runner: sys::Runner, link: Link, caps: Caps, take input: mem::Bytes, take launch: Launch, take abandoner: mem::Shared[sys::Abandoner], alloc: mem::Alloc) -> Result[Ended, sys::load::LoadError] fails task::Cancelled uses wait {
     let exec = isolation.exec
     let id = isolation.number()
     let table = isolation.table
@@ -116,7 +117,7 @@ fn relayed(isolation: Isolation, job: sys::load::Isolated, take component: text:
             watching.contents().store(true)
             isolation.wake(WOKE_ORDERS)
         })
-        let Joined(outcome: how, cancelled: _) = try await joined(isolation, id, job, component: Some(take name), link, input: take fed, runner, halted, alloc)
+        let Joined(outcome: how, cancelled: _) = try await joined(isolation, id, job, component: Some(take name), link, caps, input: take fed, runner, halted, alloc)
         outcome = how
         s.cancel()
     })
@@ -219,9 +220,10 @@ fn called_down(take calls: task::Receiver[Called], out: task::Sender[mem::Bytes]
 
 /// Routes through `answers` each answer the space sends up the first channel of `link`, a call's
 /// reply drawn through the allocator `allocs` keeps for it and its handles those of the entries of
-/// the space's `table` it names, and calls through `runner` each port the instance calls, on a task
-/// of its own sending `out` the frame of the reply; it stops hearing a space that frames a message
-/// it cannot decode or longer than `MOST_BYTES`.
+/// the space's `table` it names, and calls through `runner` each port the instance calls, and each
+/// waiting operation of a capability of a crossing kind the instance holds in `table`, on a task of
+/// its own sending `out` the frame of the reply; it stops hearing a space that frames a message it
+/// cannot decode or longer than `MOST_BYTES`.
 fn answered_up(link: Link, answers: task::Sender[Routed], allocs: task::Cown[mem::Map[u64, mem::Alloc]], table: Table, job: u64, runner: sys::Runner, out: task::Sender[mem::Bytes], exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
     var pending = mem::Bytes.empty(alloc)
     try await task::scope(exec, body: fn[mut pending](s: task::Scope) fails task::Cancelled uses wait {
@@ -238,6 +240,12 @@ fn answered_up(link: Link, answers: task::Sender[Routed], allocs: task::Cown[mem
                     let replying = out.split()
                     discard s.spawn(fn[take called, take replying]() fails task::Cancelled uses wait {
                         try await ported(take called, runner, table, job, out: replying, alloc)
+                    })
+                }
+                Up.Awaited(operation) => {
+                    let replying = out.split()
+                    discard s.spawn(fn[take operation, take replying]() fails task::Cancelled uses wait {
+                        try await kind_awaited(take operation, table, job, out: replying, alloc)
                     })
                 }
             }
@@ -304,6 +312,35 @@ fn port_answer(port: u64, hash: sys::ProtocolHash, take request: Naming, runner:
     }
     return PortAnswer.Replied(Carrying(bytes: take reply.bytes, handles: take crossing))
 } port_answer
+
+/// Calls the waiting operation of the capability of a crossing kind that an instance's space names
+/// by the handle of the entry of the space's `table` added for it, and sends `out` the frame of its
+/// result.
+fn kind_awaited(take asked: Awaiting, table: Table, job: u64, out: task::Sender[mem::Bytes], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let Awaiting(id: id, handle: handle, operation: operation, args: args) = asked
+    let answer = try await kind_answer(handle, operation, args: args.view(), table, job, alloc)
+    discard attempt await out.send(framed(Down.Ported(PortReply(id: id, answer: take answer)), alloc))
+} kind_awaited
+
+/// What crosses down of the result of the waiting operation `operation` of the capability of a
+/// crossing kind the entry `handle` of the space's `table` holds for the instance numbered `job`.
+fn kind_answer(handle: u64, operation: u64, args: Slice[u8], table: Table, job: u64, alloc: mem::Alloc) -> PortAnswer fails task::Cancelled uses wait {
+    let Some(entry) = table.held.get(handle) else {
+        return PortAnswer.Unknown
+    }
+    let Holding.Kind(capability) = entry.holding else {
+        return PortAnswer.Unknown
+    }
+    if entry.job != job {
+        return PortAnswer.Unknown
+    }
+    match attempt await capability.call(operation, args, alloc) {
+        Ok(bytes) => return PortAnswer.Replied(Carrying(bytes: take bytes, handles: mem::List[Carried].empty(alloc)))
+        Err(sys::CrossError.Cancelled(cancelled)) => fail cancelled
+        Err(sys::CrossError.Revoked(_)) => return PortAnswer.Revoked
+        Err(sys::CrossError.Refused) => return PortAnswer.Unknown
+    }
+} kind_answer
 
 /// The answer of what an instance's space gave, a reply's bytes drawn through `alloc` and its
 /// handles those of the entries of the space's `table` it names, a reply naming another refused as
@@ -429,11 +466,13 @@ struct Calling derives Encode {
     handles: mem::List[Carried]
 } Calling
 
-/// What the space of an instance sends its kernel: an answer of its instance, or a call its
-/// instance makes through a port of its runner capability.
+/// What the space of an instance sends its kernel: an answer of its instance, a call its instance
+/// makes through a port of its runner capability, or a waiting operation it calls of a capability
+/// of a crossing kind.
 enum Up derives Encode {
     Answered(Answering)
     Called(PortCall)
+    Awaited(Awaiting)
 } Up
 
 /// An answer of an instance and the number of the wait it ends.
@@ -451,7 +490,18 @@ struct PortCall derives Encode {
     call: Naming
 } PortCall
 
-/// The reply to a call an instance made through a port, and the number of its wait.
+/// A waiting operation an instance calls of a capability of a crossing kind: the number of its
+/// wait, the handle of the capability's entry of the space's table, the operation and its
+/// arguments.
+struct Awaiting derives Encode {
+    id: u64
+    handle: u64
+    operation: u64
+    args: mem::Bytes
+} Awaiting
+
+/// The reply to a call an instance made through a port or to a waiting operation of a capability of
+/// a crossing kind, and the number of its wait.
 struct PortReply derives Encode {
     id: u64
     answer: PortAnswer
@@ -619,10 +669,10 @@ struct Relaying {
 /// task in a domain run of `domain` on `world`, resuming from the checkpoint whose
 /// `mem::wire` encoding `input` is and acting through the runner capability of the space's table
 /// whose handle is `runner`, while relaying the requests and calls the kernel sends over the
-/// channel `port` serves to the instance and its answers and calls through ports back, their
-/// handles those the runtime holds through `base` for the entries of the space's table, and gives
-/// how the domain ended.
-fn served_instance(job: sys::load::Job, port: Port, base: Remote, runner: u64, domain: mem::Shared[sys::Abandoner], take world: World, take input: mem::Bytes) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
+/// channel `port` serves to the instance and its answers, and the frames `outgoing` carries, back,
+/// their handles those the runtime holds through `base` for the entries of the space's table, the
+/// replies to the waits of `waits` reaching them, and gives how the domain ended.
+fn served_instance(job: sys::load::Job, port: Port, base: Remote, runner: u64, domain: mem::Shared[sys::Abandoner], take world: World, take input: mem::Bytes, up: task::Sender[mem::Bytes], take outgoing: task::Receiver[mem::Bytes], waits: task::Cown[PortWaits]) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
     let alloc = world.alloc
     let exec = world.exec
     let Ok(checkpoint) = attempt mem::wire::Codec[Option[Checkpoint]].decode(Untrusted.of(input.view()), alloc) else {
@@ -631,8 +681,6 @@ fn served_instance(job: sys::load::Job, port: Port, base: Remote, runner: u64, d
     let task::Channel(sender: requests, receiver: asked) = task::Channel[Asked].bounded(1, alloc)
     let task::Channel(sender: calls, receiver: called) = task::Channel[Called].bounded(QUEUED_CALLS, alloc)
     let task::Channel(sender: answers, receiver: answered) = task::Channel[Routed].bounded(QUEUED_CALLS, alloc)
-    let task::Channel(sender: up, receiver: outgoing) = task::Channel[mem::Bytes].bounded(QUEUED_CALLS, alloc)
-    let waits = task::Cown.of(PortWaits(next: 0, waiting: mem::Map[u64, task::Sender[PortAnswer]].empty(alloc)), alloc)
     let forwarders = sys::Minter[Forwarder, Forwarding, u64].of(Forwarding(base: base, up: up.split(), waits: waits.share(), alloc: alloc), alloc)
     defer take forwarders.close()
     let acting = match attempt sys::Runner.served(forwarders.mint(runner)) {
@@ -894,20 +942,9 @@ fn Forwarder.call(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], ha
     }
     let Calls(base: base, up: up, waits: waits) = calls
     let sent = try naming(base, bytes, handles, alloc)
-    let task::Channel(sender: answer, receiver: answers) = task::Channel[PortAnswer].bounded(1, alloc)
-    var id: u64 = 0
-    await when mut waits {
-        id = waits.next
-        waits.next += 1
-        discard mut waits.waiting.insert(id, value: take answer)
-    }
-    match attempt await up.send(framed(Up.Called(PortCall(id: id, port: port, hash: hash, call: take sent)), alloc)) {
-        Ok(_) => {}
-        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
-        Err(task::SendError.Closed) => fail sys::RunnerError.Unknown
-    }
-    var receiver = answers
-    let Some(answered) = try await mut receiver.receive() else {
+    let Waiting(id: id, answers: answers) = try await wait_added(waits, alloc)
+    let frame = framed(Up.Called(PortCall(id: id, port: port, hash: hash, call: take sent)), alloc)
+    let Some(answered) = try await answer_awaited(up, take frame, take answers) else {
         fail sys::RunnerError.Unknown
     }
     let PortAnswer.Replied(Carrying(bytes: replied, handles: crossing)) = answered else {
@@ -926,6 +963,36 @@ fn Forwarder.call(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], ha
     }
     return reply
 } Forwarder.call
+
+/// A wait for the kernel's reply: its number, and the receiver of its answer.
+struct Waiting {
+    id: u64
+    answers: task::Receiver[PortAnswer]
+} Waiting
+
+/// A wait added to `waits`.
+fn wait_added(waits: task::Cown[PortWaits], alloc: mem::Alloc) -> Waiting fails task::Cancelled uses wait {
+    let task::Channel(sender: answer, receiver: answers) = task::Channel[PortAnswer].bounded(1, alloc)
+    var id: u64 = 0
+    await when mut waits {
+        id = waits.next
+        waits.next += 1
+        discard mut waits.waiting.insert(id, value: take answer)
+    }
+    return Waiting(id: id, answers: take answers)
+} wait_added
+
+/// Sends `up` the frame of a call waiting for the kernel's reply, and gives the answer `answers`
+/// receives for it; none once either side is closed.
+fn answer_awaited(up: task::Sender[mem::Bytes], take frame: mem::Bytes, take answers: task::Receiver[PortAnswer]) -> Option[PortAnswer] fails task::Cancelled uses wait {
+    match attempt await up.send(take frame) {
+        Ok(_) => {}
+        Err(task::SendError.Cancelled(cancelled)) => fail cancelled
+        Err(task::SendError.Closed) => return None
+    }
+    var receiver = answers
+    return try await mut receiver.receive()
+} answer_awaited
 
 fn Forwarder.reply(self, request: u64, bytes: Slice[u8], handles: Slice[sys::Handle]) fails sys::RunnerError limits stack 4_096 {
     let forward = try forwarded(self)

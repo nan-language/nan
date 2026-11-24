@@ -323,10 +323,10 @@ impl Routine {
             Routine::Copy | Routine::Fill | Routine::Grow | Routine::GrowSegment => {
                 (&[P, P, P], &[])
             }
-            Routine::OutboxMint | Routine::KindMint | Routine::KindDerive => (&[P, P, P], &[P]),
+            Routine::OutboxMint | Routine::KindDerive => (&[P, P, P], &[P]),
             Routine::Compare => (&[P, P, P], &[types::I32]),
             Routine::Alloc => (&[P, P, P], &[P]),
-            Routine::AllocIn => (&[P, P, P, P], &[P]),
+            Routine::AllocIn | Routine::KindMint => (&[P, P, P, P], &[P]),
             Routine::Split | Routine::Hold => (&[P, P], &[P]),
             Routine::Derive | Routine::Nested => (&[P, P, P, P, P], &[P]),
             Routine::Lift => (&[P, P], &[P]),

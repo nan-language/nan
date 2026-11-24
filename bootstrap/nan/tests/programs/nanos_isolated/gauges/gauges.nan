@@ -1,0 +1,89 @@
+//! Gauges whose operations cross as bytes: each adds the amounts it is given to the total the gauges of its minter share, and settles that total once its minter's clock has run on.
+
+pub open struct Gauge {
+} Gauge
+
+/// What the gauges of a minter share: their total, and the clock a settling waits on.
+pub open struct Gauged derives Send {
+    total: core::atomic::AtomicU64
+    clock: sys::Clock
+} Gauged
+
+impl Gauge: sys::Kind[Gauged, u64]
+
+impl Gauge: sys::Crossing
+
+/// The operations of a gauge: adding an amount and giving the total, and settling the total.
+const ADD: u64 = 0
+
+const SETTLE: u64 = 1
+
+/// The nanoseconds a settling waits.
+const SETTLING_NS: u64 = 1_000_000
+
+pub fn open(clock: sys::Clock, alloc: mem::Alloc) -> sys::Minter[Gauge, Gauged, u64] {
+    return sys::Minter.of(Gauged(total: core::atomic::AtomicU64.of(0), clock: clock), alloc)
+} open
+
+pub fn mint(minter: sys::Minter[Gauge, Gauged, u64]) -> Gauge {
+    return minter.mint(0)
+} mint
+
+pub fn revoke(minter: sys::Minter[Gauge, Gauged, u64], gauge: Gauge) {
+    minter.revoke(gauge)
+} revoke
+
+pub fn close(take minter: sys::Minter[Gauge, Gauged, u64]) {
+    take minter.close()
+} close
+
+pub fn Gauge.add(self, amount: u64, alloc: mem::Alloc) -> u64 fails sys::CrossError {
+    var args = mem::Bytes.empty(alloc)
+    mem::wire::Codec[u64].encode(amount, out: mut args)
+    return try total_of(try sys::Handle.of(self).invoke(ADD, args: args.view(), alloc), alloc)
+} Gauge.add
+
+pub fn Gauge.settled(self, alloc: mem::Alloc) -> u64 fails sys::CrossError uses wait {
+    return try total_of(try await sys::Handle.of(self).call(SETTLE, args: b"", alloc), alloc)
+} Gauge.settled
+
+pub fn Gauge.invoke(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError limits stack 4_096 {
+    let Ok(amount) = attempt mem::wire::Codec[u64].decode(args, alloc) else {
+        fail sys::CrossError.Refused
+    }
+    if operation != ADD {
+        fail sys::CrossError.Refused
+    }
+    let added = sys::reach(self, body: fn(state: Gauged, record: u64) => state.total.fetch_add(amount))
+    let Some(Some(before)) = added else {
+        fail sys::CrossError.Revoked(sys::Revoked.Stale)
+    }
+    return encoded_total(before.wrapping_add(amount), alloc)
+} Gauge.invoke
+
+pub fn Gauge.call(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError uses wait limits stack 4_096 {
+    if operation != SETTLE {
+        fail sys::CrossError.Refused
+    }
+    let Some(clock) = sys::reach(self, body: fn(state: Gauged, record: u64) => state.clock) else {
+        fail sys::CrossError.Revoked(sys::Revoked.Stale)
+    }
+    try await clock.sleep_ns(SETTLING_NS)
+    let Some(total) = sys::reach(self, body: fn(state: Gauged, record: u64) => state.total.load()) else {
+        fail sys::CrossError.Revoked(sys::Revoked.Stale)
+    }
+    return encoded_total(total, alloc)
+} Gauge.call
+
+fn encoded_total(total: u64, alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[u64].encode(total, out: mut bytes)
+    return bytes
+} encoded_total
+
+fn total_of(bytes: mem::Bytes, alloc: mem::Alloc) -> u64 fails sys::CrossError {
+    match attempt mem::wire::Codec[u64].decode(Untrusted.of(bytes.view()), alloc) {
+        Ok(total) => return total
+        Err(_) => fail sys::CrossError.Refused
+    }
+} total_of

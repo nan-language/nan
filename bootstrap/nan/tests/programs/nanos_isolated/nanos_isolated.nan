@@ -1,4 +1,4 @@
-//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port, their random source from a counter and their file system from a disk writing each call it serves through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, with the reports of their traps, a job reading kernel memory, in a domain of its own and outside it, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, instances of a component whose calls, a postponed one included, keyed tasks, held ones included, messages sent to themselves and checkpoints run in their spaces, with logs crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, an instance sharing its space with a job that traps and divides and with another instance that is abandoned, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
+//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port, their random source from a counter and their file system from a disk writing each call it serves through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, with the reports of their traps, a job reading kernel memory, in a domain of its own and outside it, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, instances of a component whose calls, a postponed one included, keyed tasks, held ones included, messages sent to themselves and checkpoints run in their spaces, with logs and gauges crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, an instance sharing its space with a job that traps and divides and with another instance that is abandoned, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -52,6 +52,7 @@ pub protocol Ledger {
     pub fn echo(clock: sys::Clock) -> sys::Clock limits pure
     pub fn note(log: sys::Log) -> sys::Log limits recorded
     pub fn borrow() limits recorded
+    pub fn gauge(amount: u32, given: gauges::Gauge) -> u64 limits recorded
     pub fn divide(by: u32) -> u64 limits pure
     pub fn spin() -> u64 limits pure
     pub fn wait() -> u64 limits pure
@@ -778,10 +779,11 @@ fn linked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: 
 } linked
 
 /// Reads the protocol schema of the ledger's book, then holds instances of the book in spaces over
-/// the first channel of a link, acting through a runner the kernel serves: started, called, given a
-/// log it notes through, publishing its total, and gives back, lent logs through its runner,
-/// refused a call carrying a clock, checkpointed and ended, then restored from that checkpoint, a
-/// handler that traps and a handler that never returns until the instance is abandoned.
+/// the first channel of a link, with a gauge in their worlds, acting through a runner the kernel
+/// serves: started, called, given a log it notes through, publishing its total, and gives back,
+/// lent logs through its runner, gauged, refused a call carrying a clock, checkpointed and ended,
+/// then restored from that checkpoint, a handler that traps and a handler that never returns until
+/// the instance is abandoned.
 fn booked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
     let Some(schema) = job.schema("Book", alloc: grants.alloc) else {
         stop(text: "no schema\n")
@@ -792,8 +794,16 @@ fn booked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: 
         say(text: operation.name.as_str())
     }
     say(text: "\n")
-    let lending = sys::Minter[Lending, Lent, u64].of(Lent(noter: grants.noter, alloc: grants.alloc), alloc: grants.alloc)
+    let gauging = gauges::open(grants.clock, alloc: grants.alloc)
+    defer gauges::close(take gauging)
+    let gauge = gauges::mint(gauging)
+    var caps = nanos::Caps.empty(grants.alloc)
+    mut nanos::Cap[gauges::Gauge].put(mut caps, key: "gauge", capability: gauge)
+    var later = nanos::Caps.empty(grants.alloc)
+    mut nanos::Cap[gauges::Gauge].put(mut later, key: "gauge", capability: gauges::mint(gauging))
+    let lending = sys::Minter[Lending, Lent, u64].of(Lent(noter: grants.noter, gauge: gauges::mint(gauging), alloc: grants.alloc), alloc: grants.alloc)
     defer take lending.close()
+    let given = gauges::mint(gauging)
     let Ok(runner) = attempt sys::Runner.served(lending.mint(0)) else {
         stop(text: "no runner\n")
     }
@@ -802,21 +812,21 @@ fn booked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: 
     var pool = frames_for_space(mut frames, alloc: grants.alloc)
     var extended = Some(hw::ExtendedState.of(next_frame(mut frames)))
     discard attempt await nanos::isolate(cpu, tenant: 4, services: services(grants), frames: mut pool, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn(space: nanos::Isolation) fails task::Cancelled uses wait {
-        let opened = attempt await nanos::hold_isolated(space, job, component: "Book", link, checkpoint: None, runner, alloc: grants.alloc, body: fn(take instance: nanos::Instance) -> nanos::Checkpoint fails nanos::InstanceError uses wait {
-            return try await started(take instance, grants)
+        let opened = attempt await nanos::hold_isolated(space, job, component: "Book", link, caps, checkpoint: None, runner, alloc: grants.alloc, body: fn(take instance: nanos::Instance) -> nanos::Checkpoint fails nanos::InstanceError uses wait {
+            return try await started(take instance, grants, gauging, gauges: Gauges(world: gauge, given: given))
         })
         match opened {
             Ok(Some(checkpoint)) => {
-                discard attempt await nanos::hold_isolated(space, job, component: "Book", link, checkpoint: Some(take checkpoint), runner, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+                discard attempt await nanos::hold_isolated(space, job, component: "Book", link, caps: later, checkpoint: Some(take checkpoint), runner, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
                     try await restored(take instance, grants)
                 })
             }
             else => say(text: "book unheld\n")
         }
-        discard attempt await nanos::hold_isolated(space, job, component: "Book", link, checkpoint: None, runner, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+        discard attempt await nanos::hold_isolated(space, job, component: "Book", link, caps: later, checkpoint: None, runner, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
             try await trapped(take instance, grants)
         })
-        discard attempt await nanos::hold_isolated(space, job, component: "Book", link, checkpoint: None, runner, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+        discard attempt await nanos::hold_isolated(space, job, component: "Book", link, caps: later, checkpoint: None, runner, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
             try await abandoned(take instance, grants)
         })
     })
@@ -831,6 +841,10 @@ fn booked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: 
 /// the book is held, then divides again, another book held there adds and is abandoned, and the
 /// first book adds before and after and ends with its total.
 fn shared(cpu: hw::Ring0, book: sys::load::Isolated, job: sys::load::Isolated, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
+    let gauging = gauges::open(grants.clock, alloc: grants.alloc)
+    defer gauges::close(take gauging)
+    var caps = nanos::Caps.empty(grants.alloc)
+    mut nanos::Cap[gauges::Gauge].put(mut caps, key: "gauge", capability: gauges::mint(gauging))
     var link = nanos::Link.of(next_frame(mut frames), alloc: grants.alloc)
     discard mut link.open("book", inbound: next_frame(mut frames), outbound: next_frame(mut frames))
     let neighbour = nanos::Link.of(next_frame(mut frames), alloc: grants.alloc)
@@ -839,7 +853,7 @@ fn shared(cpu: hw::Ring0, book: sys::load::Isolated, job: sys::load::Isolated, g
     var pool = frames_for_space(mut frames, alloc: grants.alloc)
     var extended = Some(hw::ExtendedState.of(next_frame(mut frames)))
     discard attempt await nanos::isolate(cpu, tenant: 5, services: services(grants), frames: mut pool, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn(space: nanos::Isolation) fails task::Cancelled uses wait {
-        discard attempt await nanos::hold_isolated(space, job: book, component: "Book", link, checkpoint: None, runner: sys::Runner.denied(), alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+        discard attempt await nanos::hold_isolated(space, job: book, component: "Book", link, caps, checkpoint: None, runner: sys::Runner.denied(), alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
             var held = instance
             defer take held.abandon()
             say(text: "shared ")
@@ -849,7 +863,7 @@ fn shared(cpu: hw::Ring0, book: sys::load::Isolated, job: sys::load::Isolated, g
             say_answer(text: "neighbour quotient ", bytes: take quotient, alloc: grants.alloc)
             try await task::scope(grants.exec, body: fn(s: task::Scope) fails task::Cancelled uses wait {
                 let second = s.spawn(fn() fails task::Cancelled uses wait limits stack 196_608 {
-                    discard attempt await nanos::hold_isolated(space, job: book, component: "Book", link: other, checkpoint: None, runner: sys::Runner.denied(), alloc: grants.alloc, body: fn(take another: nanos::Instance) fails nanos::InstanceError uses wait {
+                    discard attempt await nanos::hold_isolated(space, job: book, component: "Book", link: other, caps, checkpoint: None, runner: sys::Runner.denied(), alloc: grants.alloc, body: fn(take another: nanos::Instance) fails nanos::InstanceError uses wait {
                         var abandoning = another
                         defer take abandoning.abandon()
                         say(text: "other ")
@@ -879,13 +893,14 @@ fn shared(cpu: hw::Ring0, book: sys::load::Isolated, job: sys::load::Isolated, g
 } shared
 
 /// Starts the book, calls it and gives a checkpoint of it.
-fn started(take instance: nanos::Instance, grants: Grants) -> nanos::Checkpoint fails nanos::InstanceError uses wait {
+fn started(take instance: nanos::Instance, grants: Grants, gauging: sys::Minter[gauges::Gauge, gauges::Gauged, u64], gauges: Gauges) -> nanos::Checkpoint fails nanos::InstanceError uses wait {
     var book = instance
     defer take book.abandon()
     try await ticked(mut book, reason: sys::ResumeReason.Started, by_key: false)
     try await added(mut book, amount: 5, grants)
     try await noted(mut book, grants)
     try await borrowed(mut book, grants)
+    try await gauged(mut book, grants, gauging, gauges)
     try await postponed(mut book, grants)
     var echo = sys::Encoded.empty(grants.alloc)
     discard sys::Wire[Ledger].echo(mut echo, clock: grants.clock)
@@ -940,6 +955,38 @@ fn borrowed(mut book: nanos::Instance, grants: Grants) fails nanos::InstanceErro
     say(text: "book borrowed\n")
 } borrowed
 
+/// The gauges the book first held is given: the gauge of its world and the one a call gives it.
+struct Gauges derives Copy {
+    world: gauges::Gauge
+    given: gauges::Gauge
+} Gauges
+
+/// Has the book add 5 through the gauge its world holds, 1 through the gauge a call gives it and 10
+/// through the one its runner holds as capability 8, and settle its world's gauge from the keyed
+/// task it starts, which sends a tick once settled; then, once its world's gauge is revoked, add
+/// through it again.
+fn gauged(mut book: nanos::Instance, grants: Grants, gauging: sys::Minter[gauges::Gauge, gauges::Gauged, u64], gauges: Gauges) fails nanos::InstanceError uses wait {
+    var request = sys::Encoded.empty(grants.alloc)
+    let gauge = sys::Wire[Ledger].gauge(mut request, amount: 5, given: gauges.given)
+    let reply = try await called(mut book, take request, grants)
+    say(text: "book gauged ")
+    match reply {
+        Ok(given) => match attempt gauge.decode(Untrusted.of(given.bytes.view()), handles: given.handles.view(), alloc: grants.alloc) {
+            Ok(total) => say_number(total)
+            Err(_) => say(text: "nothing")
+        }
+        Err(_) => say(text: "nothing")
+    }
+    say(text: "\n")
+    discard try await mut book.start_keyed()
+    try await book.incoming()
+    discard try await mut book.step()
+    gauges::revoke(gauging, gauge: gauges.world)
+    var again = sys::Encoded.empty(grants.alloc)
+    discard sys::Wire[Ledger].gauge(mut again, amount: 2, given: gauges.given)
+    discard try await called(mut book, request: take again, grants)
+} gauged
+
 /// Has the book postpone a wait the kernel numbers 4, then settle it, which has the book reply to
 /// the wait through its runner.
 fn postponed(mut book: nanos::Instance, grants: Grants) fails nanos::InstanceError uses wait {
@@ -955,17 +1002,18 @@ fn postponed(mut book: nanos::Instance, grants: Grants) fails nanos::InstanceErr
 } postponed
 
 /// The runner the kernel serves the book: it writes each total the book publishes and each reply
-/// it gives, holds the noting console's log as capability 7 and lends it through port 1, refusing
-/// every other operation.
+/// it gives, holds the noting console's log as capability 7 and lends it through port 1, holds a
+/// gauge as capability 8, refusing every other operation.
 struct Lending {
 } Lending
 
 impl Lending: sys::Kind[Lent, u64]
 
-/// What the runner the kernel serves the book holds: the noting console, and the allocator it
-/// decodes through.
+/// What the runner the kernel serves the book holds: the noting console, a gauge, and the allocator
+/// it decodes through.
 struct Lent derives Copy {
     noter: Console
+    gauge: gauges::Gauge
     alloc: mem::Alloc
 } Lent
 
@@ -1027,6 +1075,12 @@ fn Lending.sync(self) fails sys::RunnerError limits stack 4_096 {
 } Lending.sync
 
 fn Lending.capability(self, id: u64) -> sys::Handle fails sys::RunnerError limits stack 4_096 {
+    if id == 8 {
+        let Some(gauge) = sys::reach(self, body: fn(state: Lent, record: u64) => state.gauge) else {
+            fail sys::RunnerError.Unknown
+        }
+        return sys::Handle.of(gauge)
+    }
     let Some(log) = lent(self) else {
         fail sys::RunnerError.Unknown
     }

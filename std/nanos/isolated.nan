@@ -122,7 +122,10 @@ const ENDS_UNDECODABLE: u64 = 3
 
 const ENDS_CANCELLED: u64 = 4
 
-/// The numbers of the trap kinds of exhausted memory, of an exception and of an abandoned domain.
+/// The numbers of the trap kinds of an index out of range, of exhausted memory, of an exception and
+/// of an abandoned domain.
+const BOUNDS: u64 = 0
+
 const EXHAUSTED: u64 = 6
 
 const EXCEPTION: u64 = 15
@@ -134,6 +137,9 @@ const MOST_BYTES: u64 = 1_048_576
 
 /// The most bytes of a trap report.
 const REPORT_BYTES: usize = 4_096
+
+/// The report of the trap ending an instance whose space wrote what no end of a bridge writes.
+const BREACH_REPORT: Str = "trap.bounds writing what no end of a bridge writes\n"
 
 /// The bytes of a start record and of the record of a port.
 const START_BYTES: usize = 104
@@ -160,19 +166,83 @@ pub closed struct Services derives Copy {
     pub fs: sys::Fs
 } Services
 
-/// An isolated space that jobs and instances join as tasks ask: its table of handles, the jobs
-/// and instances asking to join it, the signal waking the task running it, the number of the next
-/// job or instance, whether its tasks may ask no more, and the executor and allocator of its
-/// kernel's tasks.
+/// An isolated space that jobs and instances join as tasks ask: what the tasks of every isolation
+/// reach of it and the capability through which they reach it, whether its own tasks may ask no
+/// more, and the executor and allocator of its kernel's tasks.
 pub open struct Isolation derives Send {
-    table: Table
-    joins: task::Cown[mem::List[Joining]]
-    woken: hw::Signal[u64]
-    next: core::atomic::AtomicU64
+    door: mem::Shared[Door]
+    way: Doorway
     closed: core::atomic::AtomicBool
     exec: task::Executor
     alloc: mem::Alloc
 } Isolation
+
+/// What the tasks of every isolation reach of one: its table of handles, what they ask of the
+/// task running its space, the signal waking that task, the number of the next job or instance,
+/// what crossed into its table through bridges for its runtime to claim, the sender of the frames
+/// moving into its space through them while it takes any, and the next token of what crosses.
+struct Door {
+    table: Table
+    asks: task::Cown[Asks]
+    woken: hw::Signal[u64]
+    next: core::atomic::AtomicU64
+    carries: task::Cown[mem::List[Carry]]
+    moves: task::Cown[Option[task::Sender[Moving]]]
+    tokens: core::atomic::AtomicU64
+} Door
+
+/// Where an instance runs in an isolated space: the capability reaching the door of its isolation,
+/// and its number there.
+struct Placement derives Copy {
+    door: Doorway
+    id: u64
+} Placement
+
+/// A capability reaching the door of an isolation while the isolation runs, its record unused.
+struct Doorway {
+} Doorway
+
+impl Doorway: sys::Kind[mem::Shared[Door], u64]
+
+/// The door a doorway reaches, none once its isolation has returned.
+fn Doorway.reached(self) -> Option[mem::Shared[Door]] {
+    return sys::reach(self, body: fn(door: mem::Shared[Door], record: u64) => door.share())
+} Doorway.reached
+
+/// Gives `ask` to the task running the space of the isolation a doorway reaches, as `Door.asked`
+/// does; once that isolation has returned, `ask` is dropped.
+fn Doorway.asked(self, take ask: Ask) fails task::Cancelled uses wait {
+    let Some(door) = self.reached() else {
+        return
+    }
+    try await door.contents().asked(take ask)
+} Doorway.asked
+
+/// What tasks ask of the task running an isolation's space, and whether it still takes asks.
+struct Asks {
+    open: bool
+    list: mem::List[Ask]
+} Asks
+
+/// What a task asks of the task running an isolation's space: to place a job or instance; to lend
+/// its space, while it runs the instance of a number, to map the frames of a bridge to it; to open
+/// the ends of bridges for the instance of a number, which starts once they are open; that the end
+/// of a bridge be told its other end wrote or read; to close the end of a bridge; and to end the
+/// instance of a number as breaching a bridge.
+enum Ask {
+    Join(Joining)
+    Lend(Borrowing)
+    Open(Opening)
+    Ring(Ringing)
+    Close(Closing)
+    Breach(u64)
+} Ask
+
+/// An ask to lend a space to map the frames of a bridge to the instance numbered `id`.
+struct Borrowing {
+    id: u64
+    lend: task::Sender[Lending]
+} Borrowing
 
 /// The record from which a space's runtime starts a job or instance, or abandons one: what it
 /// orders, the number of the job or instance, its entry, where its input lies and its length, the
@@ -206,6 +276,7 @@ enum Holding derives Copy {
     Channel(usize)
     Runner
     Kind(sys::Handle)
+    Bridge
 } Holding
 
 /// An entry of a space's table: the number of the job or instance it was added for, 0 for the
@@ -302,8 +373,20 @@ struct Replying derives Encode {
 } Replying
 
 pub fn isolate[E](cpu: hw::Ring0, tenant: u64, services: Services, mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState], exec: task::Executor, alloc: mem::Alloc, body: fn(space: Isolation) fails E uses wait limits stack 131_072) fails E uses wait {
-    let isolation = Isolation(table: Table.of(services, alloc), joins: task::Cown.of(mem::List[Joining].empty(alloc), alloc), woken: hw::Signal[u64].empty(), next: core::atomic::AtomicU64.of(1), closed: core::atomic::AtomicBool.of(false), exec: exec, alloc: alloc)
-    try await task::scope(exec, body: fn[mut frames, mut extended](s: task::Scope) fails E uses wait {
+    let task::Channel(sender: moves, receiver: moving) = task::Channel[Moving].bounded(QUEUED_CALLS, alloc)
+    let door = Door(table: Table.of(services, alloc), asks: task::Cown.of(Asks(open: true, list: mem::List[Ask].empty(alloc)), alloc), woken: hw::Signal[u64].empty(), next: core::atomic::AtomicU64.of(1), carries: task::Cown.of(mem::List[Carry].empty(alloc), alloc), moves: task::Cown.of(Some(take moves), alloc), tokens: core::atomic::AtomicU64.of(1))
+    let shared = mem::Shared.of(take door, alloc)
+    let doors = sys::Minter[Doorway, mem::Shared[Door], u64].of(shared.share(), alloc)
+    defer take doors.close()
+    let isolation = Isolation(door: take shared, way: doors.mint(0), closed: core::atomic::AtomicBool.of(false), exec: exec, alloc: alloc)
+    var arriving = Some(take moving)
+    let scoped = attempt await task::scope(exec, body: fn[mut frames, mut extended, mut arriving](s: task::Scope) fails E uses wait {
+        let Some(moved_in) = mut arriving.extract() else {
+            return
+        }
+        let keeping = s.spawn(fn[take moved_in]() -> mem::List[hw::PhysFrame[4_096]] fails task::Cancelled uses wait {
+            return try await moves_kept(take moved_in, alloc)
+        })
         let driving = s.spawn(fn[mut frames, mut extended]() fails task::Cancelled uses wait {
             try await driven(cpu, tenant, services, isolation, mut frames, mut extended)
         })
@@ -311,11 +394,32 @@ pub fn isolate[E](cpu: hw::Ring0, tenant: u64, services: Services, mut frames: m
         isolation.closed.store(true)
         isolation.wake(WOKE_ORDERS)
         discard attempt await take driving.join()
+        discard attempt await isolation.door.contents().moves_ended()
+        match attempt await take keeping.join() {
+            Ok(left) => {
+                for frame in take left {
+                    mut frames.push(take frame)
+                }
+            }
+            Err(_) => {}
+        }
         match outcome {
             Ok(_) => {}
             Err(failure) => fail failure
         }
     })
+    match arriving {
+        Some(unkept) => {
+            discard attempt await take unkept.drain(visit: fn[mut frames](take parked: Moving) {
+                moving_released(take parked, mut frames)
+            })
+        }
+        None => {}
+    }
+    match scoped {
+        Ok(_) => {}
+        Err(failure) => fail failure
+    }
 } isolate
 
 pub fn run_isolated(space: Isolation, job: sys::load::Isolated, link: Link, take input: mem::Bytes, alloc: mem::Alloc) -> Ended fails IsolatedError uses wait {
@@ -337,15 +441,36 @@ pub fn run_isolated(space: Isolation, job: sys::load::Isolated, link: Link, take
 /// The number of the next job or instance to join the space; 0, which names none, once numbers
 /// run out.
 fn Isolation.number(self) -> u64 {
-    return self.next.fetch_add(1).value_or(0)
+    return self.door.contents().next.fetch_add(1).value_or(0)
 } Isolation.number
 
 /// Wakes the task running the space of an isolation.
 fn Isolation.wake(self, why: u64) {
+    self.door.contents().wake(why)
+} Isolation.wake
+
+/// Wakes the task running the space of the isolation of a door.
+fn Door.wake(self, why: u64) {
     hw::without_irqs(fn(t: hw::IrqsDisabled) {
         self.woken.post(t, value: why)
     })
-} Isolation.wake
+} Door.wake
+
+/// Gives `ask` to the task running the space of the isolation of a door, waking it; once the
+/// isolation takes no more, `ask` is dropped.
+fn Door.asked(self, take ask: Ask) fails task::Cancelled uses wait {
+    let asks = self.asks.share()
+    var queued = false
+    await when mut asks {
+        if asks.open {
+            mut asks.list.push(take ask)
+            queued = true
+        }
+    }
+    if queued {
+        self.wake(WOKE_ORDERS)
+    }
+} Door.asked
 
 /// What a `CALL_WAIT` call gives: that a doorbell rang, and that the kernel has orders for the
 /// runtime.
@@ -354,12 +479,15 @@ const WOKE_RUNG: u64 = 1
 const WOKE_ORDERS: u64 = 2
 
 /// The operation of the orders handle, which takes the kernel's next order, and the orders it
-/// gives: starting a job or instance, and abandoning one.
+/// gives: starting a job or instance, abandoning one, and telling one of the end of a bridge it
+/// holds.
 const TAKE: u64 = 0
 
 const ORDER_START: u64 = 0
 
 const ORDER_ABANDON: u64 = 1
+
+const ORDER_NOTICE: u64 = 2
 
 /// The handles of a space's table holding its services, its test runs and its kernel's orders.
 const LOG_HANDLE: u64 = 0
@@ -376,9 +504,11 @@ const ORDERS_HANDLE: u64 = 5
 
 /// A job or instance a task asks its isolation to place: its number, its bundle, the name of its
 /// component entry, none for a job, its input, the runner it acts through, the capabilities of its
-/// world, the keys of its link's channels, whether its holder abandoned it, and the senders through
-/// which the task running the space lends it the space to map its link, tells it through which of
-/// its channels the space moved bytes, and tells it how it ended or why it could not be placed.
+/// world, the keys of its link's channels but those carrying the calls of ports, whether it starts
+/// only once the ends of its bridges are open, whether its holder abandoned it, and the senders
+/// through which the task running the space lends it the space to map its link, tells it through
+/// which of its channels the space moved bytes, and tells it how it ended or why it could not be
+/// placed.
 struct Joining {
     id: u64
     bundle: sys::load::Isolated
@@ -387,6 +517,7 @@ struct Joining {
     runner: sys::Runner
     caps: Caps
     keys: mem::List[text::String]
+    bridged: bool
     halted: mem::Shared[core::atomic::AtomicBool]
     lend: task::Sender[Lending]
     notices: task::Sender[usize]
@@ -400,10 +531,13 @@ linear struct Lending {
 } Lending
 
 /// A space given back with the addresses at which it maps a link's frames: its doorbell, then each
-/// channel's inbound and outbound frames; none when it could not map them all.
+/// channel's inbound and outbound frames but those of ports, none when it could not map them all;
+/// the addresses at which it maps the channels of ports; and the ends of bridges it maps.
 linear struct Lent {
     space: sys::load::Space
     frames: mem::List[u64]
+    ported: mem::List[u64]
+    ends: mem::List[Bridged]
 } Lent
 
 /// How a job or instance its space ran ended: as it says, or with a trap; or why it could not be
@@ -430,10 +564,11 @@ struct Joined {
 
 /// Has the space of `isolation` run the entry of `job`, its component entry `component`'s or its
 /// job's, as the job or instance numbered `id`, on `input` with `link` and the capabilities of
-/// `caps` that cross into the space, acting through `runner`, and gives how it ended once the space
-/// no longer maps `link`'s frames, or why it could not be placed. While it runs, each ring of
-/// `link` wakes the task running the space and the channels the space moved bytes through are heard
-/// from; once `halted` holds true, or this call is cancelled, the space abandons it.
+/// `caps` that cross into the space, acting through `runner`, bridging each channel of `link` that
+/// carries the calls of a port to the instance answering them, and gives how it ended once no space
+/// maps `link`'s frames, or why it could not be placed. While it runs, each ring of `link` wakes
+/// the task running the space and the channels the space moved bytes through are heard from; once
+/// `halted` holds true, or this call is cancelled, the space abandons it.
 fn joined(isolation: Isolation, id: u64, job: sys::load::Isolated, take component: Option[text::String], link: Link, caps: Caps, take input: mem::Bytes, runner: sys::Runner, halted: mem::Shared[core::atomic::AtomicBool], alloc: mem::Alloc) -> Joined fails task::Cancelled uses wait {
     if id == 0 {
         return Joined(outcome: Err(sys::load::LoadError.Unplaceable), cancelled: None)
@@ -443,33 +578,79 @@ fn joined(isolation: Isolation, id: u64, job: sys::load::Isolated, take componen
     let task::Channel(sender: ended, receiver: ending) = task::Channel[Outcome].bounded(1, alloc)
     let task::Channel(sender: stop, receiver: stopping) = task::Channel[u8].bounded(1, alloc)
     var keys = mem::List[text::String].empty(alloc)
-    for channel in link.channels {
-        mut keys.push(text::String.of(channel.key.as_str(), alloc))
+    var keyed = mem::List[usize].empty(alloc)
+    var porting_out = false
+    for index in 0..<link.channels.len() {
+        let channel = link.channels[index]
+        match channel.port {
+            Some(porting) => {
+                porting_out = porting_out or (porting.to.is_some() and component.is_some())
+            }
+            None => {
+                mut keys.push(text::String.of(channel.key.as_str(), alloc))
+                mut keyed.push(index)
+            }
+        }
     }
     var granted = Caps.empty(alloc)
     for held in caps.held {
         mut granted.held.push(Held(key: text::String.of(held.key.as_str(), alloc), handle: held.handle))
     }
-    let joining = Joining(id: id, bundle: job.share(), component: take component, input: take input, runner: runner, caps: take granted, keys: take keys, halted: halted.share(), lend: take lend, notices: take notices, ended: take ended)
-    await when mut isolation.joins {
-        mut isolation.joins.push(take joining)
-    }
-    isolation.wake(WOKE_ORDERS)
+    let joining = Joining(id: id, bundle: job.share(), component: take component, input: take input, runner: runner, caps: take granted, keys: take keys, bridged: porting_out, halted: halted.share(), lend: take lend, notices: take notices, ended: take ended)
+    discard attempt await isolation.door.contents().asked(Ask.Join(take joining))
     var lendings = mem::List[Lending].empty(alloc)
     discard attempt await take lent.drain(visit: fn[mut lendings](take value: Lending) {
         mut lendings.push(take value)
     })
+    var ports = mem::List[Ported].empty(alloc)
     for lending in take lendings {
         let Lending(space: given, back: back) = lending
         var space = given
         let frames = mapped(mut space, link, alloc)
-        discard attempt await back.send(Lent(space: take space, frames: take frames))
+        if porting_out {
+            ports = ports_mapped(mut space, link, alloc)
+        }
+        var addresses = mem::List[u64].empty(alloc)
+        for port in ports {
+            mut addresses.push(port.inbound)
+            mut addresses.push(port.outbound)
+        }
+        discard attempt await back.send(Lent(space: take space, frames: take frames, ported: take addresses, ends: mem::List[Bridged].empty(alloc)))
     }
+    var remote = mem::List[PeerEnd].empty(alloc)
+    if porting_out {
+        var ends = mem::List[Bridged].empty(alloc)
+        for port in ports {
+            match attempt await bridge_opened(isolation, id, link, port, alloc) {
+                Ok(Some(Spanning(near: near, far: far))) => {
+                    mut ends.push(take near)
+                    mut remote.push(take far)
+                }
+                else => {}
+            }
+        }
+        discard attempt await isolation.door.contents().asked(Ask.Open(Opening(id: id, ends: take ends)))
+    }
+    let ran = attempt await run_watched(isolation, link, keyed, halted, receivers: Receivers(noticed: take noticed, stopping: take stopping, ending: take ending), take stop, alloc)
+    for far in remote {
+        discard attempt await far_closed(far, alloc)
+    }
+    match ran {
+        Ok(done) => return done
+        Err(cancellation) => fail cancellation
+    }
+} joined
+
+/// Waits until the job or instance `receivers` hears of has ended, and gives how it ended: while it
+/// runs, each ring of `link` wakes the task running the space, and the channels the space moved
+/// bytes through, whose indices in `link` `keyed` gives, are heard from; once `halted` holds true,
+/// or this call is cancelled, the space abandons it, and once it has ended, `stop` tells so.
+fn run_watched(isolation: Isolation, link: Link, keyed: mem::List[usize], halted: mem::Shared[core::atomic::AtomicBool], take receivers: Receivers, take stop: task::Sender[u8], alloc: mem::Alloc) -> Joined fails task::Cancelled uses wait {
     var outcome: Result[Ended, sys::load::LoadError] = Err(sys::load::LoadError.Unplaceable)
     var cancelled: Option[task::Cancelled] = None
-    var receivers = Some(Receivers(noticed: take noticed, stopping: take stopping, ending: take ending))
-    try await task::scope(isolation.exec, body: fn[mut outcome, mut cancelled, mut receivers](s: task::Scope) fails task::Cancelled uses wait {
-        let Some(Receivers(noticed: heard, stopping: watched, ending: told)) = mut receivers.extract() else {
+    var receiving = Some(take receivers)
+    try await task::scope(isolation.exec, body: fn[mut outcome, mut cancelled, mut receiving](s: task::Scope) fails task::Cancelled uses wait {
+        let Some(Receivers(noticed: heard, stopping: watched, ending: told)) = mut receiving.extract() else {
             return
         }
         discard s.spawn(fn() fails task::Cancelled uses wait {
@@ -484,7 +665,9 @@ fn joined(isolation: Isolation, id: u64, job: sys::load::Isolated, take componen
                 let Some(channel) = try await mut hearing.receive() else {
                     return
                 }
-                link.heard_from(channel)
+                if channel < keyed.len() {
+                    link.heard_from(keyed[channel])
+                }
             }
         })
         let watching = s.spawn(fn[take watched]() -> Option[task::Cancelled] fails task::Cancelled uses wait {
@@ -510,7 +693,7 @@ fn joined(isolation: Isolation, id: u64, job: sys::load::Isolated, take componen
         s.cancel()
     })
     return Joined(outcome: take outcome, cancelled: take cancelled)
-} joined
+} run_watched
 
 /// The receivers through which a job's or instance's task hears which of its link's channels the
 /// space moved bytes through, that it is no longer cancellable, and how it ended.
@@ -520,14 +703,17 @@ struct Receivers {
     ending: task::Receiver[Outcome]
 } Receivers
 
-/// Maps a link's doorbell, then each of its channels' inbound and outbound frames, into a space,
+/// Maps a link's doorbell, then the inbound and outbound frames of each of its channels but those of
+/// ports, into a space,
 /// giving their addresses there, or none, mapping nothing, when the space has too few pages for
 /// user frames left.
 fn mapped(mut space: sys::load::Space, link: Link, alloc: mem::Alloc) -> mem::List[u64] {
     var addresses = mem::List[u64].empty(alloc)
     var whole = shared_into(mut space, frame: link.bell, mut addresses)
     for channel in link.channels {
-        whole = whole and shared_into(mut space, frame: channel.inbound, mut addresses) and shared_into(mut space, frame: channel.outbound, mut addresses)
+        if channel.port.is_none() {
+            whole = whole and shared_into(mut space, frame: channel.inbound, mut addresses) and shared_into(mut space, frame: channel.outbound, mut addresses)
+        }
     }
     if whole {
         return addresses
@@ -552,15 +738,16 @@ fn shared_into(mut space: sys::load::Space, frame: hw::UserFrame, mut addresses:
 
 /// A job or instance its space runs: its entry, the runner it acts through, what crossed into the
 /// space's table for each capability that runner holds by number, the addresses at which the space
-/// maps its link's frames, whether its holder abandoned it and whether the space's runtime was
-/// ordered to abandon it, and the senders telling its task through which of its channels the space
-/// moved bytes and how it ended.
+/// maps its link's frames and the frames of the bridges it holds, whether its holder abandoned it,
+/// whether it breached a bridge and whether the space's runtime was ordered to abandon it, and the
+/// senders telling its task through which of its channels the space moved bytes and how it ended.
 struct Running {
     job: sys::load::Job
     runner: sys::Runner
     ids: mem::Map[u64, Carried]
     frames: mem::List[u64]
     halted: mem::Shared[core::atomic::AtomicBool]
+    breached: bool
     abandoning: bool
     notices: task::Sender[usize]
     ended: task::Sender[Outcome]
@@ -568,8 +755,9 @@ struct Running {
 
 /// A job or instance placed in its space that the space's runtime has not taken yet: its number,
 /// entry and input, whether it is an instance, the addresses of its link's frames, the keys and
-/// handles of its link's channels, the handle of its runner capability, and the encoding of what
-/// crossed into the space's table for its world's capabilities.
+/// handles of its link's channels, the handle of its runner capability, the encoding of what
+/// crossed into the space's table for its world's capabilities, and whether it waits for the ends
+/// of its bridges to open.
 struct Pending {
     id: u64
     job: sys::load::Job
@@ -580,13 +768,15 @@ struct Pending {
     channels: mem::List[u64]
     runner: u64
     granted: mem::Bytes
+    bridging: bool
 } Pending
 
 /// What the task running an isolation's space keeps of it: the state of its thread, the routine
 /// its runtime named to be resumed in at an exception, whether the thread waits for the answer to
 /// a `CALL_WAIT` call and whether that call woke by a ring, the jobs and instances it runs by
-/// number, those its runtime has not taken, those its runtime is ordered to abandon, and the files
-/// they opened.
+/// number, those its runtime has not taken, those its runtime is ordered to abandon, what its
+/// runtime is told of the ends of bridges its instances hold, those ends by their handles, the asks
+/// it has for other isolations, and the files they opened.
 struct Driven {
     state: hw::UserState
     fault_routine: u64
@@ -594,14 +784,23 @@ struct Driven {
     jobs: mem::Map[u64, Running]
     pending: mem::List[Pending]
     abandons: mem::List[u64]
+    notices: mem::List[Notice]
+    bridges: mem::Map[u64, BridgeEnd]
+    leaving: mem::List[Leaving]
     files: Files
 } Driven
+
+/// What the runtime of a space is told of the end of a bridge that the instance numbered `id` holds.
+struct Notice {
+    id: u64
+    bridging: Bridging
+} Notice
 
 /// What is kept of a space that has just been made, its thread starting its runtime.
 fn Driven.of(space: sys::load::Space, alloc: mem::Alloc) -> Driven {
     var state = hw::UserState(regs: Array[Untrusted[u64], 31].filled(Untrusted.of(0)), sp: Untrusted.of(space.stack()), ip: Untrusted.of(space.start()), flags: Untrusted.of(0))
     state.regs[register(1)] = Untrusted.of(space.boot_area())
-    return Driven(state: state, fault_routine: 0, waiting: None, jobs: mem::Map[u64, Running].empty(alloc), pending: mem::List[Pending].empty(alloc), abandons: mem::List[u64].empty(alloc), files: Files(open: mem::Map[u64, sys::fs::File].empty(alloc), next: 0))
+    return Driven(state: state, fault_routine: 0, waiting: None, jobs: mem::Map[u64, Running].empty(alloc), pending: mem::List[Pending].empty(alloc), abandons: mem::List[u64].empty(alloc), notices: mem::List[Notice].empty(alloc), bridges: mem::Map[u64, BridgeEnd].empty(alloc), leaving: mem::List[Leaving].empty(alloc), files: Files(open: mem::Map[u64, sys::fs::File].empty(alloc), next: 0))
 } Driven.of
 
 /// A space running jobs or instances, and what the task running it keeps of it.
@@ -624,21 +823,39 @@ fn driven(cpu: hw::Ring0, tenant: u64, services: Services, isolation: Isolation,
     let alloc = isolation.alloc
     var placing = mem::List[Placed].empty(alloc)
     loop {
-        var asked = mem::List[Joining].empty(alloc)
-        await when mut isolation.joins {
-            while isolation.joins.len() > 0 {
-                mut asked.push(mut isolation.joins.remove(0))
-            }
+        let asked = match attempt await asks_taken(isolation) {
+            Ok(taken) => taken
+            Err(_) => mem::List[Ask].empty(alloc)
         }
-        for joining in take asked {
-            discard attempt await admitted(cpu, tenant, isolation, take joining, mut placing, mut frames)
+        for ask in take asked {
+            match ask {
+                Ask.Join(joining) => {
+                    discard attempt await admitted(cpu, tenant, isolation, take joining, mut placing, mut frames)
+                }
+                Ask.Lend(borrowing) => {
+                    discard attempt await lent_for(take borrowing, mut placing, mut frames, alloc)
+                }
+                Ask.Open(opening) => {
+                    discard attempt await placed_asked(Ask.Open(take opening), mut placing, alloc)
+                }
+                Ask.Ring(ringing) => {
+                    discard attempt await placed_asked(Ask.Ring(take ringing), mut placing, alloc)
+                }
+                Ask.Close(closing) => {
+                    discard attempt await placed_asked(Ask.Close(take closing), mut placing, alloc)
+                }
+                Ask.Breach(id) => {
+                    discard attempt await placed_asked(Ask.Breach(id), mut placing, alloc)
+                }
+            }
         }
         let Some(placed) = mut placing.pop() else {
             if isolation.closed.load() {
                 spaces_released(take placing, mut frames)
+                discard attempt await forgotten(isolation)
                 return
             }
-            match attempt await isolation.woken.wait() {
+            match attempt await isolation.door.contents().woken.wait() {
                 Ok(_) => {}
                 Err(cancelled) => {
                     spaces_released(take placing, mut frames)
@@ -653,6 +870,7 @@ fn driven(cpu: hw::Ring0, tenant: u64, services: Services, isolation: Isolation,
         var held = kept
         if mut held.halts(mut running, alloc) {
             mut held.ended_all(mut running, kind: ABANDONED, report: "", alloc)
+            discard attempt await mut held.left()
             take running.release(mut frames)
             continue
         }
@@ -668,9 +886,13 @@ fn driven(cpu: hw::Ring0, tenant: u64, services: Services, isolation: Isolation,
             None => {}
         }
         match attempt await mut held.served(cpu, tenant, services, isolation, space: mut running, mut frames, mut extended) {
-            Ok(_) => kept_placed(take running, driving: take held, mut placing, mut frames)
+            Ok(_) => {
+                discard attempt await mut held.left()
+                kept_placed(take running, driving: take held, mut placing, mut frames)
+            }
             Err(cancelled) => {
                 mut held.ended_all(mut running, kind: ABANDONED, report: "", alloc)
+                discard attempt await mut held.left()
                 take running.release(mut frames)
                 spaces_released(take placing, mut frames)
                 discard attempt await forgotten(isolation)
@@ -698,17 +920,32 @@ fn kept_placed(take running: sys::load::Space, take driving: Driven, mut placing
     mut placing.push(Placed(space: take running, driving: take driving))
 } kept_placed
 
-/// Drops what every task asks of an isolation that no space will run, so that each hears that its
-/// job or instance could not be placed.
+/// Takes no more asks of an isolation that no space will run, and drops each it has not taken, so
+/// that each asking task hears that its job or instance could not be placed or its ask was not
+/// served.
 fn forgotten(isolation: Isolation) fails task::Cancelled uses wait {
-    var unplaced = mem::List[Joining].empty(isolation.alloc)
-    await when mut isolation.joins {
-        while isolation.joins.len() > 0 {
-            mut unplaced.push(mut isolation.joins.remove(0))
+    let asks = isolation.door.contents().asks.share()
+    var unserved = mem::List[Ask].empty(isolation.alloc)
+    await when mut asks {
+        asks.open = false
+        while asks.list.len() > 0 {
+            mut unserved.push(mut asks.list.remove(0))
         }
     }
-    discard unplaced
+    discard unserved
 } forgotten
+
+/// What the tasks of every isolation ask of the task running the space of `isolation`.
+fn asks_taken(isolation: Isolation) -> mem::List[Ask] fails task::Cancelled uses wait {
+    let asks = isolation.door.contents().asks.share()
+    var taken = mem::List[Ask].empty(isolation.alloc)
+    await when mut asks {
+        while asks.list.len() > 0 {
+            mut taken.push(mut asks.list.remove(0))
+        }
+    }
+    return taken
+} asks_taken
 
 /// Places the job or instance `joining` asks for in the space `placing` holds, making a space when
 /// it holds none: maps its bundle, lends the space to its task to map its link, adds its link's
@@ -717,7 +954,7 @@ fn forgotten(isolation: Isolation) fails task::Cancelled uses wait {
 /// jobs or instances, its frames given back to `frames` otherwise.
 fn admitted(cpu: hw::Ring0, tenant: u64, isolation: Isolation, take joining: Joining, mut placing: mem::List[Placed], mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
     let alloc = isolation.alloc
-    let Joining(id: id, bundle: bundle, component: component, input: input, runner: runner, caps: caps, keys: keys, halted: halted, lend: lend, notices: notices, ended: ended) = joining
+    let Joining(id: id, bundle: bundle, component: component, input: input, runner: runner, caps: caps, keys: keys, bridged: holding_back, halted: halted, lend: lend, notices: notices, ended: ended) = joining
     let placed = match mut placing.pop() {
         Some(held) => held
         None => match attempt bundle.space(cpu, data: 0, tenant, mut frames, alloc) {
@@ -757,21 +994,22 @@ fn admitted(cpu: hw::Ring0, tenant: u64, isolation: Isolation, take joining: Joi
         return
     }
     lents_released(take given, mut frames)
-    let Lent(space: returned_space, frames: addresses) = lent
+    let Lent(space: returned_space, frames: addresses, ported: ports, ends: _) = lent
     if addresses.len() != 1 + 2 * keys.len() {
         discard ended.offer(Outcome.Unplaced(sys::load::LoadError.Unplaceable))
         kept_placed(take returned_space, driving: take held, mut placing, mut frames)
         return
     }
+    let table = isolation.door.contents().table
     var channels = mem::List[u64].empty(alloc)
     for index in 0..<keys.len() {
-        mut channels.push(isolation.table.held_by(job: id, holding: Holding.Channel(index)))
+        mut channels.push(table.held_by(job: id, holding: Holding.Channel(index)))
     }
-    let acting = isolation.table.held_by(job: id, holding: Holding.Runner)
+    let acting = table.held_by(job: id, holding: Holding.Runner)
     var granted = mem::List[Granted].empty(alloc)
     for grant in caps.held {
         let one = Array[sys::Handle, 1].filled(grant.handle)
-        match isolation.table.admitted(job: id, handles: one.view(), alloc) {
+        match table.admitted(job: id, handles: one.view(), alloc) {
             Some(crossing) => mut granted.push(Granted(key: text::String.of(grant.key.as_str(), alloc), carried: crossing[0]))
             None => {}
         }
@@ -780,22 +1018,24 @@ fn admitted(cpu: hw::Ring0, tenant: u64, isolation: Isolation, take joining: Joi
     for address in addresses {
         mut unmapping.push(address)
     }
-    discard mut held.jobs.insert(id, value: Running(job: job, runner: runner, ids: mem::Map[u64, Carried].empty(alloc), frames: take unmapping, halted: take halted, abandoning: false, notices: take notices, ended: take ended))
-    mut held.pending.push(Pending(id: id, job: job, input: take input, held: instance, frames: take addresses, keys: take keys, channels: take channels, runner: acting, granted: encoded(granted, alloc)))
+    for address in ports {
+        mut unmapping.push(address)
+    }
+    discard mut held.jobs.insert(id, value: Running(job: job, runner: runner, ids: mem::Map[u64, Carried].empty(alloc), frames: take unmapping, halted: take halted, breached: false, abandoning: false, notices: take notices, ended: take ended))
+    mut held.pending.push(Pending(id: id, job: job, input: take input, held: instance, frames: take addresses, keys: take keys, channels: take channels, runner: acting, granted: encoded(granted, alloc), bridging: holding_back))
     mut placing.push(Placed(space: take returned_space, driving: take held))
 } admitted
 
 /// Gives back to `frames` the frames of each space a list of spaces given back holds.
 fn lents_released(take lents: mem::List[Lent], mut frames: mem::List[hw::PhysFrame[4_096]]) {
     for lent in take lents {
-        let Lent(space: space, frames: _) = lent
+        let Lent(space: space, frames: _, ported: _, ends: _) = lent
         take space.release(mut frames)
     }
 } lents_released
 
-/// Whether every job and instance the space runs was abandoned by its holder; otherwise ends each
-/// its holder abandoned before its runtime started it, unmapping its link's frames, and orders the
-/// runtime to abandon each other.
+/// Whether every job and instance the space runs was abandoned by its holder; otherwise has each
+/// its holder abandoned abandoned.
 fn Driven.halts(mut self, mut space: sys::load::Space, alloc: mem::Alloc) -> bool {
     var every = self.jobs.len() > 0
     var halted = mem::List[u64].empty(alloc)
@@ -812,58 +1052,113 @@ fn Driven.halts(mut self, mut space: sys::load::Space, alloc: mem::Alloc) -> boo
         return true
     }
     for id in halted {
-        var waiting = false
-        mut self.pending.retain(keep: fn[mut waiting](start: Pending) -> bool {
-            if start.id == id {
-                waiting = true
-                return false
-            }
-            return true
-        })
-        if not waiting {
-            mut self.abandons.push(id)
-            continue
-        }
-        match mut self.jobs.remove(id) {
-            Some(running) => {
-                for address in running.frames {
-                    mut space.unshare(address)
-                }
-                discard running.ended.offer(Outcome.Ended(Ended.Abandoned))
-            }
-            None => {}
-        }
+        mut self.abandoned(mut space, id, alloc)
     }
     return false
 } Driven.halts
 
+/// Has the job or instance numbered `id` abandoned: ends it at once when its runtime has not
+/// started it, and orders its runtime to abandon it otherwise.
+fn Driven.abandoned(mut self, mut space: sys::load::Space, id: u64, alloc: mem::Alloc) {
+    var unstarted = false
+    mut self.pending.retain(keep: fn[mut unstarted](start: Pending) -> bool {
+        if start.id == id {
+            unstarted = true
+            return false
+        }
+        return true
+    })
+    if not unstarted {
+        mut self.abandons.push(id)
+        return
+    }
+    mut self.job_ended(mut space, id, otherwise: Outcome.Ended(Ended.Abandoned), alloc)
+} Driven.abandoned
+
 /// `WOKE_ORDERS` when the kernel has orders for the space's runtime, 0 otherwise.
 fn Driven.orders(self) -> u64 {
-    if self.pending.len() > 0 or self.abandons.len() > 0 {
+    if self.abandons.len() > 0 or self.startable().is_some() or self.noticeable().is_some() {
         return WOKE_ORDERS
     }
     return 0
 } Driven.orders
 
-/// Ends every job and instance the space runs, unmapping their links' frames: each its holder
-/// abandoned `Abandoned`, each other `Trapped` with a trap of the kind `kind` numbers whose report
-/// is `report`.
-fn Driven.ended_all(mut self, mut space: sys::load::Space, kind: u64, report: Str, alloc: mem::Alloc) {
-    for entry in self.jobs {
-        let running = entry.value()
-        for address in running.frames {
-            mut space.unshare(address)
+/// The position in `pending` of the first job or instance the space's runtime may start: one whose
+/// bridges' ends are open.
+fn Driven.startable(self) -> Option[usize] {
+    for index in 0..<self.pending.len() {
+        if not self.pending[index].bridging {
+            return Some(index)
         }
-        let how = match running.halted.contents().load() {
-            true => Outcome.Ended(Ended.Abandoned)
-            false => Outcome.Trapped(Trapping(kind: kind, report: text::String.of(report, alloc)))
-        }
-        discard running.ended.offer(take how)
     }
-    self.jobs = mem::Map[u64, Running].empty(alloc)
+    return None
+} Driven.startable
+
+/// The position in `pending` of the first instance that starts once the ends of its bridges are open.
+fn Driven.startable_once_bridged(self) -> Option[usize] {
+    for index in 0..<self.pending.len() {
+        if self.pending[index].bridging {
+            return Some(index)
+        }
+    }
+    return None
+} Driven.startable_once_bridged
+
+/// The position in `notices` of the first notice for an instance the space's runtime has started.
+fn Driven.noticeable(self) -> Option[usize] {
+    for index in 0..<self.notices.len() {
+        let id = self.notices[index].id
+        var started = true
+        for start in self.pending {
+            if start.id == id {
+                started = false
+            }
+        }
+        if started {
+            return Some(index)
+        }
+    }
+    return None
+} Driven.noticeable
+
+/// Ends every job and instance the space runs as `Driven.job_ended` does, each `Trapped` with a
+/// trap of the kind `kind` numbers whose report is `report` unless its holder abandoned it or it
+/// breached a bridge.
+fn Driven.ended_all(mut self, mut space: sys::load::Space, kind: u64, report: Str, alloc: mem::Alloc) {
+    var ids = mem::List[u64].empty(alloc)
+    for entry in self.jobs {
+        mut ids.push(entry.key())
+    }
+    for id in ids {
+        mut self.job_ended(mut space, id, otherwise: Outcome.Trapped(Trapping(kind: kind, report: text::String.of(report, alloc))), alloc)
+    }
     self.pending = mem::List[Pending].empty(alloc)
     self.abandons = mem::List[u64].empty(alloc)
 } Driven.ended_all
+
+/// Ends the job or instance numbered `id`, unmapping its link's frames and those of its bridges'
+/// ends and closing those ends: `Abandoned` once its holder abandoned it, `Trapped` with a trap of
+/// `trap.bounds` whose report is `BREACH_REPORT` once it breached a bridge, and as `otherwise` says
+/// otherwise.
+fn Driven.job_ended(mut self, mut space: sys::load::Space, id: u64, take otherwise: Outcome, alloc: mem::Alloc) {
+    let Some(running) = mut self.jobs.remove(id) else {
+        return
+    }
+    for address in running.frames {
+        mut space.unshare(address)
+    }
+    mut self.ends_dropped(id, alloc)
+    mut self.notices.retain(keep: fn(notice: Notice) -> bool {
+        return notice.id != id
+    })
+    var how = otherwise
+    if running.halted.contents().load() {
+        how = Outcome.Ended(Ended.Abandoned)
+    } else if running.breached {
+        how = Outcome.Trapped(Trapping(kind: BOUNDS, report: text::String.of(BREACH_REPORT, alloc)))
+    }
+    discard running.ended.offer(take how)
+} Driven.job_ended
 
 /// Runs the space's thread until its next exit and serves it, drawing from `frames` the pages it
 /// draws: a fault on a page of the boot area it does not map draws that page, and another exception
@@ -897,11 +1192,11 @@ fn Driven.served(mut self, cpu: hw::Ring0, tenant: u64, services: Services, isol
                 let deadline = user_word(self.state.regs[register(0)])
                 if self.orders() != 0 {
                     answer = WOKE_ORDERS
-                } else if deadline == 0 {
+                } else if deadline == 0 and self.startable_once_bridged().is_none() {
                     mut self.ended_all(mut space, kind: ABANDONED, report: "", alloc)
                     return
                 } else {
-                    self.waiting = Some(try await slept_until(services.clock, deadline, rang: isolation.woken))
+                    self.waiting = Some(try await slept_until(services.clock, deadline, rang: isolation.door.contents().woken))
                     return
                 }
             } else if number == CALL_DRAW {
@@ -930,35 +1225,29 @@ fn Driven.served(mut self, cpu: hw::Ring0, tenant: u64, services: Services, isol
     }
 } Driven.served
 
-/// Ends the job or instance whose number a `CALL_END` call gives, unmapping its link's frames, as
-/// the call says, `Abandoned` once its holder abandoned it; a call naming none ends every job and
-/// instance as a trap of the kind it names, with its report, or of `trap.abandoned`.
+/// Ends the job or instance whose number a `CALL_END` call gives as `Driven.job_ended` does, as
+/// the call says; a call naming none ends every job and instance as a trap of the kind it names,
+/// with its report, or of `trap.abandoned`.
 fn Driven.ended_by(mut self, mut space: sys::load::Space, alloc: mem::Alloc) {
     let id = user_word(self.state.regs[register(4)])
-    let Some(running) = mut self.jobs.remove(id) else {
-        if id != 0 {
-            return
-        }
-        var kind = ABANDONED
-        var report = text::String.empty(alloc)
-        if user_word(self.state.regs[register(0)]) == ENDS_TRAPPED {
-            kind = user_word(self.state.regs[register(1)])
-            report = match attempt copied(space, state: self.state, at: 2, alloc) {
-                Ok(bytes) => text_of(bytes.view(), alloc)
-                Err(_) => text::String.empty(alloc)
-            }
-        }
-        mut self.ended_all(mut space, kind, report: report.as_str(), alloc)
+    if self.jobs.contains(id) {
+        let how = ended_of(space, state: self.state, alloc)
+        mut self.job_ended(mut space, id, otherwise: take how, alloc)
         return
     }
-    for address in running.frames {
-        mut space.unshare(address)
+    if id != 0 {
+        return
     }
-    let how = match running.halted.contents().load() {
-        true => Outcome.Ended(Ended.Abandoned)
-        false => ended_of(space, state: self.state, alloc)
+    var kind = ABANDONED
+    var report = text::String.empty(alloc)
+    if user_word(self.state.regs[register(0)]) == ENDS_TRAPPED {
+        kind = user_word(self.state.regs[register(1)])
+        report = match attempt copied(space, state: self.state, at: 2, alloc) {
+            Ok(bytes) => text_of(bytes.view(), alloc)
+            Err(_) => text::String.empty(alloc)
+        }
     }
-    discard running.ended.offer(take how)
+    mut self.ended_all(mut space, kind, report: report.as_str(), alloc)
 } Driven.ended_by
 
 /// Serves an `CALL_INVOKE` call: the handle of an entry of the space's table, the operation, the
@@ -978,7 +1267,7 @@ fn Driven.invoked(mut self, cpu: hw::Ring0, tenant: u64, services: Services, iso
     if capacity > MOST_BYTES {
         return INVALID
     }
-    let Some(entry) = isolation.table.held.get(handle) else {
+    let Some(entry) = isolation.door.contents().table.held.get(handle) else {
         return STALE
     }
     if entry.job != 0 and not self.jobs.contains(entry.job) {
@@ -1028,9 +1317,10 @@ fn Driven.invoked(mut self, cpu: hw::Ring0, tenant: u64, services: Services, iso
                 return STALE
             }
             var running = found
-            return runner_served(mut space, runner: running.runner, job: entry.job, operation, args, target, capacity, table: isolation.table, ids: mut running.ids, alloc)
+            return runner_served(mut space, runner: running.runner, job: entry.job, operation, args, target, capacity, table: isolation.door.contents().table, ids: mut running.ids, alloc)
         }
         Holding.Kind(capability) => return kind_invoked(mut space, capability, operation, args, target, capacity, alloc)
+        Holding.Bridge => return try await mut self.bridge_invoked(isolation.door, mut space, handle, operation, args, target, capacity, mut frames, alloc)
     }
     return INVALID
 } Driven.invoked
@@ -1062,9 +1352,10 @@ fn every_halted(jobs: mem::Map[u64, Running]) -> bool {
 } every_halted
 
 /// Serves the taking of the kernel's next order: writes at `target` the record ordering the space's
-/// runtime to abandon a job or instance, or to start one with its link's records, their keys and
-/// its input after it, and gives its length, which is past `capacity` when the order does not fit,
-/// then writing nothing; `INVALID` when there is no order.
+/// runtime to abandon a job or instance, to start one with its link's records, their keys and its
+/// input after it, or telling it of the end of a bridge one holds with what it is told after it,
+/// and gives its length, which is past `capacity` when the order does not fit, then writing
+/// nothing; `INVALID` when there is no order.
 fn Driven.order_taken(mut self, mut space: sys::load::Space, target: u64, capacity: u64, alloc: mem::Alloc) -> u64 {
     if self.abandons.len() > 0 {
         let id = self.abandons[0]
@@ -1079,15 +1370,35 @@ fn Driven.order_taken(mut self, mut space: sys::load::Space, target: u64, capaci
         discard mut self.abandons.remove(0)
         return written_back(mut space, address: target, bytes: record_bytes(record, count: START_BYTES, alloc), count: u64.widen(START_BYTES))
     }
-    if self.pending.len() == 0 {
+    match self.startable() {
+        Some(index) => {
+            let bytes = self.pending[index].laid_out(at: target, alloc)
+            let len = u64.widen(bytes.len())
+            if len > capacity {
+                return len
+            }
+            discard mut self.pending.remove(index)
+            return written_back(mut space, address: target, bytes, count: len)
+        }
+        None => {}
+    }
+    let Some(index) = self.noticeable() else {
         return INVALID
     }
-    let bytes = self.pending[0].laid_out(at: target, alloc)
+    let notice = self.notices[index]
+    let Some(running) = self.jobs.get(notice.id) else {
+        discard mut self.notices.remove(index)
+        return INVALID
+    }
+    let body = encoded(notice.bridging, alloc)
+    let record = Start(order: ORDER_NOTICE, id: notice.id, job: running.job, input: 0, input_len: 0, bell: 0, ports: 0, port_count: 0, held: 0, runner: 0, granted: target + u64.widen(START_BYTES), granted_len: u64.widen(body.len()))
+    var bytes = record_bytes(record, count: START_BYTES, alloc)
+    mut bytes.append(body.view())
     let len = u64.widen(bytes.len())
     if len > capacity {
         return len
     }
-    discard mut self.pending.remove(0)
+    discard mut self.notices.remove(index)
     return written_back(mut space, address: target, bytes, count: len)
 } Driven.order_taken
 
@@ -1238,9 +1549,13 @@ fn faulted(mut state: hw::UserState, fault: hw::UserFault, routine: u64) {
     state.ip = Untrusted.of(routine)
 } faulted
 
-/// Waits until a deadline of the clock or until `rang` is posted, giving `WOKE_RUNG` when it was
-/// and 0 otherwise.
+/// Waits until a deadline of the clock, or for good for the deadline 0, or until `rang` is posted,
+/// giving `WOKE_RUNG` when it was and 0 otherwise.
 fn slept_until(clock: sys::Clock, deadline: u64, rang: hw::Signal[u64]) -> u64 fails task::Cancelled uses wait {
+    if deadline == 0 {
+        discard try await rang.wait()
+        return WOKE_RUNG
+    }
     let elapsed = match attempt clock.elapsed_ns() {
         Ok(ns) => ns
         Err(_) => deadline
@@ -1781,11 +2096,13 @@ fn trap_of(kind: u64, report: Str, alloc: mem::Alloc) -> sys::Trap
 
 /// The first task of a space's runtime: takes each order of its kernel, waiting for its kernel to
 /// have orders, starting each job or instance it orders on a task of its own, in a domain of its own
-/// run, and abandoning the domain of each it orders abandoned.
+/// run, abandoning the domain of each it orders abandoned, and telling each instance what its kernel
+/// tells of the ends of its bridges.
 pkg fn isolated() fails task::Cancelled uses wait limits stack 16_384 {
     let granted = space_base()
     let alloc = granted.alloc
     let domains = task::Cown.of(mem::Map[u64, mem::Shared[sys::Abandoner]].empty(alloc), alloc)
+    let mailboxes = task::Cown.of(mem::Map[u64, task::Sender[Bridging]].empty(alloc), alloc)
     try await task::scope(granted.exec, body: fn(s: task::Scope) fails task::Cancelled uses wait {
         loop {
             let Some(order) = taken_order(alloc) else {
@@ -1801,16 +2118,28 @@ pkg fn isolated() fails task::Cancelled uses wait limits stack 16_384 {
                 }
                 continue
             }
+            if record.order == ORDER_NOTICE {
+                try await told_of(order, mailboxes, alloc)
+                continue
+            }
             let domain = mem::Shared.of(sys::Abandoner.new(), alloc)
             let held = domain.share()
             await when mut domains {
                 discard mut domains.insert(record.id, value: take held)
             }
+            let task::Channel(sender: posting, receiver: posted) = task::Channel[Bridging].bounded(QUEUED_CALLS, alloc)
+            await when mut mailboxes {
+                discard mut mailboxes.insert(record.id, value: take posting)
+            }
             let forgetting = domains.share()
-            discard s.spawn(fn[take order, take domain, take forgetting]() fails task::Cancelled uses wait limits stack 16_384 {
-                try await begun(order, domain, granted)
+            let unposting = mailboxes.share()
+            discard s.spawn(fn[take order, take domain, take forgetting, take posted, take unposting]() fails task::Cancelled uses wait limits stack 16_384 {
+                try await begun(order, domain, granted, notices: take posted)
                 await when mut forgetting {
                     discard mut forgetting.remove(record.id)
+                }
+                await when mut unposting {
+                    discard mut unposting.remove(record.id)
                 }
             })
         }
@@ -1844,8 +2173,9 @@ fn taken_order(alloc: mem::Alloc) -> Option[Taken] {
 /// Runs the job or instance an order starts, in a domain run of `domain`, on a world whose log,
 /// standard streams, random source and file system the kernel serves, with the capabilities that
 /// crossed for it and its link's channels in its table, holding the instance of a component entry
-/// for the kernel over its link's first channel, and ends it with the kernel as it ended.
-fn begun(order: Taken, domain: mem::Shared[sys::Abandoner], granted: Base) fails task::Cancelled uses wait {
+/// for the kernel over its link's first channel and serving the ends of its bridges `notices` tells
+/// of, and ends it with the kernel as it ended.
+fn begun(order: Taken, domain: mem::Shared[sys::Abandoner], granted: Base, take notices: task::Receiver[Bridging]) fails task::Cancelled uses wait {
     let record = order.record
     let alloc = granted.alloc
     var input = mem::Bytes.empty(alloc)
@@ -1875,7 +2205,7 @@ fn begun(order: Taken, domain: mem::Shared[sys::Abandoner], granted: Base) fails
                 0 => attempt await domain.contents().run_sized(fn[take given, take input]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
                     return try await call(job, world: take given, take input)
                 }, stack: job.stack() + CALL_STACK, exec: granted.exec, alloc)
-                else => attempt await served_instance(job, port: ports.mint(0), base, runner: record.runner, domain, world: take given, take input, up, take outgoing, waits)
+                else => attempt await served_instance(job, port: ports.mint(0), base, runner: record.runner, domain, world: take given, take input, up, take outgoing, waits, take notices)
             }
             take remotes.close()
             take ports.close()

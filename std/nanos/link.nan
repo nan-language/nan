@@ -1,4 +1,4 @@
-//! Links between a kernel and the isolated spaces it runs: the doorbell the kernel rings and the channels whose frames both sides share, the kernel's side of each and the runtime's, which serves a channel to its job as a standard stream.
+//! Links between a kernel and the isolated spaces it runs: the doorbell the kernel rings, the channels whose frames both sides share, the kernel's side of each and the runtime's, which serves a channel to its job as a standard stream, and the channels an instance calls a port through.
 
 /// The offsets in a channel frame of the count of bytes its writer has written, of the count its
 /// reader has read, and of its data, a ring of `RING_BYTES` bytes.
@@ -27,12 +27,13 @@ pub open linear struct Link derives Send {
     alloc: mem::Alloc
 } Link
 
-/// A channel of a link: its key, the frame the kernel writes and the space reads, the frame the
-/// space writes and the kernel reads, the bytes the kernel has written to the first and read
-/// from the second, and the signals waking the kernel's receiver and its sender once the space
-/// tells it moved bytes.
+/// A channel of a link: its key, the port it carries the calls of, the frame the kernel writes and
+/// the space reads, the frame the space writes and the kernel reads, the bytes the kernel has
+/// written to the first and read from the second, and the signals waking the kernel's receiver and
+/// its sender once the space tells it moved bytes.
 linear struct Channel {
     key: text::String
+    port: Option[Porting]
     inbound: hw::UserFrame
     outbound: hw::UserFrame
     sent: core::atomic::AtomicU64
@@ -51,9 +52,25 @@ pub fn Link.of(take bell: hw::PhysFrame[4_096], alloc: mem::Alloc) -> Link {
 } Link.of
 
 pub fn Link.open(mut self, key: Str, take inbound: hw::PhysFrame[4_096], take outbound: hw::PhysFrame[4_096]) -> usize {
-    mut self.channels.push(Channel(key: text::String.of(key, alloc: self.alloc), inbound: cleared(take inbound), outbound: cleared(take outbound), sent: core::atomic::AtomicU64.of(0), taken: core::atomic::AtomicU64.of(0), heard: hw::Signal[u64].empty(), room: hw::Signal[u64].empty()))
-    return self.channels.len() - 1
+    return mut self.opened(key, port: None, take inbound, take outbound)
 } Link.open
+
+pub fn Link.open_port(mut self, port: u64, to: Inbox, take inbound: hw::PhysFrame[4_096], take outbound: hw::PhysFrame[4_096]) -> usize {
+    return mut self.opened(key: "", port: Some(Porting(port: port, to: to.placed)), take inbound, take outbound)
+} Link.open_port
+
+/// The port a channel of a link carries the calls of, and where the instance answering them runs,
+/// none when it runs in no isolated space.
+struct Porting {
+    port: u64
+    to: Option[Placement]
+} Porting
+
+/// Adds a channel under `key`, carrying the calls of `port`, and gives its index.
+fn Link.opened(mut self, key: Str, take port: Option[Porting], take inbound: hw::PhysFrame[4_096], take outbound: hw::PhysFrame[4_096]) -> usize {
+    mut self.channels.push(Channel(key: text::String.of(key, alloc: self.alloc), port: take port, inbound: cleared(take inbound), outbound: cleared(take outbound), sent: core::atomic::AtomicU64.of(0), taken: core::atomic::AtomicU64.of(0), heard: hw::Signal[u64].empty(), room: hw::Signal[u64].empty()))
+    return self.channels.len() - 1
+} Link.opened
 
 pub fn Link.ring(self, bits: u64) {
     discard self.bell.fetch_or(hw::Offset[u64](bytes: BELL_WORD), bits)
@@ -117,7 +134,7 @@ pub fn Link.release(take self, mut frames: mem::List[hw::PhysFrame[4_096]]) {
     let Link(bell: bell, channels: channels, rung: _, alloc: _) = self
     mut frames.push(freed(take bell))
     for channel in take channels {
-        let Channel(key: _, inbound: inbound, outbound: outbound, sent: _, taken: _, heard: _, room: _) = channel
+        let Channel(key: _, port: _, inbound: inbound, outbound: outbound, sent: _, taken: _, heard: _, room: _) = channel
         mut frames.push(freed(take inbound))
         mut frames.push(freed(take outbound))
     }
@@ -163,11 +180,16 @@ fn channel_bit(channel: usize) -> u64 {
 /// A frame made a user frame, its words cleared.
 fn cleared(take frame: hw::PhysFrame[4_096]) -> hw::UserFrame {
     let user = hw::UserFrame.of(take frame)
-    for word in 0u64..<512 {
-        user.store(hw::Offset[u64](bytes: word * 8), value: 0)
-    }
+    wiped(user)
     return user
 } cleared
+
+/// Clears the words of a user frame.
+fn wiped(frame: hw::UserFrame) {
+    for word in 0u64..<512 {
+        frame.store(hw::Offset[u64](bytes: word * 8), value: 0)
+    }
+} wiped
 
 /// The frame of a user frame of a link the spaces it served no longer map.
 fn freed(take frame: hw::UserFrame) -> hw::PhysFrame[4_096] {

@@ -1,0 +1,1364 @@
+//! Bridges between instances in isolated spaces: the kernel's side, which maps the channel an instance calls a port through into the space of the instance answering that port, opens, rings and closes the ends of each and carries what crosses with a call or reply between the spaces' tables and frames, and the runtime's side of each end, which writes the records of the calls its instance makes through the port, or of the replies to the calls it serves, into the frame the end writes, reads the other end's from the frame it reads, and rings the other end only while that end waits.
+
+/// The operations of the end of a bridge a space holds: telling its other end that it wrote or
+/// read, telling its kernel it no longer reads or writes its frames, doing so because its other
+/// end wrote what no end writes, carrying handles of the space's table into the other end's, and
+/// claiming what crossed into the space's table for it.
+const BRIDGE_RING: u64 = 0
+
+const BRIDGE_CLOSED: u64 = 1
+
+const BRIDGE_BREACH: u64 = 2
+
+const BRIDGE_CARRY: u64 = 3
+
+const BRIDGE_CLAIM: u64 = 4
+
+/// The operations of the end of a bridge through which bytes move between spaces in frames of their
+/// own: moving pages of the space to the other end, giving the length of what moved into the space
+/// for it under a token, and mapping those frames into the space.
+const BRIDGE_MOVE: u64 = 5
+
+const BRIDGE_SIZE: u64 = 6
+
+const BRIDGE_ACCEPT: u64 = 7
+
+/// What a space's runtime is told of the end of a bridge its instance holds: that it is open, that
+/// its other end wrote or read, and that it is closed, by its handle.
+enum Bridging derives Copy, Encode {
+    Opened(EndAt)
+    Rang(u64)
+    Closed(u64)
+} Bridging
+
+/// An end of a bridge: its handle, the port its instance calls through it, none for the end
+/// serving those calls, and the addresses at which its space maps the frame it reads and the frame
+/// it writes.
+struct EndAt derives Copy, Encode {
+    handle: u64
+    port: Option[u64]
+    inbound: u64
+    outbound: u64
+} EndAt
+
+/// The ends of bridges to open for the instance numbered `id`.
+struct Opening {
+    id: u64
+    ends: mem::List[Bridged]
+} Opening
+
+/// The end of a bridge, by the handle of its entry in the table of the space mapping it, that the
+/// instance numbered `id` holds.
+struct Ringing {
+    id: u64
+    handle: u64
+} Ringing
+
+/// An ask to close the end of a bridge, by its handle, that the instance numbered `id` holds, and
+/// the sender the asking task waits on until that end is closed.
+struct Closing {
+    id: u64
+    handle: u64
+    done: Option[task::Sender[u8]]
+} Closing
+
+/// The end of a bridge a space maps, and the handle of its entry in the space's table.
+struct Bridged {
+    handle: u64
+    end: BridgeEnd
+} Bridged
+
+/// The end of a bridge: the instance holding it, the door of the isolation holding its other end,
+/// that end's instance and handle, the port its instance calls through it, none for the end
+/// serving those calls, the addresses at which its space maps the frame it reads and the frame it
+/// writes, whether it unmaps them once closed, and the senders of the tasks waiting for it to close.
+struct BridgeEnd {
+    job: u64
+    peer: Doorway
+    peer_job: u64
+    peer_handle: u64
+    port: Option[u64]
+    inbound: u64
+    outbound: u64
+    unmaps: bool
+    closing: mem::List[task::Sender[u8]]
+} BridgeEnd
+
+/// What crossed into a table for the end of a bridge whose handle is `handle`, under its token.
+struct Carry {
+    token: u64
+    handle: u64
+    carried: mem::List[Carried]
+} Carry
+
+/// A channel of a link carrying the calls of a port that a space maps: its index in the link, and
+/// the addresses at which the space maps its inbound and outbound frames.
+struct Ported derives Copy {
+    channel: usize
+    inbound: u64
+    outbound: u64
+} Ported
+
+/// Maps into a space each channel of a link carrying the calls of a port to an instance of an
+/// isolated space, each frame cleared, giving where it maps them; a channel the space has no room
+/// for is left out.
+fn ports_mapped(mut space: sys::load::Space, link: Link, alloc: mem::Alloc) -> mem::List[Ported] {
+    var ports = mem::List[Ported].empty(alloc)
+    for index in 0..<link.channels.len() {
+        let channel = link.channels[index]
+        let Some(Porting(port: _, to: Some(_))) = channel.port else {
+            continue
+        }
+        wiped(channel.inbound)
+        wiped(channel.outbound)
+        let Ok(inbound) = attempt mut space.share(channel.inbound) else {
+            continue
+        }
+        let Ok(outbound) = attempt mut space.share(channel.outbound) else {
+            mut space.unshare(inbound)
+            continue
+        }
+        mut ports.push(Ported(channel: index, inbound: inbound, outbound: outbound))
+    }
+    return ports
+} ports_mapped
+
+/// The two ends of a bridge: the end a space maps, and where the other end lies.
+struct Spanning {
+    near: Bridged
+    far: PeerEnd
+} Spanning
+
+/// The end of a bridge another space maps: the door of its isolation, the number of the instance
+/// holding it, and the handle of its entry in that space's table.
+struct PeerEnd {
+    door: Doorway
+    id: u64
+    handle: u64
+} PeerEnd
+
+/// Opens a bridge for the channel `port` of `link`, which the space of the instance numbered `id`
+/// maps, to the instance answering the calls of its port: maps that channel into the instance's
+/// space, opening the end there, and gives both ends; none when that instance no longer runs or a
+/// table or its space has no room.
+fn bridge_opened(isolation: Isolation, id: u64, link: Link, port: Ported, alloc: mem::Alloc) -> Option[Spanning] fails task::Cancelled uses wait {
+    let channel = link.channels[port.channel]
+    let Some(Porting(port: number, to: Some(target))) = channel.port else {
+        return None
+    }
+    let Some(target_door) = target.door.reached() else {
+        return None
+    }
+    let near = isolation.door.contents().table.held_by(job: id, holding: Holding.Bridge)
+    let far = target_door.contents().table.held_by(job: target.id, holding: Holding.Bridge)
+    if near == MOST_HELD or far == MOST_HELD {
+        return None
+    }
+    let task::Channel(sender: lend, receiver: lent) = task::Channel[Lending].bounded(1, alloc)
+    discard attempt await target_door.contents().asked(Ask.Lend(Borrowing(id: target.id, lend: take lend)))
+    var lendings = mem::List[Lending].empty(alloc)
+    discard attempt await take lent.drain(visit: fn[mut lendings](take value: Lending) {
+        mut lendings.push(take value)
+    })
+    var mapped_far = false
+    for lending in take lendings {
+        let Lending(space: given, back: back) = lending
+        var space = given
+        var ends = mem::List[Bridged].empty(alloc)
+        match attempt mut space.share(channel.outbound) {
+            Ok(inbound) => match attempt mut space.share(channel.inbound) {
+                Ok(outbound) => {
+                    mut ends.push(Bridged(handle: far, end: BridgeEnd(job: target.id, peer: isolation.way, peer_job: id, peer_handle: near, port: None, inbound: inbound, outbound: outbound, unmaps: true, closing: mem::List[task::Sender[u8]].empty(alloc))))
+                    mapped_far = true
+                }
+                Err(_) => mut space.unshare(inbound)
+            }
+            Err(_) => {}
+        }
+        discard attempt await back.send(Lent(space: take space, frames: mem::List[u64].empty(alloc), ported: mem::List[u64].empty(alloc), ends: take ends))
+    }
+    if not mapped_far {
+        return None
+    }
+    let own = BridgeEnd(job: id, peer: target.door, peer_job: target.id, peer_handle: far, port: Some(number), inbound: port.inbound, outbound: port.outbound, unmaps: false, closing: mem::List[task::Sender[u8]].empty(alloc))
+    return Some(Spanning(near: Bridged(handle: near, end: take own), far: PeerEnd(door: target.door, id: target.id, handle: far)))
+} bridge_opened
+
+/// Closes the end of a bridge another space maps, waiting until that space no longer maps it.
+fn far_closed(far: PeerEnd, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let task::Channel(sender: done, receiver: closed) = task::Channel[u8].bounded(1, alloc)
+    try await far.door.asked(Ask.Close(Closing(id: far.id, handle: far.handle, done: Some(take done))))
+    discard attempt await take closed.drain(visit: fn(take value: u8) {})
+} far_closed
+
+/// Lends the space `placing` holds, while it runs the instance `borrowing` names, to the task
+/// asking, which maps the frames of a bridge into it, and opens the ends of bridges it gives back
+/// with the space; without such a space the ask is dropped.
+fn lent_for(take borrowing: Borrowing, mut placing: mem::List[Placed], mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let Borrowing(id: id, lend: lend) = borrowing
+    let Some(placed) = mut placing.pop() else {
+        return
+    }
+    let Placed(space: made, driving: kept) = placed
+    if not kept.jobs.contains(id) {
+        mut placing.push(Placed(space: take made, driving: take kept))
+        return
+    }
+    let task::Channel(sender: back, receiver: giving) = task::Channel[Lent].bounded(1, alloc)
+    match lend.offer(Lending(space: take made, back: take back)) {
+        Some(Lending(space: refused, back: _)) => {
+            mut placing.push(Placed(space: take refused, driving: take kept))
+            discard attempt await take giving.drain(visit: fn[mut frames](take value: Lent) {
+                let Lent(space: stray, frames: _, ported: _, ends: _) = value
+                take stray.release(mut frames)
+            })
+            return
+        }
+        None => {}
+    }
+    discard lend
+    var given = mem::List[Lent].empty(alloc)
+    discard attempt await take giving.drain(visit: fn[mut given](take value: Lent) {
+        mut given.push(take value)
+    })
+    let Some(lent) = mut given.pop() else {
+        lents_released(take given, mut frames)
+        return
+    }
+    lents_released(take given, mut frames)
+    let Lent(space: given_back, frames: _, ported: _, ends: ends) = lent
+    var space = given_back
+    var held = kept
+    for opening in take ends {
+        mut held.bridge_opened(mut space, take opening)
+    }
+    mut placing.push(Placed(space: take space, driving: take held))
+} lent_for
+
+/// Applies to the space `placing` holds an ask to open the ends of bridges, to tell the end of one
+/// that its other end rang, to close an end, or to end an instance as breaching a bridge; without
+/// a space the ask is dropped.
+fn placed_asked(take ask: Ask, mut placing: mem::List[Placed], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let Some(placed) = mut placing.pop() else {
+        return
+    }
+    let Placed(space: made, driving: kept) = placed
+    var space = made
+    var held = kept
+    match ask {
+        Ask.Open(Opening(id: id, ends: ends)) => mut held.ends_opened(mut space, id, take ends)
+        Ask.Ring(Ringing(id: id, handle: handle)) => mut held.rang(id, handle)
+        Ask.Close(Closing(id: id, handle: handle, done: done)) => mut held.closing(id, handle, take done)
+        Ask.Breach(id) => mut held.breached(mut space, id, alloc)
+        else => {}
+    }
+    discard attempt await mut held.left()
+    mut placing.push(Placed(space: take space, driving: take held))
+} placed_asked
+
+/// An ask for the isolation a doorway reaches.
+struct Leaving {
+    door: Doorway
+    ask: Ask
+} Leaving
+
+/// Has the instance numbered `id` abandoned as breaching a bridge.
+fn Driven.breached(mut self, mut space: sys::load::Space, id: u64, alloc: mem::Alloc) {
+    let Some(found) = mut self.jobs.get_mut(id) else {
+        return
+    }
+    var running = found
+    running.breached = true
+    if running.abandoning {
+        return
+    }
+    running.abandoning = true
+    mut self.abandoned(mut space, id, alloc)
+} Driven.breached
+
+/// Serves an operation of the end of a bridge the space holds by `handle`: rings its other end;
+/// closes it, unmapping the frames it maps for itself; closes it as breached by its other end,
+/// whose instance ends; carries the handles of the space's table it names into the table of the
+/// other end's space, giving the token its runtime claims them by; or claims what crossed into the
+/// space's table for it by a token, written at `target` when it fits `capacity`, giving its length
+/// either way.
+fn Driven.bridge_invoked(mut self, door: mem::Shared[Door], mut space: sys::load::Space, handle: u64, operation: u64, args: Untrusted[mem::Bytes], target: u64, capacity: u64, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    let Some(bridge) = self.bridges.get(handle) else {
+        return STALE
+    }
+    let peer = bridge.peer
+    let peer_job = bridge.peer_job
+    let peer_handle = bridge.peer_handle
+    if operation == BRIDGE_RING {
+        try await peer.asked(Ask.Ring(Ringing(id: peer_job, handle: peer_handle)))
+        return 0
+    }
+    if operation == BRIDGE_CLOSED or operation == BRIDGE_BREACH {
+        if operation == BRIDGE_BREACH {
+            try await peer.asked(Ask.Breach(peer_job))
+        }
+        mut self.end_closed(mut space, handle)
+        return 0
+    }
+    if operation == BRIDGE_CARRY {
+        let Ok(handles) = attempt mem::wire::Codec[mem::List[u64]].decode(args.view(), alloc) else {
+            return INVALID
+        }
+        let Some(given) = door.contents().table.handed(handles, alloc) else {
+            return INVALID
+        }
+        let Some(peer_door) = peer.reached() else {
+            return INVALID
+        }
+        let Some(crossing) = peer_door.contents().table.admitted(job: peer_job, handles: given.view(), alloc) else {
+            return INVALID
+        }
+        return try await peer_door.contents().carry(handle: peer_handle, take crossing)
+    }
+    if operation == BRIDGE_MOVE {
+        let Ok(span) = attempt mem::wire::Codec[Span].decode(args.view(), alloc) else {
+            return INVALID
+        }
+        return try await moved_out(peer, handle: peer_handle, span, mut space, mut frames, alloc)
+    }
+    if operation == BRIDGE_ACCEPT {
+        let Ok(accepting) = attempt mem::wire::Codec[Accepting].decode(args.view(), alloc) else {
+            return INVALID
+        }
+        return try await door.contents().accepted(handle, accepting, mut space, mut frames, alloc)
+    }
+    let Ok(token) = attempt mem::wire::Codec[u64].decode(args.view(), alloc) else {
+        return INVALID
+    }
+    if operation == BRIDGE_SIZE {
+        return try await door.contents().moved_len(handle, token, alloc)
+    }
+    if operation != BRIDGE_CLAIM {
+        return INVALID
+    }
+    let Some(bytes) = try await door.contents().claimed(handle, token, capacity, alloc) else {
+        return INVALID
+    }
+    let len = u64.widen(bytes.len())
+    if len > capacity {
+        return len
+    }
+    return written_back(mut space, address: target, bytes, count: len)
+} Driven.bridge_invoked
+
+/// Keeps what crossed into the door's table for the end of a bridge whose handle is `handle`,
+/// giving the token its runtime claims it by.
+fn Door.carry(self, handle: u64, take crossing: mem::List[Carried]) -> u64 fails task::Cancelled uses wait {
+    let token = self.tokens.fetch_add(1).value_or(0)
+    let carries = self.carries.share()
+    await when mut carries {
+        mut carries.push(Carry(token: token, handle: handle, carried: take crossing))
+    }
+    return token
+} Door.carry
+
+/// The encoding of what crossed into the door's table for the end of a bridge whose handle is
+/// `handle` under `token`, which it no longer keeps once the encoding fits `capacity`; none when
+/// it keeps nothing under `token` for that end.
+fn Door.claimed(self, handle: u64, token: u64, capacity: u64, alloc: mem::Alloc) -> Option[mem::Bytes] fails task::Cancelled uses wait {
+    let carries = self.carries.share()
+    var found: Option[mem::Bytes] = None
+    await when mut carries {
+        for index in 0..<carries.len() {
+            if carries[index].token == token and carries[index].handle == handle {
+                let bytes = encoded(carries[index].carried, alloc)
+                if u64.widen(bytes.len()) <= capacity {
+                    discard mut carries.remove(index)
+                }
+                found = Some(take bytes)
+                break
+            }
+        }
+    }
+    return found
+} Door.claimed
+
+/// Opens the ends of bridges for the instance numbered `id`, which its runtime starts from now on;
+/// the ends are dropped once it has ended.
+fn Driven.ends_opened(mut self, mut space: sys::load::Space, id: u64, take ends: mem::List[Bridged]) {
+    for opening in take ends {
+        mut self.bridge_opened(mut space, take opening)
+    }
+    for index in 0..<self.pending.len() {
+        if self.pending[index].id == id {
+            self.pending[index].bridging = false
+        }
+    }
+} Driven.ends_opened
+
+/// Opens the end of a bridge the space maps: tells the runtime of the instance holding it, and has
+/// the frames the end maps for itself unmapped once that instance ends, or at once when it has.
+fn Driven.bridge_opened(mut self, mut space: sys::load::Space, take opening: Bridged) {
+    let Bridged(handle: handle, end: opened_end) = opening
+    let Some(found) = mut self.jobs.get_mut(opened_end.job) else {
+        if opened_end.unmaps {
+            mut space.unshare(opened_end.inbound)
+            mut space.unshare(opened_end.outbound)
+        }
+        return
+    }
+    var running = found
+    if opened_end.unmaps {
+        mut running.frames.push(opened_end.inbound)
+        mut running.frames.push(opened_end.outbound)
+    }
+    mut self.notices.push(Notice(id: opened_end.job, bridging: Bridging.Opened(EndAt(handle: handle, port: opened_end.port, inbound: opened_end.inbound, outbound: opened_end.outbound))))
+    discard mut self.bridges.insert(handle, value: take opened_end)
+} Driven.bridge_opened
+
+/// Tells the runtime of the instance numbered `id` that the other end of the end of a bridge it
+/// holds by `handle` wrote or read, unless it is told so already.
+fn Driven.rang(mut self, id: u64, handle: u64) {
+    let Some(bridge) = self.bridges.get(handle) else {
+        return
+    }
+    if bridge.job != id {
+        return
+    }
+    for notice in self.notices {
+        match notice.bridging {
+            Bridging.Rang(queued) => {
+                if queued == handle {
+                    return
+                }
+            }
+            else => {}
+        }
+    }
+    mut self.notices.push(Notice(id: id, bridging: Bridging.Rang(handle)))
+} Driven.rang
+
+/// Has the runtime of the instance numbered `id` close the end of a bridge it holds by `handle`,
+/// `done` held until the end is closed.
+fn Driven.closing(mut self, id: u64, handle: u64, take done: Option[task::Sender[u8]]) {
+    let Some(found) = mut self.bridges.get_mut(handle) else {
+        return
+    }
+    var bridge = found
+    if bridge.job != id {
+        return
+    }
+    match done {
+        Some(sender) => mut bridge.closing.push(take sender)
+        None => {}
+    }
+    mut self.notices.push(Notice(id: id, bridging: Bridging.Closed(handle)))
+} Driven.closing
+
+/// Closes the end of a bridge the space holds by `handle`, unmapping the frames it maps for itself.
+fn Driven.end_closed(mut self, mut space: sys::load::Space, handle: u64) {
+    let Some(bridge) = mut self.bridges.remove(handle) else {
+        return
+    }
+    if not bridge.unmaps {
+        return
+    }
+    mut space.unshare(bridge.inbound)
+    mut space.unshare(bridge.outbound)
+    let Some(found) = mut self.jobs.get_mut(bridge.job) else {
+        return
+    }
+    var running = found
+    mut running.frames.retain(keep: fn(address: u64) -> bool {
+        return address != bridge.inbound and address != bridge.outbound
+    })
+} Driven.end_closed
+
+/// Drops the ends of bridges the instance numbered `id` holds, whose frames are unmapped with its
+/// link's, and tells the other end of each end serving calls that it is closed.
+fn Driven.ends_dropped(mut self, id: u64, alloc: mem::Alloc) {
+    var handles = mem::List[u64].empty(alloc)
+    for entry in self.bridges {
+        if entry.value().job == id {
+            mut handles.push(entry.key())
+        }
+    }
+    for handle in handles {
+        let Some(bridge) = mut self.bridges.remove(handle) else {
+            continue
+        }
+        if bridge.port.is_none() {
+            mut self.leaving.push(Leaving(door: bridge.peer, ask: Ask.Close(Closing(id: bridge.peer_job, handle: bridge.peer_handle, done: None))))
+        }
+    }
+} Driven.ends_dropped
+
+/// Gives each ask the space has for other isolations to the isolation it is for.
+fn Driven.left(mut self) fails task::Cancelled uses wait {
+    while self.leaving.len() > 0 {
+        let Leaving(door: door, ask: ask) = mut self.leaving.remove(0)
+        try await door.asked(take ask)
+    }
+} Driven.left
+
+/// Tells the instance an order names what its kernel tells of the end of a bridge it holds.
+fn told_of(order: Taken, mailboxes: task::Cown[mem::Map[u64, task::Sender[Bridging]]], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let record = order.record
+    let Some(parts) = order.bytes.view().split_at(START_BYTES) else {
+        return
+    }
+    let Some(body) = parts.tail.prefix(usize.widen(record.granted_len)) else {
+        return
+    }
+    let Ok(bridging) = attempt mem::wire::Codec[Bridging].decode(Untrusted.of(take body), alloc) else {
+        return
+    }
+    var found: Option[task::Sender[Bridging]] = None
+    await when mut mailboxes {
+        match mailboxes.get(record.id) {
+            Some(sender) => {
+                found = Some(sender.split())
+            }
+            None => {}
+        }
+    }
+    let Some(mailbox) = found else {
+        return
+    }
+    discard attempt await mailbox.send(bridging)
+} told_of
+
+/// The offsets in a frame of a bridge of the word its reader sets while it waits for bytes and of
+/// the word its writer sets while it waits for room.
+const READER_WAITS: u64 = 16
+
+const WRITER_WAITS: u64 = 24
+
+/// The bytes from which a call's or reply's bytes move between spaces through frames of their own,
+/// and the most bytes of a record either end of a bridge writes.
+const MOVED_FROM: usize = 262_144
+
+const MOST_RECORD: usize = MOVED_FROM + 4_096
+
+/// The bit of the number a space's runtime gives a call that reached its instance over a bridge.
+const OVER_BRIDGE: u64 = 0x8000_0000_0000_0000
+
+/// The bytes of a page, through which the bytes a record would not hold move between spaces, and
+/// the most bytes that move so at once.
+const PAGE_BYTES: u64 = 4_096
+
+const MOST_MOVED: u64 = 1_073_741_824
+
+/// A call one end of a bridge writes: the number of its wait, its protocol hash and what it carries.
+struct BridgeCall derives Encode {
+    id: u64
+    hash: sys::ProtocolHash
+    payload: Payload
+} BridgeCall
+
+/// The reply the other end writes to the call of a number, none when the call failed.
+struct BridgeReply derives Encode {
+    id: u64
+    reply: Option[Payload]
+} BridgeReply
+
+/// What a call or reply carries over a bridge: its bytes, the token under which its handles crossed
+/// into the other end's table, 0 for none, and the token under which the frames holding its bytes
+/// moved into the other end's space in their place, 0 for none.
+struct Payload derives Encode {
+    bytes: mem::Bytes
+    carried: u64
+    moved: u64
+} Payload
+
+/// The end of a bridge as the tasks of a space's runtime reach it: the handle of its entry, the
+/// records queued for it, the sender nudging the task pumping it, whether it is closed, and the
+/// waits of the calls an instance makes through it.
+struct Pump {
+    handle: u64
+    queued: task::Cown[mem::List[mem::Bytes]]
+    nudge: task::Sender[u8]
+    closed: mem::Shared[core::atomic::AtomicBool]
+    waits: task::Cown[PortWaits]
+} Pump
+
+fn Pump.share(self) -> Pump {
+    return Pump(handle: self.handle, queued: self.queued.share(), nudge: self.nudge.split(), closed: self.closed.share(), waits: self.waits.share())
+} Pump.share
+
+/// Queues a record for the end to write.
+fn Pump.queue(self, take record: mem::Bytes) fails task::Cancelled uses wait {
+    let queued = self.queued.share()
+    await when mut queued {
+        mut queued.push(take record)
+    }
+    discard self.nudge.offer(0)
+} Pump.queue
+
+/// The records queued for the end, taken.
+fn Pump.taken(self, alloc: mem::Alloc) -> mem::List[mem::Bytes] fails task::Cancelled uses wait {
+    let queued = self.queued.share()
+    var records = mem::List[mem::Bytes].empty(alloc)
+    await when mut queued {
+        while queued.len() > 0 {
+            mut records.push(mut queued.remove(0))
+        }
+    }
+    return records
+} Pump.taken
+
+/// The calls that reached an instance over bridges and await its reply, by the numbers its
+/// runtime gave them, and the number of the next.
+struct Routes {
+    next: u64
+    waiting: mem::Map[u64, Route]
+} Routes
+
+/// Where the reply to a call that reached an instance over a bridge goes: the end it came through,
+/// and the number of its wait at the other end.
+struct Route {
+    pump: Pump
+    call: u64
+} Route
+
+/// What the bridges of an instance's space reach: the ends its instance calls ports through, by
+/// port, the calls its instance serves over them, the sender of the replies its instance makes to
+/// those it postponed, the remote capability its handles are minted through, and the runtime's
+/// clock and allocator.
+struct Bridges {
+    ports: task::Cown[mem::Map[u64, Pump]]
+    routes: task::Cown[Routes]
+    late: task::Sender[Late]
+    base: Remote
+    clock: sys::Clock
+    alloc: mem::Alloc
+} Bridges
+
+fn Bridges.share(self) -> Bridges {
+    return Bridges(ports: self.ports.share(), routes: self.routes.share(), late: self.late.split(), base: self.base, clock: self.clock, alloc: self.alloc)
+} Bridges.share
+
+/// A reply an instance makes to a call it postponed, which reached it over a bridge: the number its
+/// runtime gave the call, and the reply.
+struct Late {
+    request: u64
+    reply: Naming
+} Late
+
+/// Serves the ends of the bridges of an instance as its kernel tells: pumps each end that opens,
+/// its instance's calls through a port passing over it, or the calls reaching its instance through
+/// `calls`, and replies to postponed ones as `late` gives them; nudges an end whose other end
+/// wrote or read, and closes an end once told, telling the kernel.
+fn bridges_served(take notices: task::Receiver[Bridging], take late: task::Receiver[Late], bridges: Bridges, calls: task::Sender[Called], exec: task::Executor) fails task::Cancelled uses wait {
+    let alloc = bridges.alloc
+    var pumps = mem::Map[u64, Pump].empty(alloc)
+    var receiving = Some(take notices)
+    var replying = Some(take late)
+    try await task::scope(exec, body: fn[mut pumps, mut receiving, mut replying](s: task::Scope) fails task::Cancelled uses wait {
+        let Some(told) = mut receiving.extract() else {
+            return
+        }
+        let Some(answering) = mut replying.extract() else {
+            return
+        }
+        let shared = bridges.share()
+        discard s.spawn(fn[take answering, take shared]() fails task::Cancelled uses wait {
+            var receiver = answering
+            loop {
+                let Some(Late(request: request, reply: reply)) = try await mut receiver.receive() else {
+                    return
+                }
+                let routing = shared.routes.share()
+                let found = await when mut routing => mut routing.waiting.remove(request)
+                match found {
+                    Some(route) => try await replied_across(take route, take reply, bridges: shared, alloc)
+                    None => {}
+                }
+            }
+        })
+        var receiver = told
+        loop {
+            let Some(bridging) = try await mut receiver.receive() else {
+                return
+            }
+            match bridging {
+                Bridging.Opened(at) => {
+                    let task::Channel(sender: nudge, receiver: nudged) = task::Channel[u8].bounded(1, alloc)
+                    let pump = Pump(handle: at.handle, queued: task::Cown.of(mem::List[mem::Bytes].empty(alloc), alloc), nudge: take nudge, closed: mem::Shared.of(core::atomic::AtomicBool.of(false), alloc), waits: task::Cown.of(PortWaits(next: 0, waiting: mem::Map[u64, task::Sender[PortAnswer]].empty(alloc)), alloc))
+                    discard mut pumps.insert(at.handle, value: pump.share())
+                    let pumping = pump.share()
+                    let sharing = bridges.share()
+                    let inbox = calls.split()
+                    discard s.spawn(fn[take nudged, take pumping, take sharing, take inbox]() fails task::Cancelled uses wait {
+                        try await end_pumped(at, take nudged, pump: pumping, bridges: sharing, calls: inbox)
+                    })
+                }
+                Bridging.Rang(handle) => {
+                    match pumps.get(handle) {
+                        Some(pump) => {
+                            discard pump.nudge.offer(0)
+                        }
+                        None => {}
+                    }
+                }
+                Bridging.Closed(handle) => {
+                    match mut pumps.remove(handle) {
+                        Some(pump) => {
+                            pump.closed.contents().store(true)
+                            discard pump.nudge.offer(0)
+                        }
+                        None => {}
+                    }
+                    var nothing = Array[u8, 1].filled(0)
+                    discard invoke(handle, operation: BRIDGE_CLOSED, args: b"", result: mut nothing.view_mut())
+                }
+            }
+        }
+    })
+} bridges_served
+
+/// Pumps the end of a bridge `at` names until it is closed or its other end breaches it: an end its
+/// instance calls a port through carries the calls `Forwarder.call` queues and gives each reply to
+/// its wait, no longer carrying the port's calls once it stops, when it fails each call still
+/// waiting; an end serving calls gives each call to the instance through `calls`.
+fn end_pumped(at: EndAt, take nudged: task::Receiver[u8], pump: Pump, bridges: Bridges, calls: task::Sender[Called]) fails task::Cancelled uses wait {
+    let alloc = bridges.alloc
+    let Some(port) = at.port else {
+        try await pumped(at, take nudged, pump, bridges, heard: fn(record: mem::Bytes) -> bool fails task::Cancelled uses wait {
+            return try await call_heard(record, pump, bridges, calls)
+        })
+        return
+    }
+    let ports = bridges.ports.share()
+    await when mut ports {
+        discard mut ports.insert(port, value: pump.share())
+    }
+    let outcome = attempt await pumped(at, take nudged, pump, bridges, heard: fn(record: mem::Bytes) -> bool fails task::Cancelled uses wait {
+        return try await reply_heard(record, pump, alloc)
+    })
+    await when mut ports {
+        discard mut ports.remove(port)
+    }
+    let waits = pump.waits.share()
+    await when mut waits {
+        for entry in waits.waiting {
+            discard entry.value().offer(PortAnswer.Unknown)
+        }
+        waits.waiting = mem::Map[u64, task::Sender[PortAnswer]].empty(alloc)
+    }
+    match outcome {
+        Ok(_) => {}
+        Err(cancelled) => fail cancelled
+    }
+} end_pumped
+
+/// Writes the records queued for the end of a bridge `at` names into the frame it writes as that
+/// frame has room, and gives `heard` each record the other end writes into the frame it reads,
+/// ringing the other end when it waits for what this end read or wrote and waiting on `nudged`, or
+/// at most `RECHECK_NS`, while it can do neither; returns once the end is closed, or once the other
+/// end breaches it, by counts or a record no end writes, or a record `heard` refuses, which it
+/// tells the kernel.
+fn pumped(at: EndAt, take nudged: task::Receiver[u8], pump: Pump, bridges: Bridges, heard: fn(record: mem::Bytes) -> bool fails task::Cancelled uses wait) fails task::Cancelled uses wait {
+    let alloc = bridges.alloc
+    var out = mem::Bytes.empty(alloc)
+    var pending = mem::Bytes.empty(alloc)
+    var waking = nudged
+    loop {
+        for record in try await pump.taken(alloc) {
+            mut out.append(record.view())
+        }
+        if pump.closed.contents().load() {
+            return
+        }
+        var moved = false
+        if out.len() > 0 {
+            let Some(count) = ring_filled(at.outbound, data: out.view()) else {
+                breached(at.handle)
+                return
+            }
+            if count > 0 {
+                out = rest_of(out, from: count, alloc)
+                moved = true
+                if waits_taken(at.outbound + READER_WAITS) {
+                    rang_across(at.handle)
+                }
+            }
+        }
+        let Some(count) = ring_drained(at.inbound, into: mut pending, alloc) else {
+            breached(at.handle)
+            return
+        }
+        if count > 0 {
+            moved = true
+            if waits_taken(at.inbound + WRITER_WAITS) {
+                rang_across(at.handle)
+            }
+        }
+        loop {
+            let Some(len) = frame_len(pending) else {
+                break
+            }
+            if len > MOST_RECORD {
+                breached(at.handle)
+                return
+            }
+            let Some(record) = frame_off(mut pending, len, alloc) else {
+                break
+            }
+            if not try await heard(record) {
+                breached(at.handle)
+                return
+            }
+        }
+        if moved or pump.closed.contents().load() {
+            continue
+        }
+        marked_waiting(at.inbound + READER_WAITS)
+        if out.len() > 0 {
+            marked_waiting(at.outbound + WRITER_WAITS)
+        }
+        if ring_holds(at.inbound) or (out.len() > 0 and ring_has_room(at.outbound)) {
+            continue
+        }
+        discard try await task::within_ns(bridges.clock, ns: RECHECK_NS, body: fn[mut waking]() -> Option[u8] fails task::Cancelled uses wait {
+            return try await mut waking.receive()
+        })
+    }
+} pumped
+
+/// The bytes of `bytes` from `from` on.
+fn rest_of(bytes: mem::Bytes, from: usize, alloc: mem::Alloc) -> mem::Bytes {
+    var rest = mem::Bytes.empty(alloc)
+    match bytes.view().split_at(from) {
+        Some(parts) => mut rest.append(parts.tail)
+        None => {}
+    }
+    return rest
+} rest_of
+
+/// Tells the kernel that the other end of the end of a bridge whose handle is `handle` wrote what
+/// no end writes, which ends the other end's instance and closes this end.
+fn breached(handle: u64) {
+    var nothing = Array[u8, 1].filled(0)
+    discard invoke(handle, operation: BRIDGE_BREACH, args: b"", result: mut nothing.view_mut())
+} breached
+
+/// Rings the other end of the end of a bridge whose handle is `handle`.
+fn rang_across(handle: u64) {
+    var nothing = Array[u8, 1].filled(0)
+    discard invoke(handle, operation: BRIDGE_RING, args: b"", result: mut nothing.view_mut())
+} rang_across
+
+/// Sets the word at `word`, telling the other end of a bridge that this end waits.
+fn marked_waiting(word: u64) {
+    trusted "the word lies in a frame of a bridge the kernel maps for the space" {
+        discard hw::Ptr[u64].of_addr(usize.widen(word)).atomic_swap(1, order: hw::Order.SeqCst)
+    }
+} marked_waiting
+
+/// Whether the other end of a bridge set the word at `word` to say it waits, clearing it.
+fn waits_taken(word: u64) -> bool {
+    let held = trusted "the word lies in a frame of a bridge the kernel maps for the space" { hw::Ptr[u64].of_addr(usize.widen(word)).atomic_swap(0, order: hw::Order.SeqCst) }
+    return held != 0
+} waits_taken
+
+/// The count of bytes the writer of the ring of the frame at `frame` has written, and the count its
+/// reader has read.
+struct Counts derives Copy {
+    written: u64
+    read: u64
+} Counts
+
+/// The counts of the ring of the frame at `frame`, none when no reader and writer leave them.
+fn counts_of(frame: u64) -> Option[Counts] {
+    let written = trusted "the frame at `frame` is a frame of a bridge the kernel maps for the space" { hw::Ptr[u64].of_addr(usize.widen(frame + RING_WRITTEN)).atomic_load(hw::Order.SeqCst) }
+    let read = trusted "the frame at `frame` is a frame of a bridge the kernel maps for the space" { hw::Ptr[u64].of_addr(usize.widen(frame + RING_READ)).atomic_load(hw::Order.SeqCst) }
+    if written < read or written - read > RING_BYTES {
+        return None
+    }
+    return Some(Counts(written: written, read: read))
+} counts_of
+
+/// Whether the ring of the frame at `frame` holds bytes its reader has not read.
+fn ring_holds(frame: u64) -> bool {
+    return match counts_of(frame) {
+        Some(counts) => counts.written > counts.read
+        None => true
+    }
+} ring_holds
+
+/// Whether the ring of the frame at `frame` has room for its writer.
+fn ring_has_room(frame: u64) -> bool {
+    return match counts_of(frame) {
+        Some(counts) => counts.written - counts.read < RING_BYTES
+        None => true
+    }
+} ring_has_room
+
+/// Appends to `into` the bytes of the ring of the frame at `frame` its writer has written and this
+/// end has not read, giving their count; none when its counts are ones no reader and writer leave.
+fn ring_drained(frame: u64, mut into: mem::Bytes, alloc: mem::Alloc) -> Option[u64] {
+    let Some(counts) = counts_of(frame) else {
+        return None
+    }
+    let count = counts.written - counts.read
+    if count == 0 {
+        return Some(0)
+    }
+    var room = mem::Bytes.zeroed(usize.widen(count), alloc)
+    let to = hw::Ptr.of_view_mut(mut room.view_mut())
+    each_piece(at: counts.read, count, body: fn(offset: u64, from: u64, len: u64) {
+        trusted "the frame at `frame` is a frame of a bridge the kernel maps for the space, and `room` holds `count` bytes" {
+            hw::Ptr[u8].of_addr(usize.widen(frame + RING_DATA + offset)).copy(to.offset(isize.fit(from)), count: usize.widen(len))
+        }
+    })
+    mut into.append(room.view())
+    trusted "the frame at `frame` is a frame of a bridge the kernel maps for the space" {
+        hw::Ptr[u64].of_addr(usize.widen(frame + RING_READ)).atomic_store(counts.written, order: hw::Order.SeqCst)
+    }
+    return Some(count)
+} ring_drained
+
+/// Writes into the ring of the frame at `frame` as many bytes of `data` as it has room for, giving
+/// their count; none when its counts are ones no reader and writer leave.
+fn ring_filled(frame: u64, data: Slice[u8]) -> Option[usize] {
+    let Some(counts) = counts_of(frame) else {
+        return None
+    }
+    var count = RING_BYTES - (counts.written - counts.read)
+    if u64.widen(data.len()) < count {
+        count = u64.widen(data.len())
+    }
+    if count == 0 {
+        return Some(0)
+    }
+    each_piece(at: counts.written, count, body: fn(offset: u64, from: u64, len: u64) {
+        trusted "the frame at `frame` is a frame of a bridge the kernel maps for the space, and `data` holds `count` bytes" {
+            hw::Ptr.of_view(data).offset(isize.fit(from)).copy(hw::Ptr[u8].of_addr(usize.widen(frame + RING_DATA + offset)), count: usize.widen(len))
+        }
+    })
+    trusted "the frame at `frame` is a frame of a bridge the kernel maps for the space" {
+        hw::Ptr[u64].of_addr(usize.widen(frame + RING_WRITTEN)).atomic_store(counts.written + count, order: hw::Order.SeqCst)
+    }
+    return Some(usize.widen(count))
+} ring_filled
+
+/// Carries the handles of the space's table that `handles` names into the table of the other end
+/// of the end of a bridge whose handle is `handle`, giving the token they crossed under, 0 for
+/// none; fails with `RunnerError.Unknown` when one cannot cross.
+fn carried_across(handle: u64, handles: mem::List[u64], alloc: mem::Alloc) -> u64 fails sys::RunnerError {
+    if handles.len() == 0 {
+        return 0
+    }
+    var nothing = Array[u8, 1].filled(0)
+    let token = invoke(handle, operation: BRIDGE_CARRY, args: encoded(handles, alloc).view(), result: mut nothing.view_mut())
+    if token >= FAILURES {
+        fail sys::RunnerError.Unknown
+    }
+    return token
+} carried_across
+
+/// What crossed into the space's table under `token` for the end of a bridge whose handle is
+/// `handle`, nothing for 0; none when the kernel keeps nothing for it under `token`.
+fn claimed(handle: u64, token: u64, alloc: mem::Alloc) -> Option[mem::List[Carried]] {
+    if token == 0 {
+        return Some(mem::List[Carried].empty(alloc))
+    }
+    var capacity: usize = CARRIED_BYTES
+    loop {
+        var bytes = mem::Bytes.zeroed(capacity, alloc)
+        let len = invoke(handle, operation: BRIDGE_CLAIM, args: encoded(token, alloc).view(), result: mut bytes.view_mut())
+        if len >= FAILURES {
+            return None
+        }
+        if len > u64.widen(capacity) {
+            capacity = usize.widen(len)
+            continue
+        }
+        let Some(written) = bytes.view().prefix(usize.widen(len)) else {
+            return None
+        }
+        return match attempt mem::wire::Codec[mem::List[Carried]].decode(Untrusted.of(take written), alloc) {
+            Ok(crossing) => Some(take crossing)
+            Err(_) => None
+        }
+    }
+} claimed
+
+/// Calls through the end of a bridge `pump`, carrying the handles `sent` names across, and gives
+/// the reply, its handles minted through `base`.
+fn called_across(pump: Pump, base: Remote, hash: sys::ProtocolHash, take sent: Naming, alloc: mem::Alloc) -> sys::Encoded fails sys::RunnerError uses wait {
+    let Naming(bytes: bytes, handles: handles) = sent
+    let token = try carried_across(pump.handle, handles, alloc)
+    let Waiting(id: id, answers: answers) = try await wait_added(pump.waits, alloc)
+    let record = framed(BridgeCall(id: id, hash: hash, payload: try payload_of(pump.handle, take bytes, crossed: token, alloc)), alloc)
+    try await pump.queue(take record)
+    var receiver = answers
+    let Some(answered) = try await mut receiver.receive() else {
+        fail sys::RunnerError.Unknown
+    }
+    return try reply_minted(take answered, base, alloc)
+} called_across
+
+/// Gives the reply a record of the end of a bridge holds to the wait of its number, its handles
+/// claimed; false for a record no serving end writes.
+fn reply_heard(record: mem::Bytes, pump: Pump, alloc: mem::Alloc) -> bool fails task::Cancelled uses wait {
+    let Ok(BridgeReply(id: id, reply: reply)) = attempt mem::wire::Codec[BridgeReply].decode(Untrusted.of(record.view()), alloc) else {
+        return false
+    }
+    var answer = PortAnswer.Unknown
+    match reply {
+        Some(payload) => {
+            let Some(crossing) = claimed(pump.handle, token: payload.carried, alloc) else {
+                return false
+            }
+            let Some(bytes) = payload_bytes(pump.handle, take payload, alloc) else {
+                return false
+            }
+            answer = PortAnswer.Replied(Carrying(bytes: take bytes, handles: take crossing))
+        }
+        None => {}
+    }
+    try await port_replied(PortReply(id: id, answer: take answer), waits: pump.waits)
+    return true
+} reply_heard
+
+/// Gives the instance the call a record of the end of a bridge holds, numbered with `OVER_BRIDGE` set,
+/// its handles claimed and minted through the remote capability of `bridges`, keeping where its
+/// reply goes; false for a record no calling end writes.
+fn call_heard(record: mem::Bytes, pump: Pump, bridges: Bridges, calls: task::Sender[Called]) -> bool fails task::Cancelled uses wait {
+    let alloc = bridges.alloc
+    let Ok(BridgeCall(id: caller, hash: hash, payload: payload)) = attempt mem::wire::Codec[BridgeCall].decode(Untrusted.of(record.view()), alloc) else {
+        return false
+    }
+    let Some(crossing) = claimed(pump.handle, token: payload.carried, alloc) else {
+        return false
+    }
+    let Some(bytes) = payload_bytes(pump.handle, take payload, alloc) else {
+        return false
+    }
+    var encoding = sys::Encoded.empty(alloc)
+    mut encoding.bytes.append(bytes.view())
+    for crossed in crossing {
+        match minted_for(bridges.base, crossed) {
+            Some(handle) => mut encoding.handles.push(handle)
+            None => {}
+        }
+    }
+    let routes = bridges.routes.share()
+    var id: u64 = 0
+    await when mut routes {
+        id = OVER_BRIDGE | routes.next
+        routes.next += 1
+        discard mut routes.waiting.insert(id, value: Route(pump: pump.share(), call: caller))
+    }
+    discard attempt await calls.send(Called(id: id, hash: hash, request: id, encoding: take encoding, alloc: alloc))
+    return true
+} call_heard
+
+/// Writes the answer of an instance to the call numbered `id`, which reached it over a bridge, to
+/// the end it came through: a reply with its handles carried across, a failure as none; a postponed
+/// call waits for the reply `Forwarder.reply` makes.
+fn answered_across(id: u64, take answer: Answer, bridges: Bridges) fails task::Cancelled uses wait {
+    let alloc = bridges.alloc
+    let routes = bridges.routes.share()
+    let found = await when mut routes => mut routes.waiting.remove(id)
+    let Some(route) = found else {
+        return
+    }
+    match answer {
+        Answer.Served(Ok(Some(reply))) => {
+            match attempt naming(bridges.base, bytes: reply.bytes.view(), handles: reply.handles.view(), alloc) {
+                Ok(named) => try await replied_across(take route, reply: take named, bridges, alloc)
+                Err(_) => try await route.pump.queue(framed(BridgeReply(id: route.call, reply: None), alloc))
+            }
+        }
+        Answer.Served(Ok(None)) => {
+            await when mut routes {
+                discard mut routes.waiting.insert(id, value: take route)
+            }
+        }
+        else => try await route.pump.queue(framed(BridgeReply(id: route.call, reply: None), alloc))
+    }
+} answered_across
+
+/// Writes a reply over the bridge `route` names, its handles carried across, or a failure when one
+/// cannot cross or the reply is longer than a record.
+fn replied_across(take route: Route, take reply: Naming, bridges: Bridges, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let Naming(bytes: bytes, handles: handles) = reply
+    let payload = match attempt carried_across(route.pump.handle, handles, alloc) {
+        Ok(token) => match attempt payload_of(route.pump.handle, take bytes, crossed: token, alloc) {
+            Ok(carrying) => Some(take carrying)
+            Err(_) => None
+        }
+        Err(_) => None
+    }
+    try await route.pump.queue(framed(BridgeReply(id: route.call, reply: take payload), alloc))
+} replied_across
+
+/// What carries `bytes` over the end of a bridge whose handle is `handle`, with the handles that
+/// crossed under `crossed`: the bytes themselves while a record holds them, and otherwise the token
+/// under which the frames holding them moved to the other end; fails with `RunnerError.Unknown`
+/// when the kernel moves none.
+fn payload_of(handle: u64, take bytes: mem::Bytes, crossed: u64, alloc: mem::Alloc) -> Payload fails sys::RunnerError {
+    if bytes.len() < MOVED_FROM {
+        return Payload(bytes: take bytes, carried: crossed, moved: 0)
+    }
+    let len = u64.widen(bytes.len())
+    var pages = mem::Bytes.zeroed(usize.widen(paged(len) + PAGE_BYTES), alloc)
+    let start = u64.widen(hw::Ptr.of_view(pages.view()).addr())
+    let offset = (PAGE_BYTES - start % PAGE_BYTES) % PAGE_BYTES
+    let Some(parts) = mut pages.view_mut().split_at_mut(usize.widen(offset)) else {
+        fail sys::RunnerError.Unknown
+    }
+    var tail = parts.tail
+    let Some(held) = mut tail.prefix_mut(bytes.len()) else {
+        fail sys::RunnerError.Unknown
+    }
+    var into = held
+    mut into.copy_from(bytes.view())
+    var nothing = Array[u8, 1].filled(0)
+    let token = invoke(handle, operation: BRIDGE_MOVE, args: encoded(Span(address: start + offset, len: len), alloc).view(), result: mut nothing.view_mut())
+    if token >= FAILURES {
+        fail sys::RunnerError.Unknown
+    }
+    return Payload(bytes: mem::Bytes.empty(alloc), carried: crossed, moved: token)
+} payload_of
+
+/// The bytes a payload carries over the end of a bridge whose handle is `handle`: its own, or those
+/// of the frames that moved into the space for it, which the space maps in place of pages of its
+/// own; none when nothing moved under its token.
+fn payload_bytes(handle: u64, take payload: Payload, alloc: mem::Alloc) -> Option[mem::Bytes] {
+    let Payload(bytes: bytes, carried: _, moved: token) = payload
+    if token == 0 {
+        return Some(take bytes)
+    }
+    var nothing = Array[u8, 1].filled(0)
+    let len = invoke(handle, operation: BRIDGE_SIZE, args: encoded(token, alloc).view(), result: mut nothing.view_mut())
+    if len >= FAILURES or len > MOST_MOVED {
+        return None
+    }
+    var pages = mem::Bytes.zeroed(usize.widen(paged(len) + PAGE_BYTES), alloc)
+    let start = u64.widen(hw::Ptr.of_view(pages.view()).addr())
+    let offset = (PAGE_BYTES - start % PAGE_BYTES) % PAGE_BYTES
+    if invoke(handle, operation: BRIDGE_ACCEPT, args: encoded(Accepting(token: token, address: start + offset), alloc).view(), result: mut nothing.view_mut()) != len {
+        return None
+    }
+    let Some(parts) = pages.view().split_at(usize.widen(offset)) else {
+        return None
+    }
+    let Some(moved) = parts.tail.prefix(usize.widen(len)) else {
+        return None
+    }
+    var given = mem::Bytes.empty(alloc)
+    mut given.append(moved)
+    return Some(take given)
+} payload_bytes
+
+/// The bytes of the whole pages that hold `len` bytes.
+fn paged(len: u64) -> u64 {
+    return (len + PAGE_BYTES - 1) / PAGE_BYTES * PAGE_BYTES
+} paged
+
+/// Pages of a space the end of a bridge moves to its other end: where they start, and the bytes
+/// they hold.
+struct Span derives Copy, Encode {
+    address: u64
+    len: u64
+} Span
+
+/// Where a space maps the frames that moved for the end of a bridge under `token`.
+struct Accepting derives Copy, Encode {
+    token: u64
+    address: u64
+} Accepting
+
+/// What the task keeping the frames moving into an isolation's space is given: frames that moved,
+/// an ask for the length of what moved under a token, or an ask for those frames.
+linear enum Moving {
+    Parked(Moved)
+    Sized(Sizing)
+    Claimed(Claiming)
+} Moving
+
+/// Frames that moved into an isolation's space for the end of a bridge whose handle is `handle`,
+/// under `token`, holding `len` bytes.
+linear struct Moved {
+    token: u64
+    handle: u64
+    len: u64
+    frames: mem::List[hw::PhysFrame[4_096]]
+} Moved
+
+/// An ask for the length of what moved under `token` for the end of a bridge whose handle is
+/// `handle`, answered through `reply`.
+struct Sizing {
+    token: u64
+    handle: u64
+    reply: task::Sender[u64]
+} Sizing
+
+/// An ask for the frames that moved under `token` for the end of a bridge whose handle is
+/// `handle`, given through `reply`.
+struct Claiming {
+    token: u64
+    handle: u64
+    reply: task::Sender[Moved]
+} Claiming
+
+/// Keeps the frames moving into an isolation's space until the end of a bridge they moved for
+/// claims them, and gives every frame left once no sender of `moving` is left.
+fn moves_kept(take moving: task::Receiver[Moving], alloc: mem::Alloc) -> mem::List[hw::PhysFrame[4_096]] fails task::Cancelled uses wait {
+    var parked = mem::List[Moved].empty(alloc)
+    discard attempt await take moving.drain(visit: fn[mut parked](take message: Moving) {
+        match message {
+            Moving.Parked(moved) => mut parked.push(take moved)
+            Moving.Sized(Sizing(token: token, handle: handle, reply: reply)) => {
+                for moved in parked {
+                    if moved.token == token and moved.handle == handle {
+                        discard reply.offer(moved.len)
+                    }
+                }
+            }
+            Moving.Claimed(Claiming(token: token, handle: handle, reply: reply)) => {
+                for index in 0..<parked.len() {
+                    if parked[index].token == token and parked[index].handle == handle {
+                        let given = mut parked.remove(index)
+                        match reply.offer(take given) {
+                            Some(refused) => mut parked.push(take refused)
+                            None => {}
+                        }
+                        break
+                    }
+                }
+            }
+        }
+    })
+    var left = mem::List[hw::PhysFrame[4_096]].empty(alloc)
+    for moved in take parked {
+        let Moved(token: _, handle: _, len: _, frames: held) = moved
+        for frame in take held {
+            mut left.push(take frame)
+        }
+    }
+    return left
+} moves_kept
+
+/// Gives back to `frames` the frames a message for the task keeping moving frames holds.
+fn moving_released(take moving: Moving, mut frames: mem::List[hw::PhysFrame[4_096]]) {
+    match moving {
+        Moving.Parked(Moved(token: _, handle: _, len: _, frames: held)) => {
+            for frame in take held {
+                mut frames.push(take frame)
+            }
+        }
+        Moving.Sized(_) => {}
+        Moving.Claimed(_) => {}
+    }
+} moving_released
+
+/// A sender of the task keeping the frames moving into the space of a door's isolation, none once
+/// that isolation takes no more.
+fn Door.mover(self) -> Option[task::Sender[Moving]] fails task::Cancelled uses wait {
+    let moves = self.moves.share()
+    var mover: Option[task::Sender[Moving]] = None
+    await when mut moves {
+        match moves {
+            Some(sender) => {
+                mover = Some(sender.split())
+            }
+            None => {}
+        }
+    }
+    return mover
+} Door.mover
+
+/// Takes no more frames moving into the space of a door's isolation.
+fn Door.moves_ended(self) fails task::Cancelled uses wait {
+    let moves = self.moves.share()
+    await when mut moves {
+        moves = None
+    }
+} Door.moves_ended
+
+/// Moves the pages `span` names out of `space` into the space of the other end `peer` reaches of a
+/// bridge, for the end whose handle is `handle` there, giving the token they moved under; gives
+/// `INVALID`, the frames it took going to `frames`, when `space` does not map each of those pages or
+/// that end's isolation takes no more.
+fn moved_out(peer: Doorway, handle: u64, span: Span, mut space: sys::load::Space, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    if span.len == 0 or span.len > MOST_MOVED or span.address % PAGE_BYTES != 0 {
+        return INVALID
+    }
+    let len = paged(span.len)
+    var taken = mem::List[hw::PhysFrame[4_096]].empty(alloc)
+    let Ok(_) = attempt mut space.give_back(span.address, len, frames: mut taken) else {
+        for frame in take taken {
+            mut frames.push(take frame)
+        }
+        return INVALID
+    }
+    var token: u64 = 0
+    var mover: Option[task::Sender[Moving]] = None
+    if u64.widen(taken.len()) * PAGE_BYTES == len {
+        match peer.reached() {
+            Some(peer_door) => {
+                token = peer_door.contents().tokens.fetch_add(1).value_or(0)
+                mover = match attempt await peer_door.contents().mover() {
+                    Ok(sender) => sender
+                    Err(_) => None
+                }
+            }
+            None => {}
+        }
+    }
+    let Some(sender) = mover else {
+        for frame in take taken {
+            mut frames.push(take frame)
+        }
+        return INVALID
+    }
+    match sender.offer(Moving.Parked(Moved(token: token, handle: handle, len: span.len, frames: take taken))) {
+        Some(refused) => {
+            moving_released(take refused, mut frames)
+            return INVALID
+        }
+        None => return token
+    }
+} moved_out
+
+/// The length of what moved into the space of a door's isolation under `token` for the end of a
+/// bridge whose handle is `handle`, `INVALID` when nothing did.
+fn Door.moved_len(self, handle: u64, token: u64, alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    let Some(mover) = try await self.mover() else {
+        return INVALID
+    }
+    let task::Channel(sender: reply, receiver: replies) = task::Channel[u64].bounded(1, alloc)
+    discard attempt await mover.send(Moving.Sized(Sizing(token: token, handle: handle, reply: take reply)))
+    var receiver = replies
+    return match try await mut receiver.receive() {
+        Some(len) => len
+        None => INVALID
+    }
+} Door.moved_len
+
+/// Maps into `space` at the address `accepting` gives, in place of the pages it maps there, the
+/// frames that moved into it under its token for the end of a bridge whose handle is `handle`,
+/// giving the length of what moved; `INVALID` when nothing did or the space cannot map them there,
+/// which gives them to `frames`.
+fn Door.accepted(self, handle: u64, accepting: Accepting, mut space: sys::load::Space, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    let Some(mover) = try await self.mover() else {
+        return INVALID
+    }
+    let task::Channel(sender: reply, receiver: replies) = task::Channel[Moved].bounded(1, alloc)
+    discard attempt await mover.send(Moving.Claimed(Claiming(token: accepting.token, handle: handle, reply: take reply)))
+    var answered = mem::List[Moved].empty(alloc)
+    discard attempt await take replies.drain(visit: fn[mut answered](take moved: Moved) {
+        mut answered.push(take moved)
+    })
+    var len = INVALID
+    for moved in take answered {
+        let Moved(token: _, handle: _, len: held, frames: given) = moved
+        match attempt mut space.adopt(accepting.address, moved: take given, mut frames) {
+            Ok(_) => {
+                len = held
+            }
+            Err(_) => {}
+        }
+    }
+    return len
+} Door.accepted

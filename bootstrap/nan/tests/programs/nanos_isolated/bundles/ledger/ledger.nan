@@ -1,4 +1,4 @@
-//! A book served through the Ledger protocol: it adds amounts, gives back a clock it receives, notes its total through a log it receives, publishing it, and gives that log back, logs through the log its runner holds as capability 7 and the one it lends through port 1, asks its runner for a resource, which a space's runner never holds, adds through the gauge its world holds, the gauge a call gives it and the one its runner holds as capability 8, settling its world's gauge from a keyed task, postpones a wait until settled, then answers it with its total, counts the ticks of a keyed task it starts whenever resumed, sending itself a tick then, traps dividing by zero and spins without end when asked.
+//! A book served through the Ledger protocol, and a teller calling it through a port: the book adds amounts, weighs bytes, gives back a clock it receives, notes its total through a log it receives, publishing it, and gives that log back, logs through the log its runner holds as capability 7 and the one it lends through port 1, asks its runner for a resource, which a space's runner never holds, adds through the gauge its world holds, the gauge a call gives it and the one its runner holds as capability 8, settling its world's gauge from a keyed task, postpones a wait until settled, then answers it with its total, counts the ticks of a keyed task it starts whenever resumed, sending itself a tick then, traps dividing by zero and spins without end when asked; the teller relays an amount to it, timing the call, has it note through the teller's log and weighs bytes there.
 
 pub protocol Ledger {
     pub fn add(amount: u32) -> u64 limits pure
@@ -10,6 +10,7 @@ pub protocol Ledger {
     pub fn spin() -> u64 limits pure
     pub fn wait() -> u64 limits pure
     pub fn settle() limits traceless
+    pub fn weigh(bytes: mem::Bytes) -> u64 limits pure
     fn tick() limits pure
 } Ledger
 
@@ -137,6 +138,14 @@ pub fn Book.settle(mut self, mut env: Env, mut cx: sys::Cx[Ledger]) {
     discard attempt mut cx.reply(self.pending, reply)
 } Book.settle
 
+pub fn Book.weigh(mut self, take bytes: mem::Bytes, mut env: Env, mut cx: sys::Cx[Ledger]) -> u64 {
+    var sum: u64 = 0
+    for byte in bytes.view() {
+        sum = sum.wrapping_add(u64.widen(byte))
+    }
+    return sum
+} Book.weigh
+
 fn Book.tick(mut self, mut env: Env, mut cx: sys::Cx[Ledger]) {
     self.ticks += 1
 } Book.tick
@@ -148,3 +157,99 @@ pub fn Book.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: sy
         discard attempt await out.tick()
     })
 } Book.resume
+
+/// What a teller serves: relaying an amount to the book its runner reaches through port 2, having
+/// that book note through the teller's log, and weighing there 3 bytes past a number of kibibytes,
+/// each from a keyed task that tells the teller once done.
+pub protocol Till {
+    pub fn relay(amount: u32) limits recorded
+    pub fn note() limits recorded
+    pub fn weigh(kibibytes: u32) limits recorded
+    fn done() limits pure
+} Till
+
+pub closed struct TellerEnv {
+    pub log: sys::Log
+    pub clock: sys::Clock
+    pub alloc: mem::Alloc
+} TellerEnv
+
+impl TellerEnv: nanos::Environment
+
+pub fn TellerEnv.build(take world: nanos::World) -> TellerEnv {
+    return TellerEnv(log: world.log, clock: world.clock, alloc: world.alloc)
+} TellerEnv.build
+
+pub closed struct Teller derives Encode {
+    pub finished: u64
+} Teller
+
+impl Teller: sys::Component[TellerEnv, Till]
+
+pub fn Teller.start(mut env: TellerEnv) -> Teller = Teller(finished: 0)
+
+pub fn Teller.relay(mut self, take amount: u32, mut env: TellerEnv, mut cx: sys::Cx[Till]) {
+    let book = sys::Port[Ledger].of(cx, id: 2)
+    let log = env.log
+    let clock = env.clock
+    let alloc = env.alloc
+    mut cx.spawn(key: 1, run: fn(out: sys::Outbox[Till]) fails task::Cancelled uses wait {
+        var call = sys::Encoded.empty(alloc)
+        let added = sys::Wire[Ledger].add(mut call, amount)
+        let start = elapsed(clock)
+        match attempt await book.call(added, call, alloc) {
+            Ok(total) => {
+                log.info("relayed", value: total)
+                log.info("relayed within the recheck", value: elapsed(clock) - start < 900_000_000)
+            }
+            Err(_) => log.info("relayed", value: false)
+        }
+        discard attempt await out.done()
+    })
+} Teller.relay
+
+pub fn Teller.note(mut self, mut env: TellerEnv, mut cx: sys::Cx[Till]) {
+    let book = sys::Port[Ledger].of(cx, id: 2)
+    let log = env.log
+    let alloc = env.alloc
+    mut cx.spawn(key: 2, run: fn(out: sys::Outbox[Till]) fails task::Cancelled uses wait {
+        var call = sys::Encoded.empty(alloc)
+        let noting = sys::Wire[Ledger].note(mut call, log)
+        match attempt await book.call(noting, call, alloc) {
+            Ok(given) => given.info("given back", value: true)
+            Err(_) => log.info("given back", value: false)
+        }
+        discard attempt await out.done()
+    })
+} Teller.note
+
+pub fn Teller.weigh(mut self, take kibibytes: u32, mut env: TellerEnv, mut cx: sys::Cx[Till]) {
+    let book = sys::Port[Ledger].of(cx, id: 2)
+    let log = env.log
+    let alloc = env.alloc
+    mut cx.spawn(key: 3, run: fn(out: sys::Outbox[Till]) fails task::Cancelled uses wait {
+        var bytes = mem::Bytes.zeroed(usize.widen(kibibytes) * 1_024 + 3, alloc)
+        for index in 0..<bytes.len() {
+            bytes[index] = u8.truncate(index % 251)
+        }
+        var call = sys::Encoded.empty(alloc)
+        let weighing = sys::Wire[Ledger].weigh(mut call, take bytes)
+        match attempt await book.call(weighing, call, alloc) {
+            Ok(sum) => log.info("weighed", value: sum)
+            Err(_) => log.info("weighed", value: false)
+        }
+        discard attempt await out.done()
+    })
+} Teller.weigh
+
+/// The nanoseconds of a clock, 0 once it is revoked.
+fn elapsed(clock: sys::Clock) -> u64 {
+    return match attempt clock.elapsed_ns() {
+        Ok(ns) => ns
+        Err(_) => 0
+    }
+} elapsed
+
+fn Teller.done(mut self, mut env: TellerEnv, mut cx: sys::Cx[Till]) {
+    self.finished += 1
+} Teller.done

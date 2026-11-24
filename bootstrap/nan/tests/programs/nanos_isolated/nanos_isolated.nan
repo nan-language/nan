@@ -1,4 +1,4 @@
-//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port, their random source from a counter and their file system from a disk writing each call it serves through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, with the reports of their traps, a job reading kernel memory, in a domain of its own and outside it, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, instances of a component whose calls, a postponed one included, keyed tasks, held ones included, messages sent to themselves and checkpoints run in their spaces, with logs and gauges crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, an instance sharing its space with a job that traps and divides, with another instance that is abandoned and with one whose space breaches its link, a book and tellers in two spaces calling it over a bridge, a log crossing there and back, payloads streamed and moved through frames of their own, and a breach ending the book, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
+//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port, their random source from a counter and their file system from a disk writing each call it serves through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, with the reports of their traps, a job reading kernel memory, in a domain of its own and outside it, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, instances of a component whose calls, a postponed one included, keyed tasks, held ones included, messages sent to themselves and checkpoints run in their spaces, with logs and gauges crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, an instance sharing its space with a job that traps and divides, with another instance that is abandoned and with one whose space breaches its link, a book and tellers in two spaces calling it over a bridge, a log crossing there and back, payloads streamed and moved through frames of their own, a breach ending the book, and calls and replies past what a link carries failing, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -58,6 +58,7 @@ pub protocol Ledger {
     pub fn wait() -> u64 limits pure
     pub fn settle() limits traceless
     pub fn weigh(bytes: mem::Bytes) -> u64 limits pure
+    pub fn fill(kibibytes: u32) -> mem::Bytes limits recorded
 } Ledger
 
 pub protocol Till {
@@ -853,7 +854,8 @@ fn booked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: 
 
 /// Holds the ledger's book and runs the typed job in one space: the job traps dividing by zero while
 /// the book is held, then divides again, another book held there adds and is abandoned, a third
-/// ends breaching its link, and the first book adds before and after and ends with its total.
+/// ends breaching its link, and the first book adds before and after, fills past what its link
+/// carries in between, and ends with its total.
 fn shared(cpu: hw::Ring0, book: sys::load::Isolated, job: sys::load::Isolated, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
     let gauging = gauges::open(grants.clock, alloc: grants.alloc)
     defer gauges::close(take gauging)
@@ -901,6 +903,8 @@ fn shared(cpu: hw::Ring0, book: sys::load::Isolated, job: sys::load::Isolated, g
                 try await take third.join()
             })
             say(text: "shared ")
+            try await filled(mut held, grants)
+            say(text: "shared ")
             try await added(mut held, amount: 7, grants)
             undefer held
             say(text: "shared book ")
@@ -916,6 +920,19 @@ fn shared(cpu: hw::Ring0, book: sys::load::Isolated, job: sys::load::Isolated, g
     take other.release(mut frames)
     take malformed.release(mut frames)
 } shared
+
+/// Has the book fill 2 MiB, a reply longer than the first channel of its link carries, and writes
+/// how the call failed.
+fn filled(mut book: nanos::Instance, grants: Grants) fails nanos::InstanceError uses wait {
+    var request = sys::Encoded.empty(grants.alloc)
+    discard sys::Wire[Ledger].fill(mut request, kibibytes: 2_048)
+    say(text: "book filled ")
+    match try await called(mut book, take request, grants) {
+        Ok(_) => say(text: "2 MiB\n")
+        Err(sys::CallError.Malformed(core::DecodeError.Invalid)) => say(text: "malformed\n")
+        else => say(text: "otherwise\n")
+    }
+} filled
 
 /// Once the book runs, writes into the frame at `outbound`, in which its space writes the first
 /// channel of its link, what no runtime writes, then asks the book's health, whose answer has the
@@ -947,7 +964,8 @@ fn written_as_space(frame: u64, data: Slice[u8]) {
 /// teller's log, which crosses there and back, and weighs payloads past the channel's ring and past
 /// a mebibyte there; then
 /// the kernel writes what no book writes into the channel of the second, which ends the book as
-/// breaching it, and the second teller's call through its port reaches its runner instead.
+/// breaching it, and the second teller's call through its port reaches its runner instead, while
+/// one past what its link's first channel carries fails at once.
 fn bridged(cpu: hw::Ring0, ledger: sys::load::Isolated, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
     let alloc = grants.alloc
     let gauging = gauges::open(grants.clock, alloc)
@@ -1070,7 +1088,8 @@ fn tellered(take instance: nanos::Instance, grants: Grants) fails nanos::Instanc
 } tellered
 
 /// Once the second teller runs, its port bridged, writes into the channel of that port what no
-/// book writes, then, once the book has ended, has the teller relay 1 and writes how it ended.
+/// book writes, then, once the book has ended, has the teller relay 1 and weigh past what the first
+/// channel of its link carries, and writes how it ended.
 fn breaching(take instance: nanos::Instance, link: nanos::Link, port: usize, mut ended: task::Receiver[u8], grants: Grants) fails nanos::InstanceError uses wait {
     var teller = instance
     defer take teller.abandon()
@@ -1080,6 +1099,9 @@ fn breaching(take instance: nanos::Instance, link: nanos::Link, port: usize, mut
     var relay = sys::Encoded.empty(grants.alloc)
     sys::Wire[Till].relay(mut relay, amount: 1)
     try await till_done(mut teller, request: take relay, grants)
+    var weighed = sys::Encoded.empty(grants.alloc)
+    sys::Wire[Till].weigh(mut weighed, kibibytes: 2_048)
+    try await till_done(mut teller, request: take weighed, grants)
     undefer teller
     say(text: "second teller ")
     say_teller(try await take teller.end(), alloc: grants.alloc)

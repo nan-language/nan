@@ -581,6 +581,11 @@ struct Naming derives Encode {
     handles: mem::List[u64]
 } Naming
 
+/// An encoding without bytes or handles.
+fn Naming.empty(alloc: mem::Alloc) -> Naming {
+    return Naming(bytes: mem::Bytes.empty(alloc), handles: mem::List[u64].empty(alloc))
+} Naming.empty
+
 /// How a call an instance's space served failed: malformed, with the number `decode_code` gives
 /// its decoding failure, or closed.
 enum Refusal derives Encode {
@@ -597,6 +602,42 @@ fn framed[V: Encode](value: V, alloc: mem::Alloc) -> mem::Bytes {
     mut frame.append(body.view())
     return frame
 } framed
+
+/// The frame of what an instance's space sends up the first channel of its link, none when its
+/// encoding is longer than `MOST_BYTES`, which the kernel takes as a breach.
+fn up_framed(up: Up, alloc: mem::Alloc) -> Option[mem::Bytes] {
+    let frame = framed(up, alloc)
+    if u64.widen(frame.len() - FRAME_HEAD) > MOST_BYTES {
+        return None
+    }
+    return Some(take frame)
+} up_framed
+
+/// The frame of the answer numbered `id` of an instance's space; when it is longer than
+/// `MOST_BYTES`, a call's reply is refused as malformed and an encoding is sent without its bytes
+/// and handles.
+fn answer_framed(id: u64, take sent: Sent, alloc: mem::Alloc) -> mem::Bytes {
+    let up = Up.Answered(Answering(id: id, answer: take sent))
+    match up_framed(up, alloc) {
+        Some(frame) => return frame
+        None => {}
+    }
+    let Up.Answered(Answering(id: _, answer: oversized)) = up else {
+        return framed(up, alloc)
+    }
+    return framed(Up.Answered(Answering(id: id, answer: trimmed(take oversized, alloc))), alloc)
+} answer_framed
+
+/// An answer too long for the first channel of a link as its space sends it instead: a call's reply
+/// refused as malformed, an encoding without its bytes and handles.
+fn trimmed(take sent: Sent, alloc: mem::Alloc) -> Sent {
+    match sent {
+        Sent.Served(_) => return Sent.Refused(Refusal.Malformed(decode_code(core::DecodeError.Invalid)))
+        Sent.Stepped(Some(Stepping(header: header, operation: operation, call: _))) => return Sent.Stepped(Some(Stepping(header: header, operation: operation, call: Naming.empty(alloc))))
+        Sent.Taken(Some(Taking(operation: operation, header: header, delay_ns: delay_ns, call: _))) => return Sent.Taken(Some(Taking(operation: operation, header: header, delay_ns: delay_ns, call: Naming.empty(alloc))))
+        else => return sent
+    }
+} trimmed
 
 /// The length of the encoding of the first frame `pending` holds, none while it holds less than a
 /// frame's head.
@@ -868,7 +909,7 @@ fn relayed_out(take answered: task::Receiver[Routed], up: task::Sender[mem::Byte
             try await answered_across(id, take answer, bridges)
             continue
         }
-        let frame = framed(Up.Answered(Answering(id: id, answer: sent_of(take answer, base, alloc))), alloc)
+        let frame = answer_framed(id, sent: sent_of(take answer, base, alloc), alloc)
         let Ok(_) = attempt await up.send(take frame) else {
             return
         }
@@ -996,8 +1037,8 @@ fn Forwarder.call(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], ha
         None => {}
     }
     let Waiting(id: id, answers: answers) = try await wait_added(waits, alloc)
-    let frame = framed(Up.Called(PortCall(id: id, port: port, hash: hash, call: take sent)), alloc)
-    let Some(answered) = try await answer_awaited(up, take frame, take answers) else {
+    let frame = up_framed(Up.Called(PortCall(id: id, port: port, hash: hash, call: take sent)), alloc)
+    let Some(answered) = try await answer_awaited(up, waits, id, take frame, take answers) else {
         fail sys::RunnerError.Unknown
     }
     return try reply_minted(take answered, base, alloc)
@@ -1041,10 +1082,17 @@ fn wait_added(waits: task::Cown[PortWaits], alloc: mem::Alloc) -> Waiting fails 
     return Waiting(id: id, answers: take answers)
 } wait_added
 
-/// Sends `up` the frame of a call waiting for the kernel's reply, and gives the answer `answers`
-/// receives for it; none once either side is closed.
-fn answer_awaited(up: task::Sender[mem::Bytes], take frame: mem::Bytes, take answers: task::Receiver[PortAnswer]) -> Option[PortAnswer] fails task::Cancelled uses wait {
-    match attempt await up.send(take frame) {
+/// Sends `up` the frame of the call waiting in `waits` for the kernel's reply under the number
+/// `id`, and gives the answer `answers` receives for it; none once either side is closed, or,
+/// dropping the wait, when the call has no frame.
+fn answer_awaited(up: task::Sender[mem::Bytes], waits: task::Cown[PortWaits], id: u64, take frame: Option[mem::Bytes], take answers: task::Receiver[PortAnswer]) -> Option[PortAnswer] fails task::Cancelled uses wait {
+    let Some(sending) = frame else {
+        await when mut waits {
+            discard mut waits.waiting.remove(id)
+        }
+        return None
+    }
+    match attempt await up.send(take sending) {
         Ok(_) => {}
         Err(task::SendError.Cancelled(cancelled)) => fail cancelled
         Err(task::SendError.Closed) => return None

@@ -16,6 +16,7 @@ use crate::check::ty::{Arg, Const, Ty};
 use crate::nir::{
     BlockId, Constant, FnRef, NTy, Operand, Payload, Place, Role, Value, is_variant_step,
 };
+use crate::syntax::ast::Mode;
 
 /// Where a place lies.
 #[derive(Clone, Debug)]
@@ -648,10 +649,8 @@ impl Body<'_, '_, '_, '_> {
             let owned: Vec<(Ty, u64)> = params
                 .iter()
                 .zip(&offsets)
-                .filter_map(|(param, offset)| match &types[param.value.0 as usize] {
-                    NTy::Owned(ty) => Some((ty.clone(), *offset)),
-                    _ => None,
-                })
+                .filter(|(param, _)| param.mode == Mode::Take)
+                .map(|(param, offset)| (types[param.value.0 as usize].ty().clone(), *offset))
                 .collect();
             let walk = super::transfer::captures(self.lo, self.fx, instance.clone(), owned);
             self.fx.store(walk, env, 0);

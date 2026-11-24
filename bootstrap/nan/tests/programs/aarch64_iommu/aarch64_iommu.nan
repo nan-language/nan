@@ -1,4 +1,4 @@
-//! Draws entropy through a confined driver, into a pool its domain maps through a 2 MiB page too, counts its MSI-X interrupts, aims its device at an unmapped bus address and receives the IOMMU's fault, then abandons a second driver mid-request and reuses its memory.
+//! Attaches two functions of one device without ACS to one domain, draws entropy through a confined driver, into a pool its domain maps through a 2 MiB page too, counts its MSI-X interrupts, aims its device at an unmapped bus address and receives the IOMMU's fault, then abandons a second driver mid-request and reuses its memory.
 
 registers Pl011 {
     data: u8 at 0x0 write
@@ -50,13 +50,15 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     take k.anchor(0u8, run: fn[take iommu, take functions, take drawing, take abandoning](exec: task::Executor) fails task::Cancelled uses wait limits stack 2_228_224 {
         let faults = watched(iommu)
         var entropy = mem::List[hw::PciFunction].empty(alloc)
+        var others = mem::List[hw::PciFunction].empty(alloc)
         for function in take functions {
             if rng::is_entropy(function) {
                 mut entropy.push(take function)
             } else {
-                take function.release()
+                mut others.push(take function)
             }
         }
+        grouped(take others, iommu, alloc)
         match mut entropy.pop() {
             Some(function) => confined(take function, domain: take drawing, alloc, iommu, faults)
             None => {
@@ -125,6 +127,55 @@ fn release(take functions: mem::List[hw::PciFunction]) {
         take function.release()
     }
 } release
+
+/// Takes the first two functions of one device, which has no ACS capability and so makes them
+/// one group: once the first is attached to a domain, the second is refused another and attaches
+/// to the first's.
+fn grouped(take functions: mem::List[hw::PciFunction], iommu: hw::Iommu, alloc: mem::Alloc) {
+    var pair = mem::List[hw::PciFunction].empty(alloc)
+    var device = hw::PciAddress(segment: 0, bus: 0, device: 0, function: 0)
+    for function in take functions {
+        let at = function.address()
+        let of = hw::PciAddress(segment: at.segment, bus: at.bus, device: at.device, function: 0)
+        if pair.len() == 1 and of == device {
+            mut pair.push(take function)
+        } else if pair.len() == 2 {
+            take function.release()
+        } else {
+            release(take pair)
+            pair = mem::List[hw::PciFunction].empty(alloc)
+            mut pair.push(take function)
+            device = of
+        }
+    }
+    let Some(two) = mut pair.pop() else {
+        say(text: "pci: no two functions of one device\n")
+        release(take pair)
+        return
+    }
+    let Some(one) = mut pair.pop() else {
+        say(text: "pci: no two functions of one device\n")
+        take two.release()
+        release(take pair)
+        return
+    }
+    release(take pair)
+    var earlier = one
+    var later = two
+    let held = new_domain(iommu)
+    let other = new_domain(iommu)
+    let shared = earlier.group() == later.group()
+    let attached = (attempt mut earlier.attach(held.space())).is_ok()
+    let refused = attempt mut later.attach(other.space())
+    let joined = (attempt mut later.attach(held.space())).is_ok()
+    if shared and attached and refused == Err(hw::IommuError.Grouped) and joined {
+        say(text: "group: a device's functions without ACS attach to one domain, which holds the group alone\n")
+    }
+    take earlier.release()
+    take later.release()
+    take held.close()
+    take other.close()
+} grouped
 
 /// Draws entropy through a buffer of its domain, counts the queue's MSI-X interrupt, then aims
 /// the device at a buffer outside the domain.
@@ -204,7 +255,8 @@ fn interrupted(mut device: rng::Rng, space: hw::IoSpace, alloc: mem::Alloc) {
 /// Restarts the device and asks it to write a buffer of physical memory its domain does not
 /// map, then checks the buffer kept its contents once the device has served the request, and
 /// that the IOMMU's fault interrupt arrived with the write as the first fault since the earlier
-/// ones.
+/// ones, under the device's requester id or, below a PCIe-to-PCI bridge, the one the bridge
+/// gives its secondary bus.
 fn outside(mut device: rng::Rng, alloc: mem::Alloc, iommu: hw::Iommu, faults: hw::IrqShared[u64], address: hw::PciAddress) {
     while iommu.fault().is_some() {
     }
@@ -227,8 +279,11 @@ fn outside(mut device: rng::Rng, alloc: mem::Alloc, iommu: hw::Iommu, faults: hw
             break
         }
     }
-    if signalled and iommu.fault() == Some(hw::DmaFault(function: address, address: bus - bus % PAGE, write: true)) {
-        say(text: "fault: the IOMMU's interrupt reported the write with the device's function and the page it reached\n")
+    let touched = bus - bus % PAGE
+    let bridged = hw::PciAddress(segment: address.segment, bus: address.bus, device: 0, function: 0)
+    let fault = iommu.fault()
+    if signalled and (fault == Some(hw::DmaFault(function: address, address: touched, write: true)) or fault == Some(hw::DmaFault(function: bridged, address: touched, write: true))) {
+        say(text: "fault: the IOMMU's interrupt reported the write with the device's requester id and the page it reached\n")
     }
 } outside
 

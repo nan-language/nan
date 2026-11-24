@@ -2,7 +2,8 @@
 
 /// The system calls of an isolated space: waiting until a deadline of the kernel's clock, drawing
 /// and releasing pages of its boot area, reading that clock, invoking an operation of a capability
-/// the kernel serves, and ending the space.
+/// the kernel serves, ending the space, and naming the routine its kernel resumes its thread in at
+/// an exception.
 const CALL_WAIT: u64 = 1
 
 const CALL_DRAW: u64 = 2
@@ -15,11 +16,15 @@ const CALL_INVOKE: u64 = 6
 
 const CALL_END: u64 = 11
 
-/// The roles of an `hw::UserState` register in a system call, as `register` takes them: its
-/// arguments from 0, its number and its result.
+const CALL_FAULT: u64 = 12
+
+/// The roles of an `hw::UserState` register, as `register` takes them: the arguments of a system
+/// call from 0, its number and its result, and the fourth argument of a call.
 const ROLE_NUMBER: u64 = 6
 
 const ROLE_RESULT: u64 = 7
+
+const ROLE_FOURTH: u64 = 8
 
 /// A call's results from `FAILURES` up are failures: an invalid call, a stale capability, and a
 /// file operation failing with a missing entry, a refusal, an invalid path or a full device.
@@ -123,6 +128,9 @@ const ABANDONED: u64 = 16
 
 /// The most bytes the kernel copies out of a space for one call.
 const MOST_BYTES: u64 = 1_048_576
+
+/// The most bytes of a trap report.
+const REPORT_BYTES: usize = 4_096
 
 /// The bytes of a start record and of the record of a port.
 const START_BYTES: usize = 104
@@ -439,12 +447,14 @@ fn record_bytes[T: Copy](record: T, count: usize, alloc: mem::Alloc) -> mem::Byt
 
 /// Runs a space's thread until its job ends, serving its system calls and drawing from `frames`
 /// the pages it draws; a fault on a page of the boot area it does not map draws that page, and
-/// another exception ends the job as a trap of `trap.exception`. Once `halted` gives true, the
-/// space runs no more and its job ends abandoned.
+/// another exception resumes the thread in the fault routine its runtime named, which it names
+/// again once it runs, or ends the job as a trap of `trap.exception` while it names none. Once
+/// `halted` gives true, the space runs no more and its job ends abandoned.
 fn run_space(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserState, mut extended: Option[hw::ExtendedState], served: Serving, link: Link, halted: fn() -> bool, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
     let services = served.services
     var ids = mem::Map[u64, Carried].empty(alloc)
     var files = Files(open: mem::Map[u64, sys::fs::File].empty(alloc), next: 0)
+    var fault_routine: u64 = 0
     loop {
         if halted() {
             return Ended.Abandoned
@@ -454,8 +464,14 @@ fn run_space(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserSta
             hw::UserExit.Fault(fault) => {
                 match attempt mut space.draw(fault.address, len: 1, mut frames) {
                     Ok(1) => {}
-                    Err(sys::load::DrawError.Exhausted) => return Ended.Trapped(trap_of(EXHAUSTED, alloc))
-                    else => return Ended.Trapped(trap_of(EXCEPTION, alloc))
+                    Err(sys::load::DrawError.Exhausted) => return Ended.Trapped(trap_of(EXHAUSTED, report: "", alloc))
+                    else => {
+                        if fault_routine == 0 {
+                            return Ended.Trapped(trap_of(EXCEPTION, report: "", alloc))
+                        }
+                        faulted(mut state, fault, routine: fault_routine)
+                        fault_routine = 0
+                    }
                 }
             }
             hw::UserExit.Syscall => {
@@ -467,7 +483,7 @@ fn run_space(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserSta
                 if number == CALL_WAIT {
                     let deadline = user_word(state.regs[register(0)])
                     if deadline == 0 {
-                        return Ended.Trapped(trap_of(ABANDONED, alloc))
+                        return Ended.Trapped(trap_of(ABANDONED, report: "", alloc))
                     }
                     answer = try await slept_until(services.clock, deadline, link)
                 } else if number == CALL_DRAW {
@@ -487,12 +503,27 @@ fn run_space(cpu: hw::Ring0, mut space: sys::load::Space, mut state: hw::UserSta
                     }
                 } else if number == CALL_INVOKE {
                     answer = try await invoked(cpu, mut space, state, served, link, halted, mut ids, mut files, mut frames, alloc)
+                } else if number == CALL_FAULT {
+                    fault_routine = user_word(state.regs[register(0)])
+                    answer = 0
                 }
                 state.regs[register(ROLE_RESULT)] = Untrusted.of(answer)
             }
         }
     }
 } run_space
+
+/// Resumes a thread that faulted with `fault` in the routine at `routine`, as if the faulting
+/// instruction called it with the fault's vector, code and address and that instruction's
+/// address, on its stack at least 16 bytes below where it faulted, aligned to 16 bytes.
+fn faulted(mut state: hw::UserState, fault: hw::UserFault, routine: u64) {
+    state.regs[register(0)] = Untrusted.of(u64.widen(fault.vector))
+    state.regs[register(1)] = Untrusted.of(fault.code)
+    state.regs[register(2)] = Untrusted.of(fault.address)
+    state.regs[register(ROLE_FOURTH)] = state.ip
+    state.sp = Untrusted.of((user_word(state.sp) & 0xFFFF_FFFF_FFFF_FFF0).wrapping_sub(16))
+    state.ip = Untrusted.of(routine)
+} faulted
 
 /// Waits until a deadline of the clock or until the link's doorbell rings, giving 1 when it rang
 /// and 0 otherwise.
@@ -513,12 +544,16 @@ fn slept_until(clock: sys::Clock, deadline: u64, link: Link) -> u64 fails task::
     }
 } slept_until
 
-/// How the job of an `CALL_END` call ended.
+/// How the job of an `CALL_END` call ended, a trap's report being the space's text.
 fn ended_by(mut space: sys::load::Space, state: hw::UserState, alloc: mem::Alloc) -> Ended {
     let how = user_word(state.regs[register(0)])
     let detail = user_word(state.regs[register(1)])
     if how == ENDS_TRAPPED {
-        return Ended.Trapped(trap_of(detail, alloc))
+        let report = match attempt copied(space, state, at: 2, alloc) {
+            Ok(bytes) => text_of(bytes.view(), alloc)
+            Err(_) => text::String.empty(alloc)
+        }
+        return Ended.Trapped(trap_of(detail, report: report.as_str(), alloc))
     }
     if how == ENDS_UNDECODABLE {
         return Ended.Undecodable
@@ -527,12 +562,12 @@ fn ended_by(mut space: sys::load::Space, state: hw::UserState, alloc: mem::Alloc
         return Ended.Cancelled
     }
     let Ok(bytes) = attempt copied(space, state, at: 2, alloc) else {
-        return Ended.Trapped(trap_of(EXCEPTION, alloc))
+        return Ended.Trapped(trap_of(EXCEPTION, report: "", alloc))
     }
     match how {
         ENDS_RETURNED => return Ended.Returned(bytes_of(bytes.view(), alloc))
         ENDS_FAILED => return Ended.Failed(text_of(bytes.view(), alloc))
-        else => return Ended.Trapped(trap_of(ABANDONED, alloc))
+        else => return Ended.Trapped(trap_of(ABANDONED, report: "", alloc))
     }
 } ended_by
 
@@ -1079,8 +1114,9 @@ validator fn text_of(raw: Untrusted[Slice[u8]], alloc: mem::Alloc) -> text::Stri
 fn register(role: u64) -> usize limits pure, notrap, terminates
 
 /// A trap of the kind its number names, `trap.abandoned` for a number naming none, drawn through
-/// `alloc`.
-fn trap_of(kind: u64, alloc: mem::Alloc) -> sys::Trap
+/// `alloc`, whose report is `report`, or locates the call when `report` is empty or longer than a
+/// report.
+fn trap_of(kind: u64, report: Str, alloc: mem::Alloc) -> sys::Trap
 
 /// The first task of a space's runtime: runs the job its start record names, or holds the
 /// instance of the component entry it names for the kernel over its link's first channel, on a
@@ -1115,8 +1151,8 @@ pkg fn isolated(start: u64) fails task::Cancelled uses wait limits stack 16_384 
             take remotes.close()
             take ports.close()
             match outcome {
-                Ok(Ok(how)) => end_with(how)
-                Ok(Err(trap)) => end(ENDS_TRAPPED, detail: trap_number(trap), bytes: b"")
+                Ok(Ok(how)) => end_with(how, alloc)
+                Ok(Err(trap)) => end_trapped(trap, alloc)
                 Err(_) => end(ENDS_TRAPPED, detail: ABANDONED, bytes: b"")
             }
         }
@@ -1160,16 +1196,24 @@ fn port_at(record: Start, index: u64) -> PortRecord {
 } port_at
 
 /// Ends the space with how its job ended.
-fn end_with(how: Ended) {
+fn end_with(how: Ended, alloc: mem::Alloc) {
     match how {
         Ended.Returned(bytes) => end(ENDS_RETURNED, detail: 0, bytes: bytes.view())
         Ended.Failed(text) => end(ENDS_FAILED, detail: 0, bytes: text.as_str().as_bytes())
         Ended.Cancelled => end(ENDS_CANCELLED, detail: 0, bytes: b"")
         Ended.Abandoned => end(ENDS_TRAPPED, detail: ABANDONED, bytes: b"")
-        Ended.Trapped(trap) => end(ENDS_TRAPPED, detail: trap_number(trap), bytes: b"")
+        Ended.Trapped(trap) => end_trapped(trap, alloc)
         Ended.Undecodable => end(ENDS_UNDECODABLE, detail: 0, bytes: b"")
     }
 } end_with
+
+/// Ends the space with a trap of its job, giving its kind and its report.
+fn end_trapped(trap: sys::Trap, alloc: mem::Alloc) {
+    var report = mem::Bytes.zeroed(REPORT_BYTES, alloc)
+    let len = render_into(trap, into: mut report.view_mut())
+    mut report.truncate(len)
+    end(ENDS_TRAPPED, detail: trap_number(trap), bytes: report.view())
+} end_trapped
 
 /// What the capabilities a space's runtime holds by the kernel's handles share: the runtime's
 /// allocator, the handle of the capability minted for each handle of the space's table, and that

@@ -135,14 +135,15 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
     true
 }
 
-/// The index in an `hw::UserState`'s registers of each argument of a system call, of its number
-/// and of its result: on x86_64 `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`, then `rax` for both; on
-/// AArch64 `x0` to `x5`, `x8`, then `x0`.
-const X64_REGISTERS: [u64; 8] = [6, 5, 2, 9, 7, 8, 0, 0];
-const A64_REGISTERS: [u64; 8] = [0, 1, 2, 3, 4, 5, 8, 0];
+/// The index in an `hw::UserState`'s registers of each argument of a system call, of its number,
+/// of its result and of the fourth argument of a call: on x86_64 `rdi`, `rsi`, `rdx`, `r10`, `r8`,
+/// `r9`, then `rax` for both, then `rcx`; on AArch64 `x0` to `x5`, `x8`, `x0`, then `x3`.
+const X64_REGISTERS: [u64; 9] = [6, 5, 2, 9, 7, 8, 0, 0, 1];
+const A64_REGISTERS: [u64; 9] = [0, 1, 2, 3, 4, 5, 8, 0, 3];
 
-/// `nanos::trap_of(kind, alloc)`: a trap of the kind its number names, `trap.abandoned` for a
-/// number naming none, its record drawn through `alloc` and its report locating the call.
+/// `nanos::trap_of(kind, report, alloc)`: a trap of the kind its number names, `trap.abandoned` for
+/// a number naming none, its record drawn through `alloc`, whose report is `report`, or locates
+/// the call when `report` is empty or longer than a report.
 fn trap_of(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let kind = supply.param(0).scalar();
     let known =
@@ -150,13 +151,33 @@ fn trap_of(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             .icmp_imm_s(IntCC::UnsignedLessThan, kind, KINDS.len() as i64);
     let abandoned = fx.ptr(kind_number("trap.abandoned") as u64);
     let kind = fx.b.ins().select(known, kind, abandoned);
-    let cell = word_of(fx, supply.param(1));
+    let (text, len) = view(fx, supply.param(1));
+    let cell = word_of(fx, supply.param(2));
     let size = fx.ptr(report::TRAP_RECORD);
     let align = fx.ptr(8);
     let record = lo.call_routine(fx, Routine::Alloc, &[cell, size, align])[0];
     let missing = fx.b.ins().icmp_imm_s(IntCC::Equal, record, 0);
     fx.when(missing, |fx| report::raise_kind(lo, fx, "trap.exhausted"));
-    lo.call_routine(fx, Routine::TrapReport, &[kind, record]);
+    let below = fx.b.ins().iadd_imm_s(len, -1);
+    let fits =
+        fx.b.ins()
+            .icmp_imm_s(IntCC::UnsignedLessThan, below, report::REPORT as i64);
+    fx.choose_in(
+        lo,
+        fits,
+        &[],
+        |lo, fx| {
+            fx.store(kind, record, trap_record::KIND);
+            fx.store(len, record, trap_record::LEN);
+            let bytes = fx.offset(record, trap_record::BYTES);
+            lo.call_routine(fx, Routine::Copy, &[bytes, text, len]);
+            Vec::new()
+        },
+        |lo, fx| {
+            lo.call_routine(fx, Routine::TrapReport, &[kind, record]);
+            Vec::new()
+        },
+    );
     let slot = fx.slot(8, 8);
     fx.store(record, slot, 0);
     let trap = lo.held_at(fx, &supply.abi.result, slot);

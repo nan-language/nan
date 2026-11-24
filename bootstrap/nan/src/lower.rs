@@ -402,6 +402,8 @@ pub struct Lowering<'c, 'a> {
     vector_seam: Option<FuncId>,
     /// A kernel's preemption glue, which its vector seam calls on an interrupted task's stack.
     preemption: Option<FuncId>,
+    /// An isolated space's fault routine, which its kernel resumes a faulting task's thread in.
+    fault_routine: Option<FuncId>,
     reserved: HashMap<&'static str, DataId>,
     irq_stacks: Option<DataId>,
     ist_stacks: Option<(DataId, u64)>,
@@ -633,6 +635,7 @@ impl<'c, 'a> Lowering<'c, 'a> {
             machine_stubs: HashMap::new(),
             vector_seam: None,
             preemption: None,
+            fault_routine: None,
             reserved: HashMap::new(),
             irq_stacks: None,
             routine_reserve: None,

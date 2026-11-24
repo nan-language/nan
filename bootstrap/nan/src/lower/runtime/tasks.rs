@@ -590,8 +590,9 @@ impl Lowering<'_, '_> {
     /// support routine uses from code outside them or, in a kernel exporting them, from a
     /// bundle: the reserve holds the most the start of a task uses beside its usable part, each
     /// call of code the usable part holds using that call, and on a kernel taking interrupts, a
-    /// seam frame and the most its preemption glue, or the trap an exception makes, uses. None
-    /// when a support routine reaches an unbounded call site.
+    /// seam frame and the most its preemption glue, or the trap an exception makes, uses, or in an
+    /// isolated space the most its fault routine uses below where a thread faulted. None when a
+    /// support routine reaches an unbounded call site.
     fn bounded_reserve(
         &self,
         families: &HashMap<stack::Family, Vec<FuncId>>,
@@ -622,13 +623,16 @@ impl Lowering<'_, '_> {
             .copied()
             .collect();
         let started = stack::routine_use(&self.frames, families, call, &start)?;
-        let preempted = match self.preemption {
-            Some(glue) => {
+        let preempted = match (self.preemption, self.fault_routine) {
+            (Some(glue), _) => {
                 let mut preempting = vec![glue];
                 preempting.extend(self.routines.get(&Routine::TrapRaise));
                 SEAM_FRAME + stack::routine_use(&self.frames, families, 0, &preempting)?
             }
-            None => 0,
+            (None, Some(fault)) => {
+                super::space::FAULT_GAP + stack::routine_use(&self.frames, families, 0, &[fault])?
+            }
+            (None, None) => 0,
         };
         Some((call.max(started) + preempted, call))
     }

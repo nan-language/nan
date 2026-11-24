@@ -366,7 +366,7 @@ The **trap kinds** are exactly these, forming the `trap` family:
 | `trap.stack-overflow` | a task stack overflows ([stack overflow](17-suspension-io.md#stack-overflow)) |
 | `trap.duplicate-access` | one exclusive access is claimed twice at once, as by an `await when` naming one cown twice ([cowns](16-concurrency.md#cowns)) |
 | `trap.poisoned` | an `await when` acquires a poisoned cown ([poisoning](#poisoning)) |
-| `trap.exception` | a kernel task's code raises a CPU exception ([interrupt functions](24-kernel.md#interrupt-functions)) |
+| `trap.exception` | a kernel task's code, or an isolated space's, raises a CPU exception ([interrupt functions](24-kernel.md#interrupt-functions), [jobs](14-authority.md#jobs)) |
 | `trap.abandoned` | an abandoner abandons the domain it runs ([domain run](#domain-run)) |
 
 A trap kind appears only in trap reports, in `sys::TrapKind` and in `// traps:` markers; it is never a diagnostic code. [Interpreter](21-interpreter.md#interpreter) runs execute outside every domain; the interpreter defines what a trap there produces.

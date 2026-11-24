@@ -593,7 +593,7 @@ fn location_record(fx: &mut Fx, tables: Value, number: Value) -> Value {
 
 /// `TrapRaise(kind, operands, count, caller)`: abandons the `sys::Domain` body domain of the
 /// running task, its first trap writing its report into the domain's trap record, or ends the
-/// process domain with status 70 and the report.
+/// process domain with status 70 and the report, an isolated space's with its kind and report.
 fn raise(lo: &mut Lowering, fx: &mut Fx) {
     let params = fx.entry();
     let (kind, operands, count, caller) = (params[0], params[1], params[2], params[3]);
@@ -633,6 +633,11 @@ fn raise(lo: &mut Lowering, fx: &mut Fx) {
     )[0];
     let report = write(lo, fx, out, kind, operands, count, caller);
     fx.when(contained, |fx| abandon(lo, fx, task, domain, kind, report));
+    if lo.user() && !lo.seeded() {
+        let bytes = fx.b.ins().iadd_imm_s(report.out, 8);
+        let length = fx.load(PTR, report.out, 0);
+        return super::space::end_trapped(lo, fx, kind, bytes, length);
+    }
     end_with(lo, fx, report);
 }
 

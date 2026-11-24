@@ -1,8 +1,8 @@
-//! An isolated space's runtime: its one executor thread, which runs in user mode over a boot area its kernel maps as it is used, the system calls through which it reads its kernel's clock, waits for its first timer or its doorbell and ends, and its start, which runs `nanos::isolated` as its first task. A test image running alone in a space runs on such a runtime too, writing its standard streams and ending with its exit status through its kernel.
+//! An isolated space's runtime: its one executor thread, which runs in user mode over a boot area its kernel maps as it is used, the system calls through which it reads its kernel's clock, waits for its first timer or its doorbell and ends, its start, which runs `nanos::isolated` as its first task, and its fault routine, in which its kernel resumes its thread at an exception. A test image running alone in a space runs on such a runtime too, writing its standard streams and ending with its exit status through its kernel.
 
 /// The numbers of the system calls the runtime makes: waiting until a deadline of the kernel's
 /// clock, drawing and releasing pages of the boot area, reading the clock, invoking a capability
-/// its kernel serves, and ending the space with how its job ended.
+/// its kernel serves, ending the space with how its job ended, and naming the fault routine.
 const SPACE_WAIT: u64 = 1
 
 const SPACE_DRAW: u64 = 2
@@ -15,14 +15,22 @@ pkg const SPACE_INVOKE: u64 = 6
 
 pkg const SPACE_END: u64 = 11
 
+const SPACE_FAULT: u64 = 12
+
 /// How an `END` call tells a trap.
 const SPACE_TRAPPED: u64 = 2
 
 /// The symbols of the start routine, which the kernel enters with the addresses of the start record
-/// and of the boot area, and of the glue of the first task.
+/// and of the boot area, of the glue of the first task, and of the fault routine.
 pkg const SPACE_START: Str = "_NSuser_start"
 
 const SPACE_MAIN: Str = "_NSuser_main"
+
+const SPACE_FAULT_ROUTINE: Str = "_NSuser_fault"
+
+/// The most stack below a faulting thread's stack pointer that its kernel leaves above the fault
+/// routine's frame.
+const SPACE_FAULT_GAP: u64 = 32
 
 /// The data holding the operation of the task waiting on the doorbell, zero when none waits.
 pkg const SPACE_BELL: Str = "_NSspace_bell"
@@ -152,15 +160,28 @@ fn space_write_stream(mut lo: Lowering, mut fx: Fx, fd: i64, text: clif::Value, 
 
 /// Ends the space as a trap abandoning it.
 fn space_abandon(mut lo: Lowering, mut fx: Fx) {
-    let how = mut fx.ptr(SPACE_TRAPPED)
     let kind = mut fx.ptr(u64.fit(kind_number("trap.abandoned")))
-    discard space_call(mut lo, mut fx, number: SPACE_END, args: fx.list2(how, b: kind).view())
-    mut fx.b.trap(clif::TrapCode(user: 1))
+    let none = mut fx.ptr(0)
+    space_end_trapped(mut lo, mut fx, kind, report: none, len: none)
 } space_abandon
 
-/// Defines the start routine: it sets up the runtime over the boot area, starts
-/// `nanos::isolated` on the record as the first task, with the stack its own `limits stack N`
-/// demands, and runs the scheduler.
+/// Ends the space as a trap of a kind, with the report of `len` bytes at `report`.
+fn space_end_trapped(mut lo: Lowering, mut fx: Fx, kind: clif::Value, report: clif::Value, len: clif::Value) {
+    let how = mut fx.ptr(SPACE_TRAPPED)
+    discard space_call(mut lo, mut fx, number: SPACE_END, args: fx.list4(how, b: kind, c: report, d: len).view())
+    mut fx.b.trap(clif::TrapCode(user: 1))
+} space_end_trapped
+
+/// Names the fault routine to the kernel.
+fn space_arm(mut lo: Lowering, mut fx: Fx, fault: object::FuncId) {
+    let routine = mut lo.func_ref(mut fx, id: fault)
+    let address = mut fx.b.func_addr(PTR, func_ref: routine)
+    discard space_call(mut lo, mut fx, number: SPACE_FAULT, args: fx.list1(address).view())
+} space_arm
+
+/// Defines the start routine: it sets up the runtime over the boot area, names the fault routine
+/// to the kernel, starts `nanos::isolated` on the record as the first task, with the stack its own
+/// `limits stack N` demands, and runs the scheduler.
 fn Lowering.space_start(mut self) {
     let Some(isolated) = self.ck.db().std_item("nanos", name: "isolated") else {
         expect false
@@ -175,6 +196,7 @@ fn Lowering.space_start(mut self) {
         return
     }
     let main = mut self.space_main(isolated, stack)
+    let fault = mut self.space_fault()
     var signature = clif::Signature.new(CALL_CONV, alloc: self.alloc)
     for _ in 0usize..<2 {
         mut signature.params.push(clif::AbiParam.new(PTR))
@@ -187,6 +209,7 @@ fn Lowering.space_start(mut self) {
         let state_address = mut lo.state(mut fx)
         mut fx.store(area, addr: state_address, offset: STATE_BOOT_AREA)
         system_start(mut lo, mut fx)
+        space_arm(mut lo, mut fx, fault)
         let process = mut fx.load(PTR, addr: state_address, offset: STATE_PROCESS)
         let root = mut fx.load(PTR, addr: state_address, offset: STATE_ROOT)
         let glue_ref = mut lo.func_ref(mut fx, id: main)
@@ -211,6 +234,34 @@ fn Lowering.space_start(mut self) {
         mut fx.b.trap(clif::TrapCode(user: 1))
     })
 } Lowering.space_start
+
+/// Defines the fault routine, in which the kernel resumes the thread at an exception below the
+/// stack pointer it faulted at, with the exception's vector, error code or syndrome and faulting
+/// address and the address of the faulting instruction: it makes its frame return to that
+/// instruction, names itself to the kernel again, and traps with `trap.exception` there.
+fn Lowering.space_fault(mut self) -> object::FuncId {
+    var signature = clif::Signature.new(CALL_CONV, alloc: self.alloc)
+    for _ in 0usize..<4 {
+        mut signature.params.push(clif::AbiParam.new(PTR))
+    }
+    let id = mut self.module.declare_function(SPACE_FAULT_ROUTINE, linkage: object::Linkage.Local, signature)
+    mut self.define(id, take signature, flags: LINES_HIDDEN, build: fn(mut lo: Lowering, mut fx: Fx) {
+        let params = mut fx.entry()
+        let frame = mut fx.b.get_frame_pointer(PTR)
+        let returned = mut fx.b.iadd_imm_s(params[3], y: 1)
+        mut fx.store(returned, addr: frame, offset: 8)
+        let operands = mut fx.slot(size: 3 * OPERAND_RECORD, align: 8)
+        let page_fault = lo.page_fault(mut fx, vector: params[0])
+        let count = mut lo.exception_operands(mut fx, operands, vector: params[0], code: params[1], address: params[2], page_fault)
+        space_arm(mut lo, mut fx, fault: id)
+        let kind = mut fx.ptr(u64.fit(kind_number("trap.exception")))
+        let caller = mut fx.ptr(0)
+        discard mut lo.call_routine(mut fx, routine: Routine.TrapRaise, args: fx.list4(kind, b: operands, c: count, d: caller).view())
+        mut fx.b.trap(clif::TrapCode(user: 1))
+    })
+    self.fault_routine = Some(id)
+    return id
+} Lowering.space_fault
 
 /// The glue of the first task, which calls `nanos::isolated` on the start record its task record
 /// holds, its stack demanded at the function's head.

@@ -1,8 +1,9 @@
 //! An isolated space's runtime: its one executor thread, which runs in user mode over a boot
 //! area its kernel maps as it is used, the system calls through which it reads its kernel's
-//! clock, waits for its first timer or its doorbell and ends, and its start, which runs
-//! `nanos::isolated` as its first task. A test image running alone in a space runs on such a
-//! runtime too, writing its standard streams and ending with its exit status through its kernel.
+//! clock, waits for its first timer or its doorbell and ends, its start, which runs
+//! `nanos::isolated` as its first task, and its fault routine, in which its kernel resumes its
+//! thread at an exception. A test image running alone in a space runs on such a runtime too,
+//! writing its standard streams and ending with its exit status through its kernel.
 
 use cranelift_codegen::ir::{
     AbiParam, InstBuilder, Signature, TrapCode, Value, condcodes::IntCC, types,
@@ -15,6 +16,7 @@ use super::super::data::Reserved;
 use super::super::fx::{Fx, PTR};
 use super::super::machine::{BOOT_STACK, Stub};
 use super::super::stack::{At, Demand, Judged, Report};
+use super::super::trap::{OPERAND_RECORD, kind_number};
 use super::super::{CALL_CONV, Instance, Lowering, lines};
 use super::system::unavailable_unless;
 use super::tasks::{self, EXPIRED, task, thread};
@@ -24,21 +26,27 @@ use crate::nir::{Role, Span};
 
 /// The numbers of the system calls the runtime makes: waiting until a deadline of the kernel's
 /// clock, drawing and releasing pages of the boot area, reading the clock, invoking a capability
-/// its kernel serves, and ending the space with how its job ended.
+/// its kernel serves, ending the space with how its job ended, and naming the fault routine.
 pub const WAIT: u64 = 1;
 pub const DRAW: u64 = 2;
 pub const RELEASE: u64 = 3;
 pub const NOW: u64 = 5;
 pub const INVOKE: u64 = 6;
 pub const END: u64 = 11;
+pub const FAULT: u64 = 12;
 
 /// How an `END` call tells a trap.
 const TRAPPED: u64 = 2;
 
 /// The symbols of the start routine, which the kernel enters with the addresses of the start record
-/// and of the boot area, and of the glue of the first task.
+/// and of the boot area, of the glue of the first task, and of the fault routine.
 pub const START: &str = "_NSuser_start";
 const MAIN: &str = "_NSuser_main";
+const FAULT_ROUTINE: &str = "_NSuser_fault";
+
+/// The most stack below a faulting thread's stack pointer that its kernel leaves above the fault
+/// routine's frame.
+pub const FAULT_GAP: u64 = 32;
 
 /// The operation of the task waiting on the doorbell, zero when none waits.
 pub const BELL: Reserved = Reserved {
@@ -153,10 +161,23 @@ pub fn exit(lo: &mut Lowering, fx: &mut Fx, status: Value) {
 
 /// Ends the space as a trap abandoning it.
 fn abandon(lo: &mut Lowering, fx: &mut Fx) {
+    let kind = fx.ptr(kind_number("trap.abandoned") as u64);
+    let none = fx.ptr(0);
+    end_trapped(lo, fx, kind, none, none);
+}
+
+/// Ends the space as a trap of a kind, with the report of `len` bytes at `report`.
+pub fn end_trapped(lo: &mut Lowering, fx: &mut Fx, kind: Value, report: Value, len: Value) {
     let how = fx.ptr(TRAPPED);
-    let kind = fx.ptr(super::super::trap::kind_number("trap.abandoned") as u64);
-    call(lo, fx, END, &[how, kind]);
+    call(lo, fx, END, &[how, kind, report, len]);
     fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
+}
+
+/// Names the fault routine to the kernel.
+fn arm(lo: &mut Lowering, fx: &mut Fx, fault: FuncId) {
+    let routine = lo.func_ref(fx, fault);
+    let address = fx.b.ins().func_addr(PTR, routine);
+    call(lo, fx, FAULT, &[address]);
 }
 
 /// Writes a byte range to a test image's standard stream `fd`, 1 or 2, through its kernel.
@@ -168,8 +189,9 @@ pub fn write_stream(lo: &mut Lowering, fx: &mut Fx, fd: i64, text: Value, len: V
 }
 
 impl Lowering<'_, '_> {
-    /// Defines the start routine: it sets up the runtime over the boot area, starts `nanos::isolated` on the record as the first task, with the stack its own
-    /// `limits stack N` demands, and runs the scheduler.
+    /// Defines the start routine: it sets up the runtime over the boot area, names the fault
+    /// routine to the kernel, starts `nanos::isolated` on the record as the first task, with the
+    /// stack its own `limits stack N` demands, and runs the scheduler.
     pub fn space_start(&mut self) {
         let isolated = self
             .ck
@@ -182,6 +204,7 @@ impl Lowering<'_, '_> {
             .and_then(|sig| sig.limits.stack)
             .expect("the isolated space's entry stack");
         let main = self.space_main(isolated, stack);
+        let fault = self.space_fault();
         let mut signature = Signature::new(CALL_CONV);
         signature.params.extend([AbiParam::new(PTR); 2]);
         let id = self
@@ -194,6 +217,7 @@ impl Lowering<'_, '_> {
             let state_address = lo.state(fx);
             fx.store(area, state_address, state::BOOT_AREA);
             super::system::start(lo, fx);
+            arm(lo, fx, fault);
             let process = fx.load(PTR, state_address, state::PROCESS);
             let root = fx.load(PTR, state_address, state::ROOT);
             let glue = lo.func_ref(fx, main);
@@ -213,6 +237,36 @@ impl Lowering<'_, '_> {
             lo.call_routine(fx, Routine::Schedule, &[]);
             fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
         });
+    }
+
+    /// Defines the fault routine, in which the kernel resumes the thread at an exception below the
+    /// stack pointer it faulted at, with the exception's vector, error code or syndrome and
+    /// faulting address and the address of the faulting instruction: it makes its frame return to
+    /// that instruction, names itself to the kernel again, and traps with `trap.exception` there.
+    fn space_fault(&mut self) -> FuncId {
+        let mut signature = Signature::new(CALL_CONV);
+        signature.params.extend([AbiParam::new(PTR); 4]);
+        let id = self
+            .module
+            .declare_function(FAULT_ROUTINE, Linkage::Local, &signature)
+            .expect("the fault routine");
+        self.define(id, signature, lines::HIDDEN, |lo, fx| {
+            let params = fx.entry();
+            let frame = fx.b.ins().get_frame_pointer(PTR);
+            let returned = fx.b.ins().iadd_imm_s(params[3], 1);
+            fx.store(returned, frame, 8);
+            let operands = fx.slot(3 * OPERAND_RECORD, 8);
+            let page_fault = lo.page_fault(fx, params[0]);
+            let fields = [params[0], params[1], params[2]];
+            let count = lo.exception_operands(fx, operands, fields, page_fault);
+            arm(lo, fx, id);
+            let kind = fx.ptr(kind_number("trap.exception") as u64);
+            let caller = fx.ptr(0);
+            lo.call_routine(fx, Routine::TrapRaise, &[kind, operands, count, caller]);
+            fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
+        });
+        self.fault_routine = Some(id);
+        id
     }
 
     /// The glue of the first task, which calls `nanos::isolated` on the start record its task

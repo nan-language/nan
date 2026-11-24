@@ -116,7 +116,7 @@ fn jobs_space_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
             }
             let role = supply.param(0).scalar_value()
             var register = mut fx.ptr(slots[0])
-            for index in 1usize..<8 {
+            for index in 1usize..<9 {
                 let this = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: role, y: i64.fit(index))
                 let value = mut fx.ptr(slots[index])
                 register = mut fx.b.select(this, x: value, y: register)
@@ -128,15 +128,15 @@ fn jobs_space_lower(mut lo: Lowering, mut fx: Fx, supply: Supply) -> bool {
     return true
 } jobs_space_lower
 
-/// The index in an `hw::UserState`'s registers of each argument of a system call, of its number
-/// and of its result: on x86_64 `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`, then `rax` for both; on
-/// AArch64 `x0` to `x5`, `x8`, then `x0`.
-const X64_SYSCALL_REGISTERS: Array[u64, 8] = syscall_registers(6, rsi: 5, rdx: 2, r10: 9, r8: 7, r9: 8, number: 0, result: 0)
+/// The index in an `hw::UserState`'s registers of each argument of a system call, of its number,
+/// of its result and of the fourth argument of a call: on x86_64 `rdi`, `rsi`, `rdx`, `r10`, `r8`,
+/// `r9`, then `rax` for both, then `rcx`; on AArch64 `x0` to `x5`, `x8`, `x0`, then `x3`.
+const X64_SYSCALL_REGISTERS: Array[u64, 9] = syscall_registers(6, rsi: 5, rdx: 2, r10: 9, r8: 7, r9: 8, number: 0, result: 0, fourth: 1)
 
-const A64_SYSCALL_REGISTERS: Array[u64, 8] = syscall_registers(0, rsi: 1, rdx: 2, r10: 3, r8: 4, r9: 5, number: 8, result: 0)
+const A64_SYSCALL_REGISTERS: Array[u64, 9] = syscall_registers(0, rsi: 1, rdx: 2, r10: 3, r8: 4, r9: 5, number: 8, result: 0, fourth: 3)
 
-fn syscall_registers(rdi: u64, rsi: u64, rdx: u64, r10: u64, r8: u64, r9: u64, number: u64, result: u64) -> Array[u64, 8] {
-    var slots = Array[u64, 8].filled(rdi)
+fn syscall_registers(rdi: u64, rsi: u64, rdx: u64, r10: u64, r8: u64, r9: u64, number: u64, result: u64, fourth: u64) -> Array[u64, 9] {
+    var slots = Array[u64, 9].filled(rdi)
     slots[1] = rsi
     slots[2] = rdx
     slots[3] = r10
@@ -144,18 +144,21 @@ fn syscall_registers(rdi: u64, rsi: u64, rdx: u64, r10: u64, r8: u64, r9: u64, n
     slots[5] = r9
     slots[6] = number
     slots[7] = result
+    slots[8] = fourth
     return slots
 } syscall_registers
 
-/// `nanos::trap_of(kind, alloc)`: a trap of the kind its number names, `trap.abandoned` for a
-/// number naming none, its record drawn through `alloc` and its report locating the call.
+/// `nanos::trap_of(kind, report, alloc)`: a trap of the kind its number names, `trap.abandoned`
+/// for a number naming none, its record drawn through `alloc`, whose report is `report`, or
+/// locates the call when `report` is empty or longer than a report.
 fn jobs_trap_of(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     let given = supply.param(0).scalar_value()
     let abandoned_number = kind_number("trap.abandoned")
     let known = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: given, y: abandoned_number + 1)
     let abandoned = mut fx.ptr(u64.fit(abandoned_number))
     let kind = mut fx.b.select(known, x: given, y: abandoned)
-    let cell = trap_record(mut fx, trap: supply.param(1))
+    let report = sys_view(mut fx, held: supply.param(1))
+    let cell = trap_record(mut fx, trap: supply.param(2))
     let size = mut fx.ptr(REPORT_TRAP_RECORD)
     let align = mut fx.ptr(8)
     let drawn = mut lo.call_routine(mut fx, routine: Routine.Alloc, args: fx.list3(cell, b: size, c: align).view())
@@ -164,7 +167,18 @@ fn jobs_trap_of(mut lo: Lowering, mut fx: Fx, supply: Supply) {
     mut fx.if_true(missing, then: fn[mut lo](mut fx1: Fx) {
         raise_kind(mut lo, fx: mut fx1, kind: "trap.exhausted")
     })
-    discard mut lo.call_routine(mut fx, routine: Routine.TrapReport, args: fx.list2(kind, b: record).view())
+    let below = mut fx.b.iadd_imm_s(report.len, y: -1)
+    let fits = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedLessThan, x: below, y: i64.fit(REPORT_REPORT))
+    discard mut fx.choose_in(mut lo, condition: fits, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(kind, addr: record, offset: TRAP_RECORD_KIND)
+        mut fx1.store(report.len, addr: record, offset: TRAP_RECORD_LEN)
+        let bytes = mut fx1.offset(record, offset: TRAP_RECORD_BYTES)
+        discard mut lo1.call_routine(mut fx1, routine: Routine.Copy, args: fx1.list3(bytes, b: report.start, c: report.len).view())
+        return mem::List[clif::Value].empty(fx1.alloc)
+    }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
+        discard mut lo1.call_routine(mut fx1, routine: Routine.TrapReport, args: fx1.list2(kind, b: record).view())
+        return mem::List[clif::Value].empty(fx1.alloc)
+    })
     word_result(mut lo, mut fx, supply, value: record)
 } jobs_trap_of
 

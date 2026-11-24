@@ -673,9 +673,7 @@ impl Lowering<'_, '_> {
             Arch::Amd64 => fx.load(PTR, frame, frame::VECTOR),
             Arch::Aarch64 => aarch64::exception_vector(fx, code),
         };
-        let page_fault =
-            fx.b.ins()
-                .icmp_imm_s(IntCC::Equal, vector, self.vectors().page_fault);
+        let page_fault = self.page_fault(fx, vector);
         let address = fx.choose_in(
             self,
             page_fault,
@@ -684,24 +682,7 @@ impl Lowering<'_, '_> {
             |_, fx| vec![fx.ptr(0)],
         )[0];
         let operands = fx.offset(frame, layout.size);
-        let named = [("vector", vector), ("code", code), ("address", address)];
-        for (index, (name, value)) in named.into_iter().enumerate() {
-            let record = fx.offset(operands, index as u64 * OPERAND_RECORD);
-            let text = self.bytes_data(name.as_bytes());
-            let text = self.data_ref(fx, text);
-            let text = fx.b.ins().symbol_value(PTR, text);
-            fx.store(text, record, 0);
-            let len = fx.ptr(name.len() as u64);
-            fx.store(len, record, 8);
-            fx.store(value, record, 16);
-            let how = fx.ptr(Written::Unsigned as u64);
-            fx.store(how, record, 24);
-            let writer = fx.ptr(0);
-            fx.store(writer, record, 32);
-        }
-        let two = fx.ptr(2);
-        let three = fx.ptr(3);
-        let count = fx.b.ins().select(page_fault, three, two);
+        let count = self.exception_operands(fx, operands, [vector, code, address], page_fault);
         let kind = fx.ptr(kind_number("trap.exception") as u64);
         let caller = fx.ptr(0);
         for (at, value) in layout.args.into_iter().zip([kind, operands, count, caller]) {
@@ -725,6 +706,42 @@ impl Lowering<'_, '_> {
         let raise = self.func_ref(fx, raise);
         let raise = fx.b.ins().func_addr(PTR, raise);
         fx.store(raise, frame, layout.ip);
+    }
+
+    /// Whether an exception's vector is the page fault's.
+    pub fn page_fault(&self, fx: &mut Fx, vector: Value) -> Value {
+        fx.b.ins()
+            .icmp_imm_s(IntCC::Equal, vector, self.vectors().page_fault)
+    }
+
+    /// Writes at `operands` the operand records of an exception's trap, its vector, its error code
+    /// or syndrome and its faulting address, and gives how many of them its report shows: the
+    /// address only for a page fault.
+    pub fn exception_operands(
+        &mut self,
+        fx: &mut Fx,
+        operands: Value,
+        [vector, code, address]: [Value; 3],
+        page_fault: Value,
+    ) -> Value {
+        let named = [("vector", vector), ("code", code), ("address", address)];
+        for (index, (name, value)) in named.into_iter().enumerate() {
+            let record = fx.offset(operands, index as u64 * OPERAND_RECORD);
+            let text = self.bytes_data(name.as_bytes());
+            let text = self.data_ref(fx, text);
+            let text = fx.b.ins().symbol_value(PTR, text);
+            fx.store(text, record, 0);
+            let len = fx.ptr(name.len() as u64);
+            fx.store(len, record, 8);
+            fx.store(value, record, 16);
+            let how = fx.ptr(Written::Unsigned as u64);
+            fx.store(how, record, 24);
+            let writer = fx.ptr(0);
+            fx.store(writer, record, 32);
+        }
+        let two = fx.ptr(2);
+        let three = fx.ptr(3);
+        fx.b.ins().select(page_fault, three, two)
     }
 
     /// The interrupt dispatcher the vector seam calls with what fired and the saved frame; it

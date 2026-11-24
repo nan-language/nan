@@ -1,6 +1,6 @@
 # 0130. Isolated spaces drawing their boot area
 
-Status: accepted
+Status: accepted; released pages needing no invalidation superseded by 0220
 
 ## Context
 

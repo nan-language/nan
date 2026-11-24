@@ -53,7 +53,8 @@ const PREDICTION_RESTRICTION: u64 = 1;
 /// `hw::Ring0.run_user` runs user code, the stack pointer it keeps, its `hw::UserState`, on
 /// x86_64 the user stack pointer of a system call, and the root to reinstall at an exit from a
 /// user root, zero for none; on x86_64, the top of its entry stack; the tenant whose user code it
-/// last entered, and on x86_64 its entry stack, which takes up the rest of the record.
+/// last entered; the count of its entries under user roots and its user tags; and its entry
+/// stack, which takes up the rest of the record.
 pub mod cpu {
     pub const THREAD: u64 = 0;
     pub const VECTOR: u64 = 8;
@@ -87,7 +88,9 @@ pub mod cpu {
     pub const KERNEL_ROOT: u64 = 376;
     pub const ENTRY_TOP: u64 = 384;
     pub const TENANT: u64 = 392;
-    pub const SIZE: u64 = 512;
+    pub const USER_CLOCK: u64 = 400;
+    pub const USER_TAGS: u64 = 408;
+    pub const SIZE: u64 = 1536;
 }
 
 /// The model-specific register holding the GS base.

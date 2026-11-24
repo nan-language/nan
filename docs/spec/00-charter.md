@@ -554,6 +554,7 @@ Each term links to its home, whose definition governs.
 | [user frame](24-kernel.md#user-frames) | Frame the kernel holds while user threads map it. |
 | [user mode](24-kernel.md#user-mode) | Unprivileged execution of user threads. |
 | [user root](24-kernel.md#split-tables) | Root a user thread runs under in place of the kernel's. |
+| [user tag](24-kernel.md#split-tables) | Number a CPU tags a recent user root's translations with. |
 | [user thread](24-kernel.md#user-mode) | User code a kernel task runs through `hw::Ring0.run_user`. |
 | [validator](15-untrusted.md#validators) | `validator fn`, reading Untrusted contents. |
 | [variant](04-types.md#enums) | Enum alternative. |

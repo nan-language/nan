@@ -1,6 +1,6 @@
 # 0118. Nanos jobs in isolated spaces
 
-Status: accepted; the boot area mapped whole before the space runs superseded by 0130
+Status: accepted; the boot area mapped whole before the space runs superseded by 0130; every space's root taking one tag dropped at each entry superseded by 0220
 
 ## Context
 

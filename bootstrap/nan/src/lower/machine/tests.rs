@@ -101,7 +101,7 @@ fn x64_user_path_bars_predictions_between_tenants_and_clears_buffers_last() {
             .position(|window| window == bytes)
             .unwrap_or_else(|| panic!("{bytes:02x?} in the user path"))
     };
-    let mut compare = vec![0x65, 0x4c, 0x39, 0x04, 0x25];
+    let mut compare = vec![0x65, 0x48, 0x39, 0x0c, 0x25];
     compare.extend_from_slice(&(cpu::TENANT as u32).to_le_bytes());
     let mut ibpb_listed = vec![0x65, 0xf7, 0x04, 0x25];
     ibpb_listed.extend_from_slice(&(cpu::FEATURES as u32).to_le_bytes());
@@ -140,6 +140,40 @@ fn x64_user_path_bars_predictions_between_tenants_and_clears_buffers_last() {
             0xb9, 0x0a, 0x01, 0x00, 0x00, 0x0f, 0x32, 0x25, 0x20, 0x01, 0x00, 0x00
         ]),
         "the clearing is listed unless IA32_ARCH_CAPABILITIES reports MDS_NO and TAA_NO"
+    );
+}
+
+#[test]
+fn x64_user_path_keeps_the_translations_of_a_root_its_cpu_holds_a_tag_for() {
+    let code = user::X64_USER;
+    let position = |bytes: &[u8]| {
+        code.windows(bytes.len())
+            .position(|window| window == bytes)
+            .unwrap_or_else(|| panic!("{bytes:02x?} in the user path"))
+    };
+    let mut compare = vec![0x65, 0x4c, 0x39, 0x89];
+    compare.extend_from_slice(&(cpu::USER_TAGS as u32).to_le_bytes());
+    let compare = position(&compare) + compare.len();
+    assert_eq!(code[compare], 0x74, "a tag held for the root branches");
+    let held = compare + 2 + usize::from(code[compare + 1]);
+    assert_eq!(
+        code[held..held + 5],
+        [0x49, 0x0f, 0xba, 0xe9, 0x3f],
+        "to the no-flush bit of the user root's CR3 value"
+    );
+    let mut bound = vec![0x81, 0xf9];
+    bound.extend_from_slice(&(user::TAGS as u32 * 16).to_le_bytes());
+    assert!(position(&bound) < held, "the scan covers every tag");
+    let mut pcid = vec![0x4d, 0x8d, 0x8c, 0x09];
+    pcid.extend_from_slice(&(user::PCID_BASE + 1).to_le_bytes());
+    assert!(position(&pcid) > held, "a tag's PCID follows the base");
+    let kept = position(&[
+        0x0f, 0x20, 0xd8, 0x0f, 0x20, 0xe1, 0x48, 0x0f, 0xba, 0xe1, 0x11,
+    ]);
+    assert_eq!(
+        code[kept + 13..kept + 18],
+        [0x48, 0x0f, 0xba, 0xe8, 0x3f],
+        "with PCIDs enabled the running root is reinstalled without flushing"
     );
 }
 
@@ -182,7 +216,7 @@ fn aarch64_user_path_restricts_predictions_between_tenants() {
             .unwrap_or_else(|| panic!("{word:#010x} in the user path"))
     };
     let tenant = (cpu::TENANT as u32 / 8) << 10 | 6 << 5;
-    let (load, store) = (0xF940_0007 | tenant, 0xF900_0004 | tenant);
+    let (load, store) = (0xF940_0007 | tenant, 0xF900_0003 | tenant);
     let restrictions = [0xD50B_7387, 0xD50B_73A7, 0xD50B_73E7].map(at);
     let eret = 0xD69F_03E0;
     let order = [
@@ -195,6 +229,39 @@ fn aarch64_user_path_restricts_predictions_between_tenants() {
     assert!(
         order.is_sorted() && restrictions.is_sorted(),
         "a tenant other than the CPU's last restricts the predictions of EL0 before eret"
+    );
+}
+
+#[test]
+fn aarch64_user_path_drops_a_tags_translations_only_when_giving_it() {
+    let path = words(user::AARCH64_USER);
+    let at = |word: u32| {
+        path.iter()
+            .position(|held| *held == word)
+            .unwrap_or_else(|| panic!("{word:#010x} in the user path"))
+    };
+    let tags = (cpu::USER_TAGS as u32 / 8) << 15;
+    let compare = at(0xA940_2207 | tags) + 2;
+    let held = compare + (path[compare] >> 5 & 0x7_FFFF) as usize;
+    let given = at(0xF900_0202 | (cpu::USER_TAGS as u32 / 8) << 10);
+    let flush = at(0xD280_002B);
+    assert!(
+        given < flush && flush + 1 == held,
+        "a tag held for the root skips giving it and asking for the flush"
+    );
+    let asid = at(0x9100_01AD | (user::ASID_BASE + 1) << 10);
+    assert!(asid > held, "a tag's ASID follows the base");
+    let install = at(0xB400_0081);
+    assert_eq!(
+        path[install + 1..install + 6],
+        [
+            0x9250_3C01,
+            0xD508_8741,
+            0xD503_379F,
+            0xD518_2000,
+            0xD503_3FDF
+        ],
+        "the ASID's translations are dropped before the root is installed, when asked"
     );
 }
 

@@ -126,15 +126,11 @@ fn run_user(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, split: bool) {
     let area = extended::optional_area(lo, fx, &extended_ty, supply.param(2).address());
     let previous = lo.call_routine(fx, Routine::Extended, &[area])[0];
     let fault = fx.slot(24, 8);
-    let (user_root, kernel_root, tenant) = match split {
-        true => {
-            let root = word(fx, supply.param(3));
-            let (user_root, kernel_root) = lo.split_roots(fx, root);
-            (user_root, kernel_root, supply.param(4).scalar())
-        }
-        false => (fx.ptr(0), fx.ptr(0), fx.ptr(0)),
+    let (user_root, tenant) = match split {
+        true => (word(fx, supply.param(3)), supply.param(4).scalar()),
+        false => (fx.ptr(0), fx.ptr(0)),
     };
-    let kind = lo.enter_user(fx, user_state, fault, user_root, kernel_root, tenant);
+    let kind = lo.enter_user(fx, user_state, fault, user_root, tenant);
     lo.call_routine(fx, Routine::Extended, &[previous]);
     let syscall = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, SYSCALL);
     fx.when(syscall, |fx| {

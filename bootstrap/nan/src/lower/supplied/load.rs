@@ -2,7 +2,8 @@
 //! prepared bundle's preview holds, a loaded bundle's job entry, its code's address and its stack, the pins counting a load's handles on
 //! its target record, and the export table, runtime memory, window entries, translation
 //! invalidation and instruction visibility the loader of `sys::load` reads, with the user-mode
-//! runtime's image, the entries mapping an isolated space and the running root its tables share.
+//! runtime's image, the entries mapping an isolated space, the running root its tables share and
+//! the untagging of its root.
 
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, Value, condcodes::IntCC};
 
@@ -127,6 +128,11 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
             let (page, table) = (supply.param(0).scalar(), supply.param(1).scalar());
             let page = lo.restricted_page(fx, page, table);
             supply.ret(lo, fx, Held::Scalar(page));
+        }
+        "sys::load::untag" => {
+            let root = super::hw::word(fx, supply.param(0));
+            lo.untag_root(fx, root);
+            supply.done(lo, fx);
         }
         "sys::load::running_root" => {
             let root = lo.running_root(fx);

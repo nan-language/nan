@@ -17,6 +17,7 @@ use super::super::machine::Stub;
 use super::Supply;
 use crate::check::ty::Ty;
 
+pub use cpu::word;
 pub use physical::{region, region_cell, region_chunks};
 pub use windows::dma_access;
 

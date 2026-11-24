@@ -18705,7 +18705,7 @@ const TEXT_NANOS_BRIDGE: Str =
     \\} lent_for
     \\
     \\/// Applies to the space `placing` holds an ask to open the ends of bridges, to tell the end of one
-    \\/// that its other end rang, to close an end, or to end an instance as breaching a bridge; without
+    \\/// that its other end rang, to close an end, or to end an instance as breaching a channel; without
     \\/// a space the ask is dropped.
     \\fn placed_asked(take ask: Ask, mut placing: mem::List[Placed], alloc: mem::Alloc) fails task::Cancelled uses wait {
     \\    let Some(placed) = mut placing.pop() else {
@@ -18730,20 +18730,6 @@ const TEXT_NANOS_BRIDGE: Str =
     \\    door: Doorway
     \\    ask: Ask
     \\} Leaving
-    \\
-    \\/// Has the instance numbered `id` abandoned as breaching a bridge.
-    \\fn Driven.breached(mut self, mut space: sys::load::Space, id: u64, alloc: mem::Alloc) {
-    \\    let Some(found) = mut self.jobs.get_mut(id) else {
-    \\        return
-    \\    }
-    \\    var running = found
-    \\    running.breached = true
-    \\    if running.abandoning {
-    \\        return
-    \\    }
-    \\    running.abandoning = true
-    \\    mut self.abandoned(mut space, id, alloc)
-    \\} Driven.breached
     \\
     \\/// Serves an operation of the end of a bridge the space holds by `handle`: rings its other end;
     \\/// closes it, unmapping the frames it maps for itself; closes it as breached by its other end,
@@ -19940,7 +19926,7 @@ const TEXT_NANOS_HELD: Str =
     \\            try await called_down(take called, out: calls_down, answers: replies, allocs: drawing, table, job: id, alloc)
     \\        })
     \\        discard s.spawn(fn[take answered, take routing, take ports_down]() fails task::Cancelled uses wait {
-    \\            try await answered_up(link, answers: answered, allocs: routing, table, job: id, runner, out: ports_down, exec, alloc)
+    \\            try await answered_up(isolation, link, answers: answered, allocs: routing, table, job: id, runner, out: ports_down, alloc)
     \\        })
     \\        discard s.spawn(fn[take waiting, take domain, take watching]() fails task::Cancelled uses wait {
     \\            let domain_ran = attempt await domain.contents().run(fn[take waiting]() fails task::Cancelled uses wait {
@@ -20058,14 +20044,20 @@ const TEXT_NANOS_HELD: Str =
     \\/// reply drawn through the allocator `allocs` keeps for it and its handles those of the entries of
     \\/// the space's `table` it names, and calls through `runner` each port the instance calls, and each
     \\/// waiting operation of a capability of a crossing kind the instance holds in `table`, on a task of
-    \\/// its own sending `out` the frame of the reply; it stops hearing a space that frames a message it
-    \\/// cannot decode or longer than `MOST_BYTES`.
-    \\fn answered_up(link: Link, answers: task::Sender[Routed], allocs: task::Cown[mem::Map[u64, mem::Alloc]], table: Table, job: u64, runner: sys::Runner, out: task::Sender[mem::Bytes], exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
+    \\/// its own sending `out` the frame of the reply; once the space frames a message it cannot decode
+    \\/// or longer than `MOST_BYTES`, it stops hearing it and has `isolation` end the instance numbered
+    \\/// `job` as breaching the channel.
+    \\fn answered_up(isolation: Isolation, link: Link, answers: task::Sender[Routed], allocs: task::Cown[mem::Map[u64, mem::Alloc]], table: Table, job: u64, runner: sys::Runner, out: task::Sender[mem::Bytes], alloc: mem::Alloc) fails task::Cancelled uses wait {
     \\    var pending = mem::Bytes.empty(alloc)
-    \\    try await task::scope(exec, body: fn[mut pending](s: task::Scope) fails task::Cancelled uses wait {
+    \\    try await task::scope(isolation.exec, body: fn[mut pending](s: task::Scope) fails task::Cancelled uses wait {
     \\        loop {
-    \\            let Some(up) = try await next_up(link, mut pending, alloc) else {
-    \\                return
+    \\            let up = match try await next_up(link, mut pending, alloc) {
+    \\                Heard.Up(up) => up
+    \\                Heard.Breach => {
+    \\                    try await isolation.door.contents().asked(Ask.Breach(job))
+    \\                    return
+    \\                }
+    \\                Heard.Gone => return
     \\            }
     \\            match up {
     \\                Up.Answered(Answering(id: id, answer: sent)) => {
@@ -20089,14 +20081,21 @@ const TEXT_NANOS_HELD: Str =
     \\    })
     \\} answered_up
     \\
-    \\/// The next message the space sends up the first channel of `link`, after what `pending` holds of
-    \\/// it; none once the space frames one it cannot decode or longer than `MOST_BYTES`.
-    \\fn next_up(link: Link, mut pending: mem::Bytes, alloc: mem::Alloc) -> Option[Up] fails task::Cancelled uses wait {
+    \\/// What the kernel hears next up the first channel of a link: a message, a frame it cannot decode
+    \\/// or longer than `MOST_BYTES`, or nothing more once the link has no channel.
+    \\enum Heard {
+    \\    Up(Up)
+    \\    Breach
+    \\    Gone
+    \\} Heard
+    \\
+    \\/// What the space sends next up the first channel of `link`, after what `pending` holds of it.
+    \\fn next_up(link: Link, mut pending: mem::Bytes, alloc: mem::Alloc) -> Heard fails task::Cancelled uses wait {
     \\    loop {
     \\        match frame_len(pending) {
     \\            Some(len) => {
     \\                if u64.widen(len) > MOST_BYTES {
-    \\                    return None
+    \\                    return Heard.Breach
     \\                }
     \\                match frame_off(mut pending, len, alloc) {
     \\                    Some(frame) => return up_of(frame, alloc)
@@ -20108,17 +20107,17 @@ const TEXT_NANOS_HELD: Str =
     \\        let received = match attempt await link.receive(0, alloc) {
     \\            Ok(bytes) => bytes
     \\            Err(LinkError.Cancelled(cancelled)) => fail cancelled
-    \\            Err(LinkError.NoChannel) => return None
+    \\            Err(LinkError.NoChannel) => return Heard.Gone
     \\        }
     \\        mut pending.append(bytes_of(received.view(), alloc).view())
     \\    }
     \\} next_up
     \\
-    \\/// The message a frame holds, none when it does not decode.
-    \\fn up_of(frame: mem::Bytes, alloc: mem::Alloc) -> Option[Up] {
+    \\/// What the kernel hears of a frame: the message it holds, a breach when it does not decode.
+    \\fn up_of(frame: mem::Bytes, alloc: mem::Alloc) -> Heard {
     \\    match attempt mem::wire::Codec[Up].decode(Untrusted.of(frame.view()), alloc) {
-    \\        Ok(up) => return Some(take up)
-    \\        Err(_) => return None
+    \\        Ok(up) => return Heard.Up(take up)
+    \\        Err(_) => return Heard.Breach
     \\    }
     \\} up_of
     \\
@@ -21132,8 +21131,9 @@ const TEXT_NANOS_ISOLATED: Str =
     \\/// The most bytes of a trap report.
     \\const REPORT_BYTES: usize = 4_096
     \\
-    \\/// The report of the trap ending an instance whose space wrote what no end of a bridge writes.
-    \\const BREACH_REPORT: Str = "trap.bounds writing what no end of a bridge writes\\n"
+    \\/// The report of the trap ending an instance whose space wrote what no end of its link's first
+    \\/// channel or of a bridge writes.
+    \\const BREACH_REPORT: Str = "trap.bounds writing what no end of a channel writes\\n"
     \\
     \\/// The bytes of a start record and of the record of a port.
     \\const START_BYTES: usize = 104
@@ -21222,7 +21222,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\/// its space, while it runs the instance of a number, to map the frames of a bridge to it; to open
     \\/// the ends of bridges for the instance of a number, which starts once they are open; that the end
     \\/// of a bridge be told its other end wrote or read; to close the end of a bridge; and to end the
-    \\/// instance of a number as breaching a bridge.
+    \\/// instance of a number as breaching its link's first channel or a bridge.
     \\enum Ask {
     \\    Join(Joining)
     \\    Lend(Borrowing)
@@ -21733,7 +21733,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\/// A job or instance its space runs: its entry, the runner it acts through, what crossed into the
     \\/// space's table for each capability that runner holds by number, the addresses at which the space
     \\/// maps its link's frames and the frames of the bridges it holds, whether its holder abandoned it,
-    \\/// whether it breached a bridge and whether the space's runtime was ordered to abandon it, and the
+    \\/// whether it breached a channel and whether the space's runtime was ordered to abandon it, and the
     \\/// senders telling its task through which of its channels the space moved bytes and how it ended.
     \\struct Running {
     \\    job: sys::load::Job
@@ -22051,6 +22051,20 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    return false
     \\} Driven.halts
     \\
+    \\/// Has the instance numbered `id` abandoned as breaching its link's first channel or a bridge.
+    \\fn Driven.breached(mut self, mut space: sys::load::Space, id: u64, alloc: mem::Alloc) {
+    \\    let Some(found) = mut self.jobs.get_mut(id) else {
+    \\        return
+    \\    }
+    \\    var running = found
+    \\    running.breached = true
+    \\    if running.abandoning {
+    \\        return
+    \\    }
+    \\    running.abandoning = true
+    \\    mut self.abandoned(mut space, id, alloc)
+    \\} Driven.breached
+    \\
     \\/// Has the job or instance numbered `id` abandoned: ends it at once when its runtime has not
     \\/// started it, and orders its runtime to abandon it otherwise.
     \\fn Driven.abandoned(mut self, mut space: sys::load::Space, id: u64, alloc: mem::Alloc) {
@@ -22117,7 +22131,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\
     \\/// Ends every job and instance the space runs as `Driven.job_ended` does, each `Trapped` with a
     \\/// trap of the kind `kind` numbers whose report is `report` unless its holder abandoned it or it
-    \\/// breached a bridge.
+    \\/// breached a channel.
     \\fn Driven.ended_all(mut self, mut space: sys::load::Space, kind: u64, report: Str, alloc: mem::Alloc) {
     \\    var ids = mem::List[u64].empty(alloc)
     \\    for entry in self.jobs {
@@ -22132,7 +22146,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\
     \\/// Ends the job or instance numbered `id`, unmapping its link's frames and those of its bridges'
     \\/// ends and closing those ends: `Abandoned` once its holder abandoned it, `Trapped` with a trap of
-    \\/// `trap.bounds` whose report is `BREACH_REPORT` once it breached a bridge, and as `otherwise` says
+    \\/// `trap.bounds` whose report is `BREACH_REPORT` once it breached a channel, and as `otherwise` says
     \\/// otherwise.
     \\fn Driven.job_ended(mut self, mut space: sys::load::Space, id: u64, take otherwise: Outcome, alloc: mem::Alloc) {
     \\    let Some(running) = mut self.jobs.remove(id) else {

@@ -104,7 +104,7 @@ fn relayed(isolation: Isolation, id: u64, job: sys::load::Isolated, take compone
             try await called_down(take called, out: calls_down, answers: replies, allocs: drawing, table, job: id, alloc)
         })
         discard s.spawn(fn[take answered, take routing, take ports_down]() fails task::Cancelled uses wait {
-            try await answered_up(link, answers: answered, allocs: routing, table, job: id, runner, out: ports_down, exec, alloc)
+            try await answered_up(isolation, link, answers: answered, allocs: routing, table, job: id, runner, out: ports_down, alloc)
         })
         discard s.spawn(fn[take waiting, take domain, take watching]() fails task::Cancelled uses wait {
             let domain_ran = attempt await domain.contents().run(fn[take waiting]() fails task::Cancelled uses wait {
@@ -222,14 +222,20 @@ fn called_down(take calls: task::Receiver[Called], out: task::Sender[mem::Bytes]
 /// reply drawn through the allocator `allocs` keeps for it and its handles those of the entries of
 /// the space's `table` it names, and calls through `runner` each port the instance calls, and each
 /// waiting operation of a capability of a crossing kind the instance holds in `table`, on a task of
-/// its own sending `out` the frame of the reply; it stops hearing a space that frames a message it
-/// cannot decode or longer than `MOST_BYTES`.
-fn answered_up(link: Link, answers: task::Sender[Routed], allocs: task::Cown[mem::Map[u64, mem::Alloc]], table: Table, job: u64, runner: sys::Runner, out: task::Sender[mem::Bytes], exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
+/// its own sending `out` the frame of the reply; once the space frames a message it cannot decode
+/// or longer than `MOST_BYTES`, it stops hearing it and has `isolation` end the instance numbered
+/// `job` as breaching the channel.
+fn answered_up(isolation: Isolation, link: Link, answers: task::Sender[Routed], allocs: task::Cown[mem::Map[u64, mem::Alloc]], table: Table, job: u64, runner: sys::Runner, out: task::Sender[mem::Bytes], alloc: mem::Alloc) fails task::Cancelled uses wait {
     var pending = mem::Bytes.empty(alloc)
-    try await task::scope(exec, body: fn[mut pending](s: task::Scope) fails task::Cancelled uses wait {
+    try await task::scope(isolation.exec, body: fn[mut pending](s: task::Scope) fails task::Cancelled uses wait {
         loop {
-            let Some(up) = try await next_up(link, mut pending, alloc) else {
-                return
+            let up = match try await next_up(link, mut pending, alloc) {
+                Heard.Up(up) => up
+                Heard.Breach => {
+                    try await isolation.door.contents().asked(Ask.Breach(job))
+                    return
+                }
+                Heard.Gone => return
             }
             match up {
                 Up.Answered(Answering(id: id, answer: sent)) => {
@@ -253,14 +259,21 @@ fn answered_up(link: Link, answers: task::Sender[Routed], allocs: task::Cown[mem
     })
 } answered_up
 
-/// The next message the space sends up the first channel of `link`, after what `pending` holds of
-/// it; none once the space frames one it cannot decode or longer than `MOST_BYTES`.
-fn next_up(link: Link, mut pending: mem::Bytes, alloc: mem::Alloc) -> Option[Up] fails task::Cancelled uses wait {
+/// What the kernel hears next up the first channel of a link: a message, a frame it cannot decode
+/// or longer than `MOST_BYTES`, or nothing more once the link has no channel.
+enum Heard {
+    Up(Up)
+    Breach
+    Gone
+} Heard
+
+/// What the space sends next up the first channel of `link`, after what `pending` holds of it.
+fn next_up(link: Link, mut pending: mem::Bytes, alloc: mem::Alloc) -> Heard fails task::Cancelled uses wait {
     loop {
         match frame_len(pending) {
             Some(len) => {
                 if u64.widen(len) > MOST_BYTES {
-                    return None
+                    return Heard.Breach
                 }
                 match frame_off(mut pending, len, alloc) {
                     Some(frame) => return up_of(frame, alloc)
@@ -272,17 +285,17 @@ fn next_up(link: Link, mut pending: mem::Bytes, alloc: mem::Alloc) -> Option[Up]
         let received = match attempt await link.receive(0, alloc) {
             Ok(bytes) => bytes
             Err(LinkError.Cancelled(cancelled)) => fail cancelled
-            Err(LinkError.NoChannel) => return None
+            Err(LinkError.NoChannel) => return Heard.Gone
         }
         mut pending.append(bytes_of(received.view(), alloc).view())
     }
 } next_up
 
-/// The message a frame holds, none when it does not decode.
-fn up_of(frame: mem::Bytes, alloc: mem::Alloc) -> Option[Up] {
+/// What the kernel hears of a frame: the message it holds, a breach when it does not decode.
+fn up_of(frame: mem::Bytes, alloc: mem::Alloc) -> Heard {
     match attempt mem::wire::Codec[Up].decode(Untrusted.of(frame.view()), alloc) {
-        Ok(up) => return Some(take up)
-        Err(_) => return None
+        Ok(up) => return Heard.Up(take up)
+        Err(_) => return Heard.Breach
     }
 } up_of
 

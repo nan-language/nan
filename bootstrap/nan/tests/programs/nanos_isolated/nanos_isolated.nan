@@ -1,4 +1,4 @@
-//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port, their random source from a counter and their file system from a disk writing each call it serves through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, with the reports of their traps, a job reading kernel memory, in a domain of its own and outside it, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, instances of a component whose calls, a postponed one included, keyed tasks, held ones included, messages sent to themselves and checkpoints run in their spaces, with logs and gauges crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, an instance sharing its space with a job that traps and divides and with another instance that is abandoned, a book and tellers in two spaces calling it over a bridge, a log crossing there and back, payloads streamed and moved through frames of their own, and a breach ending the book, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
+//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port, their random source from a counter and their file system from a disk writing each call it serves through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, with the reports of their traps, a job reading kernel memory, in a domain of its own and outside it, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, instances of a component whose calls, a postponed one included, keyed tasks, held ones included, messages sent to themselves and checkpoints run in their spaces, with logs and gauges crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, an instance sharing its space with a job that traps and divides, with another instance that is abandoned and with one whose space breaches its link, a book and tellers in two spaces calling it over a bridge, a log crossing there and back, payloads streamed and moved through frames of their own, and a breach ending the book, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -357,6 +357,11 @@ fn OneCpu.idle(self, t: hw::IrqsDisabled, cpu: u32, until_ns: Option[u64]) -> hw
 /// The frames each space takes and draws from: 16 MiB, less than its runtime's boot area.
 const SPACE_FRAMES: usize = 4_096
 
+/// The offset of the bytes of a link's channel frame, and their count.
+const RING_DATA: u64 = 64
+
+const RING_BYTES: u64 = 4_096 - RING_DATA
+
 /// Kernel memory outside the entry area, which a space's root does not map.
 const KERNEL_PROBE: u64 = 0x1000_0000
 
@@ -623,7 +628,7 @@ fn given_up(take frame: hw::PhysFrame[4_096]) {
 /// without a stack bound recursing past the stack it starts with, a job holding memory within the
 /// frames its space draws from and past them, a space drawing and giving back pages, a job
 /// answering a line over its link, instances of a component held in spaces, one sharing its space
-/// with jobs and another instance, instances in two spaces calling over a bridge, a space's runtime
+/// with jobs and other instances, instances in two spaces calling over a bridge, a space's runtime
 /// probing kernel memory, then a job spinning on floats in a space while the same job, verified
 /// once, spins in the shared space.
 fn serve(cpu: hw::Ring0, loader: sys::load::Loader, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
@@ -847,8 +852,8 @@ fn booked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: 
 } booked
 
 /// Holds the ledger's book and runs the typed job in one space: the job traps dividing by zero while
-/// the book is held, then divides again, another book held there adds and is abandoned, and the
-/// first book adds before and after and ends with its total.
+/// the book is held, then divides again, another book held there adds and is abandoned, a third
+/// ends breaching its link, and the first book adds before and after and ends with its total.
 fn shared(cpu: hw::Ring0, book: sys::load::Isolated, job: sys::load::Isolated, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
     let gauging = gauges::open(grants.clock, alloc: grants.alloc)
     defer gauges::close(take gauging)
@@ -859,6 +864,10 @@ fn shared(cpu: hw::Ring0, book: sys::load::Isolated, job: sys::load::Isolated, g
     let neighbour = nanos::Link.of(next_frame(mut frames), alloc: grants.alloc)
     var other = nanos::Link.of(next_frame(mut frames), alloc: grants.alloc)
     discard mut other.open("book", inbound: next_frame(mut frames), outbound: next_frame(mut frames))
+    var malformed = nanos::Link.of(next_frame(mut frames), alloc: grants.alloc)
+    let up = next_frame(mut frames)
+    let up_base = up.base()
+    discard mut malformed.open("book", inbound: next_frame(mut frames), outbound: take up)
     var pool = frames_for_space(mut frames, alloc: grants.alloc)
     var extended = Some(hw::ExtendedState.of(next_frame(mut frames)))
     discard attempt await nanos::isolate(cpu, tenant: 5, services: services(grants), frames: mut pool, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn(space: nanos::Isolation) fails task::Cancelled uses wait {
@@ -884,6 +893,12 @@ fn shared(cpu: hw::Ring0, book: sys::load::Isolated, job: sys::load::Isolated, g
                     })
                 })
                 try await take second.join()
+                let third = s.spawn(fn() fails task::Cancelled uses wait limits stack 196_608 {
+                    discard attempt await nanos::hold_isolated(space, job: book, component: "Book", link: malformed, caps, checkpoint: None, runner: sys::Runner.denied(), alloc: grants.alloc, body: fn(take breacher: nanos::Instance) fails nanos::InstanceError uses wait {
+                        try await breached_up(take breacher, outbound: up_base, grants)
+                    })
+                })
+                try await take third.join()
             })
             say(text: "shared ")
             try await added(mut held, amount: 7, grants)
@@ -899,7 +914,32 @@ fn shared(cpu: hw::Ring0, book: sys::load::Isolated, job: sys::load::Isolated, g
     take link.release(mut frames)
     take neighbour.release(mut frames)
     take other.release(mut frames)
+    take malformed.release(mut frames)
 } shared
+
+/// Once the book runs, writes into the frame at `outbound`, in which its space writes the first
+/// channel of its link, what no runtime writes, then asks the book's health, whose answer has the
+/// kernel read it, and writes how the book ended.
+fn breached_up(take instance: nanos::Instance, outbound: u64, grants: Grants) fails nanos::InstanceError uses wait {
+    var book = instance
+    defer take book.abandon()
+    discard try await mut book.health()
+    written_as_space(frame: outbound, data: b"\xFF\xFF\xFF\xFF")
+    discard attempt await mut book.health()
+    undefer book
+    say(text: "breaching book ")
+    say_ended(try await take book.end(), alloc: grants.alloc)
+} breached_up
+
+/// Writes `data` into the ring of the channel frame at `frame` as a space's runtime writes there.
+fn written_as_space(frame: u64, data: Slice[u8]) {
+    let written = trusted "the frame at `frame` is a channel frame of a link this kernel holds" { hw::Ptr[u64].of_addr(usize.widen(frame)).atomic_load(hw::Order.Acquire) }
+    for at in 0..<data.len() {
+        let offset = (written + u64.widen(at)) % RING_BYTES
+        trusted "the ring of the frame at `frame` holds `RING_BYTES` bytes from `RING_DATA`" { hw::Ptr[u8].of_addr(usize.widen(frame + RING_DATA + offset)).write(data[at]) }
+    }
+    trusted "the frame at `frame` is a channel frame of a link this kernel holds" { hw::Ptr[u64].of_addr(usize.widen(frame)).atomic_store(written + u64.widen(data.len()), order: hw::Order.Release) }
+} written_as_space
 
 /// Holds a book in one space and two tellers, one after the other, in another, the port 2 of each
 /// bridged to the book over a channel the kernel maps into both spaces and the tellers acting

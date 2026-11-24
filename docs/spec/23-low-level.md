@@ -1,6 +1,6 @@
 # Low-level programming
 
-This chapter defines trusted code and its premises, trusted primitives and their structured requires, safe code and undefined behaviour, `hw::Ptr[T]`, the address types and the copies between user and kernel memory, layout items, registers items with the register windows `hw::Mmio[R]` and `hw::Ports[R]`, DMA buffers and their ordering, I/O domains, privileged intrinsics and install tokens, machine seams and compiler stubs, landing fns and `hw::mint_root`, foreign fns and calling conventions, the memory model, and the properties of the hardware types.
+This chapter defines trusted code and its premises, trusted primitives and their structured requires, safe code and undefined behaviour, `hw::Ptr[T]`, the address types and the copies between user and kernel memory, layout items, registers items with the register windows `hw::Mmio[R]` and `hw::Ports[R]`, DMA buffers and their ordering, I/O domains and their DMA faults, privileged intrinsics and install tokens, machine seams and compiler stubs, landing fns and `hw::mint_root`, foreign fns and calling conventions, the memory model, and the properties of the hardware types.
 
 ## Trusted code
 
@@ -966,6 +966,18 @@ pub open linear struct Iommu derives Send {
 
 pub fn Iommu.domain(self) -> IoDomain fails IommuError
 
+pub fn Iommu.fault(self) -> Option[DmaFault]
+
+pub fn Iommu.fault_irq[T: Any and Send](self, take dev: T, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> Result[IrqShared[T], MsiRefusal[T]]
+
+pub fn Iommu.release(take self)
+
+pub closed struct DmaFault derives Copy, Eq, Render {
+    pub function: PciAddress
+    pub address: u64
+    pub write: bool
+} DmaFault
+
 pub open linear struct IoDomain derives Send {
 } IoDomain
 
@@ -990,6 +1002,9 @@ pub closed enum IommuError derives Copy, Eq, Render {
 - `domain.space()` gives the domain's space, and `hw::IoSpace.physical()` the physical space. The space of a closed domain is **stale**: a buffer made in it maps nothing.
 - `take domain.close()` ends the domain: each function attached to it reaches no memory from then on, and its tables are freed once the IOMMU no longer caches them. The buffers made in its space stay the CPU's; their `into_box` unmaps nothing.
 - An `hw::IoDomain`, and a buffer made in a domain's space, are resources of the domain run holding them, which its [settlement](11-errors-domains.md#settlement) closes and unmaps.
+- A **DMA fault** is an access of a function's DMA that the space it is attached to does not let through: its address lies past the space or on a page the space does not map for that access. The IOMMU records them from `boot::Kernel.iommu` on: VT-d in its fault recording registers, SMMUv3 in an event queue of 128 entries. A fault arriving while they are full is lost, and VT-d may drop one arriving while a fault of the same function is recorded. `iommu.fault()` returns `Some` of the oldest recorded fault that no call returned yet, as an `hw::DmaFault` holding the function's bus path, the address of the page it reached and whether it was a write, and `None` once none is left; the other records it reads, such as those of interrupt messages and of functions attached to no space, it discards.
+- `iommu.fault_irq(take dev, on_irq: f)` installs `dev` with f on the IOMMU's fault interrupt, delivered to the boot CPU, and enables it: on VT-d its fault event, a message-signalled interrupt as `hw::IrqShared.install_msi` gives one ([locks](24-kernel.md#locks)), which the unit raises in the format without remapping; on SMMUv3 the line of its event queue, which the device tree's `interrupts` names `eventq`, installed edge-triggered as `install_platform` installs one. The interrupt arrives when the IOMMU records a fault after `fault` last returned `None`, and may arrive for later ones too. It refuses with `Unsupported` on SMMUv3 when the device tree names no such line, and otherwise as `install_msi` and `install_platform` do. A later `fault_irq` moves the fault interrupt to its own; uninstalling one leaves the IOMMU raising it.
+- `take iommu.release()` gives the IOMMU up; its domains and its fault interrupt stay.
 - A **confined operation** reaches, through a device, no memory but what the device's own I/O domain maps. The confined operations are those of this section but `hw::IoSpace.physical`, which is a device operation, and those that [register windows](#register-windows), [DMA](#dma), [locks](24-kernel.md#locks), [PCI functions](24-kernel.md#pci-functions) and [PCI ports](24-kernel.md#pci-ports) name. They are legal only in modules that `allow confined` or `allow device` names (`authority.ungranted`).
 - Each operation of this section has the device fact; `domain` traps when no memory is left for the record of its domain (`trap.exhausted`).
 
@@ -1015,6 +1030,44 @@ pub fn sector_buffer(mut disk: hw::PciFunction, domain: hw::IoDomain, heap: mem:
     try mut disk.attach(space)
     return hw::Dma.of(heap.boxed(Sector(data: Array[u8, 512].filled(0))), space)
 } sector_buffer
+```
+
+```nan
+// file: monitor/package.nan
+//! A monitor of the DMA faults of confined drivers.
+
+package monitor {
+    language 1
+    targets x86_64-bare
+    allow confined in monitor
+} monitor
+
+// file: monitor/monitor.nan
+//! Wakes on the IOMMU's fault interrupt and lists the faults it recorded.
+
+interrupt fn woken(mut wake: mem::Shared[hw::Signal[u8]], take irq: hw::IrqContext) -> hw::IrqExit limits stack 256 {
+    wake.contents().post(irq.irqs_disabled(), value: 1)
+    take irq.complete()
+    return hw::IrqExit.Resume
+} woken
+
+pub fn watch(iommu: hw::Iommu, wake: mem::Shared[hw::Signal[u8]]) -> Option[hw::IrqShared[mem::Shared[hw::Signal[u8]]]] {
+    match iommu.fault_irq(dev: wake.share(), on_irq: woken) {
+        Ok(shared) => return Some(take shared)
+        Err(_) => return None
+    }
+} watch
+
+pub fn next_faults(iommu: hw::Iommu, wake: mem::Shared[hw::Signal[u8]], alloc: mem::Alloc) -> mem::List[hw::DmaFault] fails task::Cancelled uses wait {
+    discard try await wake.contents().wait()
+    var faults = mem::List[hw::DmaFault].empty(alloc)
+    loop {
+        let Some(fault) = iommu.fault() else {
+            return faults
+        }
+        mut faults.push(fault)
+    }
+} next_faults
 ```
 
 ```nan

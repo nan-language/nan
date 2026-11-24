@@ -1,4 +1,4 @@
-//! I/O domains: the machine's IOMMU, which translates the DMA of each PCI function through the domain it is attached to, its domains and their spaces, the mappings of DMA buffers in them, and what settlement releases.
+//! I/O domains: the machine's IOMMU, which translates the DMA of each PCI function through the domain it is attached to, its domains and their spaces, the mappings of DMA buffers in them, the DMA faults it records, and what settlement releases.
 
 /// The kinds of IOMMU the runtime drives: Intel VT-d and Arm SMMUv3.
 const VTD: u64 = 1
@@ -9,8 +9,8 @@ const SMMU: u64 = 2
 /// its kind, register base, command queue, the queue's next entry, the interrupt remapping
 /// table, its flags, then past the runtime's lock and wait words, its root table of contexts or
 /// its stream table, the free table pages, what it translates, the DMAR table's remapping unit
-/// on VT-d and the entries of its stream table on SMMUv3, and the domain slots, each a domain
-/// record and a generation.
+/// on VT-d and the entries of its stream table on SMMUv3, its event queue on SMMUv3, and the
+/// domain slots, each a domain record and a generation.
 const UNIT_KIND: u64 = 0
 
 const UNIT_REGISTERS: u64 = 8
@@ -26,6 +26,8 @@ const UNIT_STREAMS: u64 = 64
 const UNIT_FREE: u64 = 72
 
 const UNIT_COVERS: u64 = 80
+
+const UNIT_EVENTS: u64 = 88
 
 const UNIT_SLOTS: u64 = 128
 
@@ -141,6 +143,11 @@ registers VtdRegisters {
     queue_tail: u64 at 0x88 read write
     queue_address: u64 at 0x90 read write
     remapping: u64 at 0xB8 read write
+    fault_status: u32 at 0x34 read write
+    fault_control: u32 at 0x38 write
+    fault_data: u32 at 0x3C write
+    fault_address: u32 at 0x40 write
+    fault_upper: u32 at 0x44 write
 } VtdRegisters
 
 const TRANSLATE: u32 = 0x8000_0000
@@ -172,6 +179,43 @@ const REMAPS: u64 = 0x8
 const EXTENDS: u64 = 0x10
 
 const PASSES: u64 = 0x40
+
+/// A fault recording register of VT-d: the page a fault reached, the requester id, and the fault
+/// reason with the bit of a read and the bit of a recorded fault, which writing it clears.
+registers FaultRecord {
+    page: u64 at 0x0 read
+    requester: u32 at 0x8 read
+    reason: u32 at 0xC read write
+} FaultRecord
+
+/// VT-d's faults: the fault status's overflow bit and where its index of the first pending
+/// record starts; where the capability's offset of the fault recording registers, in units of
+/// 16 bytes, and their count less one start; a record's recorded and read bits; the reasons of
+/// an access the domain does not let through: an address past its width, a write and a read; the
+/// address of a message in the format without remapping, which fault events take, and where it
+/// holds the destination id; where a remapped message's handle starts, which for CPU 0 is its
+/// vector.
+const FAULT_OVERFLOW: u32 = 0x1
+
+const FIRST_RECORD: u32 = 8
+
+const RECORDS_AT: u32 = 24
+
+const RECORD_COUNT: u32 = 40
+
+const RECORDED: u32 = 0x8000_0000
+
+const READ_ACCESS: u32 = 0x4000_0000
+
+const BEYOND_WIDTH: u32 = 4
+
+const UNREADABLE: u32 = 6
+
+const MSI_ADDRESS: u32 = 0xFEE0_0000
+
+const DESTINATION: u32 = 12
+
+const HANDLE: u32 = 5
 
 /// The remapping table: 2^14 entries, one per CPU and vector, its size field, and the bit
 /// selecting the extended mode.
@@ -220,6 +264,11 @@ registers SmmuRegisters {
     queue_base: u64 at 0x90 read write
     queue_produce: u32 at 0x98 read write
     queue_consume: u32 at 0x9C read write
+    irq_control: u32 at 0x50 read write
+    irq_control_ack: u32 at 0x54 read
+    events_base: u64 at 0xA0 read write
+    events_produce: u32 at 0x100A8 read write
+    events_consume: u32 at 0x100AC read write
 } SmmuRegisters
 
 /// The identity bits SMMUv3 needs: stage 1, AArch64 tables, coherent table walks, 4 KiB pages,
@@ -266,6 +315,38 @@ const BUS_SPAN: u64 = 9
 
 const LINEAR_BUSES: u64 = 4
 
+/// SMMUv3's event queue: its control bit and interrupt enable; a queue of 2^7 entries of 32
+/// bytes, a page, and the bits of its indices without and with their wrap bit; the overflow flag
+/// its produce index toggles and its consume index acknowledges; the bit of an entry's second
+/// word telling a read; the event types of an access the domain does not let through, from a
+/// translation fault to a permission fault; and the bytes of an interrupt the device tree names,
+/// a shared peripheral one's first cell being zero and its second its identifier less 32.
+const EVENT_QUEUE: u32 = 0x4
+
+const EVENT_IRQ: u32 = 0x4
+
+const LOG2_EVENTS: u64 = 7
+
+const EVENT_ENTRIES: u64 = 128
+
+const EVENT_BYTES: u64 = 32
+
+const EVENT_INDEX: u32 = 0x7F
+
+const EVENT_WRAP: u32 = 0xFF
+
+const EVENT_OVERFLOW: u32 = 0x8000_0000
+
+const READ_EVENT: u64 = 0x8_0000_0000
+
+const TRANSLATION_FAULT: u64 = 0x10
+
+const PERMISSION_FAULT: u64 = 0x13
+
+const INTERRUPT_BYTES: u64 = 12
+
+const SPI_BASE: u64 = 32
+
 /// A stream table entry's words: valid, then translated by stage 1 through one context
 /// descriptor or bypassing translation; the inner shareable write-back walks of its second word.
 const STREAM_BYTES: u64 = 64
@@ -277,10 +358,10 @@ const STREAM_BYPASS: u64 = 0x9
 const STREAM_WALKS: u64 = 0xD4
 
 /// A context descriptor's first word, a 48-bit space of 4 KiB pages walked inner shareable
-/// write-back, the upper table disabled, valid, AArch64 tables, aborting faults, its output
-/// size at `CONTEXT_SIZE` and its ASID at `CONTEXT_ASID`; its memory attributes, index 0
-/// normal write-back and index 1 device memory.
-const CONTEXT_FIRST: u64 = 0x0000_C200_C000_3510
+/// write-back, the upper table disabled, valid, AArch64 tables, recording and aborting faults,
+/// its output size at `CONTEXT_SIZE` and its ASID at `CONTEXT_ASID`; its memory attributes,
+/// index 0 normal write-back and index 1 device memory.
+const CONTEXT_FIRST: u64 = 0x0000_E200_C000_3510
 
 const CONTEXT_SIZE: u32 = 32
 
@@ -311,6 +392,12 @@ pub closed enum IommuError derives Copy, Eq, Render {
     Closed
     Unsupported
 } IommuError
+
+pub closed struct DmaFault derives Copy, Eq, Render {
+    pub function: PciAddress
+    pub address: u64
+    pub write: bool
+} DmaFault
 
 pub fn Iommu.domain(self) -> IoDomain fails IommuError {
     let unit = iommu_unit()
@@ -351,6 +438,56 @@ pub fn Iommu.domain(self) -> IoDomain fails IommuError {
     poke(record + RECORD_HOLDING, value: hold(DETACH, payload: record))
     return IoDomain(record: record)
 } Iommu.domain
+
+pub fn Iommu.fault(self) -> Option[DmaFault] {
+    let unit = iommu_unit()
+    let flags = iommu_lock()
+    var fault: Option[DmaFault] = None
+    if peek(unit + UNIT_KIND) == VTD {
+        fault = vtd_fault(unit)
+    } else {
+        fault = smmu_fault(unit)
+    }
+    iommu_unlock(flags)
+    return fault
+} Iommu.fault
+
+pub fn Iommu.fault_irq[T: Any and Send](self, take dev: T, on_irq: interrupt fn(mut dev: T, take irq: IrqContext) -> IrqExit) -> Result[IrqShared[T], MsiRefusal[T]] {
+    let unit = iommu_unit()
+    if peek(unit + UNIT_KIND) == VTD {
+        match IrqShared.install_validated(take dev, cpu: 0, source: 0, on_irq) {
+            Ok(shared) => {
+                match shared.message() {
+                    Some(message) => vtd_signalled(unit, message: message.address)
+                    None => {}
+                }
+                return Ok(take shared)
+            }
+            Err(refusal) => return Err(take refusal)
+        }
+    }
+    let line = events_line()
+    if line == 0 {
+        return Err(MsiRefusal(dev: take dev, error: MsiError.Unsupported))
+    }
+    match IrqShared.install_line(take dev, line, source: 0, edge: true, active_low: false, on_irq) {
+        Ok(shared) => {
+            let flags = iommu_lock()
+            var regs = trusted "the device tree names the SMMU's registers, which the entry root maps as device memory, and only the unit's lock holder maps them" { Mmio[SmmuRegisters].map(peek(unit + UNIT_REGISTERS)) }
+            mut regs.write(SmmuRegisters.irq_control, value: EVENT_IRQ)
+            while mut regs.read(SmmuRegisters.irq_control_ack) != EVENT_IRQ {
+            }
+            take regs.unmap()
+            iommu_unlock(flags)
+            return Ok(take shared)
+        }
+        Err(refusal) => return Err(take refusal)
+    }
+} Iommu.fault_irq
+
+pub fn Iommu.release(take self) {
+    let Iommu() = self
+} Iommu.release
 
 pub fn IoDomain.space(self) -> IoSpace {
     let unit = iommu_unit()
@@ -1003,7 +1140,8 @@ fn ioapic_requester(unit: u64, id: u8) -> Option[u32] {
 } ioapic_requester
 
 /// Enables SMMUv3: the device tree's `arm,smmu-v3` node when it translates stage 1 through
-/// AArch64 tables of 4 KiB pages with coherent walks and has stream ids for bus 0, its stream
+/// AArch64 tables of 4 KiB pages with coherent walks, has stream ids for bus 0 and takes an
+/// event queue of `LOG2_EVENTS` entries, which records the faults of its domains, its stream
 /// table holding the stream table entries of the PCI host's buses that its stream ids reach,
 /// in a level-2 table per bus, or of the buses one chunk holds when it walks no two-level
 /// table. Every function's DMA then reaches nothing until it is attached.
@@ -1017,8 +1155,10 @@ fn started_smmu() -> Option[Iommu] {
     let identity = mut regs.read(SmmuRegisters.identity0)
     let needed = STAGE1 | WALKS_COHERENT
     let sizes = mut regs.read(SmmuRegisters.identity5)
-    let stream_bits = u64.widen(mut regs.read(SmmuRegisters.identity1) & 0x3F)
-    if (identity & needed) != needed or (identity & AARCH64_TABLES) == 0 or (sizes & GRANULE_4K) == 0 or stream_bits < LOG2_ENTRIES {
+    let queue_sizes = mut regs.read(SmmuRegisters.identity1)
+    let stream_bits = u64.widen(queue_sizes & 0x3F)
+    let event_bits = u64.widen((queue_sizes >> 16) & 0x1F)
+    if (identity & needed) != needed or (identity & AARCH64_TABLES) == 0 or (sizes & GRANULE_4K) == 0 or stream_bits < LOG2_ENTRIES or event_bits < LOG2_EVENTS {
         take regs.unmap()
         return None
     }
@@ -1050,7 +1190,9 @@ fn started_smmu() -> Option[Iommu] {
         format |= TWO_LEVEL_FORMAT | BUS_SPLIT
     }
     let queue = table_page(unit)
+    let events = table_page(unit)
     poke(unit + UNIT_QUEUE, value: queue)
+    poke(unit + UNIT_EVENTS, value: events)
     mut regs.write(SmmuRegisters.control, value: 0)
     while mut regs.read(SmmuRegisters.control_ack) != 0 {
     }
@@ -1063,15 +1205,110 @@ fn started_smmu() -> Option[Iommu] {
     mut regs.write(SmmuRegisters.queue_base, value: queue | READ_ALLOCATE | LOG2_ENTRIES)
     mut regs.write(SmmuRegisters.queue_produce, value: 0)
     mut regs.write(SmmuRegisters.queue_consume, value: 0)
-    smmu_control(mut regs, value: COMMANDS)
+    mut regs.write(SmmuRegisters.events_base, value: events | LOG2_EVENTS)
+    mut regs.write(SmmuRegisters.events_produce, value: 0)
+    mut regs.write(SmmuRegisters.events_consume, value: 0)
+    smmu_control(mut regs, value: COMMANDS | EVENT_QUEUE)
     iommu_ready(unit)
     let held = iommu_lock()
     iommu_flush()
     iommu_unlock(held)
-    smmu_control(mut regs, value: COMMANDS | ENABLED)
+    smmu_control(mut regs, value: COMMANDS | EVENT_QUEUE | ENABLED)
     take regs.unmap()
     return Some(Iommu())
 } started_smmu
+
+/// The oldest access VT-d recorded that a domain did not let through, clearing every record up to
+/// it and the fault status's overflow, under the unit's lock.
+fn vtd_fault(unit: u64) -> Option[DmaFault] {
+    let base = peek(unit + UNIT_REGISTERS)
+    var regs = trusted "the DMAR table names the remapping unit's registers, which the entry root maps uncached, and only the unit's lock holder maps them" { Mmio[VtdRegisters].map(base) }
+    let caps = mut regs.read(VtdRegisters.capability)
+    let oldest = u64.widen((mut regs.read(VtdRegisters.fault_status) >> FIRST_RECORD) & 0xFF)
+    let records = base + ((caps >> RECORDS_AT) & 0x3FF) * 16
+    let count = ((caps >> RECORD_COUNT) & 0xFF) + 1
+    var fault: Option[DmaFault] = None
+    for index in 0..<count {
+        fault = vtd_record(at: records + (oldest + index) % count * 16)
+        if fault.is_some() {
+            break
+        }
+    }
+    mut regs.write(VtdRegisters.fault_status, value: FAULT_OVERFLOW)
+    take regs.unmap()
+    return fault
+} vtd_fault
+
+/// The access a fault recording register of VT-d holds when the domain did not let it through,
+/// clearing the register.
+fn vtd_record(at: u64) -> Option[DmaFault] {
+    var record = trusted "the remapping unit's capability places its fault recording registers among its registers, which the entry root maps uncached, and only the unit's lock holder maps them" { Mmio[FaultRecord].map(at) }
+    let reason = mut record.read(FaultRecord.reason)
+    var fault: Option[DmaFault] = None
+    if (reason & RECORDED) != 0 {
+        if (reason & 0xFF) >= BEYOND_WIDTH and (reason & 0xFF) <= UNREADABLE {
+            let requester = u64.widen(mut record.read(FaultRecord.requester) & 0xFFFF)
+            fault = Some(DmaFault(function: requester_address(segment: 0, requester), address: mut record.read(FaultRecord.page) & ~(PAGE_BYTES - 1), write: (reason & READ_ACCESS) == 0))
+        }
+        mut record.write(FaultRecord.reason, value: RECORDED)
+    }
+    take record.unmap()
+    return fault
+} vtd_record
+
+/// Points VT-d's fault event at the vector of CPU 0 that a remapped message names, in the
+/// format without remapping, and unmasks it. The fault event bypasses remapping, so the
+/// message's remapping entry need accept only requester 0, the host bridge, which sends none.
+fn vtd_signalled(unit: u64, message: u64) {
+    let id = cpu_hardware_id(0).value_or(0)
+    let flags = iommu_lock()
+    var regs = trusted "the DMAR table names the remapping unit's registers, which the entry root maps uncached, and only the unit's lock holder maps them" { Mmio[VtdRegisters].map(peek(unit + UNIT_REGISTERS)) }
+    mut regs.write(VtdRegisters.fault_data, value: u32.truncate((message >> HANDLE) & 0xFF))
+    mut regs.write(VtdRegisters.fault_address, value: MSI_ADDRESS | (u32.truncate(id & 0xFF) << DESTINATION))
+    if (peek(unit + UNIT_FLAGS) & EXTENDED_MODE) != 0 {
+        mut regs.write(VtdRegisters.fault_upper, value: u32.truncate(id & 0xFFFF_FF00))
+    }
+    mut regs.write(VtdRegisters.fault_control, value: 0)
+    take regs.unmap()
+    iommu_unlock(flags)
+} vtd_signalled
+
+/// The oldest access SMMUv3's event queue holds that a domain did not let through, consuming
+/// every entry up to it and acknowledging an overflow, under the unit's lock.
+fn smmu_fault(unit: u64) -> Option[DmaFault] {
+    var regs = trusted "the device tree names the SMMU's registers, which the entry root maps as device memory, and only the unit's lock holder maps them" { Mmio[SmmuRegisters].map(peek(unit + UNIT_REGISTERS)) }
+    let produced = mut regs.read(SmmuRegisters.events_produce)
+    var consumed = mut regs.read(SmmuRegisters.events_consume) & EVENT_WRAP
+    var fault: Option[DmaFault] = None
+    for _ in 0..<EVENT_ENTRIES {
+        if fault.is_some() or consumed == (produced & EVENT_WRAP) {
+            break
+        }
+        let entry = peek(unit + UNIT_EVENTS) + u64.widen(consumed & EVENT_INDEX) * EVENT_BYTES
+        let head = peek(entry)
+        if (head & 0xFF) >= TRANSLATION_FAULT and (head & 0xFF) <= PERMISSION_FAULT {
+            fault = Some(DmaFault(function: requester_address(segment: 0, requester: head >> 32), address: peek(entry + 16) & ~(PAGE_BYTES - 1), write: (peek(entry + 8) & READ_EVENT) == 0))
+        }
+        consumed = (consumed + 1) & EVENT_WRAP
+    }
+    mut regs.write(SmmuRegisters.events_consume, value: consumed | (produced & EVENT_OVERFLOW))
+    take regs.unmap()
+    return fault
+} smmu_fault
+
+/// The identifier of the shared peripheral interrupt that the `interrupts` of SMMUv3's node names
+/// `eventq`, zero when none.
+fn events_line() -> u64 {
+    let node = tree_node(compatible: "arm,smmu-v3")
+    let Some(index) = listed_at(node.interrupt_names, len: node.names_len, text: "eventq") else {
+        return 0
+    }
+    let at = node.interrupts + index * INTERRUPT_BYTES
+    if (index + 1) * INTERRUPT_BYTES > node.interrupts_len or u32_be_at(at) != 0 {
+        return 0
+    }
+    return u64.widen(u32_be_at(at + 4)) + SPI_BASE
+} events_line
 
 /// Writes SMMUv3's control register and waits until it acknowledges the value.
 fn smmu_control(mut regs: Mmio[SmmuRegisters], value: u32) {

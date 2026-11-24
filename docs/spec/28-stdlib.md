@@ -125,7 +125,7 @@ The table names every pub std type, interface, free function and registry with t
 | `hw` | `hw::IrqsDisabled`, `hw::without_irqs` | [Interrupt state](24-kernel.md#interrupt-state) |
 | `hw` | `hw::Signal` | [Signals](24-kernel.md#signals) |
 | `hw` | `hw::SpinLock`, `hw::IrqShared`, `hw::MsiMessage`, `hw::MsiError`, `hw::MsiRefusal` | [Locks](24-kernel.md#locks) |
-| `hw` | `hw::Iommu`, `hw::IoDomain`, `hw::IoSpace`, `hw::IommuError` | [I/O domains](23-low-level.md#io-domains) |
+| `hw` | `hw::Iommu`, `hw::IoDomain`, `hw::IoSpace`, `hw::IommuError`, `hw::DmaFault` | [I/O domains](23-low-level.md#io-domains) |
 | `hw` | `hw::PciFunction`, `hw::PciAddress`, `hw::PciError`, `hw::PowerState`, `hw::PciKeeper` | [PCI functions](24-kernel.md#pci-functions) |
 | `hw` | `hw::PciPort`, `hw::PortKind`, `hw::PciBuses`, `hw::PciSlot`, `hw::SlotEvents` | [PCI ports](24-kernel.md#pci-ports) |
 | `hw` | `hw::SIGNAL_VECTOR` | [Cross-CPU operations](24-kernel.md#cross-cpu-operations) |

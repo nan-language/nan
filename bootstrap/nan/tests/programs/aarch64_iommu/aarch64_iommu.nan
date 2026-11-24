@@ -1,16 +1,19 @@
-//! Draws entropy through a confined driver, into a pool its domain maps through a 2 MiB page too, counts its MSI-X interrupts, aims its device at an unmapped bus address, then abandons a second driver mid-request and reuses its memory.
+//! Draws entropy through a confined driver, into a pool its domain maps through a 2 MiB page too, counts its MSI-X interrupts, aims its device at an unmapped bus address and receives the IOMMU's fault, then abandons a second driver mid-request and reuses its memory.
 
 registers Pl011 {
     data: u8 at 0x0 write
 } Pl011
 
 /// The byte filling the memory the devices must not reach, the nanoseconds the kernel waits for
-/// writes that must not happen, and the polls of an interrupt count before it gives up.
+/// writes that must not happen, and the polls of an interrupt count before it gives up; the
+/// bytes of an IOMMU page.
 const FILL: u8 = 0x5A
 
 const PAUSE_NS: u64 = 20_000_000
 
 const INTERRUPT_POLLS: u32 = 1_000_000
+
+const PAGE: u64 = 4_096
 
 /// The bytes of a 2 MiB page.
 const LARGE: u64 = 2_097_152
@@ -44,7 +47,8 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
     say(text: "iommu: enabled\n")
     let drawing = new_domain(iommu)
     let abandoning = new_domain(iommu)
-    take k.anchor(take iommu, run: fn[take functions, take drawing, take abandoning](exec: task::Executor) fails task::Cancelled uses wait limits stack 2_228_224 {
+    take k.anchor(0u8, run: fn[take iommu, take functions, take drawing, take abandoning](exec: task::Executor) fails task::Cancelled uses wait limits stack 2_228_224 {
+        let faults = watched(iommu)
         var entropy = mem::List[hw::PciFunction].empty(alloc)
         for function in take functions {
             if rng::is_entropy(function) {
@@ -54,7 +58,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
             }
         }
         match mut entropy.pop() {
-            Some(function) => confined(take function, domain: take drawing, alloc)
+            Some(function) => confined(take function, domain: take drawing, alloc, iommu, faults)
             None => {
                 say(text: "pci: no entropy function\n")
                 take drawing.close()
@@ -63,12 +67,16 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
         let next = mut entropy.pop()
         release(take entropy)
         match next {
-            Some(function) => try await abandoned(take function, domain: take abandoning, exec, alloc, clock)
+            Some(function) => {
+                discard attempt await abandoned(take function, domain: take abandoning, exec, alloc, clock)
+            }
             None => {
                 say(text: "pci: no second entropy function\n")
                 take abandoning.close()
             }
         }
+        discard take faults.uninstall()
+        take iommu.release()
     })
 } main
 
@@ -84,6 +92,34 @@ fn new_domain(iommu: hw::Iommu) -> hw::IoDomain {
     }
 } new_domain
 
+/// A count of the IOMMU's fault interrupts installed on it; the kernel stops here when the IOMMU
+/// refuses it.
+fn watched(iommu: hw::Iommu) -> hw::IrqShared[u64] {
+    match iommu.fault_irq(dev: 0u64, on_irq: faulted) {
+        Ok(shared) => return shared
+        Err(_) => {
+            say(text: "iommu: no fault interrupt\n")
+            loop {
+            }
+        }
+    }
+} watched
+
+interrupt fn faulted(mut count: u64, take irq: hw::IrqContext) -> hw::IrqExit limits stack 1_024 {
+    count = count.wrapping_add(1)
+    take irq.complete()
+    return hw::IrqExit.Resume
+} faulted
+
+/// The interrupts an installed count has counted.
+fn count_of(shared: hw::IrqShared[u64]) -> u64 {
+    return hw::without_irqs(fn(t: hw::IrqsDisabled) -> u64 limits notrap, terminates {
+        return shared.with(t, body: fn(mut count: u64) -> u64 limits notrap, terminates, noalloc {
+            return count
+        })
+    })
+} count_of
+
 fn release(take functions: mem::List[hw::PciFunction]) {
     for function in take functions {
         take function.release()
@@ -92,8 +128,9 @@ fn release(take functions: mem::List[hw::PciFunction]) {
 
 /// Draws entropy through a buffer of its domain, counts the queue's MSI-X interrupt, then aims
 /// the device at a buffer outside the domain.
-fn confined(take function: hw::PciFunction, take domain: hw::IoDomain, alloc: mem::Alloc) {
+fn confined(take function: hw::PciFunction, take domain: hw::IoDomain, alloc: mem::Alloc, iommu: hw::Iommu, faults: hw::IrqShared[u64]) {
     let space = domain.space()
+    let address = function.address()
     match rng::start(take function, space, alloc) {
         Ok(started) => {
             var device = started
@@ -102,7 +139,7 @@ fn confined(take function: hw::PciFunction, take domain: hw::IoDomain, alloc: me
             }
             pooled(mut device, space, alloc)
             interrupted(mut device, space, alloc)
-            outside(mut device, alloc)
+            outside(mut device, alloc, iommu, faults, address)
             let stopped = take device.stop()
             take stopped.release()
         }
@@ -153,11 +190,7 @@ fn interrupted(mut device: rng::Rng, space: hw::IoSpace, alloc: mem::Alloc) {
     discard attempt mut device.draw(space, alloc)
     var counted: u64 = 0
     for _ in 0..<INTERRUPT_POLLS {
-        counted = hw::without_irqs(fn(t: hw::IrqsDisabled) -> u64 limits notrap, terminates {
-            return shared.with(t, body: fn(mut count: u64) -> u64 limits notrap, terminates, noalloc {
-                return count
-            })
-        })
+        counted = count_of(shared)
         if counted > 0 {
             break
         }
@@ -169,17 +202,33 @@ fn interrupted(mut device: rng::Rng, space: hw::IoSpace, alloc: mem::Alloc) {
 } interrupted
 
 /// Restarts the device and asks it to write a buffer of physical memory its domain does not
-/// map, then checks the buffer kept its contents once the device has served the request.
-fn outside(mut device: rng::Rng, alloc: mem::Alloc) {
+/// map, then checks the buffer kept its contents once the device has served the request, and
+/// that the IOMMU's fault interrupt arrived with the write as the first fault since the earlier
+/// ones.
+fn outside(mut device: rng::Rng, alloc: mem::Alloc, iommu: hw::Iommu, faults: hw::IrqShared[u64], address: hw::PciAddress) {
+    while iommu.fault().is_some() {
+    }
+    let before = count_of(faults)
     let heap = mem::Heap.of(alloc)
     let target = hw::Dma.of(heap.boxed(rng::Entropy.from_bits(Array[u8, 32].filled(FILL))), space: hw::IoSpace.physical())
+    let bus = target.bus_addr().value
     var served = false
     if (attempt mut device.reset()).is_ok() {
-        served = (attempt mut device.request(target.bus_addr().value)).is_ok()
+        served = (attempt mut device.request(bus)).is_ok()
     }
     let kept = take target.into_box()
     if served and untouched(kept.contents().data.view()) {
         say(text: "fault: the device's write to an unmapped bus address changed nothing\n")
+    }
+    var signalled = false
+    for _ in 0..<INTERRUPT_POLLS {
+        if count_of(faults) > before {
+            signalled = true
+            break
+        }
+    }
+    if signalled and iommu.fault() == Some(hw::DmaFault(function: address, address: bus - bus % PAGE, write: true)) {
+        say(text: "fault: the IOMMU's interrupt reported the write with the device's function and the page it reached\n")
     }
 } outside
 

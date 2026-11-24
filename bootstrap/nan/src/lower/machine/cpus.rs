@@ -11,6 +11,7 @@ use cranelift_module::{DataDescription, FuncId, Linkage, Module};
 
 use super::super::Lowering;
 use super::super::fx::{Fx, PTR, unaligned};
+use super::super::levels::field;
 use super::super::load::WINDOW_ENTRY;
 use super::super::runtime::memory::CHUNK;
 use super::super::runtime::system::{self, unavailable_unless};
@@ -26,6 +27,13 @@ pub const MAX_CPUS: u64 = 64;
 /// The PSCI function powering a processor on.
 const PSCI_CPU_ON: u64 = 0xC400_0003;
 
+/// The encoding of `ID_AA64ISAR1_EL1` for the `ReadSysReg` stub, the bit of its field reporting
+/// the prediction restriction instructions, and the bit of an AArch64 CPU record's features
+/// listing them.
+const ID_AA64ISAR1_EL1: u16 = 0x4031;
+const SPECRES_FIELD: i64 = 40;
+const PREDICTION_RESTRICTION: u64 = 1;
+
 /// The offsets of a CPU record's fields: its executor thread's record, which the `thread` stub
 /// reads; the vector its running interrupt fn serves; the top and lowest address of its
 /// interrupt stack, which the vector seam reads; its hardware id, its local APIC's id on x86_64 and
@@ -33,7 +41,7 @@ const PSCI_CPU_ON: u64 = 0xC400_0003;
 /// pseudo-descriptor loading it, and its task-state segment; the page-table root
 /// `hw::Ring0.write_cr3` or `write_ttbr0` last installed, zero for the entry root; whether a
 /// shootdown another CPU posted awaits it; the frame the vector seam saved for the interrupt it
-/// serves, zero outside one; on x86_64, the features the `CpuFeatures` stub records; on a
+/// serves, zero outside one; the features `record_features` records; on a
 /// kernel, the nanosecond of its timer's next pacing tick and the ticks its timer counts in a
 /// millisecond; whether it waits in `hw::Ring0.wait_for_interrupt`, which no preemption
 /// interrupts; whether the dispatcher running installed devices defers the end of the
@@ -44,8 +52,8 @@ const PSCI_CPU_ON: u64 = 0xC400_0003;
 /// x86_64 whether its timer runs in TSC-deadline mode; and while
 /// `hw::Ring0.run_user` runs user code, the stack pointer it keeps, its `hw::UserState`, on
 /// x86_64 the user stack pointer of a system call, and the root to reinstall at an exit from a
-/// user root, zero for none; on x86_64, the top of its entry stack, which takes up the rest of
-/// the record.
+/// user root, zero for none; on x86_64, the top of its entry stack; the tenant whose user code it
+/// last entered, and on x86_64 its entry stack, which takes up the rest of the record.
 pub mod cpu {
     pub const THREAD: u64 = 0;
     pub const VECTOR: u64 = 8;
@@ -78,6 +86,7 @@ pub mod cpu {
     pub const USER_SCRATCH: u64 = 368;
     pub const KERNEL_ROOT: u64 = 376;
     pub const ENTRY_TOP: u64 = 384;
+    pub const TENANT: u64 = 392;
     pub const SIZE: u64 = 512;
 }
 
@@ -143,7 +152,7 @@ impl Lowering<'_, '_> {
     /// register addresses from now on; the boot CPU's data-independent timing mode; on AArch64,
     /// the machine discovered; on a kernel, its clock started, on x86_64 the local APICs' mode
     /// chosen, and a CPU for each processor the platform reports; an executor thread record for
-    /// each CPU; on x86_64, the boot CPU's features recorded; on `x86_64-bare`, the boot CPU's
+    /// each CPU; the boot CPU's features recorded; on `x86_64-bare`, the boot CPU's
     /// descriptor tables loaded and AVX enabled when it has it; and, on x86_64, `CR0.WP` and
     /// `EFER.NXE` set.
     pub fn machine_init(&mut self, fx: &mut Fx) {
@@ -182,9 +191,7 @@ impl Lowering<'_, '_> {
             let cpu = self.cpu_record(fx, index);
             fx.store(record, cpu, cpu::THREAD);
         });
-        if self.ck.db.target.arch() == Some(Arch::Amd64) {
-            self.call_stub(fx, Stub::CpuFeatures, &[zero]);
-        }
+        self.record_features(fx, boot);
         if self.ck.db.target == Target::X64Bare {
             self.load_cpu_tables(fx, boot);
             self.call_stub(fx, Stub::EnableAvx, &[]);
@@ -504,6 +511,27 @@ impl Lowering<'_, '_> {
         });
     }
 
+    /// Records in the running CPU's record, `record`, the features the user paths and, on
+    /// x86_64, the other stubs read: on x86_64 through the `CpuFeatures` stub, and on AArch64
+    /// whether `ID_AA64ISAR1_EL1` reports the prediction restriction instructions.
+    fn record_features(&mut self, fx: &mut Fx, record: Value) {
+        match self.arch() {
+            Arch::Amd64 => {
+                let index = self.running_index(fx);
+                self.call_stub(fx, Stub::CpuFeatures, &[index]);
+            }
+            Arch::Aarch64 => {
+                let isar = self.call_stub(fx, Stub::ReadSysReg(ID_AA64ISAR1_EL1), &[])[0];
+                let specres = field(fx, isar, SPECRES_FIELD);
+                let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, specres, 0);
+                let restriction = fx.ptr(PREDICTION_RESTRICTION);
+                let none = fx.ptr(0);
+                let features = fx.b.ins().select(present, restriction, none);
+                fx.store(features, record, cpu::FEATURES);
+            }
+        }
+    }
+
     /// The trampoline's code, a read-only data object the boot CPU copies.
     fn trampoline_code(&mut self) -> cranelift_module::DataId {
         let id = self
@@ -520,7 +548,7 @@ impl Lowering<'_, '_> {
     }
 
     /// The glue a started CPU calls with its record: it points its base register at the record,
-    /// sets its data-independent timing mode, on x86_64 records its features, loads its
+    /// sets its data-independent timing mode, records its features, on x86_64 loads its
     /// descriptor tables, enables AVX when it has it and sets `CR0.WP` and `EFER.NXE`, opens the
     /// load window on AArch64, prepares its interrupt delivery through
     /// `prepare`, disables floating point, records that it started and runs the executor's
@@ -540,9 +568,8 @@ impl Lowering<'_, '_> {
                 let record = fx.entry()[0];
                 lo.set_cpu_base(fx, record);
                 lo.call_stub(fx, Stub::ConstantTime, &[]);
+                lo.record_features(fx, record);
                 if lo.ck.db.target.arch() != Some(Arch::Aarch64) {
-                    let index = lo.running_index(fx);
-                    lo.call_stub(fx, Stub::CpuFeatures, &[index]);
                     lo.load_cpu_tables(fx, record);
                     lo.call_stub(fx, Stub::EnableAvx, &[]);
                     lo.call_stub(fx, Stub::WriteProtect, &[]);

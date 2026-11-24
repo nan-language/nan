@@ -6,6 +6,15 @@ const MAX_CPUS: u64 = 64
 /// The PSCI function powering a processor on.
 const PSCI_CPU_ON: u64 = 0xC400_0003
 
+/// The encoding of `ID_AA64ISAR1_EL1` for the `ReadSysReg` stub, the bit of its field reporting
+/// the prediction restriction instructions, and the bit of an AArch64 CPU record's features
+/// listing them.
+const ID_AA64ISAR1_EL1: u16 = 0x4031
+
+const SPECRES_FIELD: i64 = 40
+
+const PREDICTION_RESTRICTION: u64 = 1
+
 /// The offsets of a CPU record's fields: its executor thread's record, which the `thread` stub
 /// reads; the vector its running interrupt fn serves; the top and lowest address of its
 /// interrupt stack, which the vector seam reads; its hardware id, its local APIC's id on x86_64 and
@@ -13,7 +22,7 @@ const PSCI_CPU_ON: u64 = 0xC400_0003
 /// pseudo-descriptor loading it, and its task-state segment; the page-table root
 /// `hw::Ring0.write_cr3` or `write_ttbr0` last installed, zero for the entry root; whether a
 /// shootdown another CPU posted awaits it; the frame the vector seam saved for the interrupt it
-/// serves, zero outside one; on x86_64, the features the `CpuFeatures` stub records; on a
+/// serves, zero outside one; the features `record_features` records; on a
 /// kernel, the nanosecond of its timer's next pacing tick and the ticks its timer counts in a
 /// millisecond; whether it waits in `hw::Ring0.wait_for_interrupt`, which no preemption
 /// interrupts; whether the dispatcher running installed devices defers the end of the
@@ -24,8 +33,8 @@ const PSCI_CPU_ON: u64 = 0xC400_0003
 /// whether its timer runs in TSC-deadline mode; and while
 /// `hw::Ring0.run_user` runs user code, the stack pointer it keeps, its `hw::UserState`, on
 /// x86_64 the user stack pointer of a system call, and the root to reinstall at an exit from a
-/// user root, zero for none; on x86_64, the top of its entry stack, which takes up the rest of
-/// the record.
+/// user root, zero for none; on x86_64, the top of its entry stack; the tenant whose user code it
+/// last entered, and on x86_64 its entry stack, which takes up the rest of the record.
 const CPU_THREAD: u64 = 0
 
 const CPU_VECTOR: u64 = 8
@@ -88,6 +97,8 @@ const CPU_KERNEL_ROOT: u64 = 376
 
 const CPU_ENTRY_TOP: u64 = 384
 
+const CPU_TENANT: u64 = 392
+
 const CPU_SIZE: u64 = 512
 
 /// The model-specific register holding the GS base.
@@ -148,9 +159,9 @@ fn Lowering.running_cpu(mut self, mut fx: Fx) -> clif::Value {
 /// A machine image's part of `Init`: the CPU records, the boot CPU's first, which its base
 /// register addresses from now on; the boot CPU's data-independent timing mode; on AArch64, the
 /// machine discovered; on a kernel, its clock started, on x86_64 the local APICs' mode chosen,
-/// and a CPU for each processor the platform reports; an executor thread record for each CPU; on
-/// x86_64, the boot CPU's features recorded; on `x86_64-bare`, the boot CPU's descriptor tables
-/// loaded and AVX enabled when it has it; and, on x86_64, `CR0.WP` and `EFER.NXE` set.
+/// and a CPU for each processor the platform reports; an executor thread record for each CPU; the
+/// boot CPU's features recorded; on `x86_64-bare`, the boot CPU's descriptor tables loaded and AVX
+/// enabled when it has it; and, on x86_64, `CR0.WP` and `EFER.NXE` set.
 fn Lowering.machine_init(mut self, mut fx: Fx) {
     let boot = mut self.cpu_records(mut fx)
     mut self.set_cpu_base(mut fx, record: boot)
@@ -189,9 +200,7 @@ fn Lowering.machine_init(mut self, mut fx: Fx) {
         let cpu = mut self.cpu_record(mut fx1, index)
         mut fx1.store(record, addr: cpu, offset: CPU_THREAD)
     })
-    if self.ck.db().target.arch() == Some(workspace::Arch.Amd64) {
-        discard mut self.call_stub(mut fx, stub: Stub.CpuFeatures, args: Array[clif::Value, 1].filled(zero_value).view())
-    }
+    mut self.record_features(mut fx, record: boot)
     if self.ck.db().target == workspace::Target.X64Bare {
         mut self.load_cpu_tables(mut fx, record: boot)
         discard mut self.call_stub(mut fx, stub: Stub.EnableAvx, args: mem::List[clif::Value].empty(fx.alloc).view())
@@ -537,6 +546,28 @@ fn Lowering.spin(mut self, mut fx: Fx, pauses: u64) {
     })
 } Lowering.spin
 
+/// Records in the running CPU's record, `record`, the features the user paths and, on x86_64, the
+/// other stubs read: on x86_64 through the `CpuFeatures` stub, and on AArch64 whether
+/// `ID_AA64ISAR1_EL1` reports the prediction restriction instructions.
+fn Lowering.record_features(mut self, mut fx: Fx, record: clif::Value) {
+    match self.arch() {
+        workspace::Arch.Amd64 => {
+            let index = mut self.running_index(mut fx)
+            discard mut self.call_stub(mut fx, stub: Stub.CpuFeatures, args: Array[clif::Value, 1].filled(index).view())
+        }
+        workspace::Arch.Aarch64 => {
+            let isar = mut self.call_stub(mut fx, stub: Stub.ReadSysReg(ID_AA64ISAR1_EL1), args: mem::List[clif::Value].empty(fx.alloc).view())
+            expect isar.len() > 0
+            let specres = level_field(mut fx, register: isar[0], at: SPECRES_FIELD)
+            let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: specres, y: 0)
+            let restriction = mut fx.ptr(PREDICTION_RESTRICTION)
+            let none = mut fx.ptr(0)
+            let features = mut fx.b.select(present, x: restriction, y: none)
+            mut fx.store(features, addr: record, offset: CPU_FEATURES)
+        }
+    }
+} Lowering.record_features
+
 /// The trampoline's code, a read-only data object the boot CPU copies.
 fn Lowering.trampoline_code(mut self) -> object::DataId {
     let id = mut self.module.declare_data("_NStrampoline", linkage: object::Linkage.Local, writable: false, tls: false)
@@ -550,7 +581,7 @@ fn Lowering.trampoline_code(mut self) -> object::DataId {
 } Lowering.trampoline_code
 
 /// The glue a started CPU calls with its record: it points its base register at the record,
-/// sets its data-independent timing mode, on x86_64 records its features, loads its descriptor
+/// sets its data-independent timing mode, records its features, on x86_64 loads its descriptor
 /// tables, enables AVX when it has it and sets `CR0.WP` and `EFER.NXE`, opens the load window on
 /// AArch64, prepares its interrupt delivery through `prepare`,
 /// disables floating point, records that it started and runs the executor's scheduler.
@@ -564,9 +595,8 @@ fn Lowering.cpu_glue(mut self, prepare: object::FuncId) -> object::FuncId {
         let record = entry_params[0]
         mut lo1.set_cpu_base(mut fx1, record: record)
         discard mut lo1.call_stub(mut fx1, stub: Stub.ConstantTime, args: mem::List[clif::Value].empty(fx1.alloc).view())
+        mut lo1.record_features(mut fx1, record)
         if lo1.ck.db().target.arch() != Some(workspace::Arch.Aarch64) {
-            let index = mut lo1.running_index(mut fx1)
-            discard mut lo1.call_stub(mut fx1, stub: Stub.CpuFeatures, args: Array[clif::Value, 1].filled(index).view())
             mut lo1.load_cpu_tables(mut fx1, record)
             discard mut lo1.call_stub(mut fx1, stub: Stub.EnableAvx, args: mem::List[clif::Value].empty(fx1.alloc).view())
             discard mut lo1.call_stub(mut fx1, stub: Stub.WriteProtect, args: mem::List[clif::Value].empty(fx1.alloc).view())

@@ -1061,7 +1061,7 @@ pub fn Ring0.invalidate_everywhere(self, scope: TlbScope) fails task::Cancelled 
 
 pub fn Ring0.run_user(self, mut state: UserState, mut extended: Option[ExtendedState]) -> UserExit
 
-pub fn Ring0.run_user_split(self, mut state: UserState, mut extended: Option[ExtendedState], root: PageTableRoot) -> UserExit
+pub fn Ring0.run_user_split(self, mut state: UserState, mut extended: Option[ExtendedState], root: PageTableRoot, tenant: u64) -> UserExit
 
 pub fn Ring0.entry_area(self) -> EntryArea
 

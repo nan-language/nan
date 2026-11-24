@@ -219,7 +219,7 @@ fn lacks(fx: &mut Fx, word: Value, mask: i64) -> Value {
 }
 
 /// The four-bit field of an AArch64 ID register at a bit.
-fn field(fx: &mut Fx, register: Value, at: i64) -> Value {
+pub(super) fn field(fx: &mut Fx, register: Value, at: i64) -> Value {
     let shifted = fx.b.ins().ushr_imm_s(register, at);
     fx.b.ins().band_imm_s(shifted, 0xF)
 }

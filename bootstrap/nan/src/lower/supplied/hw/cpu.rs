@@ -106,10 +106,11 @@ pub fn ring0(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     }
 }
 
-/// `run_user` and, under the user root its fourth parameter holds, `run_user_split` give
-/// `Interrupted` at once outside thread context, and otherwise enter user mode through the vector
-/// seam's user path, the running task owning the extended state its third parameter holds, if
-/// any, until the exit, and give the exit it reports.
+/// `run_user`, for tenant 0, and, under the user root its fourth parameter holds and for the
+/// tenant its fifth names, `run_user_split` give `Interrupted` at once outside thread context, and
+/// otherwise enter user mode through the vector seam's user path, the running task owning the
+/// extended state its third parameter holds, if any, until the exit, and give the exit it
+/// reports.
 fn run_user(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, split: bool) {
     let exit_ty = supply.abi.result.clone();
     let user_state = supply.param(1).address();
@@ -125,14 +126,15 @@ fn run_user(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, split: bool) {
     let area = extended::optional_area(lo, fx, &extended_ty, supply.param(2).address());
     let previous = lo.call_routine(fx, Routine::Extended, &[area])[0];
     let fault = fx.slot(24, 8);
-    let (user_root, kernel_root) = match split {
+    let (user_root, kernel_root, tenant) = match split {
         true => {
             let root = word(fx, supply.param(3));
-            lo.split_roots(fx, root)
+            let (user_root, kernel_root) = lo.split_roots(fx, root);
+            (user_root, kernel_root, supply.param(4).scalar())
         }
-        false => (fx.ptr(0), fx.ptr(0)),
+        false => (fx.ptr(0), fx.ptr(0), fx.ptr(0)),
     };
-    let kind = lo.enter_user(fx, user_state, fault, user_root, kernel_root);
+    let kind = lo.enter_user(fx, user_state, fault, user_root, kernel_root, tenant);
     lo.call_routine(fx, Routine::Extended, &[previous]);
     let syscall = fx.b.ins().icmp_imm_s(IntCC::Equal, kind, SYSCALL);
     fx.when(syscall, |fx| {

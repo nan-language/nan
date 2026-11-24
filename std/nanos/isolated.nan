@@ -257,14 +257,14 @@ struct Replying derives Encode {
     reply: Naming
 } Replying
 
-pub fn run_isolated(cpu: hw::Ring0, job: sys::load::Isolated, services: Services, link: Link, take input: mem::Bytes, mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState], alloc: mem::Alloc) -> Ended fails IsolatedError uses wait {
+pub fn run_isolated(cpu: hw::Ring0, job: sys::load::Isolated, tenant: u64, services: Services, link: Link, take input: mem::Bytes, mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState], alloc: mem::Alloc) -> Ended fails IsolatedError uses wait {
     let Some(entry) = job.job() else {
         fail IsolatedError.NoJob
     }
-    let Placed(space: made, state: started, table: table) = try placed(cpu, job, entry, services, runner: sys::Runner.denied(), link, held: false, take input, mut frames, alloc)
+    let Placed(space: made, state: started, table: table) = try placed(cpu, job, entry, tenant, services, runner: sys::Runner.denied(), link, held: false, take input, mut frames, alloc)
     var space = made
     var state = started
-    let outcome = attempt await run_space(cpu, mut space, mut state, mut extended, served: Serving(services: services, table: take table), link, halted: fn() => false, mut frames, alloc)
+    let outcome = attempt await run_space(cpu, mut space, mut state, mut extended, served: Serving(services: services, tenant: tenant, table: take table), link, halted: fn() => false, mut frames, alloc)
     take space.release(mut frames)
     match outcome {
         Ok(how) => return how
@@ -280,10 +280,10 @@ linear struct Placed {
     table: Table
 } Placed
 
-/// Makes a space of `job` from `frames` that runs `entry` on `input`, the instance of a component
-/// entry acting through `runner` when `held`, sharing `link`'s frames with it and laying out its
-/// start record.
-fn placed(cpu: hw::Ring0, job: sys::load::Isolated, entry: sys::load::Job, services: Services, runner: sys::Runner, link: Link, held: bool, take input: mem::Bytes, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Placed fails sys::load::LoadError {
+/// Makes a space of `job` for `tenant` from `frames` that runs `entry` on `input`, the instance of
+/// a component entry acting through `runner` when `held`, sharing `link`'s frames with it and
+/// laying out its start record.
+fn placed(cpu: hw::Ring0, job: sys::load::Isolated, entry: sys::load::Job, tenant: u64, services: Services, runner: sys::Runner, link: Link, held: bool, take input: mem::Bytes, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Placed fails sys::load::LoadError {
     var keys: usize = 0
     for channel in link.channels {
         keys += channel.key.as_str().as_bytes().len()
@@ -300,7 +300,7 @@ fn placed(cpu: hw::Ring0, job: sys::load::Isolated, entry: sys::load::Job, servi
         discard held_by(table, holding: Holding.Channel(index))
     }
     let acting = held_by(table, holding: Holding.Runner(runner))
-    var space = try job.space(cpu, data: u64.widen(START_BYTES + ports_len + keys + input.len()), mut frames, alloc)
+    var space = try job.space(cpu, data: u64.widen(START_BYTES + ports_len + keys + input.len()), tenant, mut frames, alloc)
     let start = space.data()
     match attempt shared(mut space, link, start, channels, alloc) {
         Ok(ports) => {
@@ -325,9 +325,11 @@ fn placed(cpu: hw::Ring0, job: sys::load::Isolated, entry: sys::load::Job, servi
     }
 } placed
 
-/// What a space's kernel serves it: its services, and its table of handles.
+/// What a space's kernel serves it: its services, the tenant its threads run for, and its table of
+/// handles.
 struct Serving {
     services: Services
+    tenant: u64
     table: Table
 } Serving
 
@@ -622,7 +624,7 @@ fn invoked(cpu: hw::Ring0, mut space: sys::load::Space, state: hw::UserState, se
         Holding.Fs(fs) => return try await filed(mut space, fs, operation, args, target, capacity, mut files, alloc)
         Holding.Tests => {
             if operation == TEST_RUN {
-                return try await test_served(cpu, services: served.services, args, halted, mut frames, alloc)
+                return try await test_served(cpu, services: served.services, tenant: served.tenant, args, halted, mut frames, alloc)
             }
         }
         Holding.Channel(index) => {
@@ -718,10 +720,10 @@ fn outcome_of(outcome: Result[Unit, sys::RunnerError]) -> u64 {
 } outcome_of
 
 /// Serves a test run: runs the test image at the path its arguments name in the file system of
-/// `services` alone in a space of its own, on the texts they give, writing what it writes to its
-/// standard output into a file made at the output path they name, and gives the status it ends
-/// with.
-fn test_served(cpu: hw::Ring0, services: Services, args: Untrusted[mem::Bytes], halted: fn() -> bool, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+/// `services` alone in a space of its own for `tenant`, on the texts they give, writing what it
+/// writes to its standard output into a file made at the output path they name, and gives the
+/// status it ends with.
+fn test_served(cpu: hw::Ring0, services: Services, tenant: u64, args: Untrusted[mem::Bytes], halted: fn() -> bool, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
     let Ok(asked) = attempt mem::wire::Codec[TestRun].decode(args.view(), alloc) else {
         return INVALID
     }
@@ -746,7 +748,7 @@ fn test_served(cpu: hw::Ring0, services: Services, args: Untrusted[mem::Bytes], 
     }
     var extended = Some(hw::ExtendedState.of(take frame))
     var file = output
-    let ran = attempt await test_space(cpu, image: alone, texts: texts.view(), output: mut file, clock: services.clock, halted, mut extended, mut frames, alloc)
+    let ran = attempt await test_space(cpu, image: alone, tenant, texts: texts.view(), output: mut file, clock: services.clock, halted, mut extended, mut frames, alloc)
     match extended {
         Some(owned) => mut frames.push(take owned.into_frame())
         None => {}
@@ -757,12 +759,12 @@ fn test_served(cpu: hw::Ring0, services: Services, args: Untrusted[mem::Bytes], 
     }
 } test_served
 
-/// Runs a test image's space on `texts` until it ends, writing what it writes to its standard
-/// output into `output`, and gives the status it ends with: the one it gives, `TIMED_OUT` once it
-/// has run for `TEST_NS` or `halted` gives true, and `CRASHED` when its thread faults on a page it
-/// cannot draw or on another exception.
-fn test_space(cpu: hw::Ring0, image: sys::load::Isolated, texts: Slice[u8], mut output: sys::fs::File, clock: sys::Clock, halted: fn() -> bool, mut extended: Option[hw::ExtendedState], mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
-    let Ok(made) = attempt image.space(cpu, data: u64.widen(TEST_START_BYTES + texts.len() + 1), mut frames, alloc) else {
+/// Runs a space of a test image for `tenant` on `texts` until it ends, writing what it writes to
+/// its standard output into `output`, and gives the status it ends with: the one it gives,
+/// `TIMED_OUT` once it has run for `TEST_NS` or `halted` gives true, and `CRASHED` when its thread
+/// faults on a page it cannot draw or on another exception.
+fn test_space(cpu: hw::Ring0, image: sys::load::Isolated, tenant: u64, texts: Slice[u8], mut output: sys::fs::File, clock: sys::Clock, halted: fn() -> bool, mut extended: Option[hw::ExtendedState], mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    let Ok(made) = attempt image.space(cpu, data: u64.widen(TEST_START_BYTES + texts.len() + 1), tenant, mut frames, alloc) else {
         return INVALID
     }
     var space = made

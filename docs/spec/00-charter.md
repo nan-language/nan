@@ -526,6 +526,7 @@ Each term links to its home, whose definition governs.
 | [task](16-concurrency.md#task-scopes) | Stackful unit of concurrency. |
 | [task closure](16-concurrency.md#task-closures) | `task fn` closure. |
 | [task scope](16-concurrency.md#task-scopes) | Region `task::scope` opens. |
+| [tenant](24-kernel.md#user-mode) | Number grouping user threads that may steer each other's branch predictions. |
 | [term order](20-prover.md#canonicalisation) | Prover's order on terms, atoms and clauses, by canonical encoding. |
 | [test](22-testing.md#test-items) | `test name for target` item. |
 | [test target](22-testing.md#test-items) | Item a test names. |

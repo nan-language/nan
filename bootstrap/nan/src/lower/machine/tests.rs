@@ -1,4 +1,5 @@
 use super::aarch64::{self, VBAR_SEAM};
+use super::cpus::cpu;
 use super::handoff::PVH_TRAMPOLINE;
 use super::interrupts::{
     CHECK, CHECKS_AT, COMMON_AT, RESERVED, SEAM_CHECKS, SEAM_COMMON, SEAM_DISPATCH, SEAM_PREEMPT,
@@ -92,6 +93,56 @@ fn x64_user_path_meets_the_vector_seam() {
     assert!(!saves_extended_state(user::X64_USER));
 }
 
+#[test]
+fn x64_user_path_bars_predictions_between_tenants_and_clears_buffers_last() {
+    let code = user::X64_USER;
+    let position = |bytes: &[u8]| {
+        code.windows(bytes.len())
+            .position(|window| window == bytes)
+            .unwrap_or_else(|| panic!("{bytes:02x?} in the user path"))
+    };
+    let mut compare = vec![0x65, 0x4c, 0x39, 0x04, 0x25];
+    compare.extend_from_slice(&(cpu::TENANT as u32).to_le_bytes());
+    let mut ibpb_listed = vec![0x65, 0xf7, 0x04, 0x25];
+    ibpb_listed.extend_from_slice(&(cpu::FEATURES as u32).to_le_bytes());
+    ibpb_listed.extend_from_slice(&0x2000u32.to_le_bytes());
+    let barrier = [
+        0xb9, 0x49, 0x00, 0x00, 0x00, 0xb8, 0x01, 0x00, 0x00, 0x00, 0x31, 0xd2, 0x0f, 0x30,
+    ];
+    let order = [
+        position(&compare),
+        position(&ibpb_listed),
+        position(&barrier),
+    ];
+    assert!(
+        order.is_sorted(),
+        "a tenant other than the CPU's last, where the CPU lists a barrier, issues it"
+    );
+    let mut clearing_listed = vec![0x65, 0xf7, 0x04, 0x25];
+    clearing_listed.extend_from_slice(&(cpu::FEATURES as u32).to_le_bytes());
+    clearing_listed.extend_from_slice(&0x4000u32.to_le_bytes());
+    let verw_swapgs_iretq = [
+        0x74, 0x05, 0x0f, 0x00, 0x6c, 0x24, 0x20, 0x0f, 0x01, 0xf8, 0x48, 0xcf,
+    ];
+    assert_eq!(
+        position(&clearing_listed) + clearing_listed.len(),
+        position(&verw_swapgs_iretq),
+        "where the CPU asks for it, verw of the frame's stack selector precedes swapgs and iretq"
+    );
+    let (_, _, features) = Stub::CpuFeatures.code(Arch::Amd64);
+    let reads = |bytes: &[u8]| features.windows(bytes.len()).any(|window| window == bytes);
+    assert!(
+        reads(&[0x0f, 0xba, 0xe2, 0x1a]) && reads(&[0x0f, 0xba, 0xe3, 0x0c]),
+        "the barrier is listed from leaf 7 and from leaf 0x8000_0008"
+    );
+    assert!(
+        reads(&[
+            0xb9, 0x0a, 0x01, 0x00, 0x00, 0x0f, 0x32, 0x25, 0x20, 0x01, 0x00, 0x00
+        ]),
+        "the clearing is listed unless IA32_ARCH_CAPABILITIES reports MDS_NO and TAA_NO"
+    );
+}
+
 /// The target of the AArch64 `b` or `bl` at `at`.
 fn a64_branch_target(word: u32, at: usize) -> usize {
     let words = ((word << 6) as i32) >> 6;
@@ -120,6 +171,31 @@ fn aarch64_user_path_meets_the_vector_table() {
             "{word:#010x} touches the floating-point registers"
         );
     }
+}
+
+#[test]
+fn aarch64_user_path_restricts_predictions_between_tenants() {
+    let path = words(user::AARCH64_USER);
+    let at = |word: u32| {
+        path.iter()
+            .position(|held| *held == word)
+            .unwrap_or_else(|| panic!("{word:#010x} in the user path"))
+    };
+    let tenant = (cpu::TENANT as u32 / 8) << 10 | 6 << 5;
+    let (load, store) = (0xF940_0007 | tenant, 0xF900_0004 | tenant);
+    let restrictions = [0xD50B_7387, 0xD50B_73A7, 0xD50B_73E7].map(at);
+    let eret = 0xD69F_03E0;
+    let order = [
+        at(load),
+        at(store),
+        restrictions[0],
+        restrictions[2],
+        at(eret),
+    ];
+    assert!(
+        order.is_sorted() && restrictions.is_sorted(),
+        "a tenant other than the CPU's last restricts the predictions of EL0 before eret"
+    );
 }
 
 #[test]

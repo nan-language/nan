@@ -206,6 +206,12 @@ struct Door {
     tokens: core::atomic::AtomicU64
 } Door
 
+/// The door of an isolation whose own capabilities are those of `services`, `moves` sending to the
+/// task keeping the frames moving into its space while it takes any.
+fn Door.of(services: Services, take moves: Option[task::Sender[Moving]], alloc: mem::Alloc) -> Door {
+    return Door(table: Table.of(services, alloc), asks: task::Cown.of(Asks(open: true, list: mem::List[Ask].empty(alloc)), alloc), woken: hw::Signal[u64].empty(), next: core::atomic::AtomicU64.of(1), carries: task::Cown.of(mem::List[Carry].empty(alloc), alloc), moves: task::Cown.of(take moves, alloc), tokens: core::atomic::AtomicU64.of(1))
+} Door.of
+
 /// Where an instance runs in an isolated space: the capability reaching the door of its isolation,
 /// and its number there.
 struct Placement derives Copy {
@@ -429,8 +435,7 @@ struct Replying derives Encode {
 
 pub fn isolate[E](cpu: hw::Ring0, tenant: u64, clock: sys::Clock, services: Services, mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState], exec: task::Executor, alloc: mem::Alloc, body: fn(space: Isolation) fails E uses wait limits stack 131_072) fails E uses wait {
     let task::Channel(sender: moves, receiver: moving) = task::Channel[Moving].bounded(QUEUED_CALLS, alloc)
-    let door = Door(table: Table.of(services, alloc), asks: task::Cown.of(Asks(open: true, list: mem::List[Ask].empty(alloc)), alloc), woken: hw::Signal[u64].empty(), next: core::atomic::AtomicU64.of(1), carries: task::Cown.of(mem::List[Carry].empty(alloc), alloc), moves: task::Cown.of(Some(take moves), alloc), tokens: core::atomic::AtomicU64.of(1))
-    let shared = mem::Shared.of(take door, alloc)
+    let shared = mem::Shared.of(Door.of(services, moves: Some(take moves), alloc), alloc)
     let doors = sys::Minter[Doorway, mem::Shared[Door], u64].of(shared.share(), alloc)
     defer take doors.close()
     let isolation = Isolation(door: take shared, way: doors.mint(0), closed: core::atomic::AtomicBool.of(false), exec: exec, alloc: alloc)
@@ -620,8 +625,9 @@ struct Joined {
 /// and the capabilities of `caps` that cross into the space, acting through `runner`, bridging each
 /// channel of `link` that carries the calls of a port to the instance answering them, and gives how
 /// it ended once no space maps `link`'s frames, or why it could not be placed, the table then taking
-/// back every entry added for it. While it runs, it is watched as `run_watched` watches it; once
-/// `halted` holds true, or this call is cancelled, the space abandons it.
+/// back every entry added for it and the door dropping what it kept for its ends. While it runs, it
+/// is watched as `run_watched` watches it; once `halted` holds true, or this call is cancelled, the
+/// space abandons it.
 fn joined(isolation: Isolation, id: u64, job: sys::load::Isolated, take component: Option[text::String], link: Link, services: Services, caps: Caps, take input: mem::Bytes, runner: sys::Runner, halted: mem::Shared[core::atomic::AtomicBool], alloc: mem::Alloc) -> Joined fails task::Cancelled uses wait {
     if id == 0 {
         return Joined(outcome: Err(sys::load::LoadError.Unplaceable), cancelled: None)
@@ -692,6 +698,7 @@ fn joined(isolation: Isolation, id: u64, job: sys::load::Isolated, take componen
     match ran {
         Ok(done) => {
             isolation.door.contents().table.taken_back(id)
+            try await isolation.door.contents().carries_dropped()
             return done
         }
         Err(cancellation) => fail cancellation
@@ -1737,6 +1744,21 @@ fn Table.admitted(self, job: u64, handles: Slice[sys::Handle], alloc: mem::Alloc
     }
     return Some(take crossing)
 } Table.admitted
+
+/// Takes back the entry of each capability `crossing` holds.
+fn Table.crossing_taken(self, crossing: Slice[Carried]) {
+    for crossed in crossing {
+        self.taken(crossed.handle())
+    }
+} Table.crossing_taken
+
+/// The handle of the entry of a space's table holding a capability the kernel added to it.
+fn Carried.handle(self) -> u64 limits pure, notrap, terminates {
+    return match self {
+        Carried.Log(handle) or Carried.Stdio(handle) or Carried.Random(handle) => handle
+        Carried.Kind(crossed) => crossed.handle
+    }
+} Carried.handle
 
 /// The entry of a space's table holding the capability `handle` holds, none for a type no space
 /// holds: a log, standard streams, a random source or a crossing kind's.

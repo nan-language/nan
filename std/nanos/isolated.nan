@@ -26,8 +26,9 @@ const ROLE_RESULT: u64 = 7
 
 const ROLE_FOURTH: u64 = 8
 
-/// A call's results from `FAILURES` up are failures: an invalid call, a stale capability, and a
-/// file operation failing with a missing entry, a refusal, an invalid path or a full device.
+/// A call's results from `FAILURES` up are failures: an invalid call, a stale capability, a file
+/// operation failing with a missing entry, a refusal, an invalid path or a full device, and a
+/// closed standard stream.
 const FAILURES: u64 = 0xFFFF_FFFF_FFFF_F000
 
 const INVALID: u64 = 0xFFFF_FFFF_FFFF_FFFF
@@ -41,6 +42,8 @@ const REFUSAL: u64 = 0xFFFF_FFFF_FFFF_FFFC
 const BAD_PATH: u64 = 0xFFFF_FFFF_FFFF_FFFB
 
 const FULL_DEVICE: u64 = 0xFFFF_FFFF_FFFF_FFFA
+
+const CLOSED_STREAM: u64 = 0xFFFF_FFFF_FFFF_FFF9
 
 /// The operations of the capabilities the kernel serves a job's space.
 const LOG_LINE: u64 = 0
@@ -2100,8 +2103,9 @@ fn written_out(mut output: sys::fs::File, data: Slice[u8]) fails task::Cancelled
 fn streamed(mut space: sys::load::Space, stdio: sys::Stdio, operation: u64, args: Untrusted[mem::Bytes], target: u64, capacity: u64, alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
     if operation == READ_IN {
         var buffer = Untrusted.of(mem::Bytes.zeroed(usize.widen(capacity), alloc))
-        let Ok(count) = attempt await stdio.read_in(mut buffer.view_mut()) else {
-            return STALE
+        let count = match attempt await stdio.read_in(mut buffer.view_mut()) {
+            Ok(count) => count
+            Err(error) => return stream_failure(error)
         }
         let Some(read) = buffer.view().prefix(count) else {
             return INVALID
@@ -2116,11 +2120,19 @@ fn streamed(mut space: sys::load::Space, stdio: sys::Stdio, operation: u64, args
         }
         return match sent {
             Ok(_) => 0
-            Err(_) => STALE
+            Err(error) => stream_failure(error)
         }
     }
     return INVALID
 } streamed
+
+/// The result naming a standard stream's failure.
+fn stream_failure(error: sys::StdioError) -> u64 {
+    return match error {
+        sys::StdioError.Revoked(_) => STALE
+        else => CLOSED_STREAM
+    }
+} stream_failure
 
 /// The files a space opened, by number, and the number of the next one.
 struct Files {
@@ -2763,7 +2775,7 @@ fn Remote.log(self, level: sys::LogLevel, message: Str, value: Str) limits stack
 
 fn Remote.read_in(self, mut buf: SliceMut[u8]) -> usize fails sys::StdioError limits stack 4_096 {
     let Some(reach) = reached(self) else {
-        fail sys::StdioError.Closed
+        fail sys::StdioError.Revoked(sys::Revoked.Stale)
     }
     return try streamed_in(reach.handle, mut buf)
 } Remote.read_in
@@ -2779,7 +2791,7 @@ fn Remote.write_err(self, data: Slice[u8]) fails sys::StdioError limits stack 4_
 /// Writes bytes to a remote standard stream.
 fn wrote(remote: Remote, operation: u64, data: Slice[u8]) fails sys::StdioError {
     let Some(reach) = reached(remote) else {
-        fail sys::StdioError.Closed
+        fail sys::StdioError.Revoked(sys::Revoked.Stale)
     }
     try streamed_out(reach.handle, operation, data)
 } wrote
@@ -2788,7 +2800,7 @@ fn wrote(remote: Remote, operation: u64, data: Slice[u8]) fails sys::StdioError 
 fn streamed_in(handle: u64, mut buf: SliceMut[u8]) -> usize fails sys::StdioError {
     let read = invoke(handle, operation: READ_IN, args: b"", result: mut buf)
     if read >= FAILURES {
-        fail sys::StdioError.Closed
+        fail stream_error(read)
     }
     return usize.widen(read)
 } streamed_in
@@ -2805,12 +2817,22 @@ fn streamed_out(handle: u64, operation: u64, data: Slice[u8]) fails sys::StdioEr
             return
         }
         var nothing = Array[u8, 1].filled(0)
-        if invoke(handle, operation, args: chunk, result: mut nothing.view_mut()) >= FAILURES {
-            fail sys::StdioError.Closed
+        let answer = invoke(handle, operation, args: chunk, result: mut nothing.view_mut())
+        if answer >= FAILURES {
+            fail stream_error(answer)
         }
         done += chunk.len()
     }
 } streamed_out
+
+/// The failure of a standard stream that a call's failure names: a stale stream's, or a closed
+/// one's for every other.
+fn stream_error(answer: u64) -> sys::StdioError {
+    return match answer {
+        STALE => sys::StdioError.Revoked(sys::Revoked.Stale)
+        else => sys::StdioError.Closed
+    }
+} stream_error
 
 fn Remote.invoke(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError limits stack 4_096 {
     let Some(reach) = reached(self) else {

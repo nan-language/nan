@@ -1,6 +1,6 @@
 # 0224. Capability kinds crossing into isolated spaces
 
-Status: accepted
+Status: accepted; capabilities crossing only to instances superseded by 0227
 
 ## Context
 

@@ -236,8 +236,8 @@ fn lent_for(take borrowing: Borrowing, mut placing: mem::List[Placed], mut frame
 } lent_for
 
 /// Applies to the space `placing` holds an ask to open the ends of bridges, to tell the end of one
-/// that its other end rang, to close an end, or to end an instance as breaching a channel; without
-/// a space the ask is dropped.
+/// that its other end rang, to close an end, to end an instance as breaching a channel, or to tell
+/// a job or instance the result of a waiting call; without a space the ask is dropped.
 fn placed_asked(take ask: Ask, mut placing: mem::List[Placed], alloc: mem::Alloc) fails task::Cancelled uses wait {
     let Some(placed) = mut placing.pop() else {
         return
@@ -250,6 +250,7 @@ fn placed_asked(take ask: Ask, mut placing: mem::List[Placed], alloc: mem::Alloc
         Ask.Ring(Ringing(id: id, handle: handle)) => mut held.rang(id, handle)
         Ask.Close(Closing(id: id, handle: handle, done: done)) => mut held.closing(id, handle, take done)
         Ask.Breach(id) => mut held.breached(mut space, id, alloc)
+        Ask.Resolve(Resolution(id: id, reply: reply)) => mut held.resolved(id, take reply)
         else => {}
     }
     discard attempt await mut held.left()
@@ -393,7 +394,7 @@ fn Driven.bridge_opened(mut self, mut space: sys::load::Space, take opening: Bri
         mut running.frames.push(opened_end.inbound)
         mut running.frames.push(opened_end.outbound)
     }
-    mut self.notices.push(Notice(id: opened_end.job, bridging: Bridging.Opened(EndAt(handle: handle, port: opened_end.port, inbound: opened_end.inbound, outbound: opened_end.outbound))))
+    mut self.notices.push(Notice(id: opened_end.job, told: Telling.Bridge(Bridging.Opened(EndAt(handle: handle, port: opened_end.port, inbound: opened_end.inbound, outbound: opened_end.outbound)))))
     discard mut self.bridges.insert(handle, value: take opened_end)
 } Driven.bridge_opened
 
@@ -407,8 +408,8 @@ fn Driven.rang(mut self, id: u64, handle: u64) {
         return
     }
     for notice in self.notices {
-        match notice.bridging {
-            Bridging.Rang(queued) => {
+        match notice.told {
+            Telling.Bridge(Bridging.Rang(queued)) => {
                 if queued == handle {
                     return
                 }
@@ -416,8 +417,16 @@ fn Driven.rang(mut self, id: u64, handle: u64) {
             else => {}
         }
     }
-    mut self.notices.push(Notice(id: id, bridging: Bridging.Rang(handle)))
+    mut self.notices.push(Notice(id: id, told: Telling.Bridge(Bridging.Rang(handle))))
 } Driven.rang
+
+/// Tells the runtime of the job or instance numbered `id`, while it runs, the reply to a waiting
+/// operation of a crossing kind's capability it called through its runner capability.
+fn Driven.resolved(mut self, id: u64, take reply: PortReply) {
+    if self.jobs.contains(id) {
+        mut self.notices.push(Notice(id: id, told: Telling.Reply(take reply)))
+    }
+} Driven.resolved
 
 /// Has the runtime of the instance numbered `id` close the end of a bridge it holds by `handle`,
 /// `done` held until the end is closed.
@@ -433,7 +442,7 @@ fn Driven.closing(mut self, id: u64, handle: u64, take done: Option[task::Sender
         Some(sender) => mut bridge.closing.push(take sender)
         None => {}
     }
-    mut self.notices.push(Notice(id: id, bridging: Bridging.Closed(handle)))
+    mut self.notices.push(Notice(id: id, told: Telling.Bridge(Bridging.Closed(handle))))
 } Driven.closing
 
 /// Closes the end of a bridge the space holds by `handle`, unmapping the frames it maps for itself.
@@ -482,8 +491,9 @@ fn Driven.left(mut self) fails task::Cancelled uses wait {
     }
 } Driven.left
 
-/// Tells the instance an order names what its kernel tells of the end of a bridge it holds.
-fn told_of(order: Taken, mailboxes: task::Cown[mem::Map[u64, task::Sender[Bridging]]], alloc: mem::Alloc) fails task::Cancelled uses wait {
+/// Tells the job or instance an order names what its kernel tells it: of the end of a bridge it
+/// holds, through its mailbox's sender, or the reply to a waiting call it made, to its wait.
+fn told_of(order: Taken, mailboxes: task::Cown[mem::Map[u64, Mailbox]], alloc: mem::Alloc) fails task::Cancelled uses wait {
     let record = order.record
     let Some(parts) = order.bytes.view().split_at(START_BYTES) else {
         return
@@ -491,23 +501,35 @@ fn told_of(order: Taken, mailboxes: task::Cown[mem::Map[u64, task::Sender[Bridgi
     let Some(body) = parts.tail.prefix(usize.widen(record.granted_len)) else {
         return
     }
-    let Ok(bridging) = attempt mem::wire::Codec[Bridging].decode(Untrusted.of(take body), alloc) else {
+    let Ok(told) = attempt mem::wire::Codec[Telling].decode(Untrusted.of(take body), alloc) else {
         return
     }
-    var found: Option[task::Sender[Bridging]] = None
+    var found: Option[Mailbox] = None
     await when mut mailboxes {
         match mailboxes.get(record.id) {
-            Some(sender) => {
-                found = Some(sender.split())
+            Some(mailbox) => {
+                found = Some(Mailbox(bridging: mailbox.bridging.split(), waits: mailbox.waits.share()))
             }
             None => {}
         }
     }
-    let Some(mailbox) = found else {
+    let Some(Mailbox(bridging: bridging, waits: waits)) = found else {
         return
     }
-    discard attempt await mailbox.send(bridging)
+    match told {
+        Telling.Bridge(notice) => {
+            discard attempt await bridging.send(notice)
+        }
+        Telling.Reply(reply) => try await port_replied(take reply, waits)
+    }
 } told_of
+
+/// What the runtime tells a job or instance by its kernel's orders: the sender of what it is told
+/// of the ends of its bridges, and the waits of the calls it made that wait for its kernel's reply.
+struct Mailbox {
+    bridging: task::Sender[Bridging]
+    waits: task::Cown[PortWaits]
+} Mailbox
 
 /// The offsets in a frame of a bridge of the word its reader sets while it waits for bytes and of
 /// the word its writer sets while it waits for room.

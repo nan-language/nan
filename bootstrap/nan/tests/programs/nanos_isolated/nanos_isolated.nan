@@ -1,4 +1,4 @@
-//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port, their random source from a counter and their file system from a disk writing each call it serves through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, with the reports of their traps, a job reading kernel memory, in a domain of its own and outside it, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, instances of a component whose calls, a postponed one included, keyed tasks, held ones included, messages sent to themselves and checkpoints run in their spaces, with logs and gauges crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, an instance sharing its space with a job that traps and divides, with another instance that is abandoned and with one whose space breaches its link, a book and tellers in two spaces calling it over a bridge, a log crossing there and back, payloads streamed and moved through frames of their own, a breach ending the book, and calls, replies, states and a job's result past what a link carries leaving their spaces, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
+//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port, their random source from a counter and their file system from a disk writing each call it serves through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, with the reports of their traps, a job reading kernel memory, in a domain of its own and outside it, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, instances of a component whose calls, a postponed one included, keyed tasks, held ones included, messages sent to themselves and checkpoints run in their spaces, with logs and gauges crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, an instance sharing its space with a job that traps, divides and adds through a gauge its world holds, logging through a log of its own and denied a random source, with another instance that is abandoned and with one whose space breaches its link, a book and tellers in two spaces calling it over a bridge, a log crossing there and back, payloads streamed and moved through frames of their own, a breach ending the book, and calls, replies, states and a job's result past what a link carries leaving their spaces, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -40,6 +40,7 @@ pub closed enum Ask derives Encode {
     Echo
     Probe
     Fill(u32)
+    Gauge(u32)
 } Ask
 
 pub closed enum Answer derives Encode {
@@ -85,7 +86,8 @@ pub closed struct Hoard derives Encode {
 } Hoard
 
 /// The serial port serving a job's log and standard streams, its state counting the bytes of
-/// standard input it has given and its record 1 for the log the book notes through.
+/// standard input it has given, its record 1 for the log the book notes through and 2 for the log
+/// of a job that has its own.
 struct Console {
 } Console
 
@@ -106,6 +108,7 @@ impl Counter: sys::RandomService
 fn Console.log(self, level: sys::LogLevel, message: Str, value: Str) limits stack 4_096 {
     match sys::reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => record) {
         Some(1) => say(text: "note ")
+        Some(2) => say(text: "job ")
         else => say(text: "log ")
     }
     match level {
@@ -480,6 +483,7 @@ struct Grants derives Copy {
     clock: sys::Clock
     console: Console
     noter: Console
+    own: Console
     counter: Counter
     disk: Disk
     exec: task::Executor
@@ -501,8 +505,23 @@ fn services(grants: Grants) -> nanos::Services {
     let Ok(fs) = attempt sys::Fs.served(grants.disk) else {
         stop(text: "no fs\n")
     }
-    return nanos::Services(clock: grants.clock, log: log, stdio: stdio, random: random, fs: fs)
+    return nanos::Services(log: log, stdio: stdio, random: random, fs: fs)
 } services
+
+/// The services of an isolated job of its own: its log on the console under its own name, and a
+/// random source revoked before it starts.
+fn own_services(grants: Grants) -> nanos::Services {
+    let served = services(grants)
+    let Ok(log) = attempt sys::Log.served(grants.own) else {
+        stop(text: "no log\n")
+    }
+    let Ok(revoker) = attempt sys::revocable(served.random) else {
+        stop(text: "no random\n")
+    }
+    let random = revoker.capability()
+    take revoker.revoke()
+    return nanos::Services(log: log, stdio: served.stdio, random: random, fs: served.fs)
+} own_services
 
 /// The frames a space takes, from the end of `frames`.
 fn frames_for_space(mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> mem::List[hw::PhysFrame[4_096]] {
@@ -553,10 +572,10 @@ fn ran(cpu: hw::Ring0, job: sys::load::Isolated, name: Str, grants: Grants, take
     var extended = Some(hw::ExtendedState.of(next_frame(mut frames)))
     let link = nanos::Link.of(next_frame(mut frames), alloc: grants.alloc)
     var held = frames_for_space(mut frames, alloc: grants.alloc)
-    discard attempt await nanos::isolate(cpu, tenant: 1, services: services(grants), frames: mut held, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn[mut left, mut results](space: nanos::Isolation) fails task::Cancelled uses wait {
+    discard attempt await nanos::isolate(cpu, tenant: 1, clock: grants.clock, services: services(grants), frames: mut held, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn[mut left, mut results](space: nanos::Isolation) fails task::Cancelled uses wait {
         while left.len() > 0 {
             let input = mut left.remove(0)
-            let outcome = attempt await nanos::run_isolated(space, job, link, take input, alloc: grants.alloc)
+            let outcome = attempt await nanos::run_isolated(space, job, link, services: services(grants), caps: nanos::Caps.empty(grants.alloc), take input, alloc: grants.alloc)
             mut results.push(report(name, take outcome, alloc: grants.alloc))
         }
     })
@@ -605,7 +624,7 @@ fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
         let consoles = sys::Minter[Console, core::atomic::AtomicU64, u64].of(core::atomic::AtomicU64.of(0), alloc)
         let counters = sys::Minter[Counter, core::atomic::AtomicU64, u64].of(core::atomic::AtomicU64.of(0), alloc)
         let disks = sys::Minter[Disk, core::atomic::AtomicU64, u64].of(core::atomic::AtomicU64.of(0), alloc)
-        let grants = Grants(clock: clock, console: consoles.mint(0), noter: consoles.mint(1), counter: counters.mint(0), disk: disks.mint(0), exec: exec, alloc: alloc)
+        let grants = Grants(clock: clock, console: consoles.mint(0), noter: consoles.mint(1), own: consoles.mint(2), counter: counters.mint(0), disk: disks.mint(0), exec: exec, alloc: alloc)
         var pool = frames
         let served = attempt await serve(cpu, loader, grants, frames: mut pool)
         take consoles.close()
@@ -727,8 +746,8 @@ fn spun(cpu: hw::Ring0, loader: sys::load::Loader, job: sys::load::Isolated, byt
             var pool = held
             var state = owned
             var result = mem::Bytes.empty(grants.alloc)
-            discard attempt await nanos::isolate(cpu, tenant: 2, services: services(grants), frames: mut pool, extended: mut state, exec: grants.exec, alloc: grants.alloc, body: fn[mut result](space: nanos::Isolation) fails task::Cancelled uses wait {
-                result = result_of(attempt await nanos::run_isolated(space, job, link, input: encoded(Ask.Spin(500_000), alloc: grants.alloc), alloc: grants.alloc), alloc: grants.alloc)
+            discard attempt await nanos::isolate(cpu, tenant: 2, clock: grants.clock, services: services(grants), frames: mut pool, extended: mut state, exec: grants.exec, alloc: grants.alloc, body: fn[mut result](space: nanos::Isolation) fails task::Cancelled uses wait {
+                result = result_of(attempt await nanos::run_isolated(space, job, link, services: services(grants), caps: nanos::Caps.empty(grants.alloc), input: encoded(Ask.Spin(500_000), alloc: grants.alloc), alloc: grants.alloc), alloc: grants.alloc)
             })
             return Spun(result: take result, frames: take pool, extended: take state, link: take link)
         })
@@ -780,8 +799,8 @@ fn linked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: 
     var result = mem::Bytes.empty(grants.alloc)
     discard attempt await task::scope(grants.exec, body: fn[mut held, mut extended, mut result](s: task::Scope) fails task::Cancelled uses wait {
         let run = s.spawn(fn[mut held, mut extended, mut result]() fails task::Cancelled uses wait limits stack 196_608 {
-            discard attempt await nanos::isolate(cpu, tenant: 3, services: services(grants), frames: mut held, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn[mut result](space: nanos::Isolation) fails task::Cancelled uses wait {
-                result = result_of(attempt await nanos::run_isolated(space, job, link, input: encoded(Ask.Echo, alloc: grants.alloc), alloc: grants.alloc), alloc: grants.alloc)
+            discard attempt await nanos::isolate(cpu, tenant: 3, clock: grants.clock, services: services(grants), frames: mut held, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn[mut result](space: nanos::Isolation) fails task::Cancelled uses wait {
+                result = result_of(attempt await nanos::run_isolated(space, job, link, services: services(grants), caps: nanos::Caps.empty(grants.alloc), input: encoded(Ask.Echo, alloc: grants.alloc), alloc: grants.alloc), alloc: grants.alloc)
             })
         })
         say_received(text: "link said ", outcome: attempt await link.receive(answer, alloc: grants.alloc), alloc: grants.alloc)
@@ -839,23 +858,23 @@ fn booked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: 
     discard mut link.open("book", inbound: next_frame(mut frames), outbound: next_frame(mut frames))
     var pool = frames_for_space(mut frames, alloc: grants.alloc)
     var extended = Some(hw::ExtendedState.of(next_frame(mut frames)))
-    discard attempt await nanos::isolate(cpu, tenant: 4, services: services(grants), frames: mut pool, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn(space: nanos::Isolation) fails task::Cancelled uses wait {
+    discard attempt await nanos::isolate(cpu, tenant: 4, clock: grants.clock, services: services(grants), frames: mut pool, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn(space: nanos::Isolation) fails task::Cancelled uses wait {
         try await hoarded(space, job, link, grants)
-        let opened = attempt await nanos::hold_isolated(space, job, component: "Book", link, caps, checkpoint: None, runner, alloc: grants.alloc, body: fn(take instance: nanos::Instance) -> nanos::Checkpoint fails nanos::InstanceError uses wait {
+        let opened = attempt await nanos::hold_isolated(space, job, component: "Book", link, services: services(grants), caps, checkpoint: None, runner, alloc: grants.alloc, body: fn(take instance: nanos::Instance) -> nanos::Checkpoint fails nanos::InstanceError uses wait {
             return try await started(take instance, grants, gauging, gauges: Gauges(world: gauge, given: given))
         })
         match opened {
             Ok(Some(checkpoint)) => {
-                discard attempt await nanos::hold_isolated(space, job, component: "Book", link, caps: later, checkpoint: Some(take checkpoint), runner, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+                discard attempt await nanos::hold_isolated(space, job, component: "Book", link, services: services(grants), caps: later, checkpoint: Some(take checkpoint), runner, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
                     try await restored(take instance, grants)
                 })
             }
             else => say(text: "book unheld\n")
         }
-        discard attempt await nanos::hold_isolated(space, job, component: "Book", link, caps: later, checkpoint: None, runner, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+        discard attempt await nanos::hold_isolated(space, job, component: "Book", link, services: services(grants), caps: later, checkpoint: None, runner, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
             try await trapped(take instance, grants)
         })
-        discard attempt await nanos::hold_isolated(space, job, component: "Book", link, caps: later, checkpoint: None, runner, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+        discard attempt await nanos::hold_isolated(space, job, component: "Book", link, services: services(grants), caps: later, checkpoint: None, runner, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
             try await abandoned(take instance, grants)
         })
     })
@@ -867,7 +886,8 @@ fn booked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: 
 } booked
 
 /// Holds the ledger's book and runs the typed job in one space: the job traps dividing by zero while
-/// the book is held, then divides again, another book held there adds and is abandoned, a third
+/// the book is held, then divides again, then adds and settles through a gauge twice, logging the
+/// second time through a log of its own and denied a random source, another book held there adds and is abandoned, a third
 /// ends breaching its link, and the first book adds before and after, fills past what its link
 /// carries in between, and ends with its total.
 fn shared(cpu: hw::Ring0, book: sys::load::Isolated, job: sys::load::Isolated, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
@@ -886,18 +906,22 @@ fn shared(cpu: hw::Ring0, book: sys::load::Isolated, job: sys::load::Isolated, g
     discard mut malformed.open("book", inbound: next_frame(mut frames), outbound: take up)
     var pool = frames_for_space(mut frames, alloc: grants.alloc)
     var extended = Some(hw::ExtendedState.of(next_frame(mut frames)))
-    discard attempt await nanos::isolate(cpu, tenant: 5, services: services(grants), frames: mut pool, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn(space: nanos::Isolation) fails task::Cancelled uses wait {
-        discard attempt await nanos::hold_isolated(space, job: book, component: "Book", link, caps, checkpoint: None, runner: sys::Runner.denied(), alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+    discard attempt await nanos::isolate(cpu, tenant: 5, clock: grants.clock, services: services(grants), frames: mut pool, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn(space: nanos::Isolation) fails task::Cancelled uses wait {
+        discard attempt await nanos::hold_isolated(space, job: book, component: "Book", link, services: services(grants), caps, checkpoint: None, runner: sys::Runner.denied(), alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
             var held = instance
             defer take held.abandon()
             say(text: "shared ")
             try await added(mut held, amount: 5, grants)
-            discard report("neighbour", outcome: attempt await nanos::run_isolated(space, job, link: neighbour, input: encoded(Ask.Divide(0), alloc: grants.alloc), alloc: grants.alloc), alloc: grants.alloc)
-            let quotient = report("neighbour", outcome: attempt await nanos::run_isolated(space, job, link: neighbour, input: encoded(Ask.Divide(4), alloc: grants.alloc), alloc: grants.alloc), alloc: grants.alloc)
+            discard report("neighbour", outcome: attempt await nanos::run_isolated(space, job, link: neighbour, services: services(grants), caps: nanos::Caps.empty(grants.alloc), input: encoded(Ask.Divide(0), alloc: grants.alloc), alloc: grants.alloc), alloc: grants.alloc)
+            let quotient = report("neighbour", outcome: attempt await nanos::run_isolated(space, job, link: neighbour, services: services(grants), caps: nanos::Caps.empty(grants.alloc), input: encoded(Ask.Divide(4), alloc: grants.alloc), alloc: grants.alloc), alloc: grants.alloc)
             say_answer(text: "neighbour quotient ", bytes: take quotient, alloc: grants.alloc)
+            let settled = report("neighbour", outcome: attempt await nanos::run_isolated(space, job, link: neighbour, services: services(grants), caps, input: encoded(Ask.Gauge(7), alloc: grants.alloc), alloc: grants.alloc), alloc: grants.alloc)
+            say_answer(text: "neighbour settled ", bytes: take settled, alloc: grants.alloc)
+            let own = report("neighbour", outcome: attempt await nanos::run_isolated(space, job, link: neighbour, services: own_services(grants), caps, input: encoded(Ask.Gauge(7), alloc: grants.alloc), alloc: grants.alloc), alloc: grants.alloc)
+            say_answer(text: "neighbour settled ", bytes: take own, alloc: grants.alloc)
             try await task::scope(grants.exec, body: fn(s: task::Scope) fails task::Cancelled uses wait {
                 let second = s.spawn(fn() fails task::Cancelled uses wait limits stack 196_608 {
-                    discard attempt await nanos::hold_isolated(space, job: book, component: "Book", link: other, caps, checkpoint: None, runner: sys::Runner.denied(), alloc: grants.alloc, body: fn(take another: nanos::Instance) fails nanos::InstanceError uses wait {
+                    discard attempt await nanos::hold_isolated(space, job: book, component: "Book", link: other, services: services(grants), caps, checkpoint: None, runner: sys::Runner.denied(), alloc: grants.alloc, body: fn(take another: nanos::Instance) fails nanos::InstanceError uses wait {
                         var abandoning = another
                         defer take abandoning.abandon()
                         say(text: "other ")
@@ -910,7 +934,7 @@ fn shared(cpu: hw::Ring0, book: sys::load::Isolated, job: sys::load::Isolated, g
                 })
                 try await take second.join()
                 let third = s.spawn(fn() fails task::Cancelled uses wait limits stack 196_608 {
-                    discard attempt await nanos::hold_isolated(space, job: book, component: "Book", link: malformed, caps, checkpoint: None, runner: sys::Runner.denied(), alloc: grants.alloc, body: fn(take breacher: nanos::Instance) fails nanos::InstanceError uses wait {
+                    discard attempt await nanos::hold_isolated(space, job: book, component: "Book", link: malformed, services: services(grants), caps, checkpoint: None, runner: sys::Runner.denied(), alloc: grants.alloc, body: fn(take breacher: nanos::Instance) fails nanos::InstanceError uses wait {
                         try await breached_up(take breacher, outbound: up_base, grants)
                     })
                 })
@@ -1007,8 +1031,8 @@ fn bridged(cpu: hw::Ring0, ledger: sys::load::Isolated, grants: Grants, mut fram
     var waiting = Some(Waits(inbox: take inboxed, end: take ended))
     discard attempt await task::scope(grants.exec, body: fn[mut book_pool, mut book_state, mut teller_pool, mut teller_state, mut teller_link, mut porting, mut waiting](s: task::Scope) fails task::Cancelled uses wait {
         let book = s.spawn(fn[mut book_pool, mut book_state]() fails task::Cancelled uses wait limits stack 196_608 {
-            discard attempt await nanos::isolate(cpu, tenant: 6, services: services(grants), frames: mut book_pool, extended: mut book_state, exec: grants.exec, alloc, body: fn(space: nanos::Isolation) fails task::Cancelled uses wait {
-                discard attempt await nanos::hold_isolated(space, job: ledger, component: "Book", link: book_link, caps, checkpoint: None, runner: sys::Runner.denied(), alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+            discard attempt await nanos::isolate(cpu, tenant: 6, clock: grants.clock, services: services(grants), frames: mut book_pool, extended: mut book_state, exec: grants.exec, alloc, body: fn(space: nanos::Isolation) fails task::Cancelled uses wait {
+                discard attempt await nanos::hold_isolated(space, job: ledger, component: "Book", link: book_link, services: services(grants), caps, checkpoint: None, runner: sys::Runner.denied(), alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
                     try await bridged_book(take instance, inboxes, ending, grants)
                 })
             })
@@ -1025,11 +1049,11 @@ fn bridged(cpu: hw::Ring0, ledger: sys::load::Isolated, grants: Grants, mut fram
             return
         }
         let port = mut teller_link.open_port(2, to: inbox, take inbound, take outbound)
-        discard attempt await nanos::isolate(cpu, tenant: 7, services: services(grants), frames: mut teller_pool, extended: mut teller_state, exec: grants.exec, alloc, body: fn[mut book_ended](space: nanos::Isolation) fails task::Cancelled uses wait {
-            discard attempt await nanos::hold_isolated(space, job: ledger, component: "Teller", link: teller_link, caps: none, checkpoint: None, runner: sys::Runner.denied(), alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+        discard attempt await nanos::isolate(cpu, tenant: 7, clock: grants.clock, services: services(grants), frames: mut teller_pool, extended: mut teller_state, exec: grants.exec, alloc, body: fn[mut book_ended](space: nanos::Isolation) fails task::Cancelled uses wait {
+            discard attempt await nanos::hold_isolated(space, job: ledger, component: "Teller", link: teller_link, services: services(grants), caps: none, checkpoint: None, runner: sys::Runner.denied(), alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
                 try await tellered(take instance, grants)
             })
-            discard attempt await nanos::hold_isolated(space, job: ledger, component: "Teller", link: teller_link, caps: none, checkpoint: None, runner: sys::Runner.denied(), alloc, body: fn[mut book_ended](take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+            discard attempt await nanos::hold_isolated(space, job: ledger, component: "Teller", link: teller_link, services: services(grants), caps: none, checkpoint: None, runner: sys::Runner.denied(), alloc, body: fn[mut book_ended](take instance: nanos::Instance) fails nanos::InstanceError uses wait {
                 try await breaching(take instance, link: teller_link, port, ended: mut book_ended, grants)
             })
         })
@@ -1561,7 +1585,7 @@ fn answered(mut book: nanos::Instance, hash: sys::ProtocolHash, number: u64, tak
 /// Grows a hoard past what the first channel of its link carries, checkpoints it and ends it, then
 /// restores it from that checkpoint and ends it, writing the bytes each state holds.
 fn hoarded(space: nanos::Isolation, job: sys::load::Isolated, link: nanos::Link, grants: Grants) fails task::Cancelled uses wait {
-    let held = attempt await nanos::hold_isolated(space, job, component: "Hoard", link, caps: nanos::Caps.empty(grants.alloc), checkpoint: None, runner: sys::Runner.denied(), alloc: grants.alloc, body: fn(take instance: nanos::Instance) -> nanos::Checkpoint fails nanos::InstanceError uses wait {
+    let held = attempt await nanos::hold_isolated(space, job, component: "Hoard", link, services: services(grants), caps: nanos::Caps.empty(grants.alloc), checkpoint: None, runner: sys::Runner.denied(), alloc: grants.alloc, body: fn(take instance: nanos::Instance) -> nanos::Checkpoint fails nanos::InstanceError uses wait {
         var hoard = instance
         defer take hoard.abandon()
         say(text: "hoard grew ")
@@ -1583,7 +1607,7 @@ fn hoarded(space: nanos::Isolation, job: sys::load::Isolated, link: nanos::Link,
         say(text: "hoard unheld\n")
         return
     }
-    discard attempt await nanos::hold_isolated(space, job, component: "Hoard", link, caps: nanos::Caps.empty(grants.alloc), checkpoint: Some(take checkpoint), runner: sys::Runner.denied(), alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+    discard attempt await nanos::hold_isolated(space, job, component: "Hoard", link, services: services(grants), caps: nanos::Caps.empty(grants.alloc), checkpoint: Some(take checkpoint), runner: sys::Runner.denied(), alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
         var hoard = instance
         defer take hoard.abandon()
         say(text: "hoard restored ")

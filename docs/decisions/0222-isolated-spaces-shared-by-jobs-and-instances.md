@@ -1,6 +1,6 @@
 # 0222. Isolated spaces shared by jobs and instances
 
-Status: accepted
+Status: accepted; the services, and so handles 0 to 3, serving every job and instance of the space superseded by 0227
 
 ## Context
 

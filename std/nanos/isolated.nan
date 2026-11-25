@@ -1729,30 +1729,50 @@ test taken_back_entries_leave_their_handles_stale for Table.taken_back {
 } taken_back_entries_leave_their_handles_stale
 
 /// What a space receives of the capabilities `handles` hold, each added to the table for the job
-/// or instance numbered `job`, none when no space holds one's type or the table is full.
+/// or instance numbered `job`; none, adding nothing, when no space holds one's type or the table is
+/// full.
 fn Table.admitted(self, job: u64, handles: Slice[sys::Handle], alloc: mem::Alloc) -> Option[mem::List[Carried]] {
-    var holdings = mem::List[Holding].empty(alloc)
+    var crossables = mem::List[Crossable].empty(alloc)
     for handle in handles {
-        let Some(holding) = holding_of(handle) else {
+        let Some(crossable) = crossable_of(handle) else {
             return None
         }
-        mut holdings.push(holding)
+        mut crossables.push(crossable)
     }
     var crossing = mem::List[Carried].empty(alloc)
-    for holding in holdings {
-        let Some(handle) = self.add(job, holding) else {
+    for crossable in crossables {
+        let Some(handle) = self.add(job, holding: crossable.holding()) else {
+            self.crossing_taken(crossing.view())
             return None
         }
-        match holding {
-            Holding.Log(_) => mut crossing.push(Carried.Log(handle))
-            Holding.Stdio(_) => mut crossing.push(Carried.Stdio(handle))
-            Holding.Random(_) => mut crossing.push(Carried.Random(handle))
-            Holding.Kind(capability) => mut crossing.push(Carried.Kind(Crossed(handle: handle, hash: handle_hash(capability))))
-            else => return None
-        }
+        mut crossing.push(crossable.carried(handle))
     }
     return Some(take crossing)
 } Table.admitted
+
+test full_tables_admit_nothing for Table.admitted {
+    let world = testing::world()
+    let table = Table.of(Services(clock: world.clock, log: world.log, stdio: world.stdio, random: world.random, fs: world.fs), alloc: world.alloc)
+    var held = mem::List[u64].empty(world.alloc)
+    for _ in 0u64..<MOST_HELD {
+        match table.add(job: 1, holding: Holding.Runner) {
+            Some(handle) => mut held.push(handle)
+            None => {}
+        }
+    }
+    var logs = mem::List[sys::Handle].empty(world.alloc)
+    for index in 0usize..<2 {
+        table.taken(held[index])
+        mut logs.push(sys::Handle.of(world.log))
+    }
+    var more = mem::List[sys::Handle].empty(world.alloc)
+    for _ in 0usize..<3 {
+        mut more.push(sys::Handle.of(world.log))
+    }
+    let refused = table.admitted(job: 2, handles: more.view(), alloc: world.alloc)
+    let fitting = table.admitted(job: 2, handles: logs.view(), alloc: world.alloc)
+    expect held.len() == 250 and refused.is_none() and fitting.is_some()
+} full_tables_admit_nothing
 
 /// Takes back the entry of each capability `crossing` holds.
 fn Table.crossing_taken(self, crossing: Slice[Carried]) {
@@ -1769,26 +1789,54 @@ fn Carried.handle(self) -> u64 limits pure, notrap, terminates {
     }
 } Carried.handle
 
-/// The entry of a space's table holding the capability `handle` holds, none for a type no space
-/// holds: a log, standard streams, a random source or a crossing kind's.
-fn holding_of(handle: sys::Handle) -> Option[Holding] {
+/// A capability of a type a space holds: a log, standard streams, a random source or a crossing
+/// kind's.
+enum Crossable derives Copy {
+    Log(sys::Log)
+    Stdio(sys::Stdio)
+    Random(sys::Random)
+    Kind(sys::Handle)
+} Crossable
+
+/// The capability `handle` holds, none for a type no space holds.
+fn crossable_of(handle: sys::Handle) -> Option[Crossable] {
     match sys::CapabilityId[sys::Log](id: 0).of_handle(handle) {
-        Some(log) => return Some(Holding.Log(log))
+        Some(log) => return Some(Crossable.Log(log))
         None => {}
     }
     match sys::CapabilityId[sys::Stdio](id: 0).of_handle(handle) {
-        Some(stdio) => return Some(Holding.Stdio(stdio))
+        Some(stdio) => return Some(Crossable.Stdio(stdio))
         None => {}
     }
     match sys::CapabilityId[sys::Random](id: 0).of_handle(handle) {
-        Some(random) => return Some(Holding.Random(random))
+        Some(random) => return Some(Crossable.Random(random))
         None => {}
     }
     if handle.crosses() {
-        return Some(Holding.Kind(handle))
+        return Some(Crossable.Kind(handle))
     }
     return None
-} holding_of
+} crossable_of
+
+/// The entry of a space's table holding the capability.
+fn Crossable.holding(self) -> Holding limits pure, notrap, terminates {
+    return match self {
+        Crossable.Log(log) => Holding.Log(log)
+        Crossable.Stdio(stdio) => Holding.Stdio(stdio)
+        Crossable.Random(random) => Holding.Random(random)
+        Crossable.Kind(capability) => Holding.Kind(capability)
+    }
+} Crossable.holding
+
+/// What a space receives of the capability once the entry `handle` of its table holds it.
+fn Crossable.carried(self, handle: u64) -> Carried limits pure, notrap, terminates {
+    return match self {
+        Crossable.Log(_) => Carried.Log(handle)
+        Crossable.Stdio(_) => Carried.Stdio(handle)
+        Crossable.Random(_) => Carried.Random(handle)
+        Crossable.Kind(capability) => Carried.Kind(Crossed(handle: handle, hash: handle_hash(capability)))
+    }
+} Crossable.carried
 
 /// The handles of the capabilities of the entries of the table that `handles`, which a space sends,
 /// name; none when one names no entry or a channel's.

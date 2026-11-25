@@ -44,6 +44,23 @@ const SPACE_RUNG: i64 = 1
 
 const SPACE_ORDERED: i64 = 2
 
+/// A call's results from `SPACE_FAILURES` up are failures, as a `NOW` call's once the kernel's
+/// clock is stale.
+const SPACE_FAILURES: i64 = -4_096
+
+/// The data holding the runtime's clock: the latest reading of the kernel's clock, nonzero once a
+/// reading has failed, and the handle of the clock the first task's grants hold plus one, zero
+/// before it is minted and once it is revoked.
+const SPACE_CLOCK: Str = "_NSspace_clock"
+
+const SPACE_CLOCK_SIZE: u64 = 24
+
+const SPACE_CLOCK_READING: u64 = 0
+
+const SPACE_CLOCK_FAILED: u64 = 8
+
+const SPACE_CLOCK_ROOT: u64 = 16
+
 /// The stack the start routine and the scheduler run on, and the boot area: the boot heap, then
 /// the runtime tables, to a whole page.
 pkg const SPACE_STACK: u64 = MACHINE_BOOT_STACK
@@ -88,17 +105,55 @@ fn space_init(mut lo: Lowering, mut fx: Fx) {
     mut fx.store(record, addr: threads, offset: 0)
 } space_init
 
-/// `ClockNow` reads the kernel's clock; `Extended` and `ExtendedOwn` give zero, the space's tasks
-/// sharing the extended state its kernel saves for its thread.
+/// `ClockNow` reads the kernel's clock, giving the latest reading once a reading fails; `Extended`
+/// and `ExtendedOwn` give zero, the space's tasks sharing the extended state its kernel saves for
+/// its thread.
 fn space_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
     discard mut fx.entry()
     let result = if routine == Routine.ClockNow {
-        space_call(mut lo, mut fx, number: SPACE_NOW, args: mem::List[clif::Value].empty(fx.alloc).view())
+        space_clock_now(mut lo, mut fx)
     } else {
         mut fx.ptr(0)
     }
     mut fx.b.ret(fx.list1(result).view())
 } space_define
+
+/// A reading of the kernel's clock through a `NOW` call, the latest one once a reading fails.
+fn space_clock_now(mut lo: Lowering, mut fx: Fx) -> clif::Value {
+    let reading = space_call(mut lo, mut fx, number: SPACE_NOW, args: mem::List[clif::Value].empty(fx.alloc).view())
+    let held = mut lo.reserved(mut fx, data_name: SPACE_CLOCK, size: SPACE_CLOCK_SIZE, align: 8)
+    let failed = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: reading, y: SPACE_FAILURES)
+    let chosen = mut fx.choose(failed, results: fx.types1(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        let one = mut fx1.ptr(1)
+        mut fx1.store(one, addr: held, offset: SPACE_CLOCK_FAILED)
+        let latest = mut fx1.load(PTR, addr: held, offset: SPACE_CLOCK_READING)
+        return fx1.list1(latest)
+    }, otherwise: fn(mut fx1: Fx) -> mem::List[clif::Value] {
+        mut fx1.store(reading, addr: held, offset: SPACE_CLOCK_READING)
+        return fx1.list1(reading)
+    })
+    return chosen[0]
+} space_clock_now
+
+/// Once a reading of the kernel's clock has failed, revokes the clock of the first task's grants,
+/// and with it every clock deriving from it, and expires every timer armed: its time stands still
+/// from then on.
+fn space_settle(mut lo: Lowering, mut fx: Fx) {
+    let held = mut lo.reserved(mut fx, data_name: SPACE_CLOCK, size: SPACE_CLOCK_SIZE, align: 8)
+    let failed_word = mut fx.load(PTR, addr: held, offset: SPACE_CLOCK_FAILED)
+    let failed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: failed_word, y: 0)
+    let root = mut fx.load(PTR, addr: held, offset: SPACE_CLOCK_ROOT)
+    let minted = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: root, y: 0)
+    let settling = mut fx.b.band(failed, y: minted)
+    mut fx.if_true(settling, then: fn[mut lo](mut fx1: Fx) {
+        let zero = mut fx1.ptr(0)
+        mut fx1.store(zero, addr: held, offset: SPACE_CLOCK_ROOT)
+        let handle = mut fx1.b.iadd_imm_s(root, y: -1)
+        discard mut lo.call_routine(mut fx1, routine: Routine.Revoke, args: fx1.list1(handle).view())
+        let end = mut fx1.int(PTR, value: -1)
+        mut lo.expire_timers_by(mut fx1, now: end)
+    })
+} space_settle
 
 /// Waits until the first timer is due, or for good without one, or until the kernel rings the
 /// doorbell, which wakes the task waiting on it, or has orders, which wakes the task waiting for

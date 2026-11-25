@@ -590,6 +590,11 @@ impl Lowering<'_, '_> {
     /// its expiry outside it.
     pub(crate) fn expire_timers(&mut self, fx: &mut Fx) {
         let now = self.call_routine(fx, Routine::ClockNow, &[])[0];
+        self.expire_timers_by(fx, now);
+    }
+
+    /// Takes each timer due by nanosecond `now` out of the timers, as `expire_timers` does.
+    pub(crate) fn expire_timers_by(&mut self, fx: &mut Fx, now: Value) {
         fx.repeat(&[], |fx, _| {
             let state_address = self.state(fx);
             let lock = fx.offset(state_address, state::TIMER_LOCK);

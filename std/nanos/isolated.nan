@@ -1351,7 +1351,7 @@ fn Driven.served(mut self, cpu: hw::Ring0, tenant: u64, clock: sys::Clock, servi
             } else if number == CALL_NOW {
                 answer = match attempt clock.elapsed_ns() {
                     Ok(ns) => ns
-                    Err(_) => INVALID
+                    Err(_) => STALE
                 }
             } else if number == CALL_INVOKE {
                 answer = try await mut self.invoked(cpu, tenant, clock, services, isolation, mut space, mut frames)
@@ -1821,27 +1821,28 @@ fn faulted(mut state: hw::UserState, fault: hw::UserFault, routine: u64) {
     state.ip = Untrusted.of(routine)
 } faulted
 
-/// Waits until a deadline of the clock, or for good for the deadline 0, or until `rang` is posted,
-/// giving `WOKE_RUNG` when it was and 0 otherwise.
+/// Waits until a deadline of the clock, or for good for the deadline 0 or a stale clock, or until
+/// `rang` is posted, giving `WOKE_RUNG` when it was and 0 otherwise.
 fn slept_until(clock: sys::Clock, deadline: u64, rang: hw::Signal[u64]) -> u64 fails task::Cancelled uses wait {
-    if deadline == 0 {
-        discard try await rang.wait()
-        return WOKE_RUNG
+    if deadline != 0 {
+        match attempt clock.elapsed_ns() {
+            Ok(elapsed) => {
+                if deadline <= elapsed {
+                    return 0
+                }
+                let woken = try await task::within_ns(clock, ns: deadline - elapsed, body: fn() -> u64 fails task::Cancelled uses wait {
+                    return try await rang.wait()
+                })
+                return match woken {
+                    Some(_) => WOKE_RUNG
+                    None => 0
+                }
+            }
+            Err(_) => {}
+        }
     }
-    let elapsed = match attempt clock.elapsed_ns() {
-        Ok(ns) => ns
-        Err(_) => deadline
-    }
-    if deadline <= elapsed {
-        return 0
-    }
-    let woken = try await task::within_ns(clock, ns: deadline - elapsed, body: fn() -> u64 fails task::Cancelled uses wait {
-        return try await rang.wait()
-    })
-    return match woken {
-        Some(_) => WOKE_RUNG
-        None => 0
-    }
+    discard try await rang.wait()
+    return WOKE_RUNG
 } slept_until
 
 /// How the job or instance of a `CALL_END` call ended, a trap's report being the space's text.

@@ -1,4 +1,4 @@
-//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port, their random source from a counter and their file system from a disk writing each call it serves through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, with the reports of their traps, a job reading kernel memory, in a domain of its own and outside it, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, drawing from a random source and writing to standard streams revoked between its draws and writes, its standard input closed, instances of a component whose calls, a postponed one included, keyed tasks, held ones included, messages sent to themselves and checkpoints run in their spaces, with logs and gauges crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, an instance sharing its space with a job that traps, divides and adds through a gauge its world holds, logging through a log of its own and denied a random source, with another instance that is abandoned and with one whose space breaches its link, a book and tellers in two spaces calling it over a bridge, a log crossing there and back, payloads streamed and moved through frames of their own, a teller and a job calling it over bridges through lines their worlds hold, whose kernel admits each call until their credit runs out or a line is revoked, a breach ending the book, and calls, replies, states and a job's result past what a link carries leaving their spaces, a job drawing from its random source in more placements of one isolation than its table holds the entries of at once, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
+//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port, their random source from a counter and their file system from a disk writing each call it serves through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, with the reports of their traps, a job reading kernel memory, in a domain of its own and outside it, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, drawing from a random source and writing to standard streams revoked between its draws and writes, its standard input closed, a job reading its clock, sleeping on it and waiting on its link in a space whose clock is revoked while its kernel sleeps, instances of a component whose calls, a postponed one included, keyed tasks, held ones included, messages sent to themselves and checkpoints run in their spaces, with logs and gauges crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, an instance sharing its space with a job that traps, divides and adds through a gauge its world holds, logging through a log of its own and denied a random source, with another instance that is abandoned and with one whose space breaches its link, a book and tellers in two spaces calling it over a bridge, a log crossing there and back, payloads streamed and moved through frames of their own, a teller and a job calling it over bridges through lines their worlds hold, whose kernel admits each call until their credit runs out or a line is revoked, a breach ending the book, and calls, replies, states and a job's result past what a link carries leaving their spaces, a job drawing from its random source in more placements of one isolation than its table holds the entries of at once, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -43,6 +43,7 @@ pub closed enum Ask derives Encode {
     Gauge(u32)
     Dial(mem::Bytes)
     Draw
+    Clocked
 } Ask
 
 pub closed enum Answer derives Encode {
@@ -692,7 +693,7 @@ fn given_up(take frame: hw::PhysFrame[4_096]) {
 /// not decode, a host program, a job trapping, failing, returning and reading kernel memory, a job
 /// without a stack bound recursing past the stack it starts with, a job holding memory within the
 /// frames its space draws from and past them, a space drawing and giving back pages, a job
-/// answering a line over its link, instances of a component held in spaces, one sharing its space
+/// answering a line over its link, a job in a space whose clock is revoked, instances of a component held in spaces, one sharing its space
 /// with jobs and other instances, instances in two spaces calling over a bridge, a space's runtime
 /// probing kernel memory, then a job spinning on floats in a space while the same job, verified
 /// once, spins in the shared space.
@@ -749,6 +750,7 @@ fn serve(cpu: hw::Ring0, loader: sys::load::Loader, grants: Grants, mut frames: 
     say_filled(mut holds.remove(1), alloc: grants.alloc)
     drew(cpu, job: typed, grants, mut frames)
     try await linked(cpu, job: typed, grants, mut frames)
+    try await unclocked(cpu, job: typed, grants, mut frames)
     let ledger = isolated(loader, bytes: fw_file(name: "opt/nan/ledger", alloc: grants.alloc).view(), alloc: grants.alloc)
     try await booked(cpu, job: ledger, grants, mut frames)
     try await shared(cpu, book: ledger, job: typed, grants, mut frames)
@@ -877,6 +879,49 @@ fn linked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: 
     returned(take extended, mut frames)
     take link.release(mut frames)
 } linked
+
+/// Runs a job in a space whose clock is revoked, on an executor of its own, which reads its world's
+/// clock, sleeps on it and says so, then reads a line its kernel sends after sleeping for 100 ms
+/// meanwhile, and writes whether the space's task ran for less than half of that sleep.
+fn unclocked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
+    let Ok(revoker) = attempt sys::revocable(grants.clock) else {
+        stop(text: "no clock\n")
+    }
+    let clock = revoker.capability()
+    take revoker.revoke()
+    let account = grants.exec.split(task::Share(weight: 1, class: 0, reserve_ppm: 0))
+    var link = nanos::Link.of(next_frame(mut frames), alloc: grants.alloc)
+    let ask = mut link.open("ask", inbound: next_frame(mut frames), outbound: next_frame(mut frames))
+    let answer = mut link.open("answer", inbound: next_frame(mut frames), outbound: next_frame(mut frames))
+    var held = frames_for_space(mut frames, alloc: grants.alloc)
+    var extended = Some(hw::ExtendedState.of(next_frame(mut frames)))
+    var result = mem::Bytes.empty(grants.alloc)
+    var spent: u64 = 0
+    discard attempt await task::scope(grants.exec, body: fn[mut held, mut extended, mut result, mut spent](s: task::Scope) fails task::Cancelled uses wait {
+        let run = s.spawn(fn[mut held, mut extended, mut result]() fails task::Cancelled uses wait limits stack 196_608 {
+            discard attempt await nanos::isolate(cpu, tenant: 9, clock, services: services(grants), frames: mut held, mut extended, exec: account.executor(), alloc: grants.alloc, body: fn[mut result](space: nanos::Isolation) fails task::Cancelled uses wait {
+                result = result_of(attempt await nanos::run_isolated(space, job, link, services: services(grants), caps: nanos::Caps.empty(grants.alloc), input: encoded(Ask.Clocked, alloc: grants.alloc), alloc: grants.alloc), alloc: grants.alloc)
+            })
+        })
+        say_received(text: "unclocked said ", outcome: attempt await link.receive(answer, alloc: grants.alloc), alloc: grants.alloc)
+        let before = account.used_ns()
+        try await grants.clock.sleep_ns(100_000_000)
+        spent = account.used_ns().saturating_sub(before)
+        discard attempt link.send(ask, data: b"ping")
+        try await take run.join()
+    })
+    take account.close()
+    match spent < 50_000_000 {
+        true => say(text: "the unclocked space waited\n")
+        false => say(text: "the unclocked space spun\n")
+    }
+    say_answer(text: "unclocked read ", bytes: take result, alloc: grants.alloc)
+    for frame in take held {
+        mut frames.push(take frame)
+    }
+    returned(take extended, mut frames)
+    take link.release(mut frames)
+} unclocked
 
 /// What revokes the random source and standard streams of a linked job.
 linear struct Revokers {

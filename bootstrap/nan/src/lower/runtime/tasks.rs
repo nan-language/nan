@@ -1021,9 +1021,9 @@ pub fn pop_ready(lo: &mut Lowering, fx: &mut Fx) -> Value {
 
 /// The scheduler of an executor thread: runs ready tasks, handling the completions on its ring
 /// between them, and waits for a completion when no task is ready; the seeded scheduler
-/// chooses each task it runs and advances its virtual clock instead of waiting, and a kernel's
-/// CPU takes its tasks from its own queue or steals them, idling as its policy says. Never
-/// returns.
+/// chooses each task it runs and advances its virtual clock instead of waiting, a kernel's CPU
+/// takes its tasks from its own queue or steals them, idling as its policy says, and an isolated
+/// space's thread first settles its clock. Never returns.
 fn schedule(lo: &mut Lowering, fx: &mut Fx) {
     fx.entry();
     let header = fx.block();
@@ -1031,6 +1031,9 @@ fn schedule(lo: &mut Lowering, fx: &mut Fx) {
     fx.b.switch_to_block(header);
     if lo.on_cpus() {
         lo.call_stub(fx, Stub::Cli, &[]);
+    }
+    if lo.user() && !lo.seeded() {
+        super::space::settle(lo, fx);
     }
     let record = match (lo.seeded(), lo.on_cpus()) {
         (true, _) => super::seeded::pick(lo, fx),

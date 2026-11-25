@@ -19438,10 +19438,10 @@ const TEXT_NANOS_BRIDGE: Str =
     \\
     \\/// Writes the records queued for the end of a bridge `at` names into the frame it writes as that
     \\/// frame has room, and gives `heard` each record the other end writes into the frame it reads,
-    \\/// ringing the other end when it waits for what this end read or wrote and waiting on `nudged`, or
-    \\/// at most `RECHECK_NS`, while it can do neither; returns once the end is closed, or once the other
-    \\/// end breaches it, by counts or a record no end writes, or a record `heard` refuses, which it
-    \\/// tells the kernel.
+    \\/// ringing the other end when it waits for what this end read or wrote and waiting on `nudged`, at
+    \\/// most `RECHECK_NS` while the runtime's clock is live, while it can do neither; returns once the
+    \\/// end is closed, or once the other end breaches it, by counts or a record no end writes, or a
+    \\/// record `heard` refuses, which it tells the kernel.
     \\fn pumped(at: EndAt, take nudged: task::Receiver[u8], pump: Pump, bridges: Bridges, heard: fn(record: mem::Bytes) -> bool fails task::Cancelled uses wait) fails task::Cancelled uses wait {
     \\    let alloc = bridges.alloc
     \\    var out = mem::Bytes.empty(alloc)
@@ -19504,9 +19504,12 @@ const TEXT_NANOS_BRIDGE: Str =
     \\        if ring_holds(at.inbound) or (out.len() > 0 and ring_has_room(at.outbound)) {
     \\            continue
     \\        }
-    \\        discard try await task::within_ns(bridges.clock, ns: RECHECK_NS, body: fn[mut waking]() -> Option[u8] fails task::Cancelled uses wait {
+    \\        let nudge = try await task::within_ns(bridges.clock, ns: RECHECK_NS, body: fn[mut waking]() -> Option[u8] fails task::Cancelled uses wait {
     \\            return try await mut waking.receive()
     \\        })
+    \\        if nudge.is_none() and (attempt bridges.clock.elapsed_ns()).is_err() {
+    \\            discard try await mut waking.receive()
+    \\        }
     \\    }
     \\} pumped
     \\
@@ -22774,7 +22777,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\            } else if number == CALL_NOW {
     \\                answer = match attempt clock.elapsed_ns() {
     \\                    Ok(ns) => ns
-    \\                    Err(_) => INVALID
+    \\                    Err(_) => STALE
     \\                }
     \\            } else if number == CALL_INVOKE {
     \\                answer = try await mut self.invoked(cpu, tenant, clock, services, isolation, mut space, mut frames)
@@ -23244,27 +23247,28 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    state.ip = Untrusted.of(routine)
     \\} faulted
     \\
-    \\/// Waits until a deadline of the clock, or for good for the deadline 0, or until `rang` is posted,
-    \\/// giving `WOKE_RUNG` when it was and 0 otherwise.
+    \\/// Waits until a deadline of the clock, or for good for the deadline 0 or a stale clock, or until
+    \\/// `rang` is posted, giving `WOKE_RUNG` when it was and 0 otherwise.
     \\fn slept_until(clock: sys::Clock, deadline: u64, rang: hw::Signal[u64]) -> u64 fails task::Cancelled uses wait {
-    \\    if deadline == 0 {
-    \\        discard try await rang.wait()
-    \\        return WOKE_RUNG
+    \\    if deadline != 0 {
+    \\        match attempt clock.elapsed_ns() {
+    \\            Ok(elapsed) => {
+    \\                if deadline <= elapsed {
+    \\                    return 0
+    \\                }
+    \\                let woken = try await task::within_ns(clock, ns: deadline - elapsed, body: fn() -> u64 fails task::Cancelled uses wait {
+    \\                    return try await rang.wait()
+    \\                })
+    \\                return match woken {
+    \\                    Some(_) => WOKE_RUNG
+    \\                    None => 0
+    \\                }
+    \\            }
+    \\            Err(_) => {}
+    \\        }
     \\    }
-    \\    let elapsed = match attempt clock.elapsed_ns() {
-    \\        Ok(ns) => ns
-    \\        Err(_) => deadline
-    \\    }
-    \\    if deadline <= elapsed {
-    \\        return 0
-    \\    }
-    \\    let woken = try await task::within_ns(clock, ns: deadline - elapsed, body: fn() -> u64 fails task::Cancelled uses wait {
-    \\        return try await rang.wait()
-    \\    })
-    \\    return match woken {
-    \\        Some(_) => WOKE_RUNG
-    \\        None => 0
-    \\    }
+    \\    discard try await rang.wait()
+    \\    return WOKE_RUNG
     \\} slept_until
     \\
     \\/// How the job or instance of a `CALL_END` call ended, a trap's report being the space's text.

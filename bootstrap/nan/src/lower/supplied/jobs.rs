@@ -49,6 +49,9 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         }
         "nanos::space_base" => {
             let base = mint_base(lo, fx);
+            let held = lo.reserved(fx, space::CLOCK);
+            let root = fx.b.ins().iadd_imm_s(base.clock, 1);
+            fx.store(root, held, space::clock::ROOT);
             let ty = supply.abi.result.clone();
             let sret = supply.sret.expect("a base's address");
             for (name, value) in [

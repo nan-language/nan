@@ -65,6 +65,24 @@ pub const ORDERS: Reserved = Reserved {
 const RUNG: i64 = 1;
 const ORDERED: i64 = 2;
 
+/// A call's results from `FAILURES` up are failures, as a `NOW` call's once the kernel's clock is
+/// stale.
+const FAILURES: i64 = -4096;
+
+/// The runtime's clock: the latest reading of the kernel's clock, nonzero once a reading has
+/// failed, and the handle of the clock the first task's grants hold plus one, zero before it is
+/// minted and once it is revoked.
+pub const CLOCK: Reserved = Reserved {
+    name: "_NSspace_clock",
+    size: 24,
+    align: 8,
+};
+pub mod clock {
+    pub const READING: u64 = 0;
+    pub const FAILED: u64 = 8;
+    pub const ROOT: u64 = 16;
+}
+
 /// The stack the start routine and the scheduler run on, and the boot area: the boot heap, then
 /// the runtime tables, to a whole page.
 pub const START_STACK: u64 = BOOT_STACK;
@@ -103,15 +121,55 @@ pub fn init(lo: &mut Lowering, fx: &mut Fx) {
     fx.store(record, threads, 0);
 }
 
-/// `ClockNow` reads the kernel's clock; `Extended` and `ExtendedOwn` give zero, the space's tasks
-/// sharing the extended state its kernel saves for its thread.
+/// `ClockNow` reads the kernel's clock, giving the latest reading once a reading fails; `Extended`
+/// and `ExtendedOwn` give zero, the space's tasks sharing the extended state its kernel saves for
+/// its thread.
 pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
     fx.entry();
     let result = match routine {
-        Routine::ClockNow => call(lo, fx, NOW, &[]),
+        Routine::ClockNow => {
+            let reading = call(lo, fx, NOW, &[]);
+            let held = lo.reserved(fx, CLOCK);
+            let failed =
+                fx.b.ins()
+                    .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, reading, FAILURES);
+            fx.choose(
+                failed,
+                &[PTR],
+                |fx| {
+                    let one = fx.ptr(1);
+                    fx.store(one, held, clock::FAILED);
+                    vec![fx.load(PTR, held, clock::READING)]
+                },
+                |fx| {
+                    fx.store(reading, held, clock::READING);
+                    vec![reading]
+                },
+            )[0]
+        }
         _ => fx.ptr(0),
     };
     fx.b.ins().return_(&[result]);
+}
+
+/// Once a reading of the kernel's clock has failed, revokes the clock of the first task's grants,
+/// and with it every clock deriving from it, and expires every timer armed: its time stands still
+/// from then on.
+pub fn settle(lo: &mut Lowering, fx: &mut Fx) {
+    let held = lo.reserved(fx, CLOCK);
+    let failed = fx.load(PTR, held, clock::FAILED);
+    let failed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, failed, 0);
+    let root = fx.load(PTR, held, clock::ROOT);
+    let minted = fx.b.ins().icmp_imm_s(IntCC::NotEqual, root, 0);
+    let settling = fx.b.ins().band(failed, minted);
+    fx.when(settling, |fx| {
+        let zero = fx.ptr(0);
+        fx.store(zero, held, clock::ROOT);
+        let handle = fx.b.ins().iadd_imm_s(root, -1);
+        lo.call_routine(fx, Routine::Revoke, &[handle]);
+        let end = fx.int(PTR, -1);
+        lo.expire_timers_by(fx, end);
+    });
 }
 
 /// Waits until the first timer is due, or for good without one, or until the kernel rings the

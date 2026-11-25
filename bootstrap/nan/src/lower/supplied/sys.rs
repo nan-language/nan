@@ -623,7 +623,7 @@ fn random(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let args = [supply.param(1)];
     let kind = (words[0], words[1]);
     if lo.kernel() {
-        served::call(lo, fx, "RandomService", "fill", kind, &args);
+        random_service(lo, fx, supply, kind, &args);
     } else {
         let served = served_entry(fx, &words);
         fx.choose_in(
@@ -631,7 +631,7 @@ fn random(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             served,
             &[],
             |lo, fx| {
-                served::call(lo, fx, "RandomService", "fill", kind, &args);
+                random_service(lo, fx, supply, kind, &args);
                 Vec::new()
             },
             |lo, fx| {
@@ -646,6 +646,19 @@ fn random(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         );
     }
     supply.done(lo, fx);
+}
+
+/// Calls the `fill` method of the kind serving a `Random` entry, its failure becoming the
+/// operation's.
+fn random_service(
+    lo: &mut Lowering,
+    fx: &mut Fx,
+    supply: &Supply,
+    kind: (Value, Value),
+    args: &[Held],
+) {
+    let called = served::call(lo, fx, "RandomService", "fill", kind, args);
+    supply.forward_failure(lo, fx, &called);
 }
 
 fn log(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {

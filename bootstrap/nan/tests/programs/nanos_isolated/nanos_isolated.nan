@@ -1,4 +1,4 @@
-//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port, their random source from a counter and their file system from a disk writing each call it serves through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, with the reports of their traps, a job reading kernel memory, in a domain of its own and outside it, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, instances of a component whose calls, a postponed one included, keyed tasks, held ones included, messages sent to themselves and checkpoints run in their spaces, with logs and gauges crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, an instance sharing its space with a job that traps, divides and adds through a gauge its world holds, logging through a log of its own and denied a random source, with another instance that is abandoned and with one whose space breaches its link, a book and tellers in two spaces calling it over a bridge, a log crossing there and back, payloads streamed and moved through frames of their own, a teller and a job calling it over bridges through lines their worlds hold, whose kernel admits each call until their credit runs out or a line is revoked, a breach ending the book, and calls, replies, states and a job's result past what a link carries leaving their spaces, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
+//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port, their random source from a counter and their file system from a disk writing each call it serves through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, with the reports of their traps, a job reading kernel memory, in a domain of its own and outside it, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell and drawing from a random source revoked between its draws, instances of a component whose calls, a postponed one included, keyed tasks, held ones included, messages sent to themselves and checkpoints run in their spaces, with logs and gauges crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, an instance sharing its space with a job that traps, divides and adds through a gauge its world holds, logging through a log of its own and denied a random source, with another instance that is abandoned and with one whose space breaches its link, a book and tellers in two spaces calling it over a bridge, a log crossing there and back, payloads streamed and moved through frames of their own, a teller and a job calling it over bridges through lines their worlds hold, whose kernel admits each call until their credit runs out or a line is revoked, a breach ending the book, and calls, replies, states and a job's result past what a link carries leaving their spaces, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -790,27 +790,42 @@ linear struct Spun {
 } Spun
 
 /// Runs the typed job answering a line over a link of two channels, `ask` and `answer`: once
-/// the job says it is ready, waits 100 ms and sends it a line, then writes what the job sent and
-/// whether its read returned before the second its runtime waits at most on the doorbell.
+/// the job says it is ready, revokes its random source, waits 100 ms and sends it a line, then
+/// writes what the job sent and whether its read returned before the second its runtime waits at
+/// most on the doorbell.
 fn linked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
+    let served = services(grants)
+    let Ok(revoker) = attempt sys::revocable(served.random) else {
+        stop(text: "no random\n")
+    }
+    let drawn = nanos::Services(log: served.log, stdio: served.stdio, random: revoker.capability(), fs: served.fs)
+    var revoking = Some(take revoker)
     var link = nanos::Link.of(next_frame(mut frames), alloc: grants.alloc)
     let ask = mut link.open("ask", inbound: next_frame(mut frames), outbound: next_frame(mut frames))
     let answer = mut link.open("answer", inbound: next_frame(mut frames), outbound: next_frame(mut frames))
     var held = frames_for_space(mut frames, alloc: grants.alloc)
     var extended = Some(hw::ExtendedState.of(next_frame(mut frames)))
     var result = mem::Bytes.empty(grants.alloc)
-    discard attempt await task::scope(grants.exec, body: fn[mut held, mut extended, mut result](s: task::Scope) fails task::Cancelled uses wait {
+    discard attempt await task::scope(grants.exec, body: fn[mut held, mut extended, mut result, mut revoking](s: task::Scope) fails task::Cancelled uses wait {
         let run = s.spawn(fn[mut held, mut extended, mut result]() fails task::Cancelled uses wait limits stack 196_608 {
             discard attempt await nanos::isolate(cpu, tenant: 3, clock: grants.clock, services: services(grants), frames: mut held, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn[mut result](space: nanos::Isolation) fails task::Cancelled uses wait {
-                result = result_of(attempt await nanos::run_isolated(space, job, link, services: services(grants), caps: nanos::Caps.empty(grants.alloc), input: encoded(Ask.Echo, alloc: grants.alloc), alloc: grants.alloc), alloc: grants.alloc)
+                result = result_of(attempt await nanos::run_isolated(space, job, link, services: drawn, caps: nanos::Caps.empty(grants.alloc), input: encoded(Ask.Echo, alloc: grants.alloc), alloc: grants.alloc), alloc: grants.alloc)
             })
         })
         say_received(text: "link said ", outcome: attempt await link.receive(answer, alloc: grants.alloc), alloc: grants.alloc)
+        let Some(revoked) = mut revoking.extract() else {
+            return
+        }
+        take revoked.revoke()
         try await grants.clock.sleep_ns(100_000_000)
         discard attempt link.send(ask, data: b"ping")
         say_received(text: "link answered ", outcome: attempt await link.receive(answer, alloc: grants.alloc), alloc: grants.alloc)
         try await take run.join()
     })
+    match revoking {
+        Some(unrevoked) => take unrevoked.revoke()
+        None => {}
+    }
     match attempt mem::wire::Codec[Answer].decode(Untrusted.of(result.view()), alloc: grants.alloc) {
         Ok(Answer.Number(waited)) => {
             match waited < 900_000_000 {

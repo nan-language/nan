@@ -1,6 +1,6 @@
 # 0227. Services of each job and instance of a space
 
-Status: accepted
+Status: accepted; a random source revoked while its job runs filling nothing in the space superseded by 0229
 
 ## Context
 

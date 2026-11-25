@@ -87,15 +87,24 @@ api core::Option.is_some core/core.nan:8
     digest: effects none | authority none | may-trap no | terminates
 ok show core::Option.is_some --api: records 1
 $ nan show sys::Handle --api
-ok show sys::Handle --api: records 2
-api sys::Handle sys/sys.nan:617
+ok show sys::Handle --api: records 5
+api sys::Handle sys/sys.nan:628
     pub open struct Handle {
     } Handle
     properties: Copy, Send
-api sys::Handle.of sys/sys.nan:620
+api sys::Handle.of sys/sys.nan:631
     pub fn Handle.of[C: Capability and Copy](capability: C) -> Handle
     digest: effects none | authority sys::Handle | may-trap no | terminates
-ok show sys::Handle --api: records 2
+api sys::Handle.crosses sys/sys.nan:633
+    pub fn Handle.crosses(self) -> bool
+    digest: effects none | authority sys::Handle | may-trap no | terminates
+api sys::Handle.invoke sys/sys.nan:635
+    pub fn Handle.invoke(self, operation: u64, args: Slice[u8], alloc: mem::Alloc) -> mem::Bytes fails CrossError
+    digest: effects alloc | authority sys::Handle | may-trap yes | terminates
+api sys::Handle.call sys/sys.nan:637
+    pub fn Handle.call(self, operation: u64, args: Slice[u8], alloc: mem::Alloc) -> mem::Bytes fails CrossError uses wait
+    digest: effects wait alloc | authority sys::Handle | may-trap yes | may-not-terminate
+ok show sys::Handle --api: records 5
 ```
 
 ### Writing commands

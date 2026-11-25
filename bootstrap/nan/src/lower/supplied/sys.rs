@@ -481,6 +481,7 @@ fn clock(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             fx.when(served, |fx| {
                 let called =
                     served::call(lo, fx, "ClockService", "elapsed_ns", (service, table), &[]);
+                supply.forward_failure(lo, fx, &called);
                 let elapsed = round_down(fx, resolution, called.result.scalar());
                 let elapsed = in_unit(fx, member, elapsed);
                 supply.ret(lo, fx, Held::Scalar(elapsed));

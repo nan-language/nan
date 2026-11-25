@@ -18914,7 +18914,7 @@ const TEXT_NANOS_BRIDGE: Str =
     \\
     \\test carries_of_ends_taken_back_are_dropped for Door.carries_dropped {
     \\    let world = testing::world()
-    \\    let door = Door.of(Services(log: world.log, stdio: world.stdio, random: world.random, fs: world.fs), moves: None, alloc: world.alloc)
+    \\    let door = Door.of(Services(clock: world.clock, log: world.log, stdio: world.stdio, random: world.random, fs: world.fs), moves: None, alloc: world.alloc)
     \\    let closed = door.table.held_by(job: 1, holding: Holding.Bridge)
     \\    let open = door.table.held_by(job: 1, holding: Holding.Bridge)
     \\    var logs = mem::List[sys::Handle].empty(world.alloc)
@@ -21474,6 +21474,8 @@ const TEXT_NANOS_ISOLATED: Str =
     \\/// The operations of the capabilities the kernel serves a job's space.
     \\const LOG_LINE: u64 = 0
     \\
+    \\const READ_CLOCK: u64 = 0
+    \\
     \\const READ_IN: u64 = 0
     \\
     \\const WRITE_OUT: u64 = 1
@@ -21598,8 +21600,9 @@ const TEXT_NANOS_ISOLATED: Str =
     \\} IsolatedError
     \\
     \\/// What the kernel serves a job or instance of an isolated space, or the space itself: the
-    \\/// capabilities a world's log, standard streams, random source and file system reach.
+    \\/// capabilities a world's clock, log, standard streams, random source and file system reach.
     \\pub closed struct Services derives Copy {
+    \\    pub clock: sys::Clock
     \\    pub log: sys::Log
     \\    pub stdio: sys::Stdio
     \\    pub random: sys::Random
@@ -21734,6 +21737,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\
     \\/// A capability a space holds by the handle naming its entry in the space's table.
     \\enum Holding derives Copy {
+    \\    Clock(sys::Clock)
     \\    Log(sys::Log)
     \\    Stdio(sys::Stdio)
     \\    Random(sys::Random)
@@ -21790,10 +21794,11 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    carried: Carried
     \\} Granted
     \\
-    \\/// What crossed into the space's table for a job's or instance's world: the handles of its log,
-    \\/// standard streams, random source and file system, its capabilities, and the ends of the bridges it
-    \\/// calls through.
+    \\/// What crossed into the space's table for a job's or instance's world: the handles of its clock,
+    \\/// log, standard streams, random source and file system, its capabilities, and the ends of the
+    \\/// bridges it calls through.
     \\struct Granting derives Encode {
+    \\    clock: u64
     \\    log: u64
     \\    stdio: u64
     \\    random: u64
@@ -21814,6 +21819,8 @@ const TEXT_NANOS_ISOLATED: Str =
     \\} Remote
     \\
     \\impl Remote: sys::Kind[Spaced, u64]
+    \\
+    \\impl Remote: sys::ClockService
     \\
     \\impl Remote: sys::LogService
     \\
@@ -21859,7 +21866,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    reply: Naming
     \\} Replying
     \\
-    \\pub fn isolate[E](cpu: hw::Ring0, tenant: u64, clock: sys::Clock, services: Services, mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState], exec: task::Executor, alloc: mem::Alloc, body: fn(space: Isolation) fails E uses wait limits stack 131_072) fails E uses wait {
+    \\pub fn isolate[E](cpu: hw::Ring0, tenant: u64, services: Services, mut frames: mem::List[hw::PhysFrame[4_096]], mut extended: Option[hw::ExtendedState], exec: task::Executor, alloc: mem::Alloc, body: fn(space: Isolation) fails E uses wait limits stack 131_072) fails E uses wait {
     \\    let task::Channel(sender: moves, receiver: moving) = task::Channel[Moving].bounded(QUEUED_CALLS, alloc)
     \\    let shared = mem::Shared.of(Door.of(services, moves: Some(take moves), alloc), alloc)
     \\    let doors = sys::Minter[Doorway, mem::Shared[Door], u64].of(shared.share(), alloc)
@@ -21874,7 +21881,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\            return try await moves_kept(take moved_in, alloc)
     \\        })
     \\        let driving = s.spawn(fn[mut frames, mut extended]() fails task::Cancelled uses wait {
-    \\            try await driven(cpu, tenant, clock, services, isolation, mut frames, mut extended)
+    \\            try await driven(cpu, tenant, clock: services.clock, services, isolation, mut frames, mut extended)
     \\        })
     \\        let outcome = attempt await body(isolation)
     \\        isolation.closed.store(true)
@@ -22563,7 +22570,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        mut channels.push(table.held_by(job: id, holding: Holding.Channel(index)))
     \\    }
     \\    let acting = table.held_by(job: id, holding: Holding.Runner)
-    \\    let granted = Granting(log: table.held_by(job: id, holding: Holding.Log(services.log)), stdio: table.held_by(job: id, holding: Holding.Stdio(services.stdio)), random: table.held_by(job: id, holding: Holding.Random(services.random)), fs: table.held_by(job: id, holding: Holding.Fs(services.fs)), caps: take crossed, ends: mem::List[EndAt].empty(alloc))
+    \\    let granted = Granting(clock: table.held_by(job: id, holding: Holding.Clock(services.clock)), log: table.held_by(job: id, holding: Holding.Log(services.log)), stdio: table.held_by(job: id, holding: Holding.Stdio(services.stdio)), random: table.held_by(job: id, holding: Holding.Random(services.random)), fs: table.held_by(job: id, holding: Holding.Fs(services.fs)), caps: take crossed, ends: mem::List[EndAt].empty(alloc))
     \\    var unmapping = mem::List[u64].empty(alloc)
     \\    for address in addresses {
     \\        mut unmapping.push(address)
@@ -22775,10 +22782,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\                    Err(_) => INVALID
     \\                }
     \\            } else if number == CALL_NOW {
-    \\                answer = match attempt clock.elapsed_ns() {
-    \\                    Ok(ns) => ns
-    \\                    Err(_) => STALE
-    \\                }
+    \\                answer = clock_answer(clock)
     \\            } else if number == CALL_INVOKE {
     \\                answer = try await mut self.invoked(cpu, tenant, clock, services, isolation, mut space, mut frames)
     \\            } else if number == CALL_FAULT {
@@ -22840,6 +22844,11 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        return STALE
     \\    }
     \\    match entry.holding {
+    \\        Holding.Clock(own) => {
+    \\            if operation == READ_CLOCK {
+    \\                return clock_answer(own)
+    \\            }
+    \\        }
     \\        Holding.Log(log) => {
     \\            if operation == LOG_LINE {
     \\                return logged(log, args, alloc)
@@ -23124,7 +23133,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\
     \\test taken_back_entries_leave_their_handles_stale for Table.taken_back {
     \\    let world = testing::world()
-    \\    let table = Table.of(Services(log: world.log, stdio: world.stdio, random: world.random, fs: world.fs), alloc: world.alloc)
+    \\    let table = Table.of(Services(clock: world.clock, log: world.log, stdio: world.stdio, random: world.random, fs: world.fs), alloc: world.alloc)
     \\    var earlier = mem::List[u64].empty(world.alloc)
     \\    for _ in 0u64..<MOST_HELD {
     \\        match table.add(job: 1, holding: Holding.Runner) {
@@ -23246,6 +23255,14 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    state.sp = Untrusted.of((user_word(state.sp) & 0xFFFF_FFFF_FFFF_FFF0).wrapping_sub(16))
     \\    state.ip = Untrusted.of(routine)
     \\} faulted
+    \\
+    \\/// A reading of a clock as a call answers it: its nanoseconds, or `STALE` once it is stale.
+    \\fn clock_answer(clock: sys::Clock) -> u64 {
+    \\    return match attempt clock.elapsed_ns() {
+    \\        Ok(ns) => ns
+    \\        Err(_) => STALE
+    \\    }
+    \\} clock_answer
     \\
     \\/// Waits until a deadline of the clock, or for good for the deadline 0 or a stale clock, or until
     \\/// `rang` is posted, giving `WOKE_RUNG` when it was and 0 otherwise.
@@ -23909,7 +23926,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    }
     \\    let task::Channel(sender: up, receiver: outgoing) = task::Channel[mem::Bytes].bounded(QUEUED_CALLS, alloc)
     \\    let kinds = task::Cown.of(mem::Map[u64, Ride].empty(alloc), alloc)
-    \\    let remotes = sys::Minter[Remote, Spaced, u64].of(Spaced(alloc: alloc, minted: mem::OnceMap[u64, sys::Handle].empty(0, alloc), handles: mem::OnceMap[u64, u64].empty(0, alloc), up: up.split(), waits: waits.share(), kinds: kinds.share(), runner: record.runner), alloc)
+    \\    let remotes = sys::Minter[Remote, Spaced, u64].of(Spaced(alloc: alloc, minted: mem::OnceMap[u64, sys::Handle].empty(0, alloc), handles: mem::OnceMap[u64, u64].empty(0, alloc), up: up.split(), waits: waits.share(), kinds: kinds.share(), runner: record.runner, clock: granted.clock), alloc)
     \\    let base = remotes.mint(MOST_HELD)
     \\    let task::Channel(sender: late, receiver: postponed) = task::Channel[Late].bounded(QUEUED_CALLS, alloc)
     \\    let bridges = Bridges(ports: task::Cown.of(mem::Map[u64, Pump].empty(alloc), alloc), kinds: take kinds, routes: task::Cown.of(Routes(next: 0, waiting: mem::Map[u64, Route].empty(alloc)), alloc), late: take late, base: base, clock: granted.clock, alloc: alloc)
@@ -23998,11 +24015,12 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    outgoing: task::Receiver[mem::Bytes]
     \\} Launched
     \\
-    \\/// The world of a job or instance of a space: its runtime's allocator, executor and clock, its log,
+    \\/// The world of a job or instance of a space: its runtime's allocator and executor, its clock, log,
     \\/// standard streams, random source and file system served by the kernel through the handles that
-    \\/// crossed for it, its random source stale from the start when the kernel's is stale, its network
-    \\/// denied, and its table holding each capability that crossed for it under its key, then each
-    \\/// channel of its link from the index `channels_from` as a standard stream under the channel's key.
+    \\/// crossed for it, its clock and random source each stale from the start when the kernel's is
+    \\/// stale, its network denied, and its table holding each capability that crossed for it under its
+    \\/// key, then each channel of its link from the index `channels_from` as a standard stream under the
+    \\/// channel's key.
     \\fn remote_world(granted: Base, record: Start, base: Remote, ports: sys::Minter[Port, Ports, u64], channels_from: u64, mut ends: mem::List[EndAt]) -> World fails sys::Revoked {
     \\    var given = mem::Bytes.zeroed(usize.widen(record.granted_len), alloc: granted.alloc)
     \\    trusted "the kernel writes what crossed for the world, `granted_len` bytes, at `granted`" {
@@ -24014,9 +24032,12 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    for at in grants.ends {
     \\        mut ends.push(at)
     \\    }
+    \\    let held_clock = try Cap[sys::Clock].held(base, handle: grants.clock, serve: served_clock)
+    \\    let clock = try Cap[sys::Clock].revoked_if(held_clock, revoked: kernel_answer(grants.clock, operation: READ_CLOCK, alloc: granted.alloc) == STALE)
     \\    let logs = try Cap[sys::Log].held(base, handle: grants.log, serve: served_log)
     \\    let streams = try Cap[sys::Stdio].held(base, handle: grants.stdio, serve: served_stdio)
-    \\    let source = try random_held(base, handle: grants.random, alloc: granted.alloc)
+    \\    let held_random = try Cap[sys::Random].held(base, handle: grants.random, serve: served_random)
+    \\    let source = try Cap[sys::Random].revoked_if(held_random, revoked: kernel_answer(grants.random, operation: FILL, alloc: granted.alloc) == STALE)
     \\    let files = try Cap[sys::Fs].held(base, handle: grants.fs, serve: served_fs)
     \\    var caps = Caps.empty(granted.alloc)
     \\    for grant in grants.caps {
@@ -24038,22 +24059,26 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        }
     \\        Cap[sys::Stdio].put(mut caps, key: named.as_str(), capability: channel)
     \\    }
-    \\    return World(alloc: granted.alloc, exec: granted.exec, clock: granted.clock, random: source, log: logs, stdio: streams, fs: files, net: sys::Net.denied(), caps: take caps)
+    \\    return World(alloc: granted.alloc, exec: granted.exec, clock: clock, random: source, log: logs, stdio: streams, fs: files, net: sys::Net.denied(), caps: take caps)
     \\} remote_world
     \\
-    \\/// The random source the runtime holds for the handle `handle` of the space's table, stale from the
-    \\/// start when the kernel's random source is stale.
-    \\fn random_held(base: Remote, handle: u64, alloc: mem::Alloc) -> sys::Random fails sys::Revoked {
-    \\    let source = try Cap[sys::Random].held(base, handle, serve: served_random)
-    \\    var nothing = mem::Bytes.empty(alloc)
-    \\    if invoke(handle, operation: FILL, args: b"", result: mut nothing.view_mut()) != STALE {
-    \\        return source
+    \\/// `capability`, or when `revoked` a revoked capability deriving from it.
+    \\fn Cap.revoked_if(capability: C, revoked: bool) -> C fails sys::Revoked {
+    \\    if not revoked {
+    \\        return capability
     \\    }
-    \\    let revoker = try sys::revocable(source)
+    \\    let revoker = try sys::revocable(capability)
     \\    let denied = revoker.capability()
     \\    take revoker.revoke()
     \\    return denied
-    \\} random_held
+    \\} Cap.revoked_if
+    \\
+    \\/// What the kernel answers an operation without arguments or result of the capability at `handle`
+    \\/// of the space's table.
+    \\fn kernel_answer(handle: u64, operation: u64, alloc: mem::Alloc) -> u64 {
+    \\    var nothing = mem::Bytes.empty(alloc)
+    \\    return invoke(handle, operation, args: b"", result: mut nothing.view_mut())
+    \\} kernel_answer
     \\
     \\/// The record of a channel of the space's link, by its index.
     \\fn port_at(record: Start, index: u64) -> PortRecord {
@@ -24085,7 +24110,8 @@ const TEXT_NANOS_ISOLATED: Str =
     \\/// allocator, the handle of the capability minted for each handle of the space's table, that handle
     \\/// by the minted capability's word, the sender of the frames an instance's space sends up, the
     \\/// waits of its calls that wait for the kernel's reply, the ends of bridges carrying the calls of
-    \\/// capabilities of crossing kinds by their handles, and the handle of its runner capability.
+    \\/// capabilities of crossing kinds by their handles, the handle of its runner capability, and the
+    \\/// runtime's clock, which times the sleeps of the clocks it holds.
     \\struct Spaced {
     \\    alloc: mem::Alloc
     \\    minted: mem::OnceMap[u64, sys::Handle]
@@ -24094,6 +24120,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    waits: task::Cown[PortWaits]
     \\    kinds: task::Cown[mem::Map[u64, Ride]]
     \\    runner: u64
+    \\    clock: sys::Clock
     \\} Spaced
     \\
     \\/// The handle the runtime holds for the handle `handle` of the space's table, minted through `mint`
@@ -24126,6 +24153,10 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    }
     \\    return capability
     \\} Cap.held
+    \\
+    \\fn served_clock(remote: Remote) -> sys::Clock fails sys::Revoked {
+    \\    return try sys::Clock.served(remote)
+    \\} served_clock
     \\
     \\fn served_log(remote: Remote) -> sys::Log fails sys::Revoked {
     \\    return try sys::Log.served(remote)
@@ -24207,6 +24238,36 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    alloc: mem::Alloc
     \\    handle: u64
     \\} Reach
+    \\
+    \\/// Reads the clock at the remote's handle.
+    \\fn Remote.elapsed_ns(self) -> u64 fails sys::Revoked limits stack 1_024 {
+    \\    let Some(reach) = reached(self) else {
+    \\        fail sys::Revoked.Stale
+    \\    }
+    \\    let ns = kernel_answer(reach.handle, operation: READ_CLOCK, alloc: reach.alloc)
+    \\    if ns >= FAILURES {
+    \\        fail sys::Revoked.Stale
+    \\    }
+    \\    return ns
+    \\} Remote.elapsed_ns
+    \\
+    \\/// Sleeps on the runtime's clock, or returns at once when the clock at the remote's handle is stale.
+    \\fn Remote.sleep_ns(self, ns: u64) fails task::Cancelled uses wait limits stack 1_024 {
+    \\    let Some(timer) = sys::reach(self, body: fn(state: Spaced, handle: u64) => Timer(clock: state.clock, alloc: state.alloc, handle: handle)) else {
+    \\        return
+    \\    }
+    \\    if kernel_answer(timer.handle, operation: READ_CLOCK, alloc: timer.alloc) >= FAILURES {
+    \\        return
+    \\    }
+    \\    try await timer.clock.sleep_ns(ns)
+    \\} Remote.sleep_ns
+    \\
+    \\/// What reaching a remote clock gives: the runtime's clock and allocator, and the remote's handle.
+    \\struct Timer derives Copy {
+    \\    clock: sys::Clock
+    \\    alloc: mem::Alloc
+    \\    handle: u64
+    \\} Timer
     \\
     \\fn Remote.log(self, level: sys::LogLevel, message: Str, value: Str) limits stack 4_096 {
     \\    let Some(reach) = reached(self) else {
@@ -29207,7 +29268,7 @@ const TEXT_SYS_SYS: Str =
     \\} RandomService
     \\
     \\pub interface ClockService {
-    \\    fn elapsed_ns(self) -> u64 limits stack 1_024
+    \\    fn elapsed_ns(self) -> u64 fails Revoked limits stack 1_024
     \\    fn sleep_ns(self, ns: u64) fails task::Cancelled uses wait limits stack 1_024
     \\} ClockService
     \\

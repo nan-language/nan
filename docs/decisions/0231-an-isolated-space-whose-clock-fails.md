@@ -1,6 +1,6 @@
 # 0231. An isolated space whose clock fails
 
-Status: accepted
+Status: accepted; every clock of a world deriving from the runtime's root clock superseded by 0232
 
 ## Context
 

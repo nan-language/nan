@@ -18639,9 +18639,9 @@ const TEXT_NANOS_BRIDGE: Str =
     \\
     \\/// Opens a bridge for the channel `port` of `link`, which the space of the job or instance numbered
     \\/// `id` maps, to the instance answering the calls it carries: maps that channel into the instance's
-    \\/// space, opening the end there, and gives both ends; none when that instance no longer runs, a
-    \\/// table or its space has no room, or `caps` holds no capability of a crossing kind under the key
-    \\/// whose calls the channel carries.
+    \\/// space, opening the end there, and gives both ends; none, the tables taking back the ends' entries,
+    \\/// when that instance no longer runs, a table or its space has no room, or `caps` holds no
+    \\/// capability of a crossing kind under the key whose calls the channel carries.
     \\fn bridge_opened(isolation: Isolation, id: u64, link: Link, caps: Caps, port: Ported, alloc: mem::Alloc) -> Option[Spanning] fails task::Cancelled uses wait {
     \\    let channel = link.channels[port.channel]
     \\    let Some(Porting(through: through, to: Some(target))) = channel.port else {
@@ -18656,6 +18656,8 @@ const TEXT_NANOS_BRIDGE: Str =
     \\    let near = isolation.door.contents().table.held_by(job: id, holding: Holding.Bridge)
     \\    let far = target_door.contents().table.held_by(job: target.id, holding: Holding.Bridge)
     \\    if near == MOST_HELD or far == MOST_HELD {
+    \\        isolation.door.contents().table.taken(near)
+    \\        target_door.contents().table.taken(far)
     \\        return None
     \\    }
     \\    let task::Channel(sender: lend, receiver: lent) = task::Channel[Lending].bounded(1, alloc)
@@ -18682,6 +18684,8 @@ const TEXT_NANOS_BRIDGE: Str =
     \\        discard attempt await back.send(Lent(space: take space, frames: mem::List[u64].empty(alloc), ported: mem::List[u64].empty(alloc), ends: take ends))
     \\    }
     \\    if not mapped_far {
+    \\        isolation.door.contents().table.taken(near)
+    \\        target_door.contents().table.taken(far)
     \\        return None
     \\    }
     \\    let own = BridgeEnd(job: id, peer: target.door, peer_job: target.id, peer_handle: far, side: side, admission: None, inbound: port.inbound, outbound: port.outbound, unmaps: false, closing: mem::List[task::Sender[u8]].empty(alloc))
@@ -18708,17 +18712,9 @@ const TEXT_NANOS_BRIDGE: Str =
     \\        if held.key.as_str() != calls.key.as_str() or not held.handle.crosses() {
     \\            continue
     \\        }
-    \\        let word = handle_word(held.handle)
-    \\        for handle in 0u64..<MOST_HELD {
-    \\            let Some(entry) = table.held.get(handle) else {
-    \\                continue
-    \\            }
-    \\            let Holding.Kind(capability) = entry.holding else {
-    \\                continue
-    \\            }
-    \\            if entry.job == id and handle_word(capability) == word {
-    \\                return Some(Sides(near: Side.Kind(Riding(handle: handle, operation: calls.operation, hash: calls.hash)), admission: Some(Admission(capability: held.handle, operation: calls.operation))))
-    \\            }
+    \\        match table.crossed(job: id, word: handle_word(held.handle)) {
+    \\            Some(handle) => return Some(Sides(near: Side.Kind(Riding(handle: handle, operation: calls.operation, hash: calls.hash)), admission: Some(Admission(capability: held.handle, operation: calls.operation))))
+    \\            None => {}
     \\        }
     \\    }
     \\    return None
@@ -18804,13 +18800,13 @@ const TEXT_NANOS_BRIDGE: Str =
     \\} Leaving
     \\
     \\/// Serves an operation of the end of a bridge the space holds by `handle`: rings its other end;
-    \\/// closes it, unmapping the frames it maps for itself; closes it as breached by its other end,
-    \\/// whose job or instance ends; carries the handles of the space's table it names into the table of
-    \\/// the other end's space, giving the token its runtime claims them by; admits a call it serves
-    \\/// through the capability its kernel admits them through, `STALE` once that is stale; or claims
-    \\/// what crossed into the space's table for it by a token, written at `target` when it fits
-    \\/// `capacity`, giving its length either way.
-    \\fn Driven.bridge_invoked(mut self, door: mem::Shared[Door], mut space: sys::load::Space, handle: u64, operation: u64, args: Untrusted[mem::Bytes], target: u64, capacity: u64, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    \\/// closes it, taking back its entry and unmapping the frames it maps for itself; closes it as
+    \\/// breached by its other end, whose job or instance ends; carries the handles of the space's table
+    \\/// it names into the table of the other end's space, giving the token its runtime claims them by;
+    \\/// admits a call it serves through the capability its kernel admits them through, `STALE` once
+    \\/// that is stale; or claims what crossed into the space's table for it by a token, written at
+    \\/// `target` when it fits `capacity`, giving its length either way.
+    \\fn Driven.bridge_invoked(mut self, mut space: sys::load::Space, handle: u64, operation: u64, args: Untrusted[mem::Bytes], target: u64, capacity: u64, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
     \\    let Some(bridge) = self.bridges.get(handle) else {
     \\        return STALE
     \\    }
@@ -18832,7 +18828,7 @@ const TEXT_NANOS_BRIDGE: Str =
     \\        let Ok(handles) = attempt mem::wire::Codec[mem::List[u64]].decode(args.view(), alloc) else {
     \\            return INVALID
     \\        }
-    \\        let Some(given) = door.contents().table.handed(handles, alloc) else {
+    \\        let Some(given) = self.door.contents().table.handed(handles, alloc) else {
     \\            return INVALID
     \\        }
     \\        let Some(peer_door) = peer.reached() else {
@@ -18863,18 +18859,18 @@ const TEXT_NANOS_BRIDGE: Str =
     \\        let Ok(accepting) = attempt mem::wire::Codec[Accepting].decode(args.view(), alloc) else {
     \\            return INVALID
     \\        }
-    \\        return try await door.contents().accepted(handle, accepting, mut space, mut frames, alloc)
+    \\        return try await self.door.contents().accepted(handle, accepting, mut space, mut frames, alloc)
     \\    }
     \\    let Ok(token) = attempt mem::wire::Codec[u64].decode(args.view(), alloc) else {
     \\        return INVALID
     \\    }
     \\    if operation == BRIDGE_SIZE {
-    \\        return try await door.contents().moved_len(handle, token, alloc)
+    \\        return try await self.door.contents().moved_len(handle, token, alloc)
     \\    }
     \\    if operation != BRIDGE_CLAIM {
     \\        return INVALID
     \\    }
-    \\    let Some(bytes) = try await door.contents().claimed(handle, token, capacity, alloc) else {
+    \\    let Some(bytes) = try await self.door.contents().claimed(handle, token, capacity, alloc) else {
     \\        return INVALID
     \\    }
     \\    let len = u64.widen(bytes.len())
@@ -18938,10 +18934,11 @@ const TEXT_NANOS_BRIDGE: Str =
     \\
     \\/// Opens the end of a bridge the space maps for an instance it runs: tells the runtime of the
     \\/// instance holding it, and has the frames the end maps for itself unmapped once that instance
-    \\/// ends, or at once when it has.
+    \\/// ends, or at once, the table taking back the end's entry, when it has.
     \\fn Driven.bridge_opened(mut self, mut space: sys::load::Space, take opening: Bridged) {
     \\    let Bridged(handle: handle, end: opened_end) = opening
     \\    let Some(found) = mut self.jobs.get_mut(opened_end.job) else {
+    \\        self.door.contents().table.taken(handle)
     \\        if opened_end.unmaps {
     \\            mut space.unshare(opened_end.inbound)
     \\            mut space.unshare(opened_end.outbound)
@@ -19004,11 +19001,13 @@ const TEXT_NANOS_BRIDGE: Str =
     \\    mut self.notices.push(Notice(id: id, told: Telling.Bridge(Bridging.Closed(handle))))
     \\} Driven.closing
     \\
-    \\/// Closes the end of a bridge the space holds by `handle`, unmapping the frames it maps for itself.
+    \\/// Closes the end of a bridge the space holds by `handle`, taking back its entry of the table and
+    \\/// unmapping the frames it maps for itself.
     \\fn Driven.end_closed(mut self, mut space: sys::load::Space, handle: u64) {
     \\    let Some(bridge) = mut self.bridges.remove(handle) else {
     \\        return
     \\    }
+    \\    self.door.contents().table.taken(handle)
     \\    if not bridge.unmaps {
     \\        return
     \\    }
@@ -20371,7 +20370,7 @@ const TEXT_NANOS_HELD: Str =
     \\    let Heard.Up(Up.Moved(movement)) = heard else {
     \\        return heard
     \\    }
-    \\    let Some(entry) = table.held.get(movement.handle) else {
+    \\    let Some(entry) = table.entry(movement.handle) else {
     \\        return Heard.Breach
     \\    }
     \\    let Holding.Runner = entry.holding else {
@@ -20472,7 +20471,7 @@ const TEXT_NANOS_HELD: Str =
     \\/// What crosses down of the result of the waiting operation `operation` of the capability of a
     \\/// crossing kind the entry `handle` of the space's `table` holds for the instance numbered `job`.
     \\fn kind_answer(handle: u64, operation: u64, args: Slice[u8], table: Table, job: u64, alloc: mem::Alloc) -> PortAnswer fails task::Cancelled uses wait {
-    \\    let Some(entry) = table.held.get(handle) else {
+    \\    let Some(entry) = table.entry(handle) else {
     \\        return PortAnswer.Unknown
     \\    }
     \\    let Holding.Kind(capability) = entry.holding else {
@@ -21528,8 +21527,12 @@ const TEXT_NANOS_ISOLATED: Str =
     \\
     \\const PORT_BYTES: usize = 40
     \\
-    \\/// The most handles a space's table holds.
+    \\/// The most entries a space's table holds at once.
     \\const MOST_HELD: u64 = 256
+    \\
+    \\/// The handles of a space's table are below `HANDLE_BOUND`: a slot whose next handle would not be
+    \\/// holds no entry again.
+    \\const HANDLE_BOUND: u64 = 0x0100_0000_0000_0000
     \\
     \\pub closed enum IsolatedError derives Render {
     \\    NoJob
@@ -21667,7 +21670,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    granted_len: u64
     \\} Start
     \\
-    \\/// A capability a space holds: its handle is the index of its entry in the space's table.
+    \\/// A capability a space holds by the handle naming its entry in the space's table.
     \\enum Holding derives Copy {
     \\    Log(sys::Log)
     \\    Stdio(sys::Stdio)
@@ -21688,11 +21691,19 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    holding: Holding
     \\} Entry
     \\
-    \\/// A space's table of handles: the entry each handle names, and the count of handles given.
+    \\/// A space's table of handles: `MOST_HELD` slots, the slot of a handle being its remainder by
+    \\/// `MOST_HELD`.
     \\struct Table {
-    \\    held: mem::OnceMap[u64, Entry]
-    \\    count: core::atomic::AtomicU64
+    \\    slots: hw::SpinLock[mem::List[Slot]]
     \\} Table
+    \\
+    \\/// A slot of a space's table: the handle naming its entry, which advances by `MOST_HELD` each time
+    \\/// its entry is taken back, so that every earlier handle of the slot is stale, and that entry, none
+    \\/// while the slot is free.
+    \\struct Slot derives Copy {
+    \\    handle: u64
+    \\    entry: Option[Entry]
+    \\} Slot
     \\
     \\/// A capability the kernel adds to a space's table for its runtime to receive: its type, and its
     \\/// handle.
@@ -21978,9 +21989,9 @@ const TEXT_NANOS_ISOLATED: Str =
     \\/// job's, as the job or instance numbered `id`, on `input` with `link`, a world reaching `services`
     \\/// and the capabilities of `caps` that cross into the space, acting through `runner`, bridging each
     \\/// channel of `link` that carries the calls of a port to the instance answering them, and gives how
-    \\/// it ended once no space maps `link`'s frames, or why it could not be placed. While it runs, it is
-    \\/// watched as `run_watched` watches it; once `halted` holds true, or this call is cancelled, the
-    \\/// space abandons it.
+    \\/// it ended once no space maps `link`'s frames, or why it could not be placed, the table then taking
+    \\/// back every entry added for it. While it runs, it is watched as `run_watched` watches it; once
+    \\/// `halted` holds true, or this call is cancelled, the space abandons it.
     \\fn joined(isolation: Isolation, id: u64, job: sys::load::Isolated, take component: Option[text::String], link: Link, services: Services, caps: Caps, take input: mem::Bytes, runner: sys::Runner, halted: mem::Shared[core::atomic::AtomicBool], alloc: mem::Alloc) -> Joined fails task::Cancelled uses wait {
     \\    if id == 0 {
     \\        return Joined(outcome: Err(sys::load::LoadError.Unplaceable), cancelled: None)
@@ -22049,7 +22060,10 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        discard attempt await far_closed(far, alloc)
     \\    }
     \\    match ran {
-    \\        Ok(done) => return done
+    \\        Ok(done) => {
+    \\            isolation.door.contents().table.taken_back(id)
+    \\            return done
+    \\        }
     \\        Err(cancellation) => fail cancellation
     \\    }
     \\} joined
@@ -22219,13 +22233,14 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    bridging: bool
     \\} Pending
     \\
-    \\/// What the task running an isolation's space keeps of it: the state of its thread, the routine
-    \\/// its runtime named to be resumed in at an exception, whether the thread waits for the answer to
-    \\/// a `CALL_WAIT` call and whether that call woke by a ring, the jobs and instances it runs by
-    \\/// number, those its runtime has not taken, those its runtime is ordered to abandon, what its
-    \\/// runtime is told of the ends of bridges its instances hold, those ends by their handles, the asks
-    \\/// it has for other isolations, and the files they opened.
+    \\/// What the task running an isolation's space keeps of it: the door of the isolation, the state of
+    \\/// its thread, the routine its runtime named to be resumed in at an exception, whether the thread
+    \\/// waits for the answer to a `CALL_WAIT` call and whether that call woke by a ring, the jobs and
+    \\/// instances it runs by number, those its runtime has not taken, those its runtime is ordered to
+    \\/// abandon, what its runtime is told of the ends of bridges its instances hold, those ends by their
+    \\/// handles, the asks it has for other isolations, and the files they opened.
     \\struct Driven {
+    \\    door: mem::Shared[Door]
     \\    state: hw::UserState
     \\    fault_routine: u64
     \\    waiting: Option[u64]
@@ -22252,11 +22267,12 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    Reply(PortReply)
     \\} Telling
     \\
-    \\/// What is kept of a space that has just been made, its thread starting its runtime.
-    \\fn Driven.of(space: sys::load::Space, alloc: mem::Alloc) -> Driven {
+    \\/// What is kept of a space of the isolation of `door` that has just been made, its thread starting
+    \\/// its runtime.
+    \\fn Driven.of(space: sys::load::Space, door: mem::Shared[Door], alloc: mem::Alloc) -> Driven {
     \\    var state = hw::UserState(regs: Array[Untrusted[u64], 31].filled(Untrusted.of(0)), sp: Untrusted.of(space.stack()), ip: Untrusted.of(space.start()), flags: Untrusted.of(0))
     \\    state.regs[register(1)] = Untrusted.of(space.boot_area())
-    \\    return Driven(state: state, fault_routine: 0, waiting: None, jobs: mem::Map[u64, Running].empty(alloc), pending: mem::List[Pending].empty(alloc), abandons: mem::List[u64].empty(alloc), notices: mem::List[Notice].empty(alloc), bridges: mem::Map[u64, BridgeEnd].empty(alloc), leaving: mem::List[Leaving].empty(alloc), files: Files(open: mem::Map[u64, sys::fs::File].empty(alloc), next: 0))
+    \\    return Driven(door: door.share(), state: state, fault_routine: 0, waiting: None, jobs: mem::Map[u64, Running].empty(alloc), pending: mem::List[Pending].empty(alloc), abandons: mem::List[u64].empty(alloc), notices: mem::List[Notice].empty(alloc), bridges: mem::Map[u64, BridgeEnd].empty(alloc), leaving: mem::List[Leaving].empty(alloc), files: Files(open: mem::Map[u64, sys::fs::File].empty(alloc), next: 0))
     \\} Driven.of
     \\
     \\/// A space running jobs or instances, and what the task running it keeps of it.
@@ -22265,9 +22281,9 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    driving: Driven
     \\} Placed
     \\
-    \\/// A space that has just been made, its thread starting its runtime.
-    \\fn placed_of(take space: sys::load::Space, alloc: mem::Alloc) -> Placed {
-    \\    let driving = Driven.of(space, alloc)
+    \\/// A space of the isolation of `door` that has just been made, its thread starting its runtime.
+    \\fn placed_of(take space: sys::load::Space, door: mem::Shared[Door], alloc: mem::Alloc) -> Placed {
+    \\    let driving = Driven.of(space, door, alloc)
     \\    return Placed(space: take space, driving: take driving)
     \\} placed_of
     \\
@@ -22428,7 +22444,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    let placed = match mut placing.pop() {
     \\        Some(held) => held
     \\        None => match attempt bundle.space(cpu, data: 0, tenant, mut frames, alloc) {
-    \\            Ok(fresh) => placed_of(take fresh, alloc)
+    \\            Ok(fresh) => placed_of(take fresh, door: isolation.door, alloc)
     \\            Err(error) => {
     \\                discard ended.offer(Outcome.Unplaced(error))
     \\                return
@@ -22622,9 +22638,9 @@ const TEXT_NANOS_ISOLATED: Str =
     \\} Driven.ended_all
     \\
     \\/// Ends the job or instance numbered `id`, unmapping its link's frames and those of its bridges'
-    \\/// ends and closing those ends: `Abandoned` once its holder abandoned it, `Trapped` with a trap of
-    \\/// `trap.bounds` whose report is `BREACH_REPORT` once it breached a channel, and as `otherwise` says
-    \\/// otherwise.
+    \\/// ends, taking back the entries of the space's table added for it and closing those ends:
+    \\/// `Abandoned` once its holder abandoned it, `Trapped` with a trap of `trap.bounds` whose report is
+    \\/// `BREACH_REPORT` once it breached a channel, and as `otherwise` says otherwise.
     \\fn Driven.job_ended(mut self, mut space: sys::load::Space, id: u64, take otherwise: Outcome, alloc: mem::Alloc) {
     \\    let Some(running) = mut self.jobs.remove(id) else {
     \\        return
@@ -22632,6 +22648,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    for address in running.frames {
     \\        mut space.unshare(address)
     \\    }
+    \\    self.door.contents().table.taken_back(id)
     \\    mut self.ends_dropped(id, alloc)
     \\    mut self.notices.retain(keep: fn(notice: Notice) -> bool {
     \\        return notice.id != id
@@ -22753,7 +22770,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    if capacity > MOST_BYTES and handle != ORDERS_HANDLE {
     \\        return INVALID
     \\    }
-    \\    let Some(entry) = isolation.door.contents().table.held.get(handle) else {
+    \\    let Some(entry) = isolation.door.contents().table.entry(handle) else {
     \\        return STALE
     \\    }
     \\    if entry.job != 0 and not self.jobs.contains(entry.job) {
@@ -22800,7 +22817,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        }
     \\        Holding.Runner => return try await mut self.runner_invoked(isolation, mut space, handle, job: entry.job, operation, args, target, capacity, mut frames)
     \\        Holding.Kind(capability) => return kind_invoked(mut space, capability, operation, args, target, capacity, alloc)
-    \\        Holding.Bridge => return try await mut self.bridge_invoked(isolation.door, mut space, handle, operation, args, target, capacity, mut frames, alloc)
+    \\        Holding.Bridge => return try await mut self.bridge_invoked(mut space, handle, operation, args, target, capacity, mut frames, alloc)
     \\    }
     \\    return INVALID
     \\} Driven.invoked
@@ -22936,7 +22953,11 @@ const TEXT_NANOS_ISOLATED: Str =
     \\/// A table holding the capabilities of `services`, the space's test runs and its kernel's orders
     \\/// by their handles.
     \\fn Table.of(services: Services, alloc: mem::Alloc) -> Table {
-    \\    let table = Table(held: mem::OnceMap[u64, Entry].empty(0, alloc), count: core::atomic::AtomicU64.of(0))
+    \\    var slots = mem::List[Slot].empty(alloc)
+    \\    for handle in 0u64..<MOST_HELD {
+    \\        mut slots.push(Slot(handle: handle, entry: None))
+    \\    }
+    \\    let table = Table(slots: hw::SpinLock.of(take slots))
     \\    discard table.held_by(job: 0, holding: Holding.Log(services.log))
     \\    discard table.held_by(job: 0, holding: Holding.Stdio(services.stdio))
     \\    discard table.held_by(job: 0, holding: Holding.Random(services.random))
@@ -22947,23 +22968,119 @@ const TEXT_NANOS_ISOLATED: Str =
     \\} Table.of
     \\
     \\/// The handle of a capability the table holds from now on for the job or instance numbered `job`,
-    \\/// `MOST_HELD`, which names none, once it is full.
+    \\/// `MOST_HELD`, which names none, while it is full.
     \\fn Table.held_by(self, job: u64, holding: Holding) -> u64 {
     \\    return self.add(job, holding).value_or(MOST_HELD)
     \\} Table.held_by
     \\
     \\/// The handle of a capability the table holds from now on for the job or instance numbered `job`,
-    \\/// none once it holds `MOST_HELD`.
+    \\/// none while it holds `MOST_HELD` entries.
     \\fn Table.add(self, job: u64, holding: Holding) -> Option[u64] {
-    \\    let Some(handle) = self.count.fetch_add(1) else {
+    \\    return hw::without_irqs(fn(t: hw::IrqsDisabled) => self.slots.with(t, body: fn(mut slots: mem::List[Slot]) -> Option[u64] {
+    \\        for index in 0..<slots.len() {
+    \\            let slot = slots[index]
+    \\            if slot.entry.is_none() and slot.handle < HANDLE_BOUND {
+    \\                slots[index] = Slot(handle: slot.handle, entry: Some(Entry(job: job, holding: holding)))
+    \\                return Some(slot.handle)
+    \\            }
+    \\        }
     \\        return None
-    \\    }
-    \\    if handle >= MOST_HELD {
-    \\        return None
-    \\    }
-    \\    discard self.held.insert(handle, value: Entry(job: job, holding: holding))
-    \\    return Some(handle)
+    \\    }))
     \\} Table.add
+    \\
+    \\/// The entry `handle` names, none when it is stale.
+    \\fn Table.entry(self, handle: u64) -> Option[Entry] {
+    \\    return hw::without_irqs(fn(t: hw::IrqsDisabled) => self.slots.with(t, body: fn(mut slots: mem::List[Slot]) -> Option[Entry] {
+    \\        let Some(slot) = slots.get(usize.widen(handle % MOST_HELD)) else {
+    \\            return None
+    \\        }
+    \\        if slot.handle != handle {
+    \\            return None
+    \\        }
+    \\        return slot.entry
+    \\    }))
+    \\} Table.entry
+    \\
+    \\/// The handle of the entry holding for the job or instance numbered `job` the capability of a
+    \\/// crossing kind whose word is `word`, none when the table holds none.
+    \\fn Table.crossed(self, job: u64, word: u64) -> Option[u64] {
+    \\    return hw::without_irqs(fn(t: hw::IrqsDisabled) => self.slots.with(t, body: fn(mut slots: mem::List[Slot]) -> Option[u64] {
+    \\        for slot in slots {
+    \\            let Some(Entry(job: holder, holding: Holding.Kind(capability))) = slot.entry else {
+    \\                continue
+    \\            }
+    \\            if holder == job and handle_word(capability) == word {
+    \\                return Some(slot.handle)
+    \\            }
+    \\        }
+    \\        return None
+    \\    }))
+    \\} Table.crossed
+    \\
+    \\/// Takes back each entry added for the job or instance numbered `job`, every handle naming one
+    \\/// stale from now on.
+    \\fn Table.taken_back(self, job: u64) {
+    \\    hw::without_irqs(fn(t: hw::IrqsDisabled) {
+    \\        self.slots.with(t, body: fn(mut slots: mem::List[Slot]) {
+    \\            for index in 0..<slots.len() {
+    \\                let Some(slot) = slots.get(index) else {
+    \\                    return
+    \\                }
+    \\                match slot.entry {
+    \\                    Some(entry) => {
+    \\                        if entry.job == job {
+    \\                            slots[index] = slot.freed()
+    \\                        }
+    \\                    }
+    \\                    None => {}
+    \\                }
+    \\            }
+    \\        })
+    \\    })
+    \\} Table.taken_back
+    \\
+    \\/// Takes back the entry `handle` names, which is stale from now on.
+    \\fn Table.taken(self, handle: u64) {
+    \\    hw::without_irqs(fn(t: hw::IrqsDisabled) {
+    \\        self.slots.with(t, body: fn(mut slots: mem::List[Slot]) {
+    \\            let index = usize.widen(handle % MOST_HELD)
+    \\            let Some(slot) = slots.get(index) else {
+    \\                return
+    \\            }
+    \\            if slot.handle == handle and slot.entry.is_some() {
+    \\                slots[index] = slot.freed()
+    \\            }
+    \\        })
+    \\    })
+    \\} Table.taken
+    \\
+    \\/// The slot once its entry is taken back.
+    \\fn Slot.freed(self) -> Slot limits pure, notrap, terminates {
+    \\    return Slot(handle: self.handle.saturating_add(MOST_HELD), entry: None)
+    \\} Slot.freed
+    \\
+    \\test taken_back_entries_leave_their_handles_stale for Table.taken_back {
+    \\    let world = testing::world()
+    \\    let table = Table.of(Services(log: world.log, stdio: world.stdio, random: world.random, fs: world.fs), alloc: world.alloc)
+    \\    var earlier = mem::List[u64].empty(world.alloc)
+    \\    for _ in 0u64..<MOST_HELD {
+    \\        match table.add(job: 1, holding: Holding.Runner) {
+    \\            Some(handle) => mut earlier.push(handle)
+    \\            None => {}
+    \\        }
+    \\    }
+    \\    table.taken_back(1)
+    \\    let again = table.held_by(job: 2, holding: Holding.Runner)
+    \\    var unnamed = true
+    \\    for handle in earlier {
+    \\        unnamed = unnamed and table.entry(handle).is_none() and handle != again
+    \\    }
+    \\    let named = match table.entry(again) {
+    \\        Some(entry) => entry.job == 2
+    \\        None => false
+    \\    }
+    \\    expect earlier.len() == 250 and unnamed and named
+    \\} taken_back_entries_leave_their_handles_stale
     \\
     \\/// What a space receives of the capabilities `handles` hold, each added to the table for the job
     \\/// or instance numbered `job`, none when no space holds one's type or the table is full.
@@ -23017,7 +23134,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\fn Table.handed(self, handles: mem::List[u64], alloc: mem::Alloc) -> Option[mem::List[sys::Handle]] {
     \\    var given = mem::List[sys::Handle].empty(alloc)
     \\    for handle in handles {
-    \\        let Some(entry) = self.held.get(handle) else {
+    \\        let Some(entry) = self.entry(handle) else {
     \\            return None
     \\        }
     \\        match entry.holding {

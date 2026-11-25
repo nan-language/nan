@@ -170,9 +170,9 @@ struct PeerEnd {
 
 /// Opens a bridge for the channel `port` of `link`, which the space of the job or instance numbered
 /// `id` maps, to the instance answering the calls it carries: maps that channel into the instance's
-/// space, opening the end there, and gives both ends; none when that instance no longer runs, a
-/// table or its space has no room, or `caps` holds no capability of a crossing kind under the key
-/// whose calls the channel carries.
+/// space, opening the end there, and gives both ends; none, the tables taking back the ends' entries,
+/// when that instance no longer runs, a table or its space has no room, or `caps` holds no
+/// capability of a crossing kind under the key whose calls the channel carries.
 fn bridge_opened(isolation: Isolation, id: u64, link: Link, caps: Caps, port: Ported, alloc: mem::Alloc) -> Option[Spanning] fails task::Cancelled uses wait {
     let channel = link.channels[port.channel]
     let Some(Porting(through: through, to: Some(target))) = channel.port else {
@@ -187,6 +187,8 @@ fn bridge_opened(isolation: Isolation, id: u64, link: Link, caps: Caps, port: Po
     let near = isolation.door.contents().table.held_by(job: id, holding: Holding.Bridge)
     let far = target_door.contents().table.held_by(job: target.id, holding: Holding.Bridge)
     if near == MOST_HELD or far == MOST_HELD {
+        isolation.door.contents().table.taken(near)
+        target_door.contents().table.taken(far)
         return None
     }
     let task::Channel(sender: lend, receiver: lent) = task::Channel[Lending].bounded(1, alloc)
@@ -213,6 +215,8 @@ fn bridge_opened(isolation: Isolation, id: u64, link: Link, caps: Caps, port: Po
         discard attempt await back.send(Lent(space: take space, frames: mem::List[u64].empty(alloc), ported: mem::List[u64].empty(alloc), ends: take ends))
     }
     if not mapped_far {
+        isolation.door.contents().table.taken(near)
+        target_door.contents().table.taken(far)
         return None
     }
     let own = BridgeEnd(job: id, peer: target.door, peer_job: target.id, peer_handle: far, side: side, admission: None, inbound: port.inbound, outbound: port.outbound, unmaps: false, closing: mem::List[task::Sender[u8]].empty(alloc))
@@ -239,17 +243,9 @@ fn sides_of(through: Through, table: Table, id: u64, caps: Caps) -> Option[Sides
         if held.key.as_str() != calls.key.as_str() or not held.handle.crosses() {
             continue
         }
-        let word = handle_word(held.handle)
-        for handle in 0u64..<MOST_HELD {
-            let Some(entry) = table.held.get(handle) else {
-                continue
-            }
-            let Holding.Kind(capability) = entry.holding else {
-                continue
-            }
-            if entry.job == id and handle_word(capability) == word {
-                return Some(Sides(near: Side.Kind(Riding(handle: handle, operation: calls.operation, hash: calls.hash)), admission: Some(Admission(capability: held.handle, operation: calls.operation))))
-            }
+        match table.crossed(job: id, word: handle_word(held.handle)) {
+            Some(handle) => return Some(Sides(near: Side.Kind(Riding(handle: handle, operation: calls.operation, hash: calls.hash)), admission: Some(Admission(capability: held.handle, operation: calls.operation))))
+            None => {}
         }
     }
     return None
@@ -335,13 +331,13 @@ struct Leaving {
 } Leaving
 
 /// Serves an operation of the end of a bridge the space holds by `handle`: rings its other end;
-/// closes it, unmapping the frames it maps for itself; closes it as breached by its other end,
-/// whose job or instance ends; carries the handles of the space's table it names into the table of
-/// the other end's space, giving the token its runtime claims them by; admits a call it serves
-/// through the capability its kernel admits them through, `STALE` once that is stale; or claims
-/// what crossed into the space's table for it by a token, written at `target` when it fits
-/// `capacity`, giving its length either way.
-fn Driven.bridge_invoked(mut self, door: mem::Shared[Door], mut space: sys::load::Space, handle: u64, operation: u64, args: Untrusted[mem::Bytes], target: u64, capacity: u64, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+/// closes it, taking back its entry and unmapping the frames it maps for itself; closes it as
+/// breached by its other end, whose job or instance ends; carries the handles of the space's table
+/// it names into the table of the other end's space, giving the token its runtime claims them by;
+/// admits a call it serves through the capability its kernel admits them through, `STALE` once
+/// that is stale; or claims what crossed into the space's table for it by a token, written at
+/// `target` when it fits `capacity`, giving its length either way.
+fn Driven.bridge_invoked(mut self, mut space: sys::load::Space, handle: u64, operation: u64, args: Untrusted[mem::Bytes], target: u64, capacity: u64, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
     let Some(bridge) = self.bridges.get(handle) else {
         return STALE
     }
@@ -363,7 +359,7 @@ fn Driven.bridge_invoked(mut self, door: mem::Shared[Door], mut space: sys::load
         let Ok(handles) = attempt mem::wire::Codec[mem::List[u64]].decode(args.view(), alloc) else {
             return INVALID
         }
-        let Some(given) = door.contents().table.handed(handles, alloc) else {
+        let Some(given) = self.door.contents().table.handed(handles, alloc) else {
             return INVALID
         }
         let Some(peer_door) = peer.reached() else {
@@ -394,18 +390,18 @@ fn Driven.bridge_invoked(mut self, door: mem::Shared[Door], mut space: sys::load
         let Ok(accepting) = attempt mem::wire::Codec[Accepting].decode(args.view(), alloc) else {
             return INVALID
         }
-        return try await door.contents().accepted(handle, accepting, mut space, mut frames, alloc)
+        return try await self.door.contents().accepted(handle, accepting, mut space, mut frames, alloc)
     }
     let Ok(token) = attempt mem::wire::Codec[u64].decode(args.view(), alloc) else {
         return INVALID
     }
     if operation == BRIDGE_SIZE {
-        return try await door.contents().moved_len(handle, token, alloc)
+        return try await self.door.contents().moved_len(handle, token, alloc)
     }
     if operation != BRIDGE_CLAIM {
         return INVALID
     }
-    let Some(bytes) = try await door.contents().claimed(handle, token, capacity, alloc) else {
+    let Some(bytes) = try await self.door.contents().claimed(handle, token, capacity, alloc) else {
         return INVALID
     }
     let len = u64.widen(bytes.len())
@@ -469,10 +465,11 @@ fn Driven.ends_opened(mut self, id: u64, take ends: mem::List[Bridged]) {
 
 /// Opens the end of a bridge the space maps for an instance it runs: tells the runtime of the
 /// instance holding it, and has the frames the end maps for itself unmapped once that instance
-/// ends, or at once when it has.
+/// ends, or at once, the table taking back the end's entry, when it has.
 fn Driven.bridge_opened(mut self, mut space: sys::load::Space, take opening: Bridged) {
     let Bridged(handle: handle, end: opened_end) = opening
     let Some(found) = mut self.jobs.get_mut(opened_end.job) else {
+        self.door.contents().table.taken(handle)
         if opened_end.unmaps {
             mut space.unshare(opened_end.inbound)
             mut space.unshare(opened_end.outbound)
@@ -535,11 +532,13 @@ fn Driven.closing(mut self, id: u64, handle: u64, take done: Option[task::Sender
     mut self.notices.push(Notice(id: id, told: Telling.Bridge(Bridging.Closed(handle))))
 } Driven.closing
 
-/// Closes the end of a bridge the space holds by `handle`, unmapping the frames it maps for itself.
+/// Closes the end of a bridge the space holds by `handle`, taking back its entry of the table and
+/// unmapping the frames it maps for itself.
 fn Driven.end_closed(mut self, mut space: sys::load::Space, handle: u64) {
     let Some(bridge) = mut self.bridges.remove(handle) else {
         return
     }
+    self.door.contents().table.taken(handle)
     if not bridge.unmaps {
         return
     }

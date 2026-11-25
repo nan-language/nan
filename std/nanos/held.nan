@@ -792,12 +792,13 @@ fn decode_error(code: u8) -> core::DecodeError {
     }
 } decode_error
 
-/// What the space's runtime tells an instance of the ends of its bridges, the replies it makes to
-/// calls it postponed that reached it over them, and the sender of the calls reaching it.
+/// What the space's runtime serves the bridges of a job or instance from: the ends opened before it
+/// started, what it is told of the ends of its bridges, and the replies it makes to calls it
+/// postponed that reached it over them.
 struct Told {
+    initial: mem::List[Pumping]
     notices: task::Receiver[Bridging]
     postponed: task::Receiver[Late]
-    calls: task::Sender[Called]
 } Told
 
 /// What the instance task of a space owns: its world, and what it receives from the space's relays.
@@ -822,9 +823,9 @@ struct Relaying {
 /// whose handle is `runner`, while relaying the requests and calls the kernel sends over the
 /// channel `port` serves to the instance and its answers, and the frames `outgoing` carries, back,
 /// their handles those the runtime holds through `base` for the entries of the space's table, the
-/// replies to the waits of `waits` reaching them, and serving the ends of bridges its kernel tells
-/// of through `notices`; gives how the domain ended.
-fn served_instance(job: sys::load::Job, port: Port, base: Remote, runner: u64, domain: mem::Shared[sys::Abandoner], take world: World, take input: mem::Bytes, up: task::Sender[mem::Bytes], take outgoing: task::Receiver[mem::Bytes], waits: task::Cown[PortWaits], take notices: task::Receiver[Bridging]) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
+/// replies to the waits of `waits` reaching them, and serving the ends of `bridges` `told` opens and
+/// tells of; gives how the domain ended.
+fn served_instance(job: sys::load::Job, port: Port, base: Remote, runner: u64, domain: mem::Shared[sys::Abandoner], take world: World, take input: mem::Bytes, up: task::Sender[mem::Bytes], take outgoing: task::Receiver[mem::Bytes], waits: task::Cown[PortWaits], bridges: Bridges, take told: Told) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
     let alloc = world.alloc
     let exec = world.exec
     let Ok(checkpoint) = attempt mem::wire::Codec[Option[Checkpoint]].decode(Untrusted.of(input.view()), alloc) else {
@@ -833,8 +834,6 @@ fn served_instance(job: sys::load::Job, port: Port, base: Remote, runner: u64, d
     let task::Channel(sender: requests, receiver: asked) = task::Channel[Asked].bounded(1, alloc)
     let task::Channel(sender: calls, receiver: called) = task::Channel[Called].bounded(QUEUED_CALLS, alloc)
     let task::Channel(sender: answers, receiver: answered) = task::Channel[Routed].bounded(QUEUED_CALLS, alloc)
-    let task::Channel(sender: late, receiver: postponed) = task::Channel[Late].bounded(QUEUED_CALLS, alloc)
-    let bridges = Bridges(ports: task::Cown.of(mem::Map[u64, Pump].empty(alloc), alloc), routes: task::Cown.of(Routes(next: 0, waiting: mem::Map[u64, Route].empty(alloc)), alloc), late: take late, base: base, clock: world.clock, alloc: alloc)
     let forwarders = sys::Minter[Forwarder, Forwarding, u64].of(Forwarding(base: base, up: up.split(), waits: waits.share(), bridges: bridges.share(), alloc: alloc), alloc)
     defer take forwarders.close()
     let acting = match attempt sys::Runner.served(forwarders.mint(runner)) {
@@ -843,30 +842,31 @@ fn served_instance(job: sys::load::Job, port: Port, base: Remote, runner: u64, d
     }
     let launch = Launch(checkpoint: take checkpoint, runner: acting, requests: take asked, calls: take called, answers: take answers)
     var entered = Some(Entered(world: take world, launch: take launch))
-    var told = Some(Told(notices: take notices, postponed: take postponed, calls: calls.split()))
+    var telling = Some(take told)
     var relaying = Some(Relaying(requests: take requests, calls: take calls, answered: take answered, outgoing: take outgoing))
     var outcome: Result[Ended, sys::Trap] = Ok(Ended.Cancelled)
-    try await task::scope(exec, body: fn[mut entered, mut relaying, mut told, mut outcome](s: task::Scope) fails task::Cancelled uses wait {
+    try await task::scope(exec, body: fn[mut entered, mut relaying, mut telling, mut outcome](s: task::Scope) fails task::Cancelled uses wait {
         let Some(Entered(world: granted, launch: launched)) = mut entered.extract() else {
             return
         }
         let Some(Relaying(requests: down, calls: inbox, answered: answering, outgoing: sending)) = mut relaying.extract() else {
             return
         }
-        let Some(Told(notices: noticing, postponed: replying, calls: bridging)) = mut told.extract() else {
+        let Some(Told(initial: open, notices: noticing, postponed: replying)) = mut telling.extract() else {
             return
         }
         let replies = waits.share()
         let framing = up.split()
         let answering_across = bridges.share()
+        let bridging = inbox.split()
         discard s.spawn(fn[take down, take inbox, take replies]() fails task::Cancelled uses wait {
             try await relayed_in(port, requests: take down, calls: take inbox, base, waits: replies, exec, alloc)
         })
         discard s.spawn(fn[take answering, take framing, take answering_across]() fails task::Cancelled uses wait {
             try await relayed_out(answered: take answering, up: framing, base, runner, bridges: answering_across, alloc)
         })
-        discard s.spawn(fn[take noticing, take replying, take bridging]() fails task::Cancelled uses wait {
-            try await bridges_served(notices: take noticing, late: take replying, bridges, calls: bridging, exec)
+        discard s.spawn(fn[take open, take noticing, take replying, take bridging]() fails task::Cancelled uses wait {
+            try await bridges_served(initial: take open, notices: take noticing, late: take replying, bridges, calls: bridging, exec)
         })
         discard s.spawn(fn[take sending]() fails task::Cancelled uses wait {
             try await written_up(port, outgoing: take sending)

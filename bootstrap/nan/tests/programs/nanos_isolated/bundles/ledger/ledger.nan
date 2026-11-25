@@ -1,4 +1,4 @@
-//! A book served through the Ledger protocol, and a teller calling it through a port: the book adds amounts, weighs bytes, fills kibibytes, gives back a clock it receives, notes its total through a log it receives, publishing it, and gives that log back, logs through the log its runner holds as capability 7 and the one it lends through port 1, asks its runner for a resource, which a space's runner never holds, adds through the gauge its world holds, the gauge a call gives it and the one its runner holds as capability 8, settling its world's gauge from a keyed task, postpones a wait until settled, then answers it with its total, counts the ticks of a keyed task it starts whenever resumed, sending itself a tick then, traps dividing by zero and spins without end when asked; the teller relays an amount to it, timing the call, has it note through the teller's log and weighs bytes there; a hoard grows its state by kibibytes.
+//! A book served through the Ledger protocol, and a teller calling it through a port: the book adds amounts, weighs bytes, fills kibibytes, gives back a clock it receives, notes its total through a log it receives, publishing it, and gives that log back, logs through the log its runner holds as capability 7 and the one it lends through port 1, asks its runner for a resource, which a space's runner never holds, adds through the gauge its world holds, the gauge a call gives it and the one its runner holds as capability 8, settling its world's gauge from a keyed task, postpones a wait until settled, then answers it with its total, counts the ticks of a keyed task it starts whenever resumed, sending itself a tick then, traps dividing by zero and spins without end when asked; the teller relays an amount to it, timing the call, has it note through the teller's log, weighs bytes there and dials it amounts to add through the line its world holds; a hoard grows its state by kibibytes.
 
 pub protocol Ledger {
     pub fn add(amount: u32) -> u64 limits pure
@@ -164,25 +164,32 @@ pub fn Book.resume(mut self, reason: sys::ResumeReason, mut env: Env, mut cx: sy
 } Book.resume
 
 /// What a teller serves: relaying an amount to the book its runner reaches through port 2, having
-/// that book note through the teller's log, and weighing there 3 bytes past a number of kibibytes,
-/// each from a keyed task that tells the teller once done.
+/// that book note through the teller's log, weighing there 3 bytes past a number of kibibytes, and
+/// dialling it an amount to add through the line its world holds, each from a keyed task that
+/// tells the teller once done.
 pub protocol Till {
     pub fn relay(amount: u32) limits recorded
     pub fn note() limits recorded
     pub fn weigh(kibibytes: u32) limits recorded
+    pub fn dial(amount: u32) limits recorded
     fn done() limits pure
 } Till
 
 pub closed struct TellerEnv {
     pub log: sys::Log
     pub clock: sys::Clock
+    pub line: Option[gauges::Line]
     pub alloc: mem::Alloc
 } TellerEnv
 
 impl TellerEnv: nanos::Environment
 
 pub fn TellerEnv.build(take world: nanos::World) -> TellerEnv {
-    return TellerEnv(log: world.log, clock: world.clock, alloc: world.alloc)
+    let line = match attempt nanos::Cap[gauges::Line].get(world.caps, key: "line") {
+        Ok(held) => Some(held)
+        Err(_) => None
+    }
+    return TellerEnv(log: world.log, clock: world.clock, line: line, alloc: world.alloc)
 } TellerEnv.build
 
 pub closed struct Teller derives Encode {
@@ -246,6 +253,28 @@ pub fn Teller.weigh(mut self, take kibibytes: u32, mut env: TellerEnv, mut cx: s
         discard attempt await out.done()
     })
 } Teller.weigh
+
+pub fn Teller.dial(mut self, take amount: u32, mut env: TellerEnv, mut cx: sys::Cx[Till]) {
+    let log = env.log
+    let line = env.line
+    let alloc = env.alloc
+    mut cx.spawn(key: 4, run: fn(out: sys::Outbox[Till]) fails task::Cancelled uses wait {
+        var call = sys::Encoded.empty(alloc)
+        discard sys::Wire[Ledger].add(mut call, amount)
+        let dialled = match line {
+            Some(held) => attempt await held.dial(call.bytes.view(), alloc)
+            None => Err(sys::CrossError.Refused)
+        }
+        match dialled {
+            Ok(reply) => match attempt mem::wire::Codec[Result[u64, Never]].decode(Untrusted.of(reply.view()), alloc) {
+                Ok(Ok(total)) => log.info("dialled", value: total)
+                else => log.info("dialled", value: false)
+            }
+            Err(failure) => log.info("dialled", value: failure)
+        }
+        discard attempt await out.done()
+    })
+} Teller.dial
 
 /// The nanoseconds of a clock, 0 once it is revoked.
 fn elapsed(clock: sys::Clock) -> u64 {

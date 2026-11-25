@@ -1,4 +1,4 @@
-//! Gauges whose operations cross as bytes: each adds the amounts it is given to the total the gauges of its minter share, and settles that total once its minter's clock has run on.
+//! Gauges and lines whose operations cross as bytes: each gauge adds the amounts it is given to the total the gauges of its minter share, and settles that total once its minter's clock has run on; each line dials the calls it is given, which its kernel admits while the credit the lines of its minter share lasts and a kernel's own call of reaches no instance.
 
 pub open struct Gauge {
 } Gauge
@@ -87,3 +87,80 @@ fn total_of(bytes: mem::Bytes, alloc: mem::Alloc) -> u64 fails sys::CrossError {
         Err(_) => fail sys::CrossError.Refused
     }
 } total_of
+
+pub open struct Line {
+} Line
+
+/// What the lines of a minter share: the calls they may still make, those their kernel admitted and
+/// those it made itself.
+pub open struct Lined derives Send {
+    credit: core::atomic::AtomicU64
+    admitted: core::atomic::AtomicU64
+    relayed: core::atomic::AtomicU64
+} Lined
+
+impl Line: sys::Kind[Lined, u64]
+
+impl Line: sys::Crossing
+
+/// The operation of a line: dialling a call.
+pub const DIAL: u64 = 0
+
+pub fn open_lines(credit: u64, alloc: mem::Alloc) -> sys::Minter[Line, Lined, u64] {
+    return sys::Minter.of(Lined(credit: core::atomic::AtomicU64.of(credit), admitted: core::atomic::AtomicU64.of(0), relayed: core::atomic::AtomicU64.of(0)), alloc)
+} open_lines
+
+pub fn mint_line(minter: sys::Minter[Line, Lined, u64]) -> Line {
+    return minter.mint(0)
+} mint_line
+
+pub fn revoke_line(minter: sys::Minter[Line, Lined, u64], line: Line) {
+    minter.revoke(line)
+} revoke_line
+
+pub fn close_lines(take minter: sys::Minter[Line, Lined, u64]) {
+    take minter.close()
+} close_lines
+
+pub fn Line.dial(self, call: Slice[u8], alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError uses wait {
+    return try await sys::Handle.of(self).call(DIAL, args: call, alloc)
+} Line.dial
+
+/// The calls the kernel of a line admitted, 0 once it is revoked.
+pub fn Line.admitted(self) -> u64 {
+    return sys::reach(self, body: fn(state: Lined, record: u64) => state.admitted.load()).value_or(0)
+} Line.admitted
+
+/// The calls the kernel of a line made itself, 0 once it is revoked.
+pub fn Line.relayed(self) -> u64 {
+    return sys::reach(self, body: fn(state: Lined, record: u64) => state.relayed.load()).value_or(0)
+} Line.relayed
+
+/// Admits a dialled call while the credit lasts.
+pub fn Line.invoke(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError limits stack 4_096 {
+    if operation != DIAL {
+        fail sys::CrossError.Refused
+    }
+    let spent = sys::reach(self, body: fn(state: Lined, record: u64) -> bool {
+        if state.credit.fetch_sub(1).is_none() {
+            return false
+        }
+        discard state.admitted.fetch_add(1)
+        return true
+    })
+    let Some(admitted) = spent else {
+        fail sys::CrossError.Revoked(sys::Revoked.Stale)
+    }
+    if not admitted {
+        fail sys::CrossError.Refused
+    }
+    return mem::Bytes.empty(alloc)
+} Line.invoke
+
+/// Counts a call its kernel makes itself, which reaches no instance.
+pub fn Line.call(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError limits stack 4_096 {
+    let Some(_) = sys::reach(self, body: fn(state: Lined, record: u64) => state.relayed.fetch_add(1)) else {
+        fail sys::CrossError.Revoked(sys::Revoked.Stale)
+    }
+    fail sys::CrossError.Refused
+} Line.call

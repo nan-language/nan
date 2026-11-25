@@ -1,4 +1,4 @@
-//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port, their random source from a counter and their file system from a disk writing each call it serves through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, with the reports of their traps, a job reading kernel memory, in a domain of its own and outside it, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, instances of a component whose calls, a postponed one included, keyed tasks, held ones included, messages sent to themselves and checkpoints run in their spaces, with logs and gauges crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, an instance sharing its space with a job that traps, divides and adds through a gauge its world holds, logging through a log of its own and denied a random source, with another instance that is abandoned and with one whose space breaches its link, a book and tellers in two spaces calling it over a bridge, a log crossing there and back, payloads streamed and moved through frames of their own, a breach ending the book, and calls, replies, states and a job's result past what a link carries leaving their spaces, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
+//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port, their random source from a counter and their file system from a disk writing each call it serves through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, with the reports of their traps, a job reading kernel memory, in a domain of its own and outside it, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, instances of a component whose calls, a postponed one included, keyed tasks, held ones included, messages sent to themselves and checkpoints run in their spaces, with logs and gauges crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, an instance sharing its space with a job that traps, divides and adds through a gauge its world holds, logging through a log of its own and denied a random source, with another instance that is abandoned and with one whose space breaches its link, a book and tellers in two spaces calling it over a bridge, a log crossing there and back, payloads streamed and moved through frames of their own, a teller and a job calling it over bridges through lines their worlds hold, whose kernel admits each call until their credit runs out or a line is revoked, a breach ending the book, and calls, replies, states and a job's result past what a link carries leaving their spaces, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -41,6 +41,7 @@ pub closed enum Ask derives Encode {
     Probe
     Fill(u32)
     Gauge(u32)
+    Dial(mem::Bytes)
 } Ask
 
 pub closed enum Answer derives Encode {
@@ -68,6 +69,7 @@ pub protocol Till {
     pub fn relay(amount: u32) limits recorded
     pub fn note() limits recorded
     pub fn weigh(kibibytes: u32) limits recorded
+    pub fn dial(amount: u32) limits recorded
 } Till
 
 pub closed struct Book derives Encode {
@@ -718,7 +720,7 @@ fn serve(cpu: hw::Ring0, loader: sys::load::Loader, grants: Grants, mut frames: 
     let ledger = isolated(loader, bytes: fw_file(name: "opt/nan/ledger", alloc: grants.alloc).view(), alloc: grants.alloc)
     try await booked(cpu, job: ledger, grants, mut frames)
     try await shared(cpu, book: ledger, job: typed, grants, mut frames)
-    try await bridged(cpu, ledger, grants, mut frames)
+    try await bridged(cpu, ledger, typed, grants, mut frames)
     probed(cpu, job: typed, grants, mut frames)
     try await spun(cpu, loader, job: typed, bytes: typed_bytes.view(), grants, mut frames)
 } serve
@@ -1005,23 +1007,35 @@ fn written_as_space(frame: u64, data: Slice[u8]) {
 /// Holds a book in one space and two tellers, one after the other, in another, the port 2 of each
 /// bridged to the book over a channel the kernel maps into both spaces and the tellers acting
 /// through a denied runner: the first relays an amount to the book, has it note through the
-/// teller's log, which crosses there and back, and weighs payloads past the channel's ring and past
-/// a mebibyte there; then
+/// teller's log, which crosses there and back, weighs payloads past the channel's ring and past
+/// a mebibyte there, and dials it amounts to add through the line its world holds, bridged to the
+/// book too, until the line's credit of two calls runs out and once the kernel revokes it; a job of
+/// the typed bundle then dials it through a line of its own over a bridge of its link; then
 /// the kernel writes what no book writes into the channel of the second, which ends the book as
 /// breaching it, and the second teller's call through its port reaches its runner instead, while
 /// one past what its link's first channel carries fails at once.
-fn bridged(cpu: hw::Ring0, ledger: sys::load::Isolated, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
+fn bridged(cpu: hw::Ring0, ledger: sys::load::Isolated, typed: sys::load::Isolated, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
     let alloc = grants.alloc
     let gauging = gauges::open(grants.clock, alloc)
     defer gauges::close(take gauging)
     var caps = nanos::Caps.empty(alloc)
     mut nanos::Cap[gauges::Gauge].put(mut caps, key: "gauge", capability: gauges::mint(gauging))
     let none = nanos::Caps.empty(alloc)
+    let lines = gauges::open_lines(credit: 2, alloc)
+    defer gauges::close_lines(take lines)
+    let line = gauges::mint_line(lines)
+    var teller_caps = nanos::Caps.empty(alloc)
+    mut nanos::Cap[gauges::Line].put(mut teller_caps, key: "line", capability: line)
+    let job_lines = gauges::open_lines(credit: 1, alloc)
+    defer gauges::close_lines(take job_lines)
+    var job_caps = nanos::Caps.empty(alloc)
+    mut nanos::Cap[gauges::Line].put(mut job_caps, key: "line", capability: gauges::mint_line(job_lines))
     var book_link = nanos::Link.of(next_frame(mut frames), alloc)
     discard mut book_link.open("book", inbound: next_frame(mut frames), outbound: next_frame(mut frames))
     var teller_link = nanos::Link.of(next_frame(mut frames), alloc)
     discard mut teller_link.open("teller", inbound: next_frame(mut frames), outbound: next_frame(mut frames))
-    var porting = Some(PortFrames(inbound: next_frame(mut frames), outbound: next_frame(mut frames)))
+    var job_link = nanos::Link.of(next_frame(mut frames), alloc)
+    var porting = Some(Openings(port: port_frames(mut frames), line: port_frames(mut frames), job: port_frames(mut frames)))
     var book_pool = frames_for_space(mut frames, alloc)
     var book_state = Some(hw::ExtendedState.of(next_frame(mut frames)))
     var teller_pool = frames_for_space(mut frames, alloc)
@@ -1029,7 +1043,7 @@ fn bridged(cpu: hw::Ring0, ledger: sys::load::Isolated, grants: Grants, mut fram
     let task::Channel(sender: inboxes, receiver: inboxed) = task::Channel[nanos::Inbox].bounded(1, alloc)
     let task::Channel(sender: ending, receiver: ended) = task::Channel[u8].bounded(1, alloc)
     var waiting = Some(Waits(inbox: take inboxed, end: take ended))
-    discard attempt await task::scope(grants.exec, body: fn[mut book_pool, mut book_state, mut teller_pool, mut teller_state, mut teller_link, mut porting, mut waiting](s: task::Scope) fails task::Cancelled uses wait {
+    discard attempt await task::scope(grants.exec, body: fn[mut book_pool, mut book_state, mut teller_pool, mut teller_state, mut teller_link, mut job_link, mut porting, mut waiting](s: task::Scope) fails task::Cancelled uses wait {
         let book = s.spawn(fn[mut book_pool, mut book_state]() fails task::Cancelled uses wait limits stack 196_608 {
             discard attempt await nanos::isolate(cpu, tenant: 6, clock: grants.clock, services: services(grants), frames: mut book_pool, extended: mut book_state, exec: grants.exec, alloc, body: fn(space: nanos::Isolation) fails task::Cancelled uses wait {
                 discard attempt await nanos::hold_isolated(space, job: ledger, component: "Book", link: book_link, services: services(grants), caps, checkpoint: None, runner: sys::Runner.denied(), alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
@@ -1045,14 +1059,17 @@ fn bridged(cpu: hw::Ring0, ledger: sys::load::Isolated, grants: Grants, mut fram
         let Some(inbox) = try await mut receiver.receive() else {
             return
         }
-        let Some(PortFrames(inbound: inbound, outbound: outbound)) = mut porting.extract() else {
+        let Some(openings) = mut porting.extract() else {
             return
         }
-        let port = mut teller_link.open_port(2, to: inbox, take inbound, take outbound)
+        let port = opened_to(mut teller_link, mut job_link, inbox, take openings)
         discard attempt await nanos::isolate(cpu, tenant: 7, clock: grants.clock, services: services(grants), frames: mut teller_pool, extended: mut teller_state, exec: grants.exec, alloc, body: fn[mut book_ended](space: nanos::Isolation) fails task::Cancelled uses wait {
-            discard attempt await nanos::hold_isolated(space, job: ledger, component: "Teller", link: teller_link, services: services(grants), caps: none, checkpoint: None, runner: sys::Runner.denied(), alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
-                try await tellered(take instance, grants)
+            discard attempt await nanos::hold_isolated(space, job: ledger, component: "Teller", link: teller_link, services: services(grants), caps: teller_caps, checkpoint: None, runner: sys::Runner.denied(), alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+                try await tellered(take instance, grants, lines, line)
             })
+            say_line(text: "line admitted ", line: gauges::mint_line(lines))
+            try await job_dialled(space, typed, link: job_link, caps: job_caps, grants)
+            say_line(text: "job line admitted ", line: gauges::mint_line(job_lines))
             discard attempt await nanos::hold_isolated(space, job: ledger, component: "Teller", link: teller_link, services: services(grants), caps: none, checkpoint: None, runner: sys::Runner.denied(), alloc, body: fn[mut book_ended](take instance: nanos::Instance) fails nanos::InstanceError uses wait {
                 try await breaching(take instance, link: teller_link, port, ended: mut book_ended, grants)
             })
@@ -1068,21 +1085,84 @@ fn bridged(cpu: hw::Ring0, ledger: sys::load::Isolated, grants: Grants, mut fram
     returned(take book_state, mut frames)
     returned(take teller_state, mut frames)
     match porting {
-        Some(PortFrames(inbound: inbound, outbound: outbound)) => {
-            mut frames.push(take inbound)
-            mut frames.push(take outbound)
+        Some(Openings(port: port, line: line_frames, job: job_frames)) => {
+            unopened(take port, mut frames)
+            unopened(take line_frames, mut frames)
+            unopened(take job_frames, mut frames)
         }
         None => {}
     }
     take book_link.release(mut frames)
     take teller_link.release(mut frames)
+    take job_link.release(mut frames)
 } bridged
 
-/// The frames of the channel of a teller's port.
+/// Writes the calls the kernel of a line admitted and those it made itself.
+fn say_line(text: Str, line: gauges::Line) {
+    say(text)
+    say_number(line.admitted())
+    say(text: " relayed ")
+    say_number(line.relayed())
+    say(text: "\n")
+} say_line
+
+/// Runs the typed job in `space` dialling the book to add 5 through the line `caps` holds, bridged
+/// to the book by `link`, and writes the total the book's reply gives.
+fn job_dialled(space: nanos::Isolation, typed: sys::load::Isolated, link: nanos::Link, caps: nanos::Caps, grants: Grants) fails task::Cancelled uses wait {
+    var call = sys::Encoded.empty(grants.alloc)
+    discard sys::Wire[Ledger].add(mut call, amount: 5)
+    let outcome = attempt await nanos::run_isolated(space, job: typed, link, services: services(grants), caps, input: encoded(Ask.Dial(take call.bytes), alloc: grants.alloc), alloc: grants.alloc)
+    let answer = result_of(take outcome, alloc: grants.alloc)
+    say(text: "job dialled ")
+    let Ok(Answer.Bytes(reply)) = attempt mem::wire::Codec[Answer].decode(Untrusted.of(answer.view()), alloc: grants.alloc) else {
+        say(text: "nothing\n")
+        return
+    }
+    match attempt mem::wire::Codec[Result[u64, Never]].decode(Untrusted.of(reply.view()), alloc: grants.alloc) {
+        Ok(Ok(total)) => {
+            say_number(total)
+            say(text: "\n")
+        }
+        else => say(text: "nothing\n")
+    }
+} job_dialled
+
+/// The frames of a bridged channel.
 linear struct PortFrames {
     inbound: hw::PhysFrame[4_096]
     outbound: hw::PhysFrame[4_096]
 } PortFrames
+
+/// The frames of a bridged channel, from `frames`.
+fn port_frames(mut frames: mem::List[hw::PhysFrame[4_096]]) -> PortFrames {
+    return PortFrames(inbound: next_frame(mut frames), outbound: next_frame(mut frames))
+} port_frames
+
+/// The frames of the channels bridged to the book: the tellers' port 2, the first teller's line
+/// and the job's line.
+linear struct Openings {
+    port: PortFrames
+    line: PortFrames
+    job: PortFrames
+} Openings
+
+/// Opens on `teller_link` the channel of port 2 and that of the line the world holds under `line`,
+/// and on `job_link` that of its line, each to the book whose inbox is `inbox`, and gives the
+/// index of the port's.
+fn opened_to(mut teller_link: nanos::Link, mut job_link: nanos::Link, inbox: nanos::Inbox, take openings: Openings) -> usize {
+    let Openings(port: PortFrames(inbound: inbound, outbound: outbound), line: PortFrames(inbound: line_in, outbound: line_out), job: PortFrames(inbound: job_in, outbound: job_out)) = openings
+    let port = mut teller_link.open_port(2, to: inbox, take inbound, take outbound)
+    discard mut teller_link.open_crossing("line", operation: gauges::DIAL, hash: sys::Wire[Ledger].hash(), to: inbox, inbound: take line_in, outbound: take line_out)
+    discard mut job_link.open_crossing("line", operation: gauges::DIAL, hash: sys::Wire[Ledger].hash(), to: inbox, inbound: take job_in, outbound: take job_out)
+    return port
+} opened_to
+
+/// Gives back to `frames` the frames of a bridged channel no link took.
+fn unopened(take port: PortFrames, mut frames: mem::List[hw::PhysFrame[4_096]]) {
+    let PortFrames(inbound: inbound, outbound: outbound) = port
+    mut frames.push(take inbound)
+    mut frames.push(take outbound)
+} unopened
 
 /// What the tellers wait for: the book's inbox, and its end.
 struct Waits {
@@ -1108,10 +1188,11 @@ fn bridged_book(take instance: nanos::Instance, inboxes: task::Sender[nanos::Inb
     discard ending.offer(0)
 } bridged_book
 
-/// Has the first teller relay 5 to the book, have it note through the teller's log and weigh 3 bytes
+/// Has the first teller relay 5 to the book, have it note through the teller's log, weigh 3 bytes
 /// past 96 KiB there, which stream through the channel, and past 2 MiB, which move through frames of
-/// their own, then writes how the teller ended.
-fn tellered(take instance: nanos::Instance, grants: Grants) fails nanos::InstanceError uses wait {
+/// their own, and dial it 2, 3 and 4 through `line`, whose credit admits two calls, then 1 once
+/// `lines` revoked it, then writes how the teller ended.
+fn tellered(take instance: nanos::Instance, grants: Grants, lines: sys::Minter[gauges::Line, gauges::Lined, u64], line: gauges::Line) fails nanos::InstanceError uses wait {
     var teller = instance
     defer take teller.abandon()
     var relay = sys::Encoded.empty(grants.alloc)
@@ -1126,6 +1207,11 @@ fn tellered(take instance: nanos::Instance, grants: Grants) fails nanos::Instanc
     var moved = sys::Encoded.empty(grants.alloc)
     sys::Wire[Till].weigh(mut moved, kibibytes: 2_048)
     try await till_done(mut teller, request: take moved, grants)
+    for amount in 2u32..<5 {
+        try await dialled(mut teller, amount, grants)
+    }
+    gauges::revoke_line(lines, line)
+    try await dialled(mut teller, amount: 1, grants)
     undefer teller
     say(text: "teller ")
     say_teller(try await take teller.end(), alloc: grants.alloc)
@@ -1150,6 +1236,13 @@ fn breaching(take instance: nanos::Instance, link: nanos::Link, port: usize, mut
     say(text: "second teller ")
     say_teller(try await take teller.end(), alloc: grants.alloc)
 } breaching
+
+/// Has a teller dial `amount` to the book through its line.
+fn dialled(mut teller: nanos::Instance, amount: u32, grants: Grants) fails nanos::InstanceError uses wait {
+    var dial = sys::Encoded.empty(grants.alloc)
+    sys::Wire[Till].dial(mut dial, amount)
+    try await till_done(mut teller, request: take dial, grants)
+} dialled
 
 /// Has a teller handle a call, start the keyed task it spawns and handle the message that task
 /// sends once done.

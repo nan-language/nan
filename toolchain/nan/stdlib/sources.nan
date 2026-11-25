@@ -18467,7 +18467,7 @@ const TEXT_MEM_WIRE_WIRE: Str =
     \\
 
 const TEXT_NANOS_BRIDGE: Str =
-    \\//! Bridges between instances in isolated spaces: the kernel's side, which maps the channel an instance calls a port through into the space of the instance answering that port, opens, rings and closes the ends of each and carries what crosses with a call or reply between the spaces' tables and frames, and the runtime's side of each end, which writes the records of the calls its instance makes through the port, or of the replies to the calls it serves, into the frame the end writes, reads the other end's from the frame it reads, and rings the other end only while that end waits.
+    \\//! Bridges between the jobs and instances of isolated spaces and the instances answering their calls: the kernel's side, which maps the channel a job or instance calls a port or a capability of a crossing kind through into the space of the instance answering those calls, opens, rings and closes the ends of each, carries what crosses with a call or reply between the spaces' tables and frames and admits each call through such a capability, and the runtime's side of each end, which writes the records of the calls its job or instance makes, or of the replies to the calls it serves, into the frame the end writes, reads the other end's from the frame it reads, and rings the other end only while that end waits.
     \\
     \\/// The operations of the end of a bridge a space holds: telling its other end that it wrote or
     \\/// read, telling its kernel it no longer reads or writes its frames, doing so because its other
@@ -18492,39 +18492,67 @@ const TEXT_NANOS_BRIDGE: Str =
     \\
     \\const BRIDGE_ACCEPT: u64 = 7
     \\
-    \\/// What a space's runtime is told of the end of a bridge its instance holds: that it is open, that
-    \\/// its other end wrote or read, and that it is closed, by its handle.
+    \\/// The operation of the end of a bridge serving the calls of a capability of a crossing kind:
+    \\/// having its kernel admit a call through that capability.
+    \\const BRIDGE_ADMIT: u64 = 8
+    \\
+    \\/// What a space's runtime is told of the end of a bridge its job or instance holds: that an end
+    \\/// serving calls opened, that its other end wrote or read, and that it is closed, by its handle.
     \\enum Bridging derives Copy, Encode {
     \\    Opened(EndAt)
     \\    Rang(u64)
     \\    Closed(u64)
     \\} Bridging
     \\
-    \\/// An end of a bridge: its handle, the port its instance calls through it, none for the end
-    \\/// serving those calls, and the addresses at which its space maps the frame it reads and the frame
-    \\/// it writes.
+    \\/// An end of a bridge: its handle, what it does, and the addresses at which its space maps the
+    \\/// frame it reads and the frame it writes.
     \\struct EndAt derives Copy, Encode {
     \\    handle: u64
-    \\    port: Option[u64]
+    \\    side: Side
     \\    inbound: u64
     \\    outbound: u64
     \\} EndAt
     \\
-    \\/// The ends of bridges to open for the instance numbered `id`.
+    \\/// What an end of a bridge does: carries the calls its job or instance makes through a port of its
+    \\/// runner capability or through a capability of a crossing kind, or serves calls, each admitted by
+    \\/// its kernel first when true.
+    \\enum Side derives Copy, Encode {
+    \\    Port(u64)
+    \\    Kind(Riding)
+    \\    Serving(bool)
+    \\} Side
+    \\
+    \\/// The calls of a capability of a crossing kind an end of a bridge carries: those of the operation
+    \\/// `operation` of the capability of the entry `handle` of the space's table, as calls of the
+    \\/// protocol of `hash`.
+    \\struct Riding derives Copy, Encode {
+    \\    handle: u64
+    \\    operation: u64
+    \\    hash: sys::ProtocolHash
+    \\} Riding
+    \\
+    \\/// The capability of a crossing kind through which the kernel admits each call an end of a bridge
+    \\/// serves, by `invoke` of `operation` on the call's bytes.
+    \\struct Admission derives Copy {
+    \\    capability: sys::Handle
+    \\    operation: u64
+    \\} Admission
+    \\
+    \\/// The ends of bridges to open for the job or instance numbered `id`.
     \\struct Opening {
     \\    id: u64
     \\    ends: mem::List[Bridged]
     \\} Opening
     \\
     \\/// The end of a bridge, by the handle of its entry in the table of the space mapping it, that the
-    \\/// instance numbered `id` holds.
+    \\/// job or instance numbered `id` holds.
     \\struct Ringing {
     \\    id: u64
     \\    handle: u64
     \\} Ringing
     \\
-    \\/// An ask to close the end of a bridge, by its handle, that the instance numbered `id` holds, and
-    \\/// the sender the asking task waits on until that end is closed.
+    \\/// An ask to close the end of a bridge, by its handle, that the job or instance numbered `id` holds,
+    \\/// and the sender the asking task waits on until that end is closed.
     \\struct Closing {
     \\    id: u64
     \\    handle: u64
@@ -18537,16 +18565,17 @@ const TEXT_NANOS_BRIDGE: Str =
     \\    end: BridgeEnd
     \\} Bridged
     \\
-    \\/// The end of a bridge: the instance holding it, the door of the isolation holding its other end,
-    \\/// that end's instance and handle, the port its instance calls through it, none for the end
-    \\/// serving those calls, the addresses at which its space maps the frame it reads and the frame it
-    \\/// writes, whether it unmaps them once closed, and the senders of the tasks waiting for it to close.
+    \\/// The end of a bridge: the job or instance holding it, the door of the isolation holding its other
+    \\/// end, that end's job or instance and handle, what it does, the capability admitting the calls it
+    \\/// serves, the addresses at which its space maps the frame it reads and the frame it writes, whether
+    \\/// it unmaps them once closed, and the senders of the tasks waiting for it to close.
     \\struct BridgeEnd {
     \\    job: u64
     \\    peer: Doorway
     \\    peer_job: u64
     \\    peer_handle: u64
-    \\    port: Option[u64]
+    \\    side: Side
+    \\    admission: Option[Admission]
     \\    inbound: u64
     \\    outbound: u64
     \\    unmaps: bool
@@ -18568,14 +18597,16 @@ const TEXT_NANOS_BRIDGE: Str =
     \\    outbound: u64
     \\} Ported
     \\
-    \\/// Maps into a space each channel of a link carrying the calls of a port to an instance of an
-    \\/// isolated space, each frame cleared, giving where it maps them; a channel the space has no room
-    \\/// for is left out.
-    \\fn ports_mapped(mut space: sys::load::Space, link: Link, alloc: mem::Alloc) -> mem::List[Ported] {
+    \\/// Maps into a space each channel of a link bridged for a job or, when `instance`, an instance, each
+    \\/// frame cleared, giving where it maps them; a channel the space has no room for is left out.
+    \\fn ports_mapped(mut space: sys::load::Space, link: Link, instance: bool, alloc: mem::Alloc) -> mem::List[Ported] {
     \\    var ports = mem::List[Ported].empty(alloc)
     \\    for index in 0..<link.channels.len() {
     \\        let channel = link.channels[index]
-    \\        let Some(Porting(port: _, to: Some(_))) = channel.port else {
+    \\        let Some(porting) = channel.port else {
+    \\            continue
+    \\        }
+    \\        if not porting.bridged(instance) {
     \\            continue
     \\        }
     \\        wiped(channel.inbound)
@@ -18606,13 +18637,17 @@ const TEXT_NANOS_BRIDGE: Str =
     \\    handle: u64
     \\} PeerEnd
     \\
-    \\/// Opens a bridge for the channel `port` of `link`, which the space of the instance numbered `id`
-    \\/// maps, to the instance answering the calls of its port: maps that channel into the instance's
-    \\/// space, opening the end there, and gives both ends; none when that instance no longer runs or a
-    \\/// table or its space has no room.
-    \\fn bridge_opened(isolation: Isolation, id: u64, link: Link, port: Ported, alloc: mem::Alloc) -> Option[Spanning] fails task::Cancelled uses wait {
+    \\/// Opens a bridge for the channel `port` of `link`, which the space of the job or instance numbered
+    \\/// `id` maps, to the instance answering the calls it carries: maps that channel into the instance's
+    \\/// space, opening the end there, and gives both ends; none when that instance no longer runs, a
+    \\/// table or its space has no room, or `caps` holds no capability of a crossing kind under the key
+    \\/// whose calls the channel carries.
+    \\fn bridge_opened(isolation: Isolation, id: u64, link: Link, caps: Caps, port: Ported, alloc: mem::Alloc) -> Option[Spanning] fails task::Cancelled uses wait {
     \\    let channel = link.channels[port.channel]
-    \\    let Some(Porting(port: number, to: Some(target))) = channel.port else {
+    \\    let Some(Porting(through: through, to: Some(target))) = channel.port else {
+    \\        return None
+    \\    }
+    \\    let Some(Sides(near: side, admission: admission)) = sides_of(through, table: isolation.door.contents().table, id, caps) else {
     \\        return None
     \\    }
     \\    let Some(target_door) = target.door.reached() else {
@@ -18637,7 +18672,7 @@ const TEXT_NANOS_BRIDGE: Str =
     \\        match attempt mut space.share(channel.outbound) {
     \\            Ok(inbound) => match attempt mut space.share(channel.inbound) {
     \\                Ok(outbound) => {
-    \\                    mut ends.push(Bridged(handle: far, end: BridgeEnd(job: target.id, peer: isolation.way, peer_job: id, peer_handle: near, port: None, inbound: inbound, outbound: outbound, unmaps: true, closing: mem::List[task::Sender[u8]].empty(alloc))))
+    \\                    mut ends.push(Bridged(handle: far, end: BridgeEnd(job: target.id, peer: isolation.way, peer_job: id, peer_handle: near, side: Side.Serving(admission.is_some()), admission: admission, inbound: inbound, outbound: outbound, unmaps: true, closing: mem::List[task::Sender[u8]].empty(alloc))))
     \\                    mapped_far = true
     \\                }
     \\                Err(_) => mut space.unshare(inbound)
@@ -18649,9 +18684,45 @@ const TEXT_NANOS_BRIDGE: Str =
     \\    if not mapped_far {
     \\        return None
     \\    }
-    \\    let own = BridgeEnd(job: id, peer: target.door, peer_job: target.id, peer_handle: far, port: Some(number), inbound: port.inbound, outbound: port.outbound, unmaps: false, closing: mem::List[task::Sender[u8]].empty(alloc))
+    \\    let own = BridgeEnd(job: id, peer: target.door, peer_job: target.id, peer_handle: far, side: side, admission: None, inbound: port.inbound, outbound: port.outbound, unmaps: false, closing: mem::List[task::Sender[u8]].empty(alloc))
     \\    return Some(Spanning(near: Bridged(handle: near, end: take own), far: PeerEnd(door: target.door, id: target.id, handle: far)))
     \\} bridge_opened
+    \\
+    \\/// What the end of a bridge a job or instance calls through does, and the capability admitting each
+    \\/// call its other end serves.
+    \\struct Sides {
+    \\    near: Side
+    \\    admission: Option[Admission]
+    \\} Sides
+    \\
+    \\/// The sides of a bridge carrying the calls `through` names for the job or instance numbered `id`:
+    \\/// through a port, or through the capability of a crossing kind `caps` holds under a key, by the
+    \\/// entry the space's `table` holds for it; none when `caps` holds no such capability or the table no
+    \\/// entry of it.
+    \\fn sides_of(through: Through, table: Table, id: u64, caps: Caps) -> Option[Sides] {
+    \\    let calls = match through {
+    \\        Through.Port(number) => return Some(Sides(near: Side.Port(number), admission: None))
+    \\        Through.Kind(kind) => kind
+    \\    }
+    \\    for held in caps.held {
+    \\        if held.key.as_str() != calls.key.as_str() or not held.handle.crosses() {
+    \\            continue
+    \\        }
+    \\        let word = handle_word(held.handle)
+    \\        for handle in 0u64..<MOST_HELD {
+    \\            let Some(entry) = table.held.get(handle) else {
+    \\                continue
+    \\            }
+    \\            let Holding.Kind(capability) = entry.holding else {
+    \\                continue
+    \\            }
+    \\            if entry.job == id and handle_word(capability) == word {
+    \\                return Some(Sides(near: Side.Kind(Riding(handle: handle, operation: calls.operation, hash: calls.hash)), admission: Some(Admission(capability: held.handle, operation: calls.operation))))
+    \\            }
+    \\        }
+    \\    }
+    \\    return None
+    \\} sides_of
     \\
     \\/// Closes the end of a bridge another space maps, waiting until that space no longer maps it.
     \\fn far_closed(far: PeerEnd, alloc: mem::Alloc) fails task::Cancelled uses wait {
@@ -18715,7 +18786,7 @@ const TEXT_NANOS_BRIDGE: Str =
     \\    var space = made
     \\    var held = kept
     \\    match ask {
-    \\        Ask.Open(Opening(id: id, ends: ends)) => mut held.ends_opened(mut space, id, take ends)
+    \\        Ask.Open(Opening(id: id, ends: ends)) => mut held.ends_opened(id, take ends)
     \\        Ask.Ring(Ringing(id: id, handle: handle)) => mut held.rang(id, handle)
     \\        Ask.Close(Closing(id: id, handle: handle, done: done)) => mut held.closing(id, handle, take done)
     \\        Ask.Breach(id) => mut held.breached(mut space, id, alloc)
@@ -18734,10 +18805,11 @@ const TEXT_NANOS_BRIDGE: Str =
     \\
     \\/// Serves an operation of the end of a bridge the space holds by `handle`: rings its other end;
     \\/// closes it, unmapping the frames it maps for itself; closes it as breached by its other end,
-    \\/// whose instance ends; carries the handles of the space's table it names into the table of the
-    \\/// other end's space, giving the token its runtime claims them by; or claims what crossed into the
-    \\/// space's table for it by a token, written at `target` when it fits `capacity`, giving its length
-    \\/// either way.
+    \\/// whose job or instance ends; carries the handles of the space's table it names into the table of
+    \\/// the other end's space, giving the token its runtime claims them by; admits a call it serves
+    \\/// through the capability its kernel admits them through, `STALE` once that is stale; or claims
+    \\/// what crossed into the space's table for it by a token, written at `target` when it fits
+    \\/// `capacity`, giving its length either way.
     \\fn Driven.bridge_invoked(mut self, door: mem::Shared[Door], mut space: sys::load::Space, handle: u64, operation: u64, args: Untrusted[mem::Bytes], target: u64, capacity: u64, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
     \\    let Some(bridge) = self.bridges.get(handle) else {
     \\        return STALE
@@ -18770,6 +18842,16 @@ const TEXT_NANOS_BRIDGE: Str =
     \\            return INVALID
     \\        }
     \\        return try await peer_door.contents().carry(handle: peer_handle, take crossing)
+    \\    }
+    \\    if operation == BRIDGE_ADMIT {
+    \\        let Some(admission) = bridge.admission else {
+    \\            return INVALID
+    \\        }
+    \\        return match attempt admission.capability.invoke(admission.operation, args: bytes_of(args.view(), alloc).view(), alloc) {
+    \\            Ok(_) => 0
+    \\            Err(sys::CrossError.Revoked(_)) => STALE
+    \\            Err(sys::CrossError.Refused) or Err(sys::CrossError.Cancelled(_)) => INVALID
+    \\        }
     \\    }
     \\    if operation == BRIDGE_MOVE {
     \\        let Ok(span) = attempt mem::wire::Codec[Span].decode(args.view(), alloc) else {
@@ -18834,21 +18916,29 @@ const TEXT_NANOS_BRIDGE: Str =
     \\    return found
     \\} Door.claimed
     \\
-    \\/// Opens the ends of bridges for the instance numbered `id`, which its runtime starts from now on;
-    \\/// the ends are dropped once it has ended.
-    \\fn Driven.ends_opened(mut self, mut space: sys::load::Space, id: u64, take ends: mem::List[Bridged]) {
-    \\    for opening in take ends {
-    \\        mut self.bridge_opened(mut space, take opening)
-    \\    }
+    \\/// Opens the ends of bridges for the job or instance numbered `id`, which its runtime starts from now
+    \\/// on with them; the ends are dropped once it has ended, or at once when it is no longer pending.
+    \\fn Driven.ends_opened(mut self, id: u64, take ends: mem::List[Bridged]) {
+    \\    var found: Option[usize] = None
     \\    for index in 0..<self.pending.len() {
     \\        if self.pending[index].id == id {
-    \\            self.pending[index].bridging = false
+    \\            found = Some(index)
     \\        }
     \\    }
+    \\    let Some(at) = found else {
+    \\        return
+    \\    }
+    \\    for opening in take ends {
+    \\        let Bridged(handle: handle, end: opened_end) = opening
+    \\        mut self.pending[at].granting.ends.push(EndAt(handle: handle, side: opened_end.side, inbound: opened_end.inbound, outbound: opened_end.outbound))
+    \\        discard mut self.bridges.insert(handle, value: take opened_end)
+    \\    }
+    \\    self.pending[at].bridging = false
     \\} Driven.ends_opened
     \\
-    \\/// Opens the end of a bridge the space maps: tells the runtime of the instance holding it, and has
-    \\/// the frames the end maps for itself unmapped once that instance ends, or at once when it has.
+    \\/// Opens the end of a bridge the space maps for an instance it runs: tells the runtime of the
+    \\/// instance holding it, and has the frames the end maps for itself unmapped once that instance
+    \\/// ends, or at once when it has.
     \\fn Driven.bridge_opened(mut self, mut space: sys::load::Space, take opening: Bridged) {
     \\    let Bridged(handle: handle, end: opened_end) = opening
     \\    let Some(found) = mut self.jobs.get_mut(opened_end.job) else {
@@ -18863,12 +18953,12 @@ const TEXT_NANOS_BRIDGE: Str =
     \\        mut running.frames.push(opened_end.inbound)
     \\        mut running.frames.push(opened_end.outbound)
     \\    }
-    \\    mut self.notices.push(Notice(id: opened_end.job, told: Telling.Bridge(Bridging.Opened(EndAt(handle: handle, port: opened_end.port, inbound: opened_end.inbound, outbound: opened_end.outbound)))))
+    \\    mut self.notices.push(Notice(id: opened_end.job, told: Telling.Bridge(Bridging.Opened(EndAt(handle: handle, side: opened_end.side, inbound: opened_end.inbound, outbound: opened_end.outbound)))))
     \\    discard mut self.bridges.insert(handle, value: take opened_end)
     \\} Driven.bridge_opened
     \\
-    \\/// Tells the runtime of the instance numbered `id` that the other end of the end of a bridge it
-    \\/// holds by `handle` wrote or read, unless it is told so already.
+    \\/// Tells the runtime of the job or instance numbered `id` that the other end of the end of a bridge
+    \\/// it holds by `handle` wrote or read, unless it is told so already.
     \\fn Driven.rang(mut self, id: u64, handle: u64) {
     \\    let Some(bridge) = self.bridges.get(handle) else {
     \\        return
@@ -18897,8 +18987,8 @@ const TEXT_NANOS_BRIDGE: Str =
     \\    }
     \\} Driven.resolved
     \\
-    \\/// Has the runtime of the instance numbered `id` close the end of a bridge it holds by `handle`,
-    \\/// `done` held until the end is closed.
+    \\/// Has the runtime of the job or instance numbered `id` close the end of a bridge it holds by
+    \\/// `handle`, `done` held until the end is closed.
     \\fn Driven.closing(mut self, id: u64, handle: u64, take done: Option[task::Sender[u8]]) {
     \\    let Some(found) = mut self.bridges.get_mut(handle) else {
     \\        return
@@ -18933,8 +19023,8 @@ const TEXT_NANOS_BRIDGE: Str =
     \\    })
     \\} Driven.end_closed
     \\
-    \\/// Drops the ends of bridges the instance numbered `id` holds, whose frames are unmapped with its
-    \\/// link's, and tells the other end of each end serving calls that it is closed.
+    \\/// Drops the ends of bridges the job or instance numbered `id` holds, whose frames are unmapped with
+    \\/// its link's, and tells the other end of each end serving calls that it is closed.
     \\fn Driven.ends_dropped(mut self, id: u64, alloc: mem::Alloc) {
     \\    var handles = mem::List[u64].empty(alloc)
     \\    for entry in self.bridges {
@@ -18946,9 +19036,10 @@ const TEXT_NANOS_BRIDGE: Str =
     \\        let Some(bridge) = mut self.bridges.remove(handle) else {
     \\            continue
     \\        }
-    \\        if bridge.port.is_none() {
-    \\            mut self.leaving.push(Leaving(door: bridge.peer, ask: Ask.Close(Closing(id: bridge.peer_job, handle: bridge.peer_handle, done: None))))
+    \\        let Side.Serving(_) = bridge.side else {
+    \\            continue
     \\        }
+    \\        mut self.leaving.push(Leaving(door: bridge.peer, ask: Ask.Close(Closing(id: bridge.peer_job, handle: bridge.peer_handle, done: None))))
     \\    }
     \\} Driven.ends_dropped
     \\
@@ -19028,10 +19119,12 @@ const TEXT_NANOS_BRIDGE: Str =
     \\    payload: Payload
     \\} BridgeCall
     \\
-    \\/// The reply the other end writes to the call of a number, none when the call failed.
+    \\/// The reply the other end writes to the call of a number, none when the call failed, through a
+    \\/// stale capability when `revoked`.
     \\struct BridgeReply derives Encode {
     \\    id: u64
     \\    reply: Option[Payload]
+    \\    revoked: bool
     \\} BridgeReply
     \\
     \\/// What a call or reply carries over a bridge: its bytes, the token under which its handles crossed
@@ -19093,12 +19186,13 @@ const TEXT_NANOS_BRIDGE: Str =
     \\    call: u64
     \\} Route
     \\
-    \\/// What the bridges of an instance's space reach: the ends its instance calls ports through, by
-    \\/// port, the calls its instance serves over them, the sender of the replies its instance makes to
-    \\/// those it postponed, the remote capability its handles are minted through, and the runtime's
-    \\/// clock and allocator.
+    \\/// What the bridges of a job's or instance's space reach: the ends it calls ports through, by port,
+    \\/// and capabilities of crossing kinds through, by their handles, the calls an instance serves over
+    \\/// them, the sender of the replies it makes to those it postponed, the remote capability its
+    \\/// handles are minted through, and the runtime's clock and allocator.
     \\struct Bridges {
     \\    ports: task::Cown[mem::Map[u64, Pump]]
+    \\    kinds: task::Cown[mem::Map[u64, Ride]]
     \\    routes: task::Cown[Routes]
     \\    late: task::Sender[Late]
     \\    base: Remote
@@ -19107,8 +19201,20 @@ const TEXT_NANOS_BRIDGE: Str =
     \\} Bridges
     \\
     \\fn Bridges.share(self) -> Bridges {
-    \\    return Bridges(ports: self.ports.share(), routes: self.routes.share(), late: self.late.split(), base: self.base, clock: self.clock, alloc: self.alloc)
+    \\    return Bridges(ports: self.ports.share(), kinds: self.kinds.share(), routes: self.routes.share(), late: self.late.split(), base: self.base, clock: self.clock, alloc: self.alloc)
     \\} Bridges.share
+    \\
+    \\/// The end of a bridge carrying the calls of the operation `operation` of a capability of a crossing
+    \\/// kind, as calls of the protocol of `hash`.
+    \\struct Ride {
+    \\    pump: Pump
+    \\    operation: u64
+    \\    hash: sys::ProtocolHash
+    \\} Ride
+    \\
+    \\fn Ride.share(self) -> Ride {
+    \\    return Ride(pump: self.pump.share(), operation: self.operation, hash: self.hash)
+    \\} Ride.share
     \\
     \\/// A reply an instance makes to a call it postponed, which reached it over a bridge: the number its
     \\/// runtime gave the call, and the reply.
@@ -19117,21 +19223,62 @@ const TEXT_NANOS_BRIDGE: Str =
     \\    reply: Naming
     \\} Late
     \\
-    \\/// Serves the ends of the bridges of an instance as its kernel tells: pumps each end that opens,
-    \\/// its instance's calls through a port passing over it, or the calls reaching its instance through
-    \\/// `calls`, and replies to postponed ones as `late` gives them; nudges an end whose other end
-    \\/// wrote or read, and closes an end once told, telling the kernel.
-    \\fn bridges_served(take notices: task::Receiver[Bridging], take late: task::Receiver[Late], bridges: Bridges, calls: task::Sender[Called], exec: task::Executor) fails task::Cancelled uses wait {
+    \\/// An end of a bridge a job or instance holds, the pump through which the tasks of its runtime reach
+    \\/// it, and the receiver of the nudges of the task pumping it.
+    \\struct Pumping {
+    \\    at: EndAt
+    \\    pump: Pump
+    \\    nudged: task::Receiver[u8]
+    \\} Pumping
+    \\
+    \\/// The pumping of the end of a bridge `at` names, which `bridges` reaches from now on by the port or
+    \\/// the capability whose calls it carries.
+    \\fn pumping_of(at: EndAt, bridges: Bridges) -> Pumping fails task::Cancelled uses wait {
+    \\    let alloc = bridges.alloc
+    \\    let task::Channel(sender: nudge, receiver: nudged) = task::Channel[u8].bounded(1, alloc)
+    \\    let pump = Pump(handle: at.handle, queued: task::Cown.of(mem::List[mem::Bytes].empty(alloc), alloc), nudge: take nudge, closed: mem::Shared.of(core::atomic::AtomicBool.of(false), alloc), waits: task::Cown.of(PortWaits(next: 0, waiting: mem::Map[u64, task::Sender[PortAnswer]].empty(alloc)), alloc))
+    \\    let ports = bridges.ports.share()
+    \\    let kinds = bridges.kinds.share()
+    \\    match at.side {
+    \\        Side.Port(port) => {
+    \\            await when mut ports {
+    \\                discard mut ports.insert(port, value: pump.share())
+    \\            }
+    \\        }
+    \\        Side.Kind(riding) => {
+    \\            await when mut kinds {
+    \\                discard mut kinds.insert(riding.handle, value: Ride(pump: pump.share(), operation: riding.operation, hash: riding.hash))
+    \\            }
+    \\        }
+    \\        Side.Serving(_) => {}
+    \\    }
+    \\    return Pumping(at: at, pump: take pump, nudged: take nudged)
+    \\} pumping_of
+    \\
+    \\/// Serves the ends of the bridges of a job or instance: pumps each end in `initial` and each that
+    \\/// opens as its kernel tells, the calls it makes through a port or a capability of a crossing kind
+    \\/// passing over it, or the calls reaching an instance through `calls`, and replies to postponed
+    \\/// ones as `late` gives them; nudges an end whose other end wrote or read, and closes an end once
+    \\/// told, telling the kernel.
+    \\fn bridges_served(take initial: mem::List[Pumping], take notices: task::Receiver[Bridging], take late: task::Receiver[Late], bridges: Bridges, calls: task::Sender[Called], exec: task::Executor) fails task::Cancelled uses wait {
     \\    let alloc = bridges.alloc
     \\    var pumps = mem::Map[u64, Pump].empty(alloc)
+    \\    var opening = Some(take initial)
     \\    var receiving = Some(take notices)
     \\    var replying = Some(take late)
-    \\    try await task::scope(exec, body: fn[mut pumps, mut receiving, mut replying](s: task::Scope) fails task::Cancelled uses wait {
+    \\    try await task::scope(exec, body: fn[mut pumps, mut opening, mut receiving, mut replying](s: task::Scope) fails task::Cancelled uses wait {
+    \\        let Some(open) = mut opening.extract() else {
+    \\            return
+    \\        }
     \\        let Some(told) = mut receiving.extract() else {
     \\            return
     \\        }
     \\        let Some(answering) = mut replying.extract() else {
     \\            return
+    \\        }
+    \\        for pumping in take open {
+    \\            discard mut pumps.insert(pumping.at.handle, value: pumping.pump.share())
+    \\            pumped_on(s, take pumping, bridges, calls)
     \\        }
     \\        let shared = bridges.share()
     \\        discard s.spawn(fn[take answering, take shared]() fails task::Cancelled uses wait {
@@ -19155,15 +19302,9 @@ const TEXT_NANOS_BRIDGE: Str =
     \\            }
     \\            match bridging {
     \\                Bridging.Opened(at) => {
-    \\                    let task::Channel(sender: nudge, receiver: nudged) = task::Channel[u8].bounded(1, alloc)
-    \\                    let pump = Pump(handle: at.handle, queued: task::Cown.of(mem::List[mem::Bytes].empty(alloc), alloc), nudge: take nudge, closed: mem::Shared.of(core::atomic::AtomicBool.of(false), alloc), waits: task::Cown.of(PortWaits(next: 0, waiting: mem::Map[u64, task::Sender[PortAnswer]].empty(alloc)), alloc))
-    \\                    discard mut pumps.insert(at.handle, value: pump.share())
-    \\                    let pumping = pump.share()
-    \\                    let sharing = bridges.share()
-    \\                    let inbox = calls.split()
-    \\                    discard s.spawn(fn[take nudged, take pumping, take sharing, take inbox]() fails task::Cancelled uses wait {
-    \\                        try await end_pumped(at, take nudged, pump: pumping, bridges: sharing, calls: inbox)
-    \\                    })
+    \\                    let pumping = try await pumping_of(at, bridges)
+    \\                    discard mut pumps.insert(at.handle, value: pumping.pump.share())
+    \\                    pumped_on(s, take pumping, bridges, calls)
     \\                }
     \\                Bridging.Rang(handle) => {
     \\                    match pumps.get(handle) {
@@ -19189,27 +19330,49 @@ const TEXT_NANOS_BRIDGE: Str =
     \\    })
     \\} bridges_served
     \\
-    \\/// Pumps the end of a bridge `at` names until it is closed or its other end breaches it: an end its
-    \\/// instance calls a port through carries the calls `Forwarder.call` queues and gives each reply to
-    \\/// its wait, no longer carrying the port's calls once it stops, when it fails each call still
-    \\/// waiting; an end serving calls gives each call to the instance through `calls`.
+    \\/// Pumps an end of a bridge on a task of `s`, as `end_pumped` does.
+    \\fn pumped_on(s: task::Scope, take pumping: Pumping, bridges: Bridges, calls: task::Sender[Called]) {
+    \\    let Pumping(at: at, pump: pump, nudged: nudged) = pumping
+    \\    let sharing = bridges.share()
+    \\    let inbox = calls.split()
+    \\    discard s.spawn(fn[take nudged, take pump, take sharing, take inbox]() fails task::Cancelled uses wait {
+    \\        try await end_pumped(at, take nudged, pump, bridges: sharing, calls: inbox)
+    \\    })
+    \\} pumped_on
+    \\
+    \\/// Pumps the end of a bridge `at` names until it is closed or its other end breaches it: an end a
+    \\/// job or instance calls a port or a capability of a crossing kind through carries the calls
+    \\/// `Forwarder.call` or `Remote.call` queues and gives each reply to its wait, no longer carrying
+    \\/// those calls once it stops, when it fails each call still waiting; an end serving calls gives each
+    \\/// call to the instance through `calls`.
     \\fn end_pumped(at: EndAt, take nudged: task::Receiver[u8], pump: Pump, bridges: Bridges, calls: task::Sender[Called]) fails task::Cancelled uses wait {
     \\    let alloc = bridges.alloc
-    \\    let Some(port) = at.port else {
-    \\        try await pumped(at, take nudged, pump, bridges, heard: fn(record: mem::Bytes) -> bool fails task::Cancelled uses wait {
-    \\            return try await call_heard(record, pump, bridges, calls)
-    \\        })
-    \\        return
-    \\    }
-    \\    let ports = bridges.ports.share()
-    \\    await when mut ports {
-    \\        discard mut ports.insert(port, value: pump.share())
+    \\    match at.side {
+    \\        Side.Serving(admits) => {
+    \\            try await pumped(at, take nudged, pump, bridges, heard: fn(record: mem::Bytes) -> bool fails task::Cancelled uses wait {
+    \\                return try await call_heard(record, pump, bridges, calls, admits)
+    \\            })
+    \\            return
+    \\        }
+    \\        else => {}
     \\    }
     \\    let outcome = attempt await pumped(at, take nudged, pump, bridges, heard: fn(record: mem::Bytes) -> bool fails task::Cancelled uses wait {
     \\        return try await reply_heard(record, pump, alloc)
     \\    })
-    \\    await when mut ports {
-    \\        discard mut ports.remove(port)
+    \\    let ports = bridges.ports.share()
+    \\    let kinds = bridges.kinds.share()
+    \\    match at.side {
+    \\        Side.Port(port) => {
+    \\            await when mut ports {
+    \\                discard mut ports.remove(port)
+    \\            }
+    \\        }
+    \\        Side.Kind(riding) => {
+    \\            await when mut kinds {
+    \\                discard mut kinds.remove(riding.handle)
+    \\            }
+    \\        }
+    \\        Side.Serving(_) => {}
     \\    }
     \\    let waits = pump.waits.share()
     \\    await when mut waits {
@@ -19309,7 +19472,7 @@ const TEXT_NANOS_BRIDGE: Str =
     \\} rest_of
     \\
     \\/// Tells the kernel that the other end of the end of a bridge whose handle is `handle` wrote what
-    \\/// no end writes, which ends the other end's instance and closes this end.
+    \\/// no end writes, which ends the other end's job or instance and closes this end.
     \\fn breached(handle: u64) {
     \\    var nothing = Array[u8, 1].filled(0)
     \\    discard invoke(handle, operation: BRIDGE_BREACH, args: b"", result: mut nothing.view_mut())
@@ -19472,13 +19635,39 @@ const TEXT_NANOS_BRIDGE: Str =
     \\    return try reply_minted(take answered, base, alloc)
     \\} called_across
     \\
+    \\/// Calls the operation of a capability of a crossing kind that the end of a bridge `ride` carries,
+    \\/// `args` its bytes, and gives the bytes of the reply; fails with `CrossError.Revoked` once the
+    \\/// capability admitting it at the other end is stale, and with `Refused` once that capability
+    \\/// refuses it, its bytes cannot move, it fails, or its reply carries handles.
+    \\fn rode_across(ride: Ride, take args: mem::Bytes, alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError uses wait {
+    \\    let Ok(payload) = attempt payload_of(ride.pump.handle, bytes: take args, crossed: 0, alloc) else {
+    \\        fail sys::CrossError.Refused
+    \\    }
+    \\    let Waiting(id: id, answers: answers) = try await wait_added(ride.pump.waits, alloc)
+    \\    try await ride.pump.queue(framed(BridgeCall(id: id, hash: ride.hash, payload: take payload), alloc))
+    \\    var receiver = answers
+    \\    match try await mut receiver.receive() {
+    \\        Some(PortAnswer.Replied(Carrying(bytes: bytes, handles: handles))) => {
+    \\            if handles.len() == 0 {
+    \\                return bytes
+    \\            }
+    \\        }
+    \\        Some(PortAnswer.Revoked) => fail sys::CrossError.Revoked(sys::Revoked.Stale)
+    \\        else => {}
+    \\    }
+    \\    fail sys::CrossError.Refused
+    \\} rode_across
+    \\
     \\/// Gives the reply a record of the end of a bridge holds to the wait of its number, its handles
     \\/// claimed; false for a record no serving end writes.
     \\fn reply_heard(record: mem::Bytes, pump: Pump, alloc: mem::Alloc) -> bool fails task::Cancelled uses wait {
-    \\    let Ok(BridgeReply(id: id, reply: reply)) = attempt mem::wire::Codec[BridgeReply].decode(Untrusted.of(record.view()), alloc) else {
+    \\    let Ok(BridgeReply(id: id, reply: reply, revoked: revoked)) = attempt mem::wire::Codec[BridgeReply].decode(Untrusted.of(record.view()), alloc) else {
     \\        return false
     \\    }
     \\    var answer = PortAnswer.Unknown
+    \\    if revoked {
+    \\        answer = PortAnswer.Revoked
+    \\    }
     \\    match reply {
     \\        Some(payload) => {
     \\            let Some(crossing) = claimed(pump.handle, token: payload.carried, alloc) else {
@@ -19497,10 +19686,14 @@ const TEXT_NANOS_BRIDGE: Str =
     \\
     \\/// Gives the instance the call a record of the end of a bridge holds, numbered with `OVER_BRIDGE` set,
     \\/// its handles claimed and minted through the remote capability of `bridges`, keeping where its
-    \\/// reply goes; false for a record no calling end writes.
-    \\fn call_heard(record: mem::Bytes, pump: Pump, bridges: Bridges, calls: task::Sender[Called]) -> bool fails task::Cancelled uses wait {
+    \\/// reply goes; when `admits`, has the kernel admit it first, replying with a failure to one it does
+    \\/// not admit; false for a record no calling end writes, which carries handles when `admits`.
+    \\fn call_heard(record: mem::Bytes, pump: Pump, bridges: Bridges, calls: task::Sender[Called], admits: bool) -> bool fails task::Cancelled uses wait {
     \\    let alloc = bridges.alloc
     \\    let Ok(BridgeCall(id: caller, hash: hash, payload: payload)) = attempt mem::wire::Codec[BridgeCall].decode(Untrusted.of(record.view()), alloc) else {
+    \\        return false
+    \\    }
+    \\    if admits and payload.carried != 0 {
     \\        return false
     \\    }
     \\    let Some(crossing) = claimed(pump.handle, token: payload.carried, alloc) else {
@@ -19508,6 +19701,14 @@ const TEXT_NANOS_BRIDGE: Str =
     \\    }
     \\    let Some(bytes) = payload_bytes(pump.handle, take payload, alloc) else {
     \\        return false
+    \\    }
+    \\    if admits {
+    \\        var nothing = Array[u8, 1].filled(0)
+    \\        let admission = invoke(pump.handle, operation: BRIDGE_ADMIT, args: bytes.view(), result: mut nothing.view_mut())
+    \\        if admission != 0 {
+    \\            try await pump.queue(framed(BridgeReply(id: caller, reply: None, revoked: admission == STALE), alloc))
+    \\            return true
+    \\        }
     \\    }
     \\    var encoding = sys::Encoded.empty(alloc)
     \\    mut encoding.bytes.append(bytes.view())
@@ -19542,7 +19743,7 @@ const TEXT_NANOS_BRIDGE: Str =
     \\        Answer.Served(Ok(Some(reply))) => {
     \\            match attempt naming(bridges.base, bytes: reply.bytes.view(), handles: reply.handles.view(), alloc) {
     \\                Ok(named) => try await replied_across(take route, reply: take named, bridges, alloc)
-    \\                Err(_) => try await route.pump.queue(framed(BridgeReply(id: route.call, reply: None), alloc))
+    \\                Err(_) => try await route.pump.queue(framed(BridgeReply(id: route.call, reply: None, revoked: false), alloc))
     \\            }
     \\        }
     \\        Answer.Served(Ok(None)) => {
@@ -19550,7 +19751,7 @@ const TEXT_NANOS_BRIDGE: Str =
     \\                discard mut routes.waiting.insert(id, value: take route)
     \\            }
     \\        }
-    \\        else => try await route.pump.queue(framed(BridgeReply(id: route.call, reply: None), alloc))
+    \\        else => try await route.pump.queue(framed(BridgeReply(id: route.call, reply: None, revoked: false), alloc))
     \\    }
     \\} answered_across
     \\
@@ -19565,7 +19766,7 @@ const TEXT_NANOS_BRIDGE: Str =
     \\        }
     \\        Err(_) => None
     \\    }
-    \\    try await route.pump.queue(framed(BridgeReply(id: route.call, reply: take payload), alloc))
+    \\    try await route.pump.queue(framed(BridgeReply(id: route.call, reply: take payload, revoked: false), alloc))
     \\} replied_across
     \\
     \\/// What carries `bytes` over the end of a bridge whose handle is `handle`, with the handles that
@@ -20655,12 +20856,13 @@ const TEXT_NANOS_HELD: Str =
     \\    }
     \\} decode_error
     \\
-    \\/// What the space's runtime tells an instance of the ends of its bridges, the replies it makes to
-    \\/// calls it postponed that reached it over them, and the sender of the calls reaching it.
+    \\/// What the space's runtime serves the bridges of a job or instance from: the ends opened before it
+    \\/// started, what it is told of the ends of its bridges, and the replies it makes to calls it
+    \\/// postponed that reached it over them.
     \\struct Told {
+    \\    initial: mem::List[Pumping]
     \\    notices: task::Receiver[Bridging]
     \\    postponed: task::Receiver[Late]
-    \\    calls: task::Sender[Called]
     \\} Told
     \\
     \\/// What the instance task of a space owns: its world, and what it receives from the space's relays.
@@ -20685,9 +20887,9 @@ const TEXT_NANOS_HELD: Str =
     \\/// whose handle is `runner`, while relaying the requests and calls the kernel sends over the
     \\/// channel `port` serves to the instance and its answers, and the frames `outgoing` carries, back,
     \\/// their handles those the runtime holds through `base` for the entries of the space's table, the
-    \\/// replies to the waits of `waits` reaching them, and serving the ends of bridges its kernel tells
-    \\/// of through `notices`; gives how the domain ended.
-    \\fn served_instance(job: sys::load::Job, port: Port, base: Remote, runner: u64, domain: mem::Shared[sys::Abandoner], take world: World, take input: mem::Bytes, up: task::Sender[mem::Bytes], take outgoing: task::Receiver[mem::Bytes], waits: task::Cown[PortWaits], take notices: task::Receiver[Bridging]) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
+    \\/// replies to the waits of `waits` reaching them, and serving the ends of `bridges` `told` opens and
+    \\/// tells of; gives how the domain ended.
+    \\fn served_instance(job: sys::load::Job, port: Port, base: Remote, runner: u64, domain: mem::Shared[sys::Abandoner], take world: World, take input: mem::Bytes, up: task::Sender[mem::Bytes], take outgoing: task::Receiver[mem::Bytes], waits: task::Cown[PortWaits], bridges: Bridges, take told: Told) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
     \\    let alloc = world.alloc
     \\    let exec = world.exec
     \\    let Ok(checkpoint) = attempt mem::wire::Codec[Option[Checkpoint]].decode(Untrusted.of(input.view()), alloc) else {
@@ -20696,8 +20898,6 @@ const TEXT_NANOS_HELD: Str =
     \\    let task::Channel(sender: requests, receiver: asked) = task::Channel[Asked].bounded(1, alloc)
     \\    let task::Channel(sender: calls, receiver: called) = task::Channel[Called].bounded(QUEUED_CALLS, alloc)
     \\    let task::Channel(sender: answers, receiver: answered) = task::Channel[Routed].bounded(QUEUED_CALLS, alloc)
-    \\    let task::Channel(sender: late, receiver: postponed) = task::Channel[Late].bounded(QUEUED_CALLS, alloc)
-    \\    let bridges = Bridges(ports: task::Cown.of(mem::Map[u64, Pump].empty(alloc), alloc), routes: task::Cown.of(Routes(next: 0, waiting: mem::Map[u64, Route].empty(alloc)), alloc), late: take late, base: base, clock: world.clock, alloc: alloc)
     \\    let forwarders = sys::Minter[Forwarder, Forwarding, u64].of(Forwarding(base: base, up: up.split(), waits: waits.share(), bridges: bridges.share(), alloc: alloc), alloc)
     \\    defer take forwarders.close()
     \\    let acting = match attempt sys::Runner.served(forwarders.mint(runner)) {
@@ -20706,30 +20906,31 @@ const TEXT_NANOS_HELD: Str =
     \\    }
     \\    let launch = Launch(checkpoint: take checkpoint, runner: acting, requests: take asked, calls: take called, answers: take answers)
     \\    var entered = Some(Entered(world: take world, launch: take launch))
-    \\    var told = Some(Told(notices: take notices, postponed: take postponed, calls: calls.split()))
+    \\    var telling = Some(take told)
     \\    var relaying = Some(Relaying(requests: take requests, calls: take calls, answered: take answered, outgoing: take outgoing))
     \\    var outcome: Result[Ended, sys::Trap] = Ok(Ended.Cancelled)
-    \\    try await task::scope(exec, body: fn[mut entered, mut relaying, mut told, mut outcome](s: task::Scope) fails task::Cancelled uses wait {
+    \\    try await task::scope(exec, body: fn[mut entered, mut relaying, mut telling, mut outcome](s: task::Scope) fails task::Cancelled uses wait {
     \\        let Some(Entered(world: granted, launch: launched)) = mut entered.extract() else {
     \\            return
     \\        }
     \\        let Some(Relaying(requests: down, calls: inbox, answered: answering, outgoing: sending)) = mut relaying.extract() else {
     \\            return
     \\        }
-    \\        let Some(Told(notices: noticing, postponed: replying, calls: bridging)) = mut told.extract() else {
+    \\        let Some(Told(initial: open, notices: noticing, postponed: replying)) = mut telling.extract() else {
     \\            return
     \\        }
     \\        let replies = waits.share()
     \\        let framing = up.split()
     \\        let answering_across = bridges.share()
+    \\        let bridging = inbox.split()
     \\        discard s.spawn(fn[take down, take inbox, take replies]() fails task::Cancelled uses wait {
     \\            try await relayed_in(port, requests: take down, calls: take inbox, base, waits: replies, exec, alloc)
     \\        })
     \\        discard s.spawn(fn[take answering, take framing, take answering_across]() fails task::Cancelled uses wait {
     \\            try await relayed_out(answered: take answering, up: framing, base, runner, bridges: answering_across, alloc)
     \\        })
-    \\        discard s.spawn(fn[take noticing, take replying, take bridging]() fails task::Cancelled uses wait {
-    \\            try await bridges_served(notices: take noticing, late: take replying, bridges, calls: bridging, exec)
+    \\        discard s.spawn(fn[take open, take noticing, take replying, take bridging]() fails task::Cancelled uses wait {
+    \\            try await bridges_served(initial: take open, notices: take noticing, late: take replying, bridges, calls: bridging, exec)
     \\        })
     \\        discard s.spawn(fn[take sending]() fails task::Cancelled uses wait {
     \\            try await written_up(port, outgoing: take sending)
@@ -21517,13 +21718,15 @@ const TEXT_NANOS_ISOLATED: Str =
     \\} Granted
     \\
     \\/// What crossed into the space's table for a job's or instance's world: the handles of its log,
-    \\/// standard streams, random source and file system, and its capabilities.
+    \\/// standard streams, random source and file system, its capabilities, and the ends of the bridges it
+    \\/// calls through.
     \\struct Granting derives Encode {
     \\    log: u64
     \\    stdio: u64
     \\    random: u64
     \\    fs: u64
     \\    caps: mem::List[Granted]
+    \\    ends: mem::List[EndAt]
     \\} Granting
     \\
     \\/// The allocator, executor and clock of a space's runtime.
@@ -21786,6 +21989,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    let task::Channel(sender: notices, receiver: noticed) = task::Channel[Notified].bounded(QUEUED_CALLS, alloc)
     \\    let task::Channel(sender: ended, receiver: ending) = task::Channel[Outcome].bounded(1, alloc)
     \\    let task::Channel(sender: stop, receiver: stopping) = task::Channel[u8].bounded(1, alloc)
+    \\    let instance = component.is_some()
     \\    var keys = mem::List[text::String].empty(alloc)
     \\    var keyed = mem::List[usize].empty(alloc)
     \\    var porting_out = false
@@ -21793,7 +21997,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        let channel = link.channels[index]
     \\        match channel.port {
     \\            Some(porting) => {
-    \\                porting_out = porting_out or (porting.to.is_some() and component.is_some())
+    \\                porting_out = porting_out or porting.bridged(instance)
     \\            }
     \\            None => {
     \\                mut keys.push(text::String.of(channel.key.as_str(), alloc))
@@ -21817,7 +22021,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        var space = given
     \\        let frames = mapped(mut space, link, alloc)
     \\        if porting_out {
-    \\            ports = ports_mapped(mut space, link, alloc)
+    \\            ports = ports_mapped(mut space, link, instance, alloc)
     \\        }
     \\        var addresses = mem::List[u64].empty(alloc)
     \\        for port in ports {
@@ -21830,7 +22034,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    if porting_out {
     \\        var ends = mem::List[Bridged].empty(alloc)
     \\        for port in ports {
-    \\            match attempt await bridge_opened(isolation, id, link, port, alloc) {
+    \\            match attempt await bridge_opened(isolation, id, link, caps, port, alloc) {
     \\                Ok(Some(Spanning(near: near, far: far))) => {
     \\                    mut ends.push(take near)
     \\                    mut remote.push(take far)
@@ -22000,9 +22204,8 @@ const TEXT_NANOS_ISOLATED: Str =
     \\
     \\/// A job or instance placed in its space that the space's runtime has not taken yet: its number,
     \\/// entry and input, whether it is an instance, the addresses of its link's frames, the keys and
-    \\/// handles of its link's channels, the handle of its runner capability, the encoding of what
-    \\/// crossed into the space's table for its world, and whether it waits for the ends of its bridges
-    \\/// to open.
+    \\/// handles of its link's channels, the handle of its runner capability, what crossed into the
+    \\/// space's table for its world, and whether it waits for the ends of its bridges to open.
     \\struct Pending {
     \\    id: u64
     \\    job: sys::load::Job
@@ -22012,7 +22215,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    keys: mem::List[text::String]
     \\    channels: mem::List[u64]
     \\    runner: u64
-    \\    granted: mem::Bytes
+    \\    granting: Granting
     \\    bridging: bool
     \\} Pending
     \\
@@ -22214,10 +22417,11 @@ const TEXT_NANOS_ISOLATED: Str =
     \\} asks_taken
     \\
     \\/// Places the job or instance `joining` asks for in the space `placing` holds, making a space when
-    \\/// it holds none: maps its bundle, lends the space to its task to map its link, adds its link's
-    \\/// channels, its runner, its world's services and each capability of its world that crosses to the
-    \\/// table, and queues its start; or tells its task why it could not be placed. `placing` keeps the
-    \\/// space while it runs jobs or instances, its frames given back to `frames` otherwise.
+    \\/// it holds none: maps its bundle, adds each capability of its world that crosses to the table,
+    \\/// lends the space to its task to map and bridge its link, adds its link's channels, its runner and
+    \\/// its world's services to the table, and queues its start; or tells its task why it could not be
+    \\/// placed. `placing` keeps the space while it runs jobs or instances, its frames given back to
+    \\/// `frames` otherwise.
     \\fn admitted(cpu: hw::Ring0, tenant: u64, isolation: Isolation, take joining: Joining, mut placing: mem::List[Placed], mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
     \\    let alloc = isolation.alloc
     \\    let Joining(id: id, bundle: bundle, component: component, input: input, runner: runner, services: services, caps: caps, keys: keys, bridged: holding_back, halted: halted, lend: lend, notices: notices, ended: ended) = joining
@@ -22247,6 +22451,15 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        kept_placed(take running, driving: take held, mut placing, mut frames)
     \\        return
     \\    }
+    \\    let table = isolation.door.contents().table
+    \\    var crossed = mem::List[Granted].empty(alloc)
+    \\    for grant in caps.held {
+    \\        let one = Array[sys::Handle, 1].filled(grant.handle)
+    \\        match table.admitted(job: id, handles: one.view(), alloc) {
+    \\            Some(crossing) => mut crossed.push(Granted(key: text::String.of(grant.key.as_str(), alloc), carried: crossing[0]))
+    \\            None => {}
+    \\        }
+    \\    }
     \\    let task::Channel(sender: back, receiver: giving) = task::Channel[Lent].bounded(1, alloc)
     \\    discard attempt await lend.send(Lending(space: take running, back: take back))
     \\    discard lend
@@ -22266,20 +22479,12 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        kept_placed(take returned_space, driving: take held, mut placing, mut frames)
     \\        return
     \\    }
-    \\    let table = isolation.door.contents().table
     \\    var channels = mem::List[u64].empty(alloc)
     \\    for index in 0..<keys.len() {
     \\        mut channels.push(table.held_by(job: id, holding: Holding.Channel(index)))
     \\    }
     \\    let acting = table.held_by(job: id, holding: Holding.Runner)
-    \\    var granted = Granting(log: table.held_by(job: id, holding: Holding.Log(services.log)), stdio: table.held_by(job: id, holding: Holding.Stdio(services.stdio)), random: table.held_by(job: id, holding: Holding.Random(services.random)), fs: table.held_by(job: id, holding: Holding.Fs(services.fs)), caps: mem::List[Granted].empty(alloc))
-    \\    for grant in caps.held {
-    \\        let one = Array[sys::Handle, 1].filled(grant.handle)
-    \\        match table.admitted(job: id, handles: one.view(), alloc) {
-    \\            Some(crossing) => mut granted.caps.push(Granted(key: text::String.of(grant.key.as_str(), alloc), carried: crossing[0]))
-    \\            None => {}
-    \\        }
-    \\    }
+    \\    let granted = Granting(log: table.held_by(job: id, holding: Holding.Log(services.log)), stdio: table.held_by(job: id, holding: Holding.Stdio(services.stdio)), random: table.held_by(job: id, holding: Holding.Random(services.random)), fs: table.held_by(job: id, holding: Holding.Fs(services.fs)), caps: take crossed, ends: mem::List[EndAt].empty(alloc))
     \\    var unmapping = mem::List[u64].empty(alloc)
     \\    for address in addresses {
     \\        mut unmapping.push(address)
@@ -22288,7 +22493,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        mut unmapping.push(address)
     \\    }
     \\    discard mut held.jobs.insert(id, value: Running(job: job, runner: runner, ids: mem::Map[u64, Carried].empty(alloc), frames: take unmapping, halted: take halted, breached: false, abandoning: false, notices: take notices, ended: take ended))
-    \\    mut held.pending.push(Pending(id: id, job: job, input: take input, held: instance, frames: take addresses, keys: take keys, channels: take channels, runner: acting, granted: encoded(granted, alloc), bridging: holding_back))
+    \\    mut held.pending.push(Pending(id: id, job: job, input: take input, held: instance, frames: take addresses, keys: take keys, channels: take channels, runner: acting, granting: take granted, bridging: holding_back))
     \\    mut placing.push(Placed(space: take returned_space, driving: take held))
     \\} admitted
     \\
@@ -22718,12 +22923,13 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    }
     \\    let input_at = keys_at + u64.widen(keys.len())
     \\    let granted_at = input_at + u64.widen(self.input.len())
-    \\    let record = Start(order: ORDER_START, id: self.id, job: self.job, input: input_at, input_len: u64.widen(self.input.len()), bell: self.frames[0], ports: ports_at, port_count: u64.widen(self.keys.len()), held: held, runner: self.runner, granted: granted_at, granted_len: u64.widen(self.granted.len()))
+    \\    let granted = encoded(self.granting, alloc)
+    \\    let record = Start(order: ORDER_START, id: self.id, job: self.job, input: input_at, input_len: u64.widen(self.input.len()), bell: self.frames[0], ports: ports_at, port_count: u64.widen(self.keys.len()), held: held, runner: self.runner, granted: granted_at, granted_len: u64.widen(granted.len()))
     \\    var bytes = record_bytes(record, count: START_BYTES, alloc)
     \\    mut bytes.append(ports.view())
     \\    mut bytes.append(keys.view())
     \\    mut bytes.append(self.input.view())
-    \\    mut bytes.append(self.granted.view())
+    \\    mut bytes.append(granted.view())
     \\    return bytes
     \\} Pending.laid_out
     \\
@@ -23477,8 +23683,9 @@ const TEXT_NANOS_ISOLATED: Str =
     \\/// Runs the job or instance an order starts, in a domain run of `domain`, on a world whose log,
     \\/// standard streams, random source and file system the kernel serves, with the capabilities that
     \\/// crossed for it and its link's channels in its table, holding the instance of a component entry
-    \\/// for the kernel over its link's first channel and serving the ends of its bridges `notices` tells
-    \\/// of, its waiting calls answered through `waits`, and ends it with the kernel as it ended.
+    \\/// for the kernel over its link's first channel, serving the ends of the bridges it starts with and
+    \\/// those `notices` tells of and answering its waiting calls through `waits`, and ends it with the
+    \\/// kernel as it ended.
     \\fn begun(order: Taken, domain: mem::Shared[sys::Abandoner], granted: Base, take notices: task::Receiver[Bridging], waits: task::Cown[PortWaits]) fails task::Cancelled uses wait {
     \\    let record = order.record
     \\    let alloc = granted.alloc
@@ -23496,17 +23703,29 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        mut list.push(port_at(record, index))
     \\    }
     \\    let task::Channel(sender: up, receiver: outgoing) = task::Channel[mem::Bytes].bounded(QUEUED_CALLS, alloc)
-    \\    let remotes = sys::Minter[Remote, Spaced, u64].of(Spaced(alloc: alloc, minted: mem::OnceMap[u64, sys::Handle].empty(0, alloc), handles: mem::OnceMap[u64, u64].empty(0, alloc), up: up.split(), waits: waits.share(), runner: record.runner), alloc)
+    \\    let kinds = task::Cown.of(mem::Map[u64, Ride].empty(alloc), alloc)
+    \\    let remotes = sys::Minter[Remote, Spaced, u64].of(Spaced(alloc: alloc, minted: mem::OnceMap[u64, sys::Handle].empty(0, alloc), handles: mem::OnceMap[u64, u64].empty(0, alloc), up: up.split(), waits: waits.share(), kinds: kinds.share(), runner: record.runner), alloc)
     \\    let base = remotes.mint(MOST_HELD)
+    \\    let task::Channel(sender: late, receiver: postponed) = task::Channel[Late].bounded(QUEUED_CALLS, alloc)
+    \\    let bridges = Bridges(ports: task::Cown.of(mem::Map[u64, Pump].empty(alloc), alloc), kinds: take kinds, routes: task::Cown.of(Routes(next: 0, waiting: mem::Map[u64, Route].empty(alloc)), alloc), late: take late, base: base, clock: granted.clock, alloc: alloc)
     \\    let ports = sys::Minter[Port, Ports, u64].of(Ports(bell: record.bell, list: take list), alloc)
-    \\    let world = attempt remote_world(granted, record, base, ports, channels_from: record.held)
+    \\    var ends = mem::List[EndAt].empty(alloc)
+    \\    let world = attempt remote_world(granted, record, base, ports, channels_from: record.held, mut ends)
     \\    let job = record.job
     \\    let id = record.id
     \\    match world {
     \\        Ok(given) => {
+    \\            var initial = mem::List[Pumping].empty(alloc)
+    \\            for at in ends {
+    \\                match attempt await pumping_of(at, bridges) {
+    \\                    Ok(pumping) => mut initial.push(take pumping)
+    \\                    Err(_) => {}
+    \\                }
+    \\            }
+    \\            let told = Told(initial: take initial, notices: take notices, postponed: take postponed)
     \\            let outcome = match record.held {
-    \\                0 => attempt await served_job(job, runner: record.runner, domain, world: take given, take input, take outgoing)
-    \\                else => attempt await served_instance(job, port: ports.mint(0), base, runner: record.runner, domain, world: take given, take input, up, take outgoing, waits, take notices)
+    \\                0 => attempt await served_job(job, runner: record.runner, domain, world: take given, take input, take outgoing, bridges, take told)
+    \\                else => attempt await served_instance(job, port: ports.mint(0), base, runner: record.runner, domain, world: take given, take input, up, take outgoing, waits, bridges, take told)
     \\            }
     \\            take remotes.close()
     \\            take ports.close()
@@ -23526,16 +23745,25 @@ const TEXT_NANOS_ISOLATED: Str =
     \\
     \\/// Runs the job `job` in a domain run of `domain` on `world` and `input`, sending its kernel through
     \\/// the runner capability of the space's table whose handle is `runner` each message `outgoing`
-    \\/// carries, which an instance's link's first channel would carry; gives how the domain ended.
-    \\fn served_job(job: sys::load::Job, runner: u64, domain: mem::Shared[sys::Abandoner], take world: World, take input: mem::Bytes, take outgoing: task::Receiver[mem::Bytes]) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
+    \\/// carries, which an instance's link's first channel would carry, and serving the ends of `bridges`
+    \\/// `told` opens and tells of; gives how the domain ended.
+    \\fn served_job(job: sys::load::Job, runner: u64, domain: mem::Shared[sys::Abandoner], take world: World, take input: mem::Bytes, take outgoing: task::Receiver[mem::Bytes], bridges: Bridges, take told: Told) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
     \\    let alloc = world.alloc
     \\    let exec = world.exec
     \\    var given = Some(Launched(world: take world, input: take input, outgoing: take outgoing))
+    \\    var telling = Some(take told)
     \\    var outcome: Result[Ended, sys::Trap] = Ok(Ended.Cancelled)
-    \\    try await task::scope(exec, body: fn[mut given, mut outcome](s: task::Scope) fails task::Cancelled uses wait {
+    \\    try await task::scope(exec, body: fn[mut given, mut telling, mut outcome](s: task::Scope) fails task::Cancelled uses wait {
     \\        let Some(Launched(world: granted, input: fed, outgoing: sending)) = mut given.extract() else {
     \\            return
     \\        }
+    \\        let Some(Told(initial: open, notices: noticing, postponed: replying)) = mut telling.extract() else {
+    \\            return
+    \\        }
+    \\        let unserved = task::Channel[Called].bounded(1, alloc).sender
+    \\        discard s.spawn(fn[take open, take noticing, take replying, take unserved]() fails task::Cancelled uses wait {
+    \\            try await bridges_served(initial: take open, notices: take noticing, late: take replying, bridges, calls: unserved, exec)
+    \\        })
     \\        discard s.spawn(fn[take sending]() fails task::Cancelled uses wait {
     \\            var receiver = sending
     \\            loop {
@@ -23570,13 +23798,16 @@ const TEXT_NANOS_ISOLATED: Str =
     \\/// crossed for it, its random source stale from the start when the kernel's is stale, its network
     \\/// denied, and its table holding each capability that crossed for it under its key, then each
     \\/// channel of its link from the index `channels_from` as a standard stream under the channel's key.
-    \\fn remote_world(granted: Base, record: Start, base: Remote, ports: sys::Minter[Port, Ports, u64], channels_from: u64) -> World fails sys::Revoked {
+    \\fn remote_world(granted: Base, record: Start, base: Remote, ports: sys::Minter[Port, Ports, u64], channels_from: u64, mut ends: mem::List[EndAt]) -> World fails sys::Revoked {
     \\    var given = mem::Bytes.zeroed(usize.widen(record.granted_len), alloc: granted.alloc)
     \\    trusted "the kernel writes what crossed for the world, `granted_len` bytes, at `granted`" {
     \\        hw::Ptr[u8].of_addr(usize.widen(record.granted)).copy(hw::Ptr.of_view_mut(mut given.view_mut()), count: usize.widen(record.granted_len))
     \\    }
     \\    let Ok(grants) = attempt mem::wire::Codec[Granting].decode(Untrusted.of(given.view()), alloc: granted.alloc) else {
     \\        fail sys::Revoked.Stale
+    \\    }
+    \\    for at in grants.ends {
+    \\        mut ends.push(at)
     \\    }
     \\    let logs = try Cap[sys::Log].held(base, handle: grants.log, serve: served_log)
     \\    let streams = try Cap[sys::Stdio].held(base, handle: grants.stdio, serve: served_stdio)
@@ -23648,13 +23879,15 @@ const TEXT_NANOS_ISOLATED: Str =
     \\/// What the capabilities a space's runtime holds by the kernel's handles share: the runtime's
     \\/// allocator, the handle of the capability minted for each handle of the space's table, that handle
     \\/// by the minted capability's word, the sender of the frames an instance's space sends up, the
-    \\/// waits of its calls that wait for the kernel's reply and the handle of its runner capability.
+    \\/// waits of its calls that wait for the kernel's reply, the ends of bridges carrying the calls of
+    \\/// capabilities of crossing kinds by their handles, and the handle of its runner capability.
     \\struct Spaced {
     \\    alloc: mem::Alloc
     \\    minted: mem::OnceMap[u64, sys::Handle]
     \\    handles: mem::OnceMap[u64, u64]
     \\    up: task::Sender[mem::Bytes]
     \\    waits: task::Cown[PortWaits]
+    \\    kinds: task::Cown[mem::Map[u64, Ride]]
     \\    runner: u64
     \\} Spaced
     \\
@@ -23852,12 +24085,30 @@ const TEXT_NANOS_ISOLATED: Str =
     \\} Remote.invoke
     \\
     \\fn Remote.call(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError uses wait limits stack 4_096 {
-    \\    let Some(uplink) = sys::reach(self, body: fn(state: Spaced, handle: u64) => Uplink(up: state.up.split(), waits: state.waits.share(), runner: state.runner, handle: handle)) else {
+    \\    let Some(uplink) = sys::reach(self, body: fn(state: Spaced, handle: u64) => Uplink(up: state.up.split(), waits: state.waits.share(), kinds: state.kinds.share(), runner: state.runner, handle: handle)) else {
     \\        fail sys::CrossError.Revoked(sys::Revoked.Stale)
     \\    }
-    \\    let Uplink(up: up, waits: waits, runner: runner, handle: handle) = uplink
+    \\    let Uplink(up: up, waits: waits, kinds: kinds, runner: runner, handle: handle) = uplink
+    \\    let given = bytes_of(args, alloc)
+    \\    if u64.widen(given.len()) <= MOST_BYTES {
+    \\        var ride: Option[Ride] = None
+    \\        await when mut kinds {
+    \\            match kinds.get(handle) {
+    \\                Some(found) => {
+    \\                    if found.operation == operation {
+    \\                        ride = Some(found.share())
+    \\                    }
+    \\                }
+    \\                None => {}
+    \\            }
+    \\        }
+    \\        match ride {
+    \\            Some(across) => return try await rode_across(across, args: take given, alloc)
+    \\            None => {}
+    \\        }
+    \\    }
     \\    let Waiting(id: id, answers: answers) = try await wait_added(waits, alloc)
-    \\    let frame = up_framed(Up.Awaited(Awaiting(id: id, handle: handle, operation: operation, args: bytes_of(args, alloc))), runner, alloc)
+    \\    let frame = up_framed(Up.Awaited(Awaiting(id: id, handle: handle, operation: operation, args: take given)), runner, alloc)
     \\    let answered = try await answer_awaited(up, waits, id, take frame, take answers)
     \\    match answered {
     \\        Some(PortAnswer.Replied(Carrying(bytes: bytes, handles: _))) => return bytes
@@ -23867,11 +24118,13 @@ const TEXT_NANOS_ISOLATED: Str =
     \\} Remote.call
     \\
     \\/// What reaching a remote capability gives for an operation that waits for the kernel's reply: the
-    \\/// sender of the frames the space sends up, the waits for the kernel's replies, the handle of the
-    \\/// runner capability and the capability's own.
+    \\/// sender of the frames the space sends up, the waits for the kernel's replies, the ends of bridges
+    \\/// carrying the calls of capabilities of crossing kinds, the handle of the runner capability and the
+    \\/// capability's own.
     \\struct Uplink {
     \\    up: task::Sender[mem::Bytes]
     \\    waits: task::Cown[PortWaits]
+    \\    kinds: task::Cown[mem::Map[u64, Ride]]
     \\    runner: u64
     \\    handle: u64
     \\} Uplink
@@ -24289,7 +24542,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\
 
 const TEXT_NANOS_LINK: Str =
-    \\//! Links between a kernel and the isolated spaces it runs: the doorbell the kernel rings, the channels whose frames both sides share, the kernel's side of each and the runtime's, which serves a channel to its job as a standard stream, and the channels an instance calls a port through.
+    \\//! Links between a kernel and the isolated spaces it runs: the doorbell the kernel rings, the channels whose frames both sides share, the kernel's side of each and the runtime's, which serves a channel to its job as a standard stream, and the channels a job or instance calls a port or a capability of a crossing kind through.
     \\
     \\/// The offsets in a channel frame of the count of bytes its writer has written, of the count its
     \\/// reader has read, and of its data, a ring of `RING_BYTES` bytes.
@@ -24347,15 +24600,47 @@ const TEXT_NANOS_LINK: Str =
     \\} Link.open
     \\
     \\pub fn Link.open_port(mut self, port: u64, to: Inbox, take inbound: hw::PhysFrame[4_096], take outbound: hw::PhysFrame[4_096]) -> usize {
-    \\    return mut self.opened(key: "", port: Some(Porting(port: port, to: to.placed)), take inbound, take outbound)
+    \\    return mut self.opened(key: "", port: Some(Porting(through: Through.Port(port), to: to.placed)), take inbound, take outbound)
     \\} Link.open_port
     \\
-    \\/// The port a channel of a link carries the calls of, and where the instance answering them runs,
+    \\pub fn Link.open_crossing(mut self, key: Str, operation: u64, hash: sys::ProtocolHash, to: Inbox, take inbound: hw::PhysFrame[4_096], take outbound: hw::PhysFrame[4_096]) -> usize {
+    \\    let calls = KindCalls(key: text::String.of(key, alloc: self.alloc), operation: operation, hash: hash)
+    \\    return mut self.opened(key: "", port: Some(Porting(through: Through.Kind(take calls), to: to.placed)), take inbound, take outbound)
+    \\} Link.open_crossing
+    \\
+    \\/// What a channel of a link carries the calls of, and where the instance answering them runs,
     \\/// none when it runs in no isolated space.
     \\struct Porting {
-    \\    port: u64
+    \\    through: Through
     \\    to: Option[Placement]
     \\} Porting
+    \\
+    \\/// What the calls a channel of a link carries are made through: a port of the runner capability,
+    \\/// or a capability of a crossing kind of the world.
+    \\enum Through {
+    \\    Port(u64)
+    \\    Kind(KindCalls)
+    \\} Through
+    \\
+    \\/// The waiting operation of the capability of a crossing kind the world holds under `key` whose
+    \\/// calls a channel of a link carries, as calls of the protocol of `hash`.
+    \\struct KindCalls {
+    \\    key: text::String
+    \\    operation: u64
+    \\    hash: sys::ProtocolHash
+    \\} KindCalls
+    \\
+    \\/// Whether the channel carrying these calls is bridged for a job or, when `instance`, an instance:
+    \\/// a job holds no port of a runner capability.
+    \\fn Porting.bridged(self, instance: bool) -> bool {
+    \\    if self.to.is_none() {
+    \\        return false
+    \\    }
+    \\    return match self.through {
+    \\        Through.Port(_) => instance
+    \\        Through.Kind(_) => true
+    \\    }
+    \\} Porting.bridged
     \\
     \\/// Adds a channel under `key`, carrying the calls of `port`, and gives its index.
     \\fn Link.opened(mut self, key: Str, take port: Option[Porting], take inbound: hw::PhysFrame[4_096], take outbound: hw::PhysFrame[4_096]) -> usize {

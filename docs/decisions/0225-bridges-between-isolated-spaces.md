@@ -1,6 +1,6 @@
 # 0225. Bridges between isolated spaces
 
-Status: accepted
+Status: accepted; waiting operations of crossing kinds always reaching the kernel superseded by 0228
 
 ## Context
 

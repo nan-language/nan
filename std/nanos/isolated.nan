@@ -344,13 +344,15 @@ struct Granted derives Encode {
 } Granted
 
 /// What crossed into the space's table for a job's or instance's world: the handles of its log,
-/// standard streams, random source and file system, and its capabilities.
+/// standard streams, random source and file system, its capabilities, and the ends of the bridges it
+/// calls through.
 struct Granting derives Encode {
     log: u64
     stdio: u64
     random: u64
     fs: u64
     caps: mem::List[Granted]
+    ends: mem::List[EndAt]
 } Granting
 
 /// The allocator, executor and clock of a space's runtime.
@@ -613,6 +615,7 @@ fn joined(isolation: Isolation, id: u64, job: sys::load::Isolated, take componen
     let task::Channel(sender: notices, receiver: noticed) = task::Channel[Notified].bounded(QUEUED_CALLS, alloc)
     let task::Channel(sender: ended, receiver: ending) = task::Channel[Outcome].bounded(1, alloc)
     let task::Channel(sender: stop, receiver: stopping) = task::Channel[u8].bounded(1, alloc)
+    let instance = component.is_some()
     var keys = mem::List[text::String].empty(alloc)
     var keyed = mem::List[usize].empty(alloc)
     var porting_out = false
@@ -620,7 +623,7 @@ fn joined(isolation: Isolation, id: u64, job: sys::load::Isolated, take componen
         let channel = link.channels[index]
         match channel.port {
             Some(porting) => {
-                porting_out = porting_out or (porting.to.is_some() and component.is_some())
+                porting_out = porting_out or porting.bridged(instance)
             }
             None => {
                 mut keys.push(text::String.of(channel.key.as_str(), alloc))
@@ -644,7 +647,7 @@ fn joined(isolation: Isolation, id: u64, job: sys::load::Isolated, take componen
         var space = given
         let frames = mapped(mut space, link, alloc)
         if porting_out {
-            ports = ports_mapped(mut space, link, alloc)
+            ports = ports_mapped(mut space, link, instance, alloc)
         }
         var addresses = mem::List[u64].empty(alloc)
         for port in ports {
@@ -657,7 +660,7 @@ fn joined(isolation: Isolation, id: u64, job: sys::load::Isolated, take componen
     if porting_out {
         var ends = mem::List[Bridged].empty(alloc)
         for port in ports {
-            match attempt await bridge_opened(isolation, id, link, port, alloc) {
+            match attempt await bridge_opened(isolation, id, link, caps, port, alloc) {
                 Ok(Some(Spanning(near: near, far: far))) => {
                     mut ends.push(take near)
                     mut remote.push(take far)
@@ -827,9 +830,8 @@ struct Running {
 
 /// A job or instance placed in its space that the space's runtime has not taken yet: its number,
 /// entry and input, whether it is an instance, the addresses of its link's frames, the keys and
-/// handles of its link's channels, the handle of its runner capability, the encoding of what
-/// crossed into the space's table for its world, and whether it waits for the ends of its bridges
-/// to open.
+/// handles of its link's channels, the handle of its runner capability, what crossed into the
+/// space's table for its world, and whether it waits for the ends of its bridges to open.
 struct Pending {
     id: u64
     job: sys::load::Job
@@ -839,7 +841,7 @@ struct Pending {
     keys: mem::List[text::String]
     channels: mem::List[u64]
     runner: u64
-    granted: mem::Bytes
+    granting: Granting
     bridging: bool
 } Pending
 
@@ -1041,10 +1043,11 @@ fn asks_taken(isolation: Isolation) -> mem::List[Ask] fails task::Cancelled uses
 } asks_taken
 
 /// Places the job or instance `joining` asks for in the space `placing` holds, making a space when
-/// it holds none: maps its bundle, lends the space to its task to map its link, adds its link's
-/// channels, its runner, its world's services and each capability of its world that crosses to the
-/// table, and queues its start; or tells its task why it could not be placed. `placing` keeps the
-/// space while it runs jobs or instances, its frames given back to `frames` otherwise.
+/// it holds none: maps its bundle, adds each capability of its world that crosses to the table,
+/// lends the space to its task to map and bridge its link, adds its link's channels, its runner and
+/// its world's services to the table, and queues its start; or tells its task why it could not be
+/// placed. `placing` keeps the space while it runs jobs or instances, its frames given back to
+/// `frames` otherwise.
 fn admitted(cpu: hw::Ring0, tenant: u64, isolation: Isolation, take joining: Joining, mut placing: mem::List[Placed], mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
     let alloc = isolation.alloc
     let Joining(id: id, bundle: bundle, component: component, input: input, runner: runner, services: services, caps: caps, keys: keys, bridged: holding_back, halted: halted, lend: lend, notices: notices, ended: ended) = joining
@@ -1074,6 +1077,15 @@ fn admitted(cpu: hw::Ring0, tenant: u64, isolation: Isolation, take joining: Joi
         kept_placed(take running, driving: take held, mut placing, mut frames)
         return
     }
+    let table = isolation.door.contents().table
+    var crossed = mem::List[Granted].empty(alloc)
+    for grant in caps.held {
+        let one = Array[sys::Handle, 1].filled(grant.handle)
+        match table.admitted(job: id, handles: one.view(), alloc) {
+            Some(crossing) => mut crossed.push(Granted(key: text::String.of(grant.key.as_str(), alloc), carried: crossing[0]))
+            None => {}
+        }
+    }
     let task::Channel(sender: back, receiver: giving) = task::Channel[Lent].bounded(1, alloc)
     discard attempt await lend.send(Lending(space: take running, back: take back))
     discard lend
@@ -1093,20 +1105,12 @@ fn admitted(cpu: hw::Ring0, tenant: u64, isolation: Isolation, take joining: Joi
         kept_placed(take returned_space, driving: take held, mut placing, mut frames)
         return
     }
-    let table = isolation.door.contents().table
     var channels = mem::List[u64].empty(alloc)
     for index in 0..<keys.len() {
         mut channels.push(table.held_by(job: id, holding: Holding.Channel(index)))
     }
     let acting = table.held_by(job: id, holding: Holding.Runner)
-    var granted = Granting(log: table.held_by(job: id, holding: Holding.Log(services.log)), stdio: table.held_by(job: id, holding: Holding.Stdio(services.stdio)), random: table.held_by(job: id, holding: Holding.Random(services.random)), fs: table.held_by(job: id, holding: Holding.Fs(services.fs)), caps: mem::List[Granted].empty(alloc))
-    for grant in caps.held {
-        let one = Array[sys::Handle, 1].filled(grant.handle)
-        match table.admitted(job: id, handles: one.view(), alloc) {
-            Some(crossing) => mut granted.caps.push(Granted(key: text::String.of(grant.key.as_str(), alloc), carried: crossing[0]))
-            None => {}
-        }
-    }
+    let granted = Granting(log: table.held_by(job: id, holding: Holding.Log(services.log)), stdio: table.held_by(job: id, holding: Holding.Stdio(services.stdio)), random: table.held_by(job: id, holding: Holding.Random(services.random)), fs: table.held_by(job: id, holding: Holding.Fs(services.fs)), caps: take crossed, ends: mem::List[EndAt].empty(alloc))
     var unmapping = mem::List[u64].empty(alloc)
     for address in addresses {
         mut unmapping.push(address)
@@ -1115,7 +1119,7 @@ fn admitted(cpu: hw::Ring0, tenant: u64, isolation: Isolation, take joining: Joi
         mut unmapping.push(address)
     }
     discard mut held.jobs.insert(id, value: Running(job: job, runner: runner, ids: mem::Map[u64, Carried].empty(alloc), frames: take unmapping, halted: take halted, breached: false, abandoning: false, notices: take notices, ended: take ended))
-    mut held.pending.push(Pending(id: id, job: job, input: take input, held: instance, frames: take addresses, keys: take keys, channels: take channels, runner: acting, granted: encoded(granted, alloc), bridging: holding_back))
+    mut held.pending.push(Pending(id: id, job: job, input: take input, held: instance, frames: take addresses, keys: take keys, channels: take channels, runner: acting, granting: take granted, bridging: holding_back))
     mut placing.push(Placed(space: take returned_space, driving: take held))
 } admitted
 
@@ -1545,12 +1549,13 @@ fn Pending.laid_out(self, at: u64, alloc: mem::Alloc) -> mem::Bytes {
     }
     let input_at = keys_at + u64.widen(keys.len())
     let granted_at = input_at + u64.widen(self.input.len())
-    let record = Start(order: ORDER_START, id: self.id, job: self.job, input: input_at, input_len: u64.widen(self.input.len()), bell: self.frames[0], ports: ports_at, port_count: u64.widen(self.keys.len()), held: held, runner: self.runner, granted: granted_at, granted_len: u64.widen(self.granted.len()))
+    let granted = encoded(self.granting, alloc)
+    let record = Start(order: ORDER_START, id: self.id, job: self.job, input: input_at, input_len: u64.widen(self.input.len()), bell: self.frames[0], ports: ports_at, port_count: u64.widen(self.keys.len()), held: held, runner: self.runner, granted: granted_at, granted_len: u64.widen(granted.len()))
     var bytes = record_bytes(record, count: START_BYTES, alloc)
     mut bytes.append(ports.view())
     mut bytes.append(keys.view())
     mut bytes.append(self.input.view())
-    mut bytes.append(self.granted.view())
+    mut bytes.append(granted.view())
     return bytes
 } Pending.laid_out
 
@@ -2304,8 +2309,9 @@ fn taken_order(alloc: mem::Alloc) -> Option[Taken] {
 /// Runs the job or instance an order starts, in a domain run of `domain`, on a world whose log,
 /// standard streams, random source and file system the kernel serves, with the capabilities that
 /// crossed for it and its link's channels in its table, holding the instance of a component entry
-/// for the kernel over its link's first channel and serving the ends of its bridges `notices` tells
-/// of, its waiting calls answered through `waits`, and ends it with the kernel as it ended.
+/// for the kernel over its link's first channel, serving the ends of the bridges it starts with and
+/// those `notices` tells of and answering its waiting calls through `waits`, and ends it with the
+/// kernel as it ended.
 fn begun(order: Taken, domain: mem::Shared[sys::Abandoner], granted: Base, take notices: task::Receiver[Bridging], waits: task::Cown[PortWaits]) fails task::Cancelled uses wait {
     let record = order.record
     let alloc = granted.alloc
@@ -2323,17 +2329,29 @@ fn begun(order: Taken, domain: mem::Shared[sys::Abandoner], granted: Base, take 
         mut list.push(port_at(record, index))
     }
     let task::Channel(sender: up, receiver: outgoing) = task::Channel[mem::Bytes].bounded(QUEUED_CALLS, alloc)
-    let remotes = sys::Minter[Remote, Spaced, u64].of(Spaced(alloc: alloc, minted: mem::OnceMap[u64, sys::Handle].empty(0, alloc), handles: mem::OnceMap[u64, u64].empty(0, alloc), up: up.split(), waits: waits.share(), runner: record.runner), alloc)
+    let kinds = task::Cown.of(mem::Map[u64, Ride].empty(alloc), alloc)
+    let remotes = sys::Minter[Remote, Spaced, u64].of(Spaced(alloc: alloc, minted: mem::OnceMap[u64, sys::Handle].empty(0, alloc), handles: mem::OnceMap[u64, u64].empty(0, alloc), up: up.split(), waits: waits.share(), kinds: kinds.share(), runner: record.runner), alloc)
     let base = remotes.mint(MOST_HELD)
+    let task::Channel(sender: late, receiver: postponed) = task::Channel[Late].bounded(QUEUED_CALLS, alloc)
+    let bridges = Bridges(ports: task::Cown.of(mem::Map[u64, Pump].empty(alloc), alloc), kinds: take kinds, routes: task::Cown.of(Routes(next: 0, waiting: mem::Map[u64, Route].empty(alloc)), alloc), late: take late, base: base, clock: granted.clock, alloc: alloc)
     let ports = sys::Minter[Port, Ports, u64].of(Ports(bell: record.bell, list: take list), alloc)
-    let world = attempt remote_world(granted, record, base, ports, channels_from: record.held)
+    var ends = mem::List[EndAt].empty(alloc)
+    let world = attempt remote_world(granted, record, base, ports, channels_from: record.held, mut ends)
     let job = record.job
     let id = record.id
     match world {
         Ok(given) => {
+            var initial = mem::List[Pumping].empty(alloc)
+            for at in ends {
+                match attempt await pumping_of(at, bridges) {
+                    Ok(pumping) => mut initial.push(take pumping)
+                    Err(_) => {}
+                }
+            }
+            let told = Told(initial: take initial, notices: take notices, postponed: take postponed)
             let outcome = match record.held {
-                0 => attempt await served_job(job, runner: record.runner, domain, world: take given, take input, take outgoing)
-                else => attempt await served_instance(job, port: ports.mint(0), base, runner: record.runner, domain, world: take given, take input, up, take outgoing, waits, take notices)
+                0 => attempt await served_job(job, runner: record.runner, domain, world: take given, take input, take outgoing, bridges, take told)
+                else => attempt await served_instance(job, port: ports.mint(0), base, runner: record.runner, domain, world: take given, take input, up, take outgoing, waits, bridges, take told)
             }
             take remotes.close()
             take ports.close()
@@ -2353,16 +2371,25 @@ fn begun(order: Taken, domain: mem::Shared[sys::Abandoner], granted: Base, take 
 
 /// Runs the job `job` in a domain run of `domain` on `world` and `input`, sending its kernel through
 /// the runner capability of the space's table whose handle is `runner` each message `outgoing`
-/// carries, which an instance's link's first channel would carry; gives how the domain ended.
-fn served_job(job: sys::load::Job, runner: u64, domain: mem::Shared[sys::Abandoner], take world: World, take input: mem::Bytes, take outgoing: task::Receiver[mem::Bytes]) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
+/// carries, which an instance's link's first channel would carry, and serving the ends of `bridges`
+/// `told` opens and tells of; gives how the domain ended.
+fn served_job(job: sys::load::Job, runner: u64, domain: mem::Shared[sys::Abandoner], take world: World, take input: mem::Bytes, take outgoing: task::Receiver[mem::Bytes], bridges: Bridges, take told: Told) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
     let alloc = world.alloc
     let exec = world.exec
     var given = Some(Launched(world: take world, input: take input, outgoing: take outgoing))
+    var telling = Some(take told)
     var outcome: Result[Ended, sys::Trap] = Ok(Ended.Cancelled)
-    try await task::scope(exec, body: fn[mut given, mut outcome](s: task::Scope) fails task::Cancelled uses wait {
+    try await task::scope(exec, body: fn[mut given, mut telling, mut outcome](s: task::Scope) fails task::Cancelled uses wait {
         let Some(Launched(world: granted, input: fed, outgoing: sending)) = mut given.extract() else {
             return
         }
+        let Some(Told(initial: open, notices: noticing, postponed: replying)) = mut telling.extract() else {
+            return
+        }
+        let unserved = task::Channel[Called].bounded(1, alloc).sender
+        discard s.spawn(fn[take open, take noticing, take replying, take unserved]() fails task::Cancelled uses wait {
+            try await bridges_served(initial: take open, notices: take noticing, late: take replying, bridges, calls: unserved, exec)
+        })
         discard s.spawn(fn[take sending]() fails task::Cancelled uses wait {
             var receiver = sending
             loop {
@@ -2397,13 +2424,16 @@ struct Launched {
 /// crossed for it, its random source stale from the start when the kernel's is stale, its network
 /// denied, and its table holding each capability that crossed for it under its key, then each
 /// channel of its link from the index `channels_from` as a standard stream under the channel's key.
-fn remote_world(granted: Base, record: Start, base: Remote, ports: sys::Minter[Port, Ports, u64], channels_from: u64) -> World fails sys::Revoked {
+fn remote_world(granted: Base, record: Start, base: Remote, ports: sys::Minter[Port, Ports, u64], channels_from: u64, mut ends: mem::List[EndAt]) -> World fails sys::Revoked {
     var given = mem::Bytes.zeroed(usize.widen(record.granted_len), alloc: granted.alloc)
     trusted "the kernel writes what crossed for the world, `granted_len` bytes, at `granted`" {
         hw::Ptr[u8].of_addr(usize.widen(record.granted)).copy(hw::Ptr.of_view_mut(mut given.view_mut()), count: usize.widen(record.granted_len))
     }
     let Ok(grants) = attempt mem::wire::Codec[Granting].decode(Untrusted.of(given.view()), alloc: granted.alloc) else {
         fail sys::Revoked.Stale
+    }
+    for at in grants.ends {
+        mut ends.push(at)
     }
     let logs = try Cap[sys::Log].held(base, handle: grants.log, serve: served_log)
     let streams = try Cap[sys::Stdio].held(base, handle: grants.stdio, serve: served_stdio)
@@ -2475,13 +2505,15 @@ fn end_trapped(trap: sys::Trap, job: u64, alloc: mem::Alloc) {
 /// What the capabilities a space's runtime holds by the kernel's handles share: the runtime's
 /// allocator, the handle of the capability minted for each handle of the space's table, that handle
 /// by the minted capability's word, the sender of the frames an instance's space sends up, the
-/// waits of its calls that wait for the kernel's reply and the handle of its runner capability.
+/// waits of its calls that wait for the kernel's reply, the ends of bridges carrying the calls of
+/// capabilities of crossing kinds by their handles, and the handle of its runner capability.
 struct Spaced {
     alloc: mem::Alloc
     minted: mem::OnceMap[u64, sys::Handle]
     handles: mem::OnceMap[u64, u64]
     up: task::Sender[mem::Bytes]
     waits: task::Cown[PortWaits]
+    kinds: task::Cown[mem::Map[u64, Ride]]
     runner: u64
 } Spaced
 
@@ -2679,12 +2711,30 @@ fn Remote.invoke(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::A
 } Remote.invoke
 
 fn Remote.call(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError uses wait limits stack 4_096 {
-    let Some(uplink) = sys::reach(self, body: fn(state: Spaced, handle: u64) => Uplink(up: state.up.split(), waits: state.waits.share(), runner: state.runner, handle: handle)) else {
+    let Some(uplink) = sys::reach(self, body: fn(state: Spaced, handle: u64) => Uplink(up: state.up.split(), waits: state.waits.share(), kinds: state.kinds.share(), runner: state.runner, handle: handle)) else {
         fail sys::CrossError.Revoked(sys::Revoked.Stale)
     }
-    let Uplink(up: up, waits: waits, runner: runner, handle: handle) = uplink
+    let Uplink(up: up, waits: waits, kinds: kinds, runner: runner, handle: handle) = uplink
+    let given = bytes_of(args, alloc)
+    if u64.widen(given.len()) <= MOST_BYTES {
+        var ride: Option[Ride] = None
+        await when mut kinds {
+            match kinds.get(handle) {
+                Some(found) => {
+                    if found.operation == operation {
+                        ride = Some(found.share())
+                    }
+                }
+                None => {}
+            }
+        }
+        match ride {
+            Some(across) => return try await rode_across(across, args: take given, alloc)
+            None => {}
+        }
+    }
     let Waiting(id: id, answers: answers) = try await wait_added(waits, alloc)
-    let frame = up_framed(Up.Awaited(Awaiting(id: id, handle: handle, operation: operation, args: bytes_of(args, alloc))), runner, alloc)
+    let frame = up_framed(Up.Awaited(Awaiting(id: id, handle: handle, operation: operation, args: take given)), runner, alloc)
     let answered = try await answer_awaited(up, waits, id, take frame, take answers)
     match answered {
         Some(PortAnswer.Replied(Carrying(bytes: bytes, handles: _))) => return bytes
@@ -2694,11 +2744,13 @@ fn Remote.call(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::All
 } Remote.call
 
 /// What reaching a remote capability gives for an operation that waits for the kernel's reply: the
-/// sender of the frames the space sends up, the waits for the kernel's replies, the handle of the
-/// runner capability and the capability's own.
+/// sender of the frames the space sends up, the waits for the kernel's replies, the ends of bridges
+/// carrying the calls of capabilities of crossing kinds, the handle of the runner capability and the
+/// capability's own.
 struct Uplink {
     up: task::Sender[mem::Bytes]
     waits: task::Cown[PortWaits]
+    kinds: task::Cown[mem::Map[u64, Ride]]
     runner: u64
     handle: u64
 } Uplink

@@ -18681,7 +18681,7 @@ const TEXT_NANOS_BRIDGE: Str =
     \\            }
     \\            Err(_) => {}
     \\        }
-    \\        discard attempt await back.send(Lent(space: take space, frames: mem::List[u64].empty(alloc), ported: mem::List[u64].empty(alloc), ends: take ends))
+    \\        discard attempt await back.send(Lent(space: take space, frames: mem::List[u64].empty(alloc), ported: mem::List[u64].empty(alloc), ends: take ends, given: mem::List[hw::PhysFrame[4_096]].empty(alloc)))
     \\    }
     \\    if not mapped_far {
     \\        isolation.door.contents().table.taken(near)
@@ -18744,10 +18744,11 @@ const TEXT_NANOS_BRIDGE: Str =
     \\    match lend.offer(Lending(space: take made, back: take back)) {
     \\        Some(Lending(space: refused, back: _)) => {
     \\            mut placing.push(Placed(space: take refused, driving: take kept))
-    \\            discard attempt await take giving.drain(visit: fn[mut frames](take value: Lent) {
-    \\                let Lent(space: stray, frames: _, ported: _, ends: _) = value
-    \\                take stray.release(mut frames)
+    \\            var strays = mem::List[Lent].empty(alloc)
+    \\            discard attempt await take giving.drain(visit: fn[mut strays](take value: Lent) {
+    \\                mut strays.push(take value)
     \\            })
+    \\            lents_released(take strays, mut frames)
     \\            return
     \\        }
     \\        None => {}
@@ -18762,7 +18763,8 @@ const TEXT_NANOS_BRIDGE: Str =
     \\        return
     \\    }
     \\    lents_released(take given, mut frames)
-    \\    let Lent(space: given_back, frames: _, ported: _, ends: ends) = lent
+    \\    let Lent(space: given_back, frames: _, ported: _, ends: ends, given: lending) = lent
+    \\    frames_given(take lending, mut frames)
     \\    var space = given_back
     \\    var held = kept
     \\    for opening in take ends {
@@ -20211,45 +20213,65 @@ const TEXT_NANOS_HELD: Str =
     \\/// The bytes of a frame's head, which holds the length of the encoding following it.
     \\const FRAME_HEAD: usize = 4
     \\
-    \\pub fn hold_isolated[T, E](space: Isolation, job: sys::load::Isolated, component: Str, link: Link, services: Services, caps: Caps, take checkpoint: Option[Checkpoint], runner: sys::Runner, alloc: mem::Alloc, body: fn(take instance: Instance) -> T fails E uses wait limits stack 65_536) -> Option[T] fails E uses wait {
+    \\pub fn hold_isolated[T, E](space: Isolation, job: sys::load::Isolated, component: Str, link: Link, services: Services, caps: Caps, take checkpoint: Option[Checkpoint], runner: sys::Runner, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc, body: fn(take instance: Instance) -> T fails E uses wait limits stack 65_536) -> Option[T] fails E uses wait {
     \\    if job.component(component).is_none() {
     \\        return None
     \\    }
     \\    var given = Some(take checkpoint)
     \\    var named = Some(text::String.of(component, alloc))
+    \\    var lent = Some(frames_taken(mut frames, alloc))
+    \\    let task::Channel(sender: giving_back, receiver: given_back) = task::Channel[mem::List[hw::PhysFrame[4_096]]].bounded(1, alloc)
     \\    var result: Option[T] = None
-    \\    try await task::scope(space.exec, body: fn[mut given, mut named, mut result](s: task::Scope) fails E uses wait {
+    \\    let scoped = attempt await task::scope(space.exec, body: fn[mut given, mut named, mut lent, mut result](s: task::Scope) fails E uses wait {
     \\        let Some(from) = mut given.extract() else {
     \\            return
     \\        }
     \\        let Some(name) = mut named.extract() else {
     \\            return
     \\        }
+    \\        let Some(drawn_from) = mut lent.extract() else {
+    \\            return
+    \\        }
     \\        let id = space.number()
     \\        let Opened(instance: instance, launch: launch, ending: ending, last: last) = opened(s, checkpoint: None, runner: sys::Runner.denied(), placed: Some(Placement(door: space.way, id: id)), alloc)
     \\        let abandoning = instance.abandoner.share()
-    \\        discard s.spawn(fn[take from, take name, take launch, take ending, take last, take abandoning]() fails task::Cancelled uses wait {
-    \\            let ended = match attempt await held_in(space, id, job, component: take name, runner, link, services, caps, checkpoint: take from, take launch, abandoner: take abandoning, alloc) {
+    \\        let back = giving_back.split()
+    \\        discard s.spawn(fn[take from, take name, take launch, take ending, take last, take abandoning, take drawn_from, take back]() fails task::Cancelled uses wait {
+    \\            var held = drawn_from
+    \\            let ended = match attempt await held_in(space, id, job, component: take name, runner, link, services, caps, checkpoint: take from, take launch, abandoner: take abandoning, frames: mut held, alloc) {
     \\                Ok(how) => how
     \\                Err(cancelled) => failed(take cancelled, alloc)
     \\            }
+    \\            discard attempt await back.send(take held)
     \\            discard attempt await ending.send(Routed.Ended)
     \\            discard attempt await last.send(take ended)
     \\        })
     \\        result = Some(try await body(take instance))
     \\    })
-    \\    return result
+    \\    discard giving_back
+    \\    discard attempt await take given_back.drain(visit: fn[mut frames](take held: mem::List[hw::PhysFrame[4_096]]) {
+    \\        frames_given(take held, mut frames)
+    \\    })
+    \\    match lent {
+    \\        Some(unlent) => frames_given(take unlent, mut frames)
+    \\        None => {}
+    \\    }
+    \\    match scoped {
+    \\        Ok(_) => return result
+    \\        Err(failure) => fail failure
+    \\    }
     \\} hold_isolated
     \\
     \\/// Has the space of `isolation` run the instance of the component entry `component` of `job`,
     \\/// numbered `id`, resuming from `checkpoint`, its world reaching `services` and holding the
     \\/// capabilities of `caps` that cross, acting through `runner`, until it ends, and gives how it ended: failed with the rendering of an
-    \\/// `IsolatedError` when `link` has no channel or the instance cannot be placed.
-    \\fn held_in(isolation: Isolation, id: u64, job: sys::load::Isolated, take component: text::String, runner: sys::Runner, link: Link, services: Services, caps: Caps, take checkpoint: Option[Checkpoint], take launch: Launch, take abandoner: mem::Shared[sys::Abandoner], alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
+    \\/// `IsolatedError` when `link` has no channel or the instance cannot be placed. It lends the
+    \\/// isolation the frames of `frames` while it runs.
+    \\fn held_in(isolation: Isolation, id: u64, job: sys::load::Isolated, take component: text::String, runner: sys::Runner, link: Link, services: Services, caps: Caps, take checkpoint: Option[Checkpoint], take launch: Launch, take abandoner: mem::Shared[sys::Abandoner], mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Ended fails task::Cancelled uses wait {
     \\    if link.channels.len() == 0 or link.channels[0].port.is_some() {
     \\        return failed(IsolatedError.NoChannel, alloc)
     \\    }
-    \\    match try await relayed(isolation, id, job, take component, runner, link, services, caps, input: encoded(checkpoint, alloc), take launch, take abandoner, alloc) {
+    \\    match try await relayed(isolation, id, job, take component, runner, link, services, caps, input: encoded(checkpoint, alloc), take launch, take abandoner, mut frames, alloc) {
     \\        Ok(how) => return how
     \\        Err(error) => return failed(IsolatedError.Unplaced(error), alloc)
     \\    }
@@ -20272,9 +20294,10 @@ const TEXT_NANOS_HELD: Str =
     \\/// routing the answers the space sends up it, calling through `runner` the ports the instance calls
     \\/// and the capabilities of crossing kinds whose waiting operations it calls, and gives how it ended
     \\/// or why it could not be placed once the space's table has taken back every entry added for it,
-    \\/// those its relays add once it has ended included; once `abandoner` abandons, the space abandons
-    \\/// the instance, which ends abandoned.
-    \\fn relayed(isolation: Isolation, id: u64, job: sys::load::Isolated, take component: text::String, runner: sys::Runner, link: Link, services: Services, caps: Caps, take input: mem::Bytes, take launch: Launch, take abandoner: mem::Shared[sys::Abandoner], alloc: mem::Alloc) -> Result[Ended, sys::load::LoadError] fails task::Cancelled uses wait {
+    \\/// those its relays add once it has ended included, the instance lending the isolation the frames of
+    \\/// `frames` while it runs; once `abandoner` abandons, the space abandons the instance, which ends
+    \\/// abandoned.
+    \\fn relayed(isolation: Isolation, id: u64, job: sys::load::Isolated, take component: text::String, runner: sys::Runner, link: Link, services: Services, caps: Caps, take input: mem::Bytes, take launch: Launch, take abandoner: mem::Shared[sys::Abandoner], mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Result[Ended, sys::load::LoadError] fails task::Cancelled uses wait {
     \\    let exec = isolation.exec
     \\    let table = isolation.door.contents().table
     \\    let Launch(checkpoint: _, runner: _, requests: requests, calls: calls, answers: answers) = launch
@@ -20286,7 +20309,7 @@ const TEXT_NANOS_HELD: Str =
     \\    var given = Some(take component)
     \\    var feeding = Some(take input)
     \\    var outcome: Result[Ended, sys::load::LoadError] = Err(sys::load::LoadError.Unplaceable)
-    \\    let relaying = attempt await task::scope(exec, body: fn[mut relays, mut given, mut feeding, mut outcome](s: task::Scope) fails task::Cancelled uses wait {
+    \\    let relaying = attempt await task::scope(exec, body: fn[mut relays, mut given, mut feeding, mut outcome, mut frames](s: task::Scope) fails task::Cancelled uses wait {
     \\        let Some(Relays(requests: asked, calls: called, outgoing: sending, parked: waiting, abandoner: domain)) = mut relays.extract() else {
     \\            return
     \\        }
@@ -20327,7 +20350,7 @@ const TEXT_NANOS_HELD: Str =
     \\            watching.contents().store(true)
     \\            isolation.wake(WOKE_ORDERS)
     \\        })
-    \\        let Joined(outcome: how, cancelled: _) = try await joined(isolation, id, job, component: Some(take name), link, services, caps, input: take fed, runner, halted, alloc)
+    \\        let Joined(outcome: how, cancelled: _) = try await joined(isolation, id, job, component: Some(take name), link, services, caps, input: take fed, runner, halted, mut frames, alloc)
     \\        outcome = how
     \\        s.cancel()
     \\    })
@@ -21055,16 +21078,16 @@ const TEXT_NANOS_HELD: Str =
     \\} Relaying
     \\
     \\/// Holds the instance of the component entry `job` in a space for its kernel: runs the instance
-    \\/// task in a domain run of `domain` on `world`, resuming from the checkpoint whose
+    \\/// task on `world` as `entry_run` does, resuming from the checkpoint whose
     \\/// `mem::wire` encoding `input` is and acting through the runner capability of the space's table
     \\/// whose handle is `runner`, while relaying the requests and calls the kernel sends over the
     \\/// channel `port` serves to the instance and its answers, and the frames `outgoing` carries, back,
     \\/// their handles those the runtime holds through `base` for the entries of the space's table, the
     \\/// replies to the waits of `waits` reaching them, and serving the ends of `bridges` `told` opens and
-    \\/// tells of; gives how the domain ended.
-    \\fn served_instance(job: sys::load::Job, port: Port, base: Remote, runner: u64, domain: mem::Shared[sys::Abandoner], take world: World, take input: mem::Bytes, up: task::Sender[mem::Bytes], take outgoing: task::Receiver[mem::Bytes], waits: task::Cown[PortWaits], bridges: Bridges, take told: Told) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
-    \\    let alloc = world.alloc
-    \\    let exec = world.exec
+    \\/// tells of, on the runtime's executor and allocator `granted` gives; gives how the domain ended.
+    \\fn served_instance(job: sys::load::Job, port: Port, base: Remote, runner: u64, domain: mem::Shared[sys::Abandoner], granted: Base, take world: World, take input: mem::Bytes, up: task::Sender[mem::Bytes], take outgoing: task::Receiver[mem::Bytes], waits: task::Cown[PortWaits], bridges: Bridges, take told: Told) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
+    \\    let alloc = granted.alloc
+    \\    let exec = granted.exec
     \\    let Ok(checkpoint) = attempt mem::wire::Codec[Option[Checkpoint]].decode(Untrusted.of(input.view()), alloc) else {
     \\        return Ok(Ended.Undecodable)
     \\    }
@@ -21083,7 +21106,7 @@ const TEXT_NANOS_HELD: Str =
     \\    var relaying = Some(Relaying(requests: take requests, calls: take calls, answered: take answered, outgoing: take outgoing))
     \\    var outcome: Result[Ended, sys::Trap] = Ok(Ended.Cancelled)
     \\    try await task::scope(exec, body: fn[mut entered, mut relaying, mut telling, mut outcome](s: task::Scope) fails task::Cancelled uses wait {
-    \\        let Some(Entered(world: granted, launch: launched)) = mut entered.extract() else {
+    \\        let Some(Entered(world: given, launch: launched)) = mut entered.extract() else {
     \\            return
     \\        }
     \\        let Some(Relaying(requests: down, calls: inbox, answered: answering, outgoing: sending)) = mut relaying.extract() else {
@@ -21108,9 +21131,7 @@ const TEXT_NANOS_HELD: Str =
     \\        discard s.spawn(fn[take sending]() fails task::Cancelled uses wait {
     \\            try await written_up(port, outgoing: take sending)
     \\        })
-    \\        outcome = try await domain.contents().run_sized(fn[take granted, take launched]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
-    \\            return try await call(job, world: take granted, input: take launched)
-    \\        }, stack: job.stack() + CALL_STACK, exec, alloc)
+    \\        outcome = try await entry_run(job, domain, world: take given, input: take launched, exec, alloc)
     \\        s.cancel()
     \\    })
     \\    return outcome
@@ -21702,7 +21723,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\const BREACH_REPORT: Str = "trap.bounds writing what no end of a channel writes\\n"
     \\
     \\/// The bytes of a start record and of the record of a port.
-    \\const START_BYTES: usize = 104
+    \\const START_BYTES: usize = 112
     \\
     \\const PORT_BYTES: usize = 40
     \\
@@ -21803,7 +21824,8 @@ const TEXT_NANOS_ISOLATED: Str =
     \\/// to the kernel through the runner capability of an instance; to tell the runtime of the job
     \\/// or instance of a number the result of a waiting operation of a crossing kind's capability it
     \\/// called through its runner capability; and to take back the frames that moved for the ends of
-    \\/// bridges and the runner capabilities its table no longer names.
+    \\/// bridges and the runner capabilities its table no longer names, giving back the frames a job or
+    \\/// instance lent.
     \\enum Ask {
     \\    Join(Joining)
     \\    Lend(Borrowing)
@@ -21813,8 +21835,15 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    Breach(u64)
     \\    Read(Reading)
     \\    Resolve(Resolution)
-    \\    Reclaim
+    \\    Reclaim(Repaying)
     \\} Ask
+    \\
+    \\/// An ask to give back, through `reply`, the `count` frames a job or instance that has ended lent
+    \\/// its isolation.
+    \\struct Repaying {
+    \\    count: u64
+    \\    reply: task::Sender[mem::List[hw::PhysFrame[4_096]]]
+    \\} Repaying
     \\
     \\/// The result of a waiting operation of a crossing kind's capability that the job or instance
     \\/// numbered `id` called through its runner capability.
@@ -21841,8 +21870,8 @@ const TEXT_NANOS_ISOLATED: Str =
     \\/// orders, the number of the job or instance, its entry, where its input lies and its length, the
     \\/// address of its link's doorbell, where the records of its link's channels lie and their count,
     \\/// 1 when it is the instance of a component entry that the link's first channel carries, 0 for a
-    \\/// job, the handle of its runner capability, and where the encoding of what crossed into the
-    \\/// space's table for its world lies and its length.
+    \\/// job, the handle of its runner capability, where the encoding of what crossed into the space's
+    \\/// table for its world lies and its length, and the bytes of the frames it lent.
     \\struct Start derives Copy {
     \\    order: u64
     \\    id: u64
@@ -21856,6 +21885,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    runner: u64
     \\    granted: u64
     \\    granted_len: u64
+    \\    budget: u64
     \\} Start
     \\
     \\/// A capability a space holds by the handle naming its entry in the space's table.
@@ -22051,12 +22081,12 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    }
     \\} isolate
     \\
-    \\pub fn run_isolated(space: Isolation, job: sys::load::Isolated, link: Link, services: Services, caps: Caps, take input: mem::Bytes, alloc: mem::Alloc) -> Ended fails IsolatedError uses wait {
+    \\pub fn run_isolated(space: Isolation, job: sys::load::Isolated, link: Link, services: Services, caps: Caps, take input: mem::Bytes, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Ended fails IsolatedError uses wait {
     \\    if job.job().is_none() {
     \\        fail IsolatedError.NoJob
     \\    }
     \\    let halted = mem::Shared.of(core::atomic::AtomicBool.of(false), alloc)
-    \\    let Joined(outcome: outcome, cancelled: cancelled) = try await joined(space, id: space.number(), job, component: None, link, services, caps, take input, runner: sys::Runner.denied(), halted, alloc)
+    \\    let Joined(outcome: outcome, cancelled: cancelled) = try await joined(space, id: space.number(), job, component: None, link, services, caps, take input, runner: sys::Runner.denied(), halted, mut frames, alloc)
     \\    match cancelled {
     \\        Some(cancellation) => fail IsolatedError.Cancelled(take cancellation)
     \\        None => {}
@@ -22159,12 +22189,14 @@ const TEXT_NANOS_ISOLATED: Str =
     \\
     \\/// A space given back with the addresses at which it maps a link's frames: its doorbell, then each
     \\/// channel's inbound and outbound frames but those of ports, none when it could not map them all;
-    \\/// the addresses at which it maps the channels of ports; and the ends of bridges it maps.
+    \\/// the addresses at which it maps the channels of ports; the ends of bridges it maps; and the
+    \\/// frames the job or instance it was lent for lends its isolation.
     \\linear struct Lent {
     \\    space: sys::load::Space
     \\    frames: mem::List[u64]
     \\    ported: mem::List[u64]
     \\    ends: mem::List[Bridged]
+    \\    given: mem::List[hw::PhysFrame[4_096]]
     \\} Lent
     \\
     \\/// How a job or instance its space ran ended: as it says, or with a trap; or why it could not be
@@ -22195,9 +22227,10 @@ const TEXT_NANOS_ISOLATED: Str =
     \\/// channel of `link` that carries the calls of a port to the instance answering them, and gives how
     \\/// it ended once no space maps `link`'s frames, or why it could not be placed, the table then
     \\/// taking back every entry added for it, the door dropping what it kept for its ends and the frames
-    \\/// that moved for it going back to the isolation's. While it runs, it is watched as `run_watched`
-    \\/// watches it; once `halted` holds true, or this call is cancelled, the space abandons it.
-    \\fn joined(isolation: Isolation, id: u64, job: sys::load::Isolated, take component: Option[text::String], link: Link, services: Services, caps: Caps, take input: mem::Bytes, runner: sys::Runner, halted: mem::Shared[core::atomic::AtomicBool], alloc: mem::Alloc) -> Joined fails task::Cancelled uses wait {
+    \\/// that moved for it going back to the isolation's, which gives back to `frames` those it lent the
+    \\/// isolation once it was placed. While it runs, it is watched as `run_watched` watches it; once
+    \\/// `halted` holds true, or this call is cancelled, the space abandons it.
+    \\fn joined(isolation: Isolation, id: u64, job: sys::load::Isolated, take component: Option[text::String], link: Link, services: Services, caps: Caps, take input: mem::Bytes, runner: sys::Runner, halted: mem::Shared[core::atomic::AtomicBool], mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> Joined fails task::Cancelled uses wait {
     \\    if id == 0 {
     \\        return Joined(outcome: Err(sys::load::LoadError.Unplaceable), cancelled: None)
     \\    }
@@ -22231,21 +22264,9 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    discard attempt await take lent.drain(visit: fn[mut lendings](take value: Lending) {
     \\        mut lendings.push(take value)
     \\    })
-    \\    var ports = mem::List[Ported].empty(alloc)
-    \\    for lending in take lendings {
-    \\        let Lending(space: given, back: back) = lending
-    \\        var space = given
-    \\        let frames = mapped(mut space, link, alloc)
-    \\        if porting_out {
-    \\            ports = ports_mapped(mut space, link, instance, alloc)
-    \\        }
-    \\        var addresses = mem::List[u64].empty(alloc)
-    \\        for port in ports {
-    \\            mut addresses.push(port.inbound)
-    \\            mut addresses.push(port.outbound)
-    \\        }
-    \\        discard attempt await back.send(Lent(space: take space, frames: take frames, ported: take addresses, ends: mem::List[Bridged].empty(alloc)))
-    \\    }
+    \\    let held = u64.widen(frames.len())
+    \\    let ports = try await lents_sent(take lendings, link, porting_out, instance, mut frames, alloc)
+    \\    let handed = held - u64.widen(frames.len())
     \\    var remote = mem::List[PeerEnd].empty(alloc)
     \\    if porting_out {
     \\        var ends = mem::List[Bridged].empty(alloc)
@@ -22264,16 +22285,67 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    for far in remote {
     \\        discard attempt await far_closed(far, alloc)
     \\    }
+    \\    if ran.is_ok() {
+    \\        isolation.door.contents().table.taken_back(id)
+    \\        try await isolation.door.contents().carries_dropped()
+    \\    }
+    \\    try await isolation.repaid(count: handed, mut frames)
     \\    match ran {
-    \\        Ok(done) => {
-    \\            isolation.door.contents().table.taken_back(id)
-    \\            try await isolation.door.contents().carries_dropped()
-    \\            try await isolation.door.contents().asked(Ask.Reclaim)
-    \\            return done
-    \\        }
+    \\        Ok(done) => return done
     \\        Err(cancellation) => fail cancellation
     \\    }
     \\} joined
+    \\
+    \\/// Maps `link`'s frames into each space lent, and the channels of its ports when `porting_out`, for
+    \\/// a job or, when `instance`, an instance, and gives back each space with the addresses at which it
+    \\/// maps them and every frame of `frames`; gives the channels of ports it mapped.
+    \\fn lents_sent(take lendings: mem::List[Lending], link: Link, porting_out: bool, instance: bool, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> mem::List[Ported] fails task::Cancelled uses wait {
+    \\    var ports = mem::List[Ported].empty(alloc)
+    \\    for lending in take lendings {
+    \\        let Lending(space: given, back: back) = lending
+    \\        var space = given
+    \\        let mapping = mapped(mut space, link, alloc)
+    \\        if porting_out {
+    \\            ports = ports_mapped(mut space, link, instance, alloc)
+    \\        }
+    \\        var addresses = mem::List[u64].empty(alloc)
+    \\        for port in ports {
+    \\            mut addresses.push(port.inbound)
+    \\            mut addresses.push(port.outbound)
+    \\        }
+    \\        discard attempt await back.send(Lent(space: take space, frames: take mapping, ported: take addresses, ends: mem::List[Bridged].empty(alloc), given: frames_taken(mut frames, alloc)))
+    \\    }
+    \\    return ports
+    \\} lents_sent
+    \\
+    \\/// Every frame of `frames`, taken out of it.
+    \\fn frames_taken(mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> mem::List[hw::PhysFrame[4_096]] {
+    \\    var taken = mem::List[hw::PhysFrame[4_096]].empty(alloc)
+    \\    mut taken.reserve(frames.len())
+    \\    loop {
+    \\        let Some(frame) = mut frames.pop() else {
+    \\            return taken
+    \\        }
+    \\        mut taken.push(take frame)
+    \\    }
+    \\} frames_taken
+    \\
+    \\/// Gives back to `frames` every frame of `given`.
+    \\fn frames_given(take given: mem::List[hw::PhysFrame[4_096]], mut frames: mem::List[hw::PhysFrame[4_096]]) {
+    \\    for frame in take given {
+    \\        mut frames.push(take frame)
+    \\    }
+    \\} frames_given
+    \\
+    \\/// Has the task running the space of an isolation take back the frames that moved for what its
+    \\/// table no longer names and give back to `frames` the `count` frames a job or instance lent it.
+    \\fn Isolation.repaid(self, count: u64, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
+    \\    let task::Channel(sender: reply, receiver: replies) = task::Channel[mem::List[hw::PhysFrame[4_096]]].bounded(1, alloc: self.alloc)
+    \\    discard attempt await self.door.contents().asked(Ask.Reclaim(Repaying(count: count, reply: take reply)))
+    \\    discard attempt await take replies.drain(visit: fn[mut frames](take given: mem::List[hw::PhysFrame[4_096]]) {
+    \\        frames_given(take given, mut frames)
+    \\    })
+    \\} Isolation.repaid
     \\
     \\/// Waits until the job or instance numbered `id` that `receivers` hears of has ended, and gives how
     \\/// it ended: while it runs, each ring of `link` wakes the task running the space, the channels the
@@ -22426,7 +22498,8 @@ const TEXT_NANOS_ISOLATED: Str =
     \\/// A job or instance placed in its space that the space's runtime has not taken yet: its number,
     \\/// entry and input, whether it is an instance, the addresses of its link's frames, the keys and
     \\/// handles of its link's channels, the handle of its runner capability, what crossed into the
-    \\/// space's table for its world, and whether it waits for the ends of its bridges to open.
+    \\/// space's table for its world, whether it waits for the ends of its bridges to open, and the bytes
+    \\/// of the frames it lent.
     \\struct Pending {
     \\    id: u64
     \\    job: sys::load::Job
@@ -22438,6 +22511,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    runner: u64
     \\    granting: Granting
     \\    bridging: bool
+    \\    budget: u64
     \\} Pending
     \\
     \\/// What the task running an isolation's space keeps of it: the door of the isolation, the state of
@@ -22590,12 +22664,48 @@ const TEXT_NANOS_ISOLATED: Str =
     \\            Ask.Read(reading) => {
     \\                discard attempt await isolation.door.contents().read(take reading, mut frames, alloc)
     \\            }
-    \\            Ask.Reclaim => {
+    \\            Ask.Reclaim(repaying) => {
     \\                discard attempt await isolation.door.contents().moves_dropped(mut frames, alloc)
+    \\                discard attempt await repaid(isolation, take repaying, mut placing, mut frames)
     \\            }
     \\        }
     \\    }
     \\} asks_served
+    \\
+    \\/// Gives back through `repaying` the frames a job or instance lent, from `frames`; when `frames`
+    \\/// holds fewer, the space having drawn them for itself, first ends every job and instance of the
+    \\/// space `placing` holds `Trapped` with a trap of `trap.exhausted`, giving back its frames, then
+    \\/// gives as many as `frames` holds.
+    \\fn repaid(isolation: Isolation, take repaying: Repaying, mut placing: mem::List[Placed], mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
+    \\    let alloc = isolation.alloc
+    \\    let Repaying(count: count, reply: reply) = repaying
+    \\    if u64.widen(frames.len()) < count {
+    \\        match mut placing.pop() {
+    \\            Some(placed) => {
+    \\                let Placed(space: made, driving: kept) = placed
+    \\                var running = made
+    \\                var held = kept
+    \\                mut held.ended_all(mut running, kind: EXHAUSTED, report: "", alloc)
+    \\                discard attempt await mut held.left()
+    \\                take running.release(mut frames)
+    \\                try await isolation.door.contents().moves_dropped(mut frames, alloc)
+    \\            }
+    \\            None => {}
+    \\        }
+    \\    }
+    \\    var given = mem::List[hw::PhysFrame[4_096]].empty(alloc)
+    \\    mut given.reserve(usize.widen(count.min(u64.widen(frames.len()))))
+    \\    while u64.widen(given.len()) < count {
+    \\        let Some(frame) = mut frames.pop() else {
+    \\            break
+    \\        }
+    \\        mut given.push(take frame)
+    \\    }
+    \\    match reply.offer(take given) {
+    \\        Some(refused) => frames_given(take refused, mut frames)
+    \\        None => {}
+    \\    }
+    \\} repaid
     \\
     \\/// Gives back to `frames` the frames of each space of a list.
     \\fn spaces_released(take placing: mem::List[Placed], mut frames: mem::List[hw::PhysFrame[4_096]]) {
@@ -22699,7 +22809,9 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        return
     \\    }
     \\    lents_released(take given, mut frames)
-    \\    let Lent(space: returned_space, frames: addresses, ported: ports, ends: _) = lent
+    \\    let Lent(space: returned_space, frames: addresses, ported: ports, ends: _, given: lending) = lent
+    \\    let budget = u64.widen(lending.len()) * PAGE_BYTES
+    \\    frames_given(take lending, mut frames)
     \\    if addresses.len() != 1 + 2 * keys.len() {
     \\        discard ended.offer(Outcome.Unplaced(sys::load::LoadError.Unplaceable))
     \\        kept_placed(take returned_space, driving: take held, mut placing, mut frames)
@@ -22719,15 +22831,17 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        mut unmapping.push(address)
     \\    }
     \\    discard mut held.jobs.insert(id, value: Running(job: job, runner: runner, ids: mem::Map[u64, Carried].empty(alloc), frames: take unmapping, halted: take halted, breached: false, abandoning: false, notices: take notices, ended: take ended))
-    \\    mut held.pending.push(Pending(id: id, job: job, input: take input, held: instance, frames: take addresses, keys: take keys, channels: take channels, runner: acting, granting: take granted, bridging: holding_back))
+    \\    mut held.pending.push(Pending(id: id, job: job, input: take input, held: instance, frames: take addresses, keys: take keys, channels: take channels, runner: acting, granting: take granted, bridging: holding_back, budget: budget))
     \\    mut placing.push(Placed(space: take returned_space, driving: take held))
     \\} admitted
     \\
-    \\/// Gives back to `frames` the frames of each space a list of spaces given back holds.
+    \\/// Gives back to `frames` the frames of each space a list of spaces given back holds, and those lent
+    \\/// with it.
     \\fn lents_released(take lents: mem::List[Lent], mut frames: mem::List[hw::PhysFrame[4_096]]) {
     \\    for lent in take lents {
-    \\        let Lent(space: space, frames: _, ported: _, ends: _) = lent
+    \\        let Lent(space: space, frames: _, ported: _, ends: _, given: given) = lent
     \\        take space.release(mut frames)
+    \\        frames_given(take given, mut frames)
     \\    }
     \\} lents_released
     \\
@@ -23111,7 +23225,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\            discard mut self.abandons.remove(0)
     \\            return INVALID
     \\        }
-    \\        let record = Start(order: ORDER_ABANDON, id: id, job: running.job, input: 0, input_len: 0, bell: 0, ports: 0, port_count: 0, held: 0, runner: 0, granted: 0, granted_len: 0)
+    \\        let record = Start(order: ORDER_ABANDON, id: id, job: running.job, input: 0, input_len: 0, bell: 0, ports: 0, port_count: 0, held: 0, runner: 0, granted: 0, granted_len: 0, budget: 0)
     \\        if u64.widen(START_BYTES) > capacity {
     \\            return u64.widen(START_BYTES)
     \\        }
@@ -23139,7 +23253,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        return INVALID
     \\    }
     \\    let body = encoded(notice.told, alloc)
-    \\    let record = Start(order: ORDER_NOTICE, id: notice.id, job: running.job, input: 0, input_len: 0, bell: 0, ports: 0, port_count: 0, held: 0, runner: 0, granted: target + u64.widen(START_BYTES), granted_len: u64.widen(body.len()))
+    \\    let record = Start(order: ORDER_NOTICE, id: notice.id, job: running.job, input: 0, input_len: 0, bell: 0, ports: 0, port_count: 0, held: 0, runner: 0, granted: target + u64.widen(START_BYTES), granted_len: u64.widen(body.len()), budget: 0)
     \\    var bytes = record_bytes(record, count: START_BYTES, alloc)
     \\    mut bytes.append(body.view())
     \\    let len = u64.widen(bytes.len())
@@ -23170,7 +23284,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    let input_at = keys_at + u64.widen(keys.len())
     \\    let granted_at = input_at + u64.widen(self.input.len())
     \\    let granted = encoded(self.granting, alloc)
-    \\    let record = Start(order: ORDER_START, id: self.id, job: self.job, input: input_at, input_len: u64.widen(self.input.len()), bell: self.frames[0], ports: ports_at, port_count: u64.widen(self.keys.len()), held: held, runner: self.runner, granted: granted_at, granted_len: u64.widen(granted.len()))
+    \\    let record = Start(order: ORDER_START, id: self.id, job: self.job, input: input_at, input_len: u64.widen(self.input.len()), bell: self.frames[0], ports: ports_at, port_count: u64.widen(self.keys.len()), held: held, runner: self.runner, granted: granted_at, granted_len: u64.widen(granted.len()), budget: self.budget)
     \\    var bytes = record_bytes(record, count: START_BYTES, alloc)
     \\    mut bytes.append(ports.view())
     \\    mut bytes.append(keys.view())
@@ -24283,15 +24397,20 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    }
     \\} taken_order
     \\
-    \\/// Runs the job or instance an order starts, in a domain run of `domain`, on a world whose log,
-    \\/// standard streams, random source and file system the kernel serves, with the capabilities that
-    \\/// crossed for it and its link's channels in its table, holding the instance of a component entry
-    \\/// for the kernel over its link's first channel, serving the ends of the bridges it starts with and
-    \\/// those `notices` tells of and answering its waiting calls through `waits`, and ends it with the
-    \\/// kernel as it ended.
+    \\/// Runs the job or instance an order starts, in a domain run of `domain`, on a world drawing within
+    \\/// the bytes of the frames it lent, whose log, standard streams, random source and file system the
+    \\/// kernel serves, with the capabilities that crossed for it and its link's channels in its table,
+    \\/// holding the instance of a component entry for the kernel over its link's first channel, serving
+    \\/// the ends of the bridges it starts with and those `notices` tells of and answering its waiting
+    \\/// calls through `waits`, and ends it with the kernel as it ended.
     \\fn begun(order: Taken, domain: mem::Shared[sys::Abandoner], granted: Base, take notices: task::Receiver[Bridging], waits: task::Cown[PortWaits]) fails task::Cancelled uses wait {
     \\    let record = order.record
     \\    let alloc = granted.alloc
+    \\    let budget = alloc.split(usize.widen(record.budget))
+    \\    defer take budget.close()
+    \\    let account = granted.exec.split_on(task::Share(weight: 1, class: 0, reserve_ppm: 0), alloc: budget.alloc())
+    \\    defer take account.close()
+    \\    let drawing = Base(alloc: budget.alloc(), exec: account.executor(), clock: granted.clock)
     \\    var input = mem::Bytes.empty(alloc)
     \\    let from = usize.widen(record.input).wrapping_sub(hw::Ptr.of_view(order.bytes.view()).addr())
     \\    match order.bytes.view().split_at(from) {
@@ -24313,7 +24432,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    let bridges = Bridges(ports: task::Cown.of(mem::Map[u64, Pump].empty(alloc), alloc), kinds: take kinds, routes: task::Cown.of(Routes(next: 0, waiting: mem::Map[u64, Route].empty(alloc)), alloc), late: take late, base: base, clock: granted.clock, alloc: alloc)
     \\    let ports = sys::Minter[Port, Ports, u64].of(Ports(bell: record.bell, list: take list), alloc)
     \\    var ends = mem::List[EndAt].empty(alloc)
-    \\    let world = attempt remote_world(granted, record, base, ports, channels_from: record.held, mut ends)
+    \\    let world = attempt remote_world(granted, drawing, record, base, ports, channels_from: record.held, mut ends)
     \\    let job = record.job
     \\    let id = record.id
     \\    match world {
@@ -24327,8 +24446,8 @@ const TEXT_NANOS_ISOLATED: Str =
     \\            }
     \\            let told = Told(initial: take initial, notices: take notices, postponed: take postponed)
     \\            let outcome = match record.held {
-    \\                0 => attempt await served_job(job, runner: record.runner, domain, world: take given, take input, take outgoing, bridges, take told)
-    \\                else => attempt await served_instance(job, port: ports.mint(0), base, runner: record.runner, domain, world: take given, take input, up, take outgoing, waits, bridges, take told)
+    \\                0 => attempt await served_job(job, runner: record.runner, domain, granted, world: take given, take input, take outgoing, bridges, take told)
+    \\                else => attempt await served_instance(job, port: ports.mint(0), base, runner: record.runner, domain, granted, world: take given, take input, up, take outgoing, waits, bridges, take told)
     \\            }
     \\            take remotes.close()
     \\            take ports.close()
@@ -24346,18 +24465,19 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    }
     \\} begun
     \\
-    \\/// Runs the job `job` in a domain run of `domain` on `world` and `input`, sending its kernel through
-    \\/// the runner capability of the space's table whose handle is `runner` each message `outgoing`
+    \\/// Runs the job `job` on `world` and `input` as `entry_run` does, sending its kernel through the
+    \\/// runner capability of the space's table whose handle is `runner` each message `outgoing`
     \\/// carries, which an instance's link's first channel would carry, and serving the ends of `bridges`
-    \\/// `told` opens and tells of; gives how the domain ended.
-    \\fn served_job(job: sys::load::Job, runner: u64, domain: mem::Shared[sys::Abandoner], take world: World, take input: mem::Bytes, take outgoing: task::Receiver[mem::Bytes], bridges: Bridges, take told: Told) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
-    \\    let alloc = world.alloc
-    \\    let exec = world.exec
+    \\/// `told` opens and tells of on the runtime's executor and allocator `granted` gives; gives how the
+    \\/// domain ended.
+    \\fn served_job(job: sys::load::Job, runner: u64, domain: mem::Shared[sys::Abandoner], granted: Base, take world: World, take input: mem::Bytes, take outgoing: task::Receiver[mem::Bytes], bridges: Bridges, take told: Told) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
+    \\    let alloc = granted.alloc
+    \\    let exec = granted.exec
     \\    var given = Some(Launched(world: take world, input: take input, outgoing: take outgoing))
     \\    var telling = Some(take told)
     \\    var outcome: Result[Ended, sys::Trap] = Ok(Ended.Cancelled)
     \\    try await task::scope(exec, body: fn[mut given, mut telling, mut outcome](s: task::Scope) fails task::Cancelled uses wait {
-    \\        let Some(Launched(world: granted, input: fed, outgoing: sending)) = mut given.extract() else {
+    \\        let Some(Launched(world: launched, input: fed, outgoing: sending)) = mut given.extract() else {
     \\            return
     \\        }
     \\        let Some(Told(initial: open, notices: noticing, postponed: replying)) = mut telling.extract() else {
@@ -24380,13 +24500,29 @@ const TEXT_NANOS_ISOLATED: Str =
     \\                discard invoke(runner, operation: RUN_UP, args: parts.tail, result: mut nothing.view_mut())
     \\            }
     \\        })
-    \\        outcome = try await domain.contents().run_sized(fn[take granted, take fed]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
-    \\            return try await call(job, world: take granted, input: take fed)
-    \\        }, stack: job.stack() + CALL_STACK, exec, alloc)
+    \\        outcome = try await entry_run(job, domain, world: take launched, input: take fed, exec, alloc)
     \\        s.cancel()
     \\    })
     \\    return outcome
     \\} served_job
+    \\
+    \\/// Runs the entry of `job` on `world` and `input` in a domain run of `domain` on `exec` and
+    \\/// `alloc`, whose first task runs it in a domain of its own on the world's executor and allocator,
+    \\/// which draw its stack, so that a world drawing too little for that stack ends the run trapped as
+    \\/// the entry's trap does; gives how the run ended.
+    \\fn entry_run[I: Send](job: sys::load::Job, domain: mem::Shared[sys::Abandoner], take world: World, take input: I, exec: task::Executor, alloc: mem::Alloc) -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
+    \\    let ran = try await domain.contents().run(fn[take world, take input]() -> Result[Ended, sys::Trap] fails task::Cancelled uses wait {
+    \\        let drawing = world.exec
+    \\        let budget = world.alloc
+    \\        return try await sys::Domain.run_sized(fn[take world, take input]() -> Ended fails task::Cancelled uses wait limits stack 4_096 {
+    \\            return try await call(job, take world, take input)
+    \\        }, stack: job.stack() + CALL_STACK, exec: drawing, alloc: budget)
+    \\    }, exec, alloc)
+    \\    return match ran {
+    \\        Ok(inner) => inner
+    \\        Err(trap) => Err(take trap)
+    \\    }
+    \\} entry_run
     \\
     \\/// What a job of a space owns: its world, its input and the receiver of the messages to send its
     \\/// kernel.
@@ -24396,13 +24532,13 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    outgoing: task::Receiver[mem::Bytes]
     \\} Launched
     \\
-    \\/// The world of a job or instance of a space: its runtime's allocator and executor, its clock, log,
+    \\/// The world of a job or instance of a space: the allocator and executor `drawing` gives, its clock, log,
     \\/// standard streams, random source and file system served by the kernel through the handles that
     \\/// crossed for it, its clock and random source each stale from the start when the kernel's is
     \\/// stale, its network denied, and its table holding each capability that crossed for it under its
     \\/// key, then each channel of its link from the index `channels_from` as a standard stream under the
     \\/// channel's key.
-    \\fn remote_world(granted: Base, record: Start, base: Remote, ports: sys::Minter[Port, Ports, u64], channels_from: u64, mut ends: mem::List[EndAt]) -> World fails sys::Revoked {
+    \\fn remote_world(granted: Base, drawing: Base, record: Start, base: Remote, ports: sys::Minter[Port, Ports, u64], channels_from: u64, mut ends: mem::List[EndAt]) -> World fails sys::Revoked {
     \\    var given = mem::Bytes.zeroed(usize.widen(record.granted_len), alloc: granted.alloc)
     \\    trusted "the kernel writes what crossed for the world, `granted_len` bytes, at `granted`" {
     \\        hw::Ptr[u8].of_addr(usize.widen(record.granted)).copy(hw::Ptr.of_view_mut(mut given.view_mut()), count: usize.widen(record.granted_len))
@@ -24440,7 +24576,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        }
     \\        Cap[sys::Stdio].put(mut caps, key: named.as_str(), capability: channel)
     \\    }
-    \\    return World(alloc: granted.alloc, exec: granted.exec, clock: clock, random: source, log: logs, stdio: streams, fs: files, net: sys::Net.denied(), caps: take caps)
+    \\    return World(alloc: drawing.alloc, exec: drawing.exec, clock: clock, random: source, log: logs, stdio: streams, fs: files, net: sys::Net.denied(), caps: take caps)
     \\} remote_world
     \\
     \\/// `capability`, or when `revoked` a revoked capability deriving from it.

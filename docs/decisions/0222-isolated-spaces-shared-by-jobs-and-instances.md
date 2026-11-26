@@ -1,6 +1,6 @@
 # 0222. Isolated spaces shared by jobs and instances
 
-Status: accepted; the services, and so handles 0 to 3, serving every job and instance of the space superseded by 0227
+Status: accepted; the services, and so handles 0 to 3, serving every job and instance of the space superseded by 0227; the space drawing for every job and instance from the frames `isolate` borrows superseded by 0238
 
 ## Context
 

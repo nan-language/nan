@@ -9,8 +9,11 @@ registers Exit {
 } Exit
 
 /// The bytes of the largest region of usable memory the kernel's file system and the job's image
-/// draw from; the space draws its pages from the rest of usable memory.
+/// draw from; the space draws its pages from the rest of usable memory, its own from
+/// `SPACE_FRAMES` of its frames, 128 MiB, and each run of the job from the others, which it lends.
 const STORE_BYTES: u64 = 805_306_368
+
+const SPACE_FRAMES: usize = 32_768
 
 /// The boot module's files holding the toolchain's bundle and the commands it runs, one per line,
 /// its arguments separated by spaces.
@@ -680,15 +683,25 @@ fn served(cpu: hw::Ring0, loader: sys::load::Loader, take files: mem::List[Store
         stop(text: "out of frames\n")
     }
     var extended = Some(hw::ExtendedState.of(take state))
+    var own = mem::List[hw::PhysFrame[4_096]].empty(alloc)
+    for _ in 0..<SPACE_FRAMES {
+        let Some(frame) = mut frames.pop() else {
+            stop(text: "out of frames\n")
+        }
+        mut own.push(take frame)
+    }
     var code: u8 = 0
-    discard attempt await nanos::isolate(cpu, tenant: 1, services, mut frames, mut extended, exec, alloc, body: fn[mut code](space: nanos::Isolation) fails task::Cancelled uses wait {
+    discard attempt await nanos::isolate(cpu, tenant: 1, services, frames: mut own, mut extended, exec, alloc, body: fn[mut code, mut frames](space: nanos::Isolation) fails task::Cancelled uses wait {
         for command in split(commands.view(), separator: b'\n', alloc) {
-            code = status_of(attempt await nanos::run_isolated(space, job, link, services, caps: nanos::Caps.empty(alloc), input: host_input(command.view(), alloc), alloc), alloc)
+            code = status_of(attempt await nanos::run_isolated(space, job, link, services, caps: nanos::Caps.empty(alloc), input: host_input(command.view(), alloc), mut frames, alloc), alloc)
             if code != 0 {
                 break
             }
         }
     })
+    for frame in take own {
+        mut frames.push(take frame)
+    }
     take link.release(mut frames)
     match extended {
         Some(owned) => mut frames.push(take owned.into_frame())

@@ -1,6 +1,6 @@
 # 0225. Bridges between isolated spaces
 
-Status: accepted; waiting operations of crossing kinds always reaching the kernel superseded by 0228
+Status: accepted; waiting operations of crossing kinds always reaching the kernel superseded by 0228; frames moved but never mapped kept until the isolation returns superseded by 0234
 
 ## Context
 

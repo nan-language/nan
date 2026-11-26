@@ -1,6 +1,6 @@
 # 0226. Moving large messages off a link's first channel
 
-Status: accepted
+Status: accepted; what a space moves to its kernel without naming it kept until the isolation returns superseded by 0234
 
 ## Context
 

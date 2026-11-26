@@ -18800,12 +18800,13 @@ const TEXT_NANOS_BRIDGE: Str =
     \\} Leaving
     \\
     \\/// Serves an operation of the end of a bridge the space holds by `handle`: rings its other end;
-    \\/// closes it, taking back its entry, dropping what the door kept for it and unmapping the frames it
-    \\/// maps for itself; closes it as breached by its other end, whose job or instance ends; carries the
-    \\/// handles of the space's table it names into the table of the other end's space, giving the token
-    \\/// its runtime claims them by; admits a call it serves through the capability its kernel admits
-    \\/// them through, `STALE` once that is stale; or claims what crossed into the space's table for it
-    \\/// by a token, written at `target` when it fits `capacity`, giving its length either way.
+    \\/// closes it, taking back its entry, dropping what the door kept for it, giving back to `frames`
+    \\/// those that moved for it and unmapping the frames it maps for itself; closes it as breached by
+    \\/// its other end, whose job or instance ends; carries the handles of the space's table it names
+    \\/// into the table of the other end's space, giving the token its runtime claims them by; admits a
+    \\/// call it serves through the capability its kernel admits them through, `STALE` once that is
+    \\/// stale; or claims what crossed into the space's table for it by a token, written at `target` when
+    \\/// it fits `capacity`, giving its length either way.
     \\fn Driven.bridge_invoked(mut self, mut space: sys::load::Space, handle: u64, operation: u64, args: Untrusted[mem::Bytes], target: u64, capacity: u64, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
     \\    let Some(bridge) = self.bridges.get(handle) else {
     \\        return STALE
@@ -18823,6 +18824,7 @@ const TEXT_NANOS_BRIDGE: Str =
     \\        }
     \\        mut self.end_closed(mut space, handle)
     \\        try await self.door.contents().carries_dropped()
+    \\        try await self.door.contents().moves_dropped(mut frames, alloc)
     \\        return 0
     \\    }
     \\    if operation == BRIDGE_CARRY {
@@ -19907,13 +19909,21 @@ const TEXT_NANOS_BRIDGE: Str =
     \\} Accepting
     \\
     \\/// What the task keeping the frames moving into an isolation's space, or to its kernel, is given:
-    \\/// frames that moved, an ask for the length of what moved under a token, or an ask for those
-    \\/// frames.
+    \\/// frames that moved, an ask for the length of what moved under a token, an ask for those frames,
+    \\/// or an ask for the frames that moved for what its table no longer names.
     \\linear enum Moving {
-    \\    Parked(Moved)
+    \\    Parked(Parking)
     \\    Sized(Sizing)
     \\    Claimed(Claiming)
+    \\    Dropped(Dropping)
     \\} Moving
+    \\
+    \\/// Frames that moved, and the sender through which they are given back when the table of the
+    \\/// isolation they moved to no longer names what they moved for.
+    \\linear struct Parking {
+    \\    moved: Moved
+    \\    refused: task::Sender[Moved]
+    \\} Parking
     \\
     \\/// Frames that moved into an isolation's space for the end of a bridge whose handle is `handle`, or
     \\/// to its kernel through the runner capability whose handle it is, under `token`, holding `len`
@@ -19941,14 +19951,30 @@ const TEXT_NANOS_BRIDGE: Str =
     \\    reply: task::Sender[Moved]
     \\} Claiming
     \\
+    \\/// An ask for the frames that moved for the ends of bridges and the runner capabilities an
+    \\/// isolation's table no longer names, given through `reply`.
+    \\struct Dropping {
+    \\    reply: task::Sender[mem::List[Moved]]
+    \\} Dropping
+    \\
     \\/// Keeps the frames moving into an isolation's space, or to its kernel, until the end of a bridge
-    \\/// or the runner capability they moved for claims them, and gives every frame left once no sender
-    \\/// of `moving` is left.
-    \\fn moves_kept(take moving: task::Receiver[Moving], alloc: mem::Alloc) -> mem::List[hw::PhysFrame[4_096]] fails task::Cancelled uses wait {
+    \\/// or the runner capability they moved for claims them, refusing those moving for one the
+    \\/// isolation's `table` no longer names and giving up, when asked, those kept for one it no longer
+    \\/// names, and gives every frame left once no sender of `moving` is left.
+    \\fn moves_kept(take moving: task::Receiver[Moving], table: Table, alloc: mem::Alloc) -> mem::List[hw::PhysFrame[4_096]] fails task::Cancelled uses wait {
     \\    var parked = mem::List[Moved].empty(alloc)
     \\    discard attempt await take moving.drain(visit: fn[mut parked](take message: Moving) {
     \\        match message {
-    \\            Moving.Parked(moved) => mut parked.push(take moved)
+    \\            Moving.Parked(Parking(moved: moved, refused: refused)) => {
+    \\                if table.entry(moved.handle).is_some() {
+    \\                    mut parked.push(take moved)
+    \\                } else {
+    \\                    match refused.offer(take moved) {
+    \\                        Some(kept) => mut parked.push(take kept)
+    \\                        None => {}
+    \\                    }
+    \\                }
+    \\            }
     \\            Moving.Sized(Sizing(token: token, handle: handle, reply: reply)) => {
     \\                for moved in parked {
     \\                    if moved.token == token and moved.handle == handle {
@@ -19968,6 +19994,25 @@ const TEXT_NANOS_BRIDGE: Str =
     \\                    }
     \\                }
     \\            }
+    \\            Moving.Dropped(Dropping(reply: reply)) => {
+    \\                var dropped = mem::List[Moved].empty(alloc)
+    \\                var index: usize = 0
+    \\                while index < parked.len() {
+    \\                    if table.entry(parked[index].handle).is_some() {
+    \\                        index += 1
+    \\                    } else {
+    \\                        mut dropped.push(mut parked.remove(index))
+    \\                    }
+    \\                }
+    \\                match reply.offer(take dropped) {
+    \\                    Some(refused) => {
+    \\                        for moved in take refused {
+    \\                            mut parked.push(take moved)
+    \\                        }
+    \\                    }
+    \\                    None => {}
+    \\                }
+    \\            }
     \\        }
     \\    })
     \\    var left = mem::List[hw::PhysFrame[4_096]].empty(alloc)
@@ -19983,15 +20028,20 @@ const TEXT_NANOS_BRIDGE: Str =
     \\/// Gives back to `frames` the frames a message for the task keeping moving frames holds.
     \\fn moving_released(take moving: Moving, mut frames: mem::List[hw::PhysFrame[4_096]]) {
     \\    match moving {
-    \\        Moving.Parked(Moved(token: _, handle: _, len: _, frames: held)) => {
-    \\            for frame in take held {
-    \\                mut frames.push(take frame)
-    \\            }
-    \\        }
+    \\        Moving.Parked(Parking(moved: moved, refused: _)) => moved_released(take moved, mut frames)
     \\        Moving.Sized(_) => {}
     \\        Moving.Claimed(_) => {}
+    \\        Moving.Dropped(_) => {}
     \\    }
     \\} moving_released
+    \\
+    \\/// Gives back to `frames` the frames that moved.
+    \\fn moved_released(take moved: Moved, mut frames: mem::List[hw::PhysFrame[4_096]]) {
+    \\    let Moved(token: _, handle: _, len: _, frames: held) = moved
+    \\    for frame in take held {
+    \\        mut frames.push(take frame)
+    \\    }
+    \\} moved_released
     \\
     \\/// A sender of the task keeping the frames moving into the space of a door's isolation, none once
     \\/// that isolation takes no more.
@@ -20020,7 +20070,7 @@ const TEXT_NANOS_BRIDGE: Str =
     \\/// Moves the pages `span` names out of `space` to the isolation `peer` reaches, for the end of a
     \\/// bridge or the runner capability whose handle is `handle` there, giving the token they moved
     \\/// under; gives `INVALID`, the frames it took going to `frames`, when `space` does not map each of
-    \\/// those pages or that isolation takes no more.
+    \\/// those pages, that isolation takes no more or its table no longer names that end or capability.
     \\fn moved_out(peer: Doorway, handle: u64, span: Span, mut space: sys::load::Space, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
     \\    if span.len == 0 or span.len > MOST_MOVED or span.address % PAGE_BYTES != 0 {
     \\        return INVALID
@@ -20033,34 +20083,67 @@ const TEXT_NANOS_BRIDGE: Str =
     \\        }
     \\        return INVALID
     \\    }
-    \\    var token: u64 = 0
-    \\    var mover: Option[task::Sender[Moving]] = None
     \\    if u64.widen(taken.len()) * PAGE_BYTES == len {
     \\        match peer.reached() {
-    \\            Some(peer_door) => {
-    \\                token = peer_door.contents().tokens.fetch_add(1).value_or(0)
-    \\                mover = match attempt await peer_door.contents().mover() {
-    \\                    Ok(sender) => sender
-    \\                    Err(_) => None
-    \\                }
-    \\            }
+    \\            Some(peer_door) => return try await peer_door.contents().moved_in(handle, len: span.len, moved: take taken, mut frames, alloc)
     \\            None => {}
     \\        }
     \\    }
+    \\    for frame in take taken {
+    \\        mut frames.push(take frame)
+    \\    }
+    \\    return INVALID
+    \\} moved_out
+    \\
+    \\/// Keeps `moved`, the frames holding `len` bytes that moved into the space of a door's isolation,
+    \\/// or to its kernel, for the end of a bridge or the runner capability whose handle is `handle`,
+    \\/// giving the token they moved under; gives `INVALID`, `moved` going to `frames`, when the
+    \\/// isolation takes no more or its table no longer names that end or capability.
+    \\fn Door.moved_in(self, handle: u64, len: u64, take moved: mem::List[hw::PhysFrame[4_096]], mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
+    \\    let token = self.tokens.fetch_add(1).value_or(0)
+    \\    let mover = match attempt await self.mover() {
+    \\        Ok(sender) => sender
+    \\        Err(_) => None
+    \\    }
     \\    let Some(sender) = mover else {
-    \\        for frame in take taken {
+    \\        for frame in take moved {
     \\            mut frames.push(take frame)
     \\        }
     \\        return INVALID
     \\    }
-    \\    match sender.offer(Moving.Parked(Moved(token: token, handle: handle, len: span.len, frames: take taken))) {
-    \\        Some(refused) => {
-    \\            moving_released(take refused, mut frames)
-    \\            return INVALID
+    \\    let task::Channel(sender: refusing, receiver: refusals) = task::Channel[Moved].bounded(1, alloc)
+    \\    var refused = false
+    \\    match sender.offer(Moving.Parked(Parking(moved: Moved(token: token, handle: handle, len: len, frames: take moved), refused: take refusing))) {
+    \\        Some(unsent) => {
+    \\            moving_released(take unsent, mut frames)
+    \\            refused = true
     \\        }
-    \\        None => return token
+    \\        None => {}
     \\    }
-    \\} moved_out
+    \\    try await take refusals.drain(visit: fn[mut frames, mut refused](take given: Moved) {
+    \\        moved_released(take given, mut frames)
+    \\        refused = true
+    \\    })
+    \\    if refused {
+    \\        return INVALID
+    \\    }
+    \\    return token
+    \\} Door.moved_in
+    \\
+    \\/// Gives back to `frames` the frames that moved into the space of a door's isolation, or to its
+    \\/// kernel, for each end of a bridge or runner capability its table no longer names.
+    \\fn Door.moves_dropped(self, mut frames: mem::List[hw::PhysFrame[4_096]], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    \\    let Some(mover) = try await self.mover() else {
+    \\        return
+    \\    }
+    \\    let task::Channel(sender: reply, receiver: replies) = task::Channel[mem::List[Moved]].bounded(1, alloc)
+    \\    discard attempt await mover.send(Moving.Dropped(Dropping(reply: take reply)))
+    \\    discard attempt await take replies.drain(visit: fn[mut frames](take dropped: mem::List[Moved]) {
+    \\        for moved in take dropped {
+    \\            moved_released(take moved, mut frames)
+    \\        }
+    \\    })
+    \\} Door.moves_dropped
     \\
     \\/// The length of what moved into the space of a door's isolation under `token` for the end of a
     \\/// bridge whose handle is `handle`, `INVALID` when nothing did.
@@ -21684,9 +21767,10 @@ const TEXT_NANOS_ISOLATED: Str =
     \\/// the ends of bridges for the instance of a number, which starts once they are open; that the end
     \\/// of a bridge be told its other end wrote or read; to close the end of a bridge; to end the
     \\/// instance of a number as breaching its link's first channel or a bridge; to give what moved
-    \\/// to the kernel through the runner capability of an instance; and to tell the runtime of the job
+    \\/// to the kernel through the runner capability of an instance; to tell the runtime of the job
     \\/// or instance of a number the result of a waiting operation of a crossing kind's capability it
-    \\/// called through its runner capability.
+    \\/// called through its runner capability; and to take back the frames that moved for the ends of
+    \\/// bridges and the runner capabilities its table no longer names.
     \\enum Ask {
     \\    Join(Joining)
     \\    Lend(Borrowing)
@@ -21696,6 +21780,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    Breach(u64)
     \\    Read(Reading)
     \\    Resolve(Resolution)
+    \\    Reclaim
     \\} Ask
     \\
     \\/// The result of a waiting operation of a crossing kind's capability that the job or instance
@@ -21894,7 +21979,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\            return
     \\        }
     \\        let keeping = s.spawn(fn[take moved_in]() -> mem::List[hw::PhysFrame[4_096]] fails task::Cancelled uses wait {
-    \\            return try await moves_kept(take moved_in, alloc)
+    \\            return try await moves_kept(take moved_in, table: isolation.door.contents().table, alloc)
     \\        })
     \\        let driving = s.spawn(fn[mut frames, mut extended]() fails task::Cancelled uses wait {
     \\            try await driven(cpu, tenant, clock: services.clock, services, isolation, mut frames, mut extended)
@@ -22073,10 +22158,10 @@ const TEXT_NANOS_ISOLATED: Str =
     \\/// job's, as the job or instance numbered `id`, on `input` with `link`, a world reaching `services`
     \\/// and the capabilities of `caps` that cross into the space, acting through `runner`, bridging each
     \\/// channel of `link` that carries the calls of a port to the instance answering them, and gives how
-    \\/// it ended once no space maps `link`'s frames, or why it could not be placed, the table then taking
-    \\/// back every entry added for it and the door dropping what it kept for its ends. While it runs, it
-    \\/// is watched as `run_watched` watches it; once `halted` holds true, or this call is cancelled, the
-    \\/// space abandons it.
+    \\/// it ended once no space maps `link`'s frames, or why it could not be placed, the table then
+    \\/// taking back every entry added for it, the door dropping what it kept for its ends and the frames
+    \\/// that moved for it going back to the isolation's. While it runs, it is watched as `run_watched`
+    \\/// watches it; once `halted` holds true, or this call is cancelled, the space abandons it.
     \\fn joined(isolation: Isolation, id: u64, job: sys::load::Isolated, take component: Option[text::String], link: Link, services: Services, caps: Caps, take input: mem::Bytes, runner: sys::Runner, halted: mem::Shared[core::atomic::AtomicBool], alloc: mem::Alloc) -> Joined fails task::Cancelled uses wait {
     \\    if id == 0 {
     \\        return Joined(outcome: Err(sys::load::LoadError.Unplaceable), cancelled: None)
@@ -22148,6 +22233,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        Ok(done) => {
     \\            isolation.door.contents().table.taken_back(id)
     \\            try await isolation.door.contents().carries_dropped()
+    \\            try await isolation.door.contents().asked(Ask.Reclaim)
     \\            return done
     \\        }
     \\        Err(cancellation) => fail cancellation
@@ -22468,6 +22554,9 @@ const TEXT_NANOS_ISOLATED: Str =
     \\            }
     \\            Ask.Read(reading) => {
     \\                discard attempt await isolation.door.contents().read(take reading, mut frames, alloc)
+    \\            }
+    \\            Ask.Reclaim => {
+    \\                discard attempt await isolation.door.contents().moves_dropped(mut frames, alloc)
     \\            }
     \\        }
     \\    }

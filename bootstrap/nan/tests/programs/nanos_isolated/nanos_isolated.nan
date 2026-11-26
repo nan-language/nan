@@ -1,4 +1,4 @@
-//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port, their random source from a counter and their file system from a disk writing each call it serves through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, with the reports of their traps, a job reading kernel memory, in a domain of its own and outside it, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, drawing from a random source and writing to standard streams revoked between its draws and writes, its standard input closed, a job reading its clock, sleeping on it and waiting on its link in a space whose clock is revoked while its kernel sleeps, two jobs of one space reading their clocks and sleeping on them once one's clock is revoked, instances of a component whose calls, a postponed one included, keyed tasks, held ones included, messages sent to themselves and checkpoints run in their spaces, with logs and gauges crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, an instance sharing its space with a job that traps, divides and adds through a gauge its world holds, logging through a log of its own and denied a random source, with another instance that is abandoned and with one whose space breaches its link, a book and tellers in two spaces calling it over a bridge, a log crossing there and back, payloads streamed and moved through frames of their own, a teller and a job calling it over bridges through lines their worlds hold, whose kernel admits each call until their credit runs out or a line is revoked, a breach ending the book, and calls, replies, states and a job's result past what a link carries leaving their spaces, a job drawing from its random source in more placements of one isolation than its table holds the entries of at once, an instance answering more calls giving it logs than its table holds the entries of at once, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
+//! Runs the jobs of nanos bundles in isolated spaces, serving their logs and standard streams on the serial port, their random source from a counter and their file system from a disk writing each call it serves through system calls: a typed job using floats and lanes, an input it does not decode, a host program, jobs that trap, fail and return, with the reports of their traps, a job reading kernel memory, in a domain of its own and outside it, a job recursing past the stack it starts with, a job holding memory within the frames its space draws from and past them, a space drawing and giving back pages of its boot area, a job exchanging lines with the kernel over the channels of its link, woken by its doorbell, drawing from a random source and writing to standard streams revoked between its draws and writes, its standard input closed, a job reading its clock, sleeping on it and waiting on its link in a space whose clock is revoked while its kernel sleeps, two jobs of one space reading their clocks and sleeping on them once one's clock is revoked, instances of a component whose calls, a postponed one included, keyed tasks, held ones included, messages sent to themselves and checkpoints run in their spaces, with logs and gauges crossing into and out of them and a runner the kernel serves, one ending trapped and one abandoned, an instance sharing its space with a job that traps, divides and adds through a gauge its world holds, logging through a log of its own and denied a random source, with another instance that is abandoned and with one whose space breaches its link, a book and tellers in two spaces calling it over a bridge, a log crossing there and back, payloads streamed and moved through frames of their own, a teller and a job calling it over bridges through lines their worlds hold, whose kernel admits each call until their credit runs out or a line is revoked, a breach ending the book, and calls, replies, states and a job's result past what a link carries leaving their spaces, a job drawing from its random source in more placements of one isolation than its table holds the entries of at once, books of one isolation breaching their link with more replies moved to the kernel unread than its frames hold, an instance answering more calls giving it logs than its table holds the entries of at once, a space's runtime probing kernel memory, and a job spinning on floats while a job of the shared space does.
 
 registers Uart {
     data: u8 at 0x0 write
@@ -624,6 +624,90 @@ fn reclaimed(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frame
     say(text: " of the placements of one isolation\n")
 } reclaimed
 
+/// The books one isolation holds one after another, each moving to the kernel a reply it never
+/// reads: more than the isolation's frames hold unless the frames of each reply come back to it.
+const BREACHING_BOOKS: usize = 3
+
+/// Holds `BREACHING_BOOKS` books one after another in one isolation, each breaching its link once
+/// it moved its reply to the kernel as `fill_breached` has it, and writes how many ended trapped
+/// breaching it.
+fn fills_unread(cpu: hw::Ring0, ledger: sys::load::Isolated, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
+    let gauging = gauges::open(grants.clock, alloc: grants.alloc)
+    defer gauges::close(take gauging)
+    var caps = nanos::Caps.empty(grants.alloc)
+    mut nanos::Cap[gauges::Gauge].put(mut caps, key: "gauge", capability: gauges::mint(gauging))
+    var links = mem::List[nanos::Link].empty(grants.alloc)
+    var outbounds = mem::List[u64].empty(grants.alloc)
+    for _ in 0..<BREACHING_BOOKS {
+        var link = nanos::Link.of(next_frame(mut frames), alloc: grants.alloc)
+        let up = next_frame(mut frames)
+        mut outbounds.push(up.base())
+        discard mut link.open("book", inbound: next_frame(mut frames), outbound: take up)
+        mut links.push(take link)
+    }
+    var extended = Some(hw::ExtendedState.of(next_frame(mut frames)))
+    var held = frames_for_space(mut frames, alloc: grants.alloc)
+    var breached: u64 = 0
+    discard attempt await nanos::isolate(cpu, tenant: 11, services: services(grants), frames: mut held, mut extended, exec: grants.exec, alloc: grants.alloc, body: fn[mut breached](space: nanos::Isolation) fails task::Cancelled uses wait {
+        for index in 0..<links.len() {
+            let outbound = outbounds[index]
+            let held_book = attempt await nanos::hold_isolated(space, job: ledger, component: "Book", link: links[index], services: services(grants), caps, checkpoint: None, runner: sys::Runner.denied(), alloc: grants.alloc, body: fn(take instance: nanos::Instance) -> bool fails nanos::InstanceError uses wait {
+                return try await fill_breached(take instance, outbound, grants)
+            })
+            match held_book {
+                Ok(Some(true)) => {
+                    breached += 1
+                }
+                else => {}
+            }
+        }
+    })
+    for frame in take held {
+        mut frames.push(take frame)
+    }
+    returned(take extended, mut frames)
+    for link in take links {
+        take link.release(mut frames)
+    }
+    say(text: "breached ")
+    say_number(breached)
+    say(text: " books of one isolation leaving a fill unread\n")
+} fills_unread
+
+/// Has the book fill 3 MiB, a reply that moves to the kernel through frames of their own: once the
+/// call is incoming, writes into the frame at `outbound`, in which its space writes the first
+/// channel of its link, the start of a frame no runtime writes, which the first bytes the space
+/// writes after it complete, then steps the book, and gives whether it ended trapped breaching the
+/// link.
+fn fill_breached(take instance: nanos::Instance, outbound: u64, grants: Grants) -> bool fails nanos::InstanceError uses wait {
+    var book = instance
+    defer take book.abandon()
+    var request = sys::Encoded.empty(grants.alloc)
+    discard sys::Wire[Ledger].fill(mut request, kibibytes: 3_072)
+    var pending = Some(take request)
+    try await task::scope(grants.exec, body: fn[mut book, mut pending](s: task::Scope) fails nanos::InstanceError uses wait {
+        let Some(call) = mut pending.extract() else {
+            return
+        }
+        let inbox = book.inbox()
+        let replied = s.spawn(fn[take inbox, take call]() fails task::Cancelled uses wait limits stack 16_384 {
+            discard attempt await inbox.call(sys::Wire[Ledger].hash(), request: 0, encoding: take call, alloc: grants.alloc)
+        })
+        try await book.incoming()
+        written_as_space(frame: outbound, data: b"\x05\x00\x00\x00\xFF\xFF\xFF\xFF")
+        discard attempt await mut book.step()
+        try await take replied.join()
+    })
+    undefer book
+    match try await take book.end() {
+        nanos::Ended.Trapped(trap) => match trap.kind() {
+            sys::TrapKind.Bounds => return true
+            else => return false
+        }
+        else => return false
+    }
+} fill_breached
+
 /// The last frame of a list, or a stop when none is left.
 fn next_frame(mut frames: mem::List[hw::PhysFrame[4_096]]) -> hw::PhysFrame[4_096] {
     let Some(frame) = mut frames.pop() else {
@@ -695,8 +779,10 @@ fn given_up(take frame: hw::PhysFrame[4_096]) {
 /// not decode, a host program, a job trapping, failing, returning and reading kernel memory, a job
 /// without a stack bound recursing past the stack it starts with, a job holding memory within the
 /// frames its space draws from and past them, a space drawing and giving back pages, a job
-/// answering a line over its link, a job in a space whose clock is revoked, two jobs sharing a space, one of whose clocks is revoked, instances of a component held in spaces, one sharing its space
-/// with jobs and other instances, instances in two spaces calling over a bridge, a space's runtime
+/// answering a line over its link, a job in a space whose clock is revoked, two jobs sharing a
+/// space, one of whose clocks is revoked, instances of a component held in spaces, one sharing its
+/// space with jobs and other instances, instances in two spaces calling over a bridge, instances of
+/// one space breaching their link with a reply moved to the kernel unread, a space's runtime
 /// probing kernel memory, then a job spinning on floats in a space while the same job, verified
 /// once, spins in the shared space.
 fn serve(cpu: hw::Ring0, loader: sys::load::Loader, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
@@ -759,6 +845,7 @@ fn serve(cpu: hw::Ring0, loader: sys::load::Loader, grants: Grants, mut frames: 
     try await shared(cpu, book: ledger, job: typed, grants, mut frames)
     try await bridged(cpu, ledger, typed, grants, mut frames)
     try await reclaimed(cpu, job: typed, grants, mut frames)
+    try await fills_unread(cpu, ledger, grants, mut frames)
     probed(cpu, job: typed, grants, mut frames)
     try await spun(cpu, loader, job: typed, bytes: typed_bytes.view(), grants, mut frames)
 } serve

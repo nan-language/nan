@@ -2737,7 +2737,7 @@ fn begun(order: Taken, domain: mem::Shared[sys::Abandoner], granted: Base, take 
     }
     let task::Channel(sender: up, receiver: outgoing) = task::Channel[mem::Bytes].bounded(QUEUED_CALLS, alloc)
     let kinds = task::Cown.of(mem::Map[u64, Ride].empty(alloc), alloc)
-    let remotes = sys::Minter[Remote, Spaced, u64].of(Spaced(alloc: alloc, minted: mem::OnceMap[u64, sys::Handle].empty(0, alloc), handles: mem::OnceMap[u64, u64].empty(0, alloc), up: up.split(), waits: waits.share(), kinds: kinds.share(), runner: record.runner, clock: granted.clock), alloc)
+    let remotes = sys::Minter[Remote, Spaced, u64].of(Spaced(alloc: alloc, minted: unminted(alloc), up: up.split(), waits: waits.share(), kinds: kinds.share(), runner: record.runner, clock: granted.clock), alloc)
     let base = remotes.mint(MOST_HELD)
     let task::Channel(sender: late, receiver: postponed) = task::Channel[Late].bounded(QUEUED_CALLS, alloc)
     let bridges = Bridges(ports: task::Cown.of(mem::Map[u64, Pump].empty(alloc), alloc), kinds: take kinds, routes: task::Cown.of(Routes(next: 0, waiting: mem::Map[u64, Route].empty(alloc)), alloc), late: take late, base: base, clock: granted.clock, alloc: alloc)
@@ -2918,15 +2918,14 @@ fn end_trapped(trap: sys::Trap, job: u64, alloc: mem::Alloc) {
 } end_trapped
 
 /// What the capabilities a space's runtime holds by the kernel's handles share: the runtime's
-/// allocator, the handle of the capability minted for each handle of the space's table, that handle
-/// by the minted capability's word, the sender of the frames an instance's space sends up, the
-/// waits of its calls that wait for the kernel's reply, the ends of bridges carrying the calls of
-/// capabilities of crossing kinds by their handles, the handle of its runner capability, and the
-/// runtime's clock, which times the sleeps of the clocks it holds.
+/// allocator, what it minted for the last handle of each slot of the space's table it received, the
+/// sender of the frames an instance's space sends up, the waits of its calls that wait for the
+/// kernel's reply, the ends of bridges carrying the calls of capabilities of crossing kinds by their
+/// handles, the handle of its runner capability, and the runtime's clock, which times the sleeps of
+/// the clocks it holds.
 struct Spaced {
     alloc: mem::Alloc
-    minted: mem::OnceMap[u64, sys::Handle]
-    handles: mem::OnceMap[u64, u64]
+    minted: hw::SpinLock[mem::List[Option[Minted]]]
     up: task::Sender[mem::Bytes]
     waits: task::Cown[PortWaits]
     kinds: task::Cown[mem::Map[u64, Ride]]
@@ -2934,24 +2933,112 @@ struct Spaced {
     clock: sys::Clock
 } Spaced
 
+/// What a space's runtime minted for a handle of the space's table: that handle, the remote
+/// capability reaching its entry, and the handle of the capability served through that remote.
+struct Minted derives Copy {
+    handle: u64
+    remote: Remote
+    held: sys::Handle
+} Minted
+
+/// What a space's runtime keeps of what it minted before it mints anything: no capability for any
+/// slot of the space's table.
+fn unminted(alloc: mem::Alloc) -> hw::SpinLock[mem::List[Option[Minted]]] {
+    var slots = mem::List[Option[Minted]].empty(alloc)
+    for _ in 0u64..<MOST_HELD {
+        mut slots.push(None)
+    }
+    return hw::SpinLock.of(take slots)
+} unminted
+
 /// The handle the runtime holds for the handle `handle` of the space's table, minted through `mint`
-/// from a remote capability deriving from `base` the first time.
+/// from a remote capability deriving from `base` the first time, which revokes the capability
+/// minted for an earlier handle of its slot, the table having taken that handle back; a stale one
+/// once the runtime holds one for a later handle of its slot.
 fn held_for(base: Remote, handle: u64, mint: fn(remote: Remote) -> sys::Handle fails sys::Revoked) -> sys::Handle fails sys::Revoked {
-    match sys::reach(base, body: fn(state: Spaced, record: u64) => state.minted.get(handle)) {
-        Some(Some(minted)) => return minted
+    match sys::reach(base, body: fn(state: Spaced, record: u64) => state.minted_at(handle)) {
+        Some(Some(minted)) => return minted.held
         Some(None) => {}
         None => fail sys::Revoked.Stale
     }
-    let minted = try mint(try sys::derive(base, narrow: fn(state: Spaced, record: u64) => handle))
-    let kept = sys::reach(base, body: fn(state: Spaced, record: u64) -> sys::Handle {
-        discard state.handles.insert(handle_word(minted), value: handle)
-        return state.minted.insert(handle, value: minted)
-    })
-    let Some(stored) = kept else {
+    let remote = try sys::derive(base, narrow: fn(state: Spaced, record: u64) => handle)
+    let held = try mint(remote)
+    let Some(kept) = sys::reach(base, body: fn(state: Spaced, record: u64) => state.kept(Minted(handle: handle, remote: remote, held: held))) else {
+        revoke(remote)
         fail sys::Revoked.Stale
     }
-    return stored
+    match kept.revoked {
+        Some(given_up) => revoke(given_up)
+        None => {}
+    }
+    return kept.held
 } held_for
+
+/// What a space's runtime minted for the handle `handle` of the space's table, none when it minted
+/// nothing for it or the slot's last handle it received is another.
+fn Spaced.minted_at(self, handle: u64) -> Option[Minted] {
+    return hw::without_irqs(fn(t: hw::IrqsDisabled) => self.minted.with(t, body: fn(mut slots: mem::List[Option[Minted]]) -> Option[Minted] {
+        let Some(Some(minted)) = slots.get(usize.widen(handle % MOST_HELD)) else {
+            return None
+        }
+        if minted.handle != handle {
+            return None
+        }
+        return Some(minted)
+    }))
+} Spaced.minted_at
+
+/// What a space's runtime holds once it has minted `minted`: the handle of the capability it holds
+/// for `minted.handle`, and the remote capability to revoke, that of an earlier handle of its slot
+/// when it keeps `minted`, and `minted`'s own when it already holds a capability for that handle or
+/// one for a later handle of its slot.
+struct Kept derives Copy {
+    held: sys::Handle
+    revoked: Option[Remote]
+} Kept
+
+/// Keeps `minted` for its handle's slot unless the runtime holds a capability for that handle or a
+/// later one of the slot.
+fn Spaced.kept(self, minted: Minted) -> Kept {
+    return hw::without_irqs(fn(t: hw::IrqsDisabled) => self.minted.with(t, body: fn(mut slots: mem::List[Option[Minted]]) -> Kept {
+        let index = usize.widen(minted.handle % MOST_HELD)
+        let Some(held) = slots.get(index) else {
+            return Kept(held: minted.held, revoked: Some(minted.remote))
+        }
+        match held {
+            Some(earlier) => {
+                if earlier.handle == minted.handle {
+                    return Kept(held: earlier.held, revoked: Some(minted.remote))
+                }
+                if earlier.handle > minted.handle {
+                    return Kept(held: minted.held, revoked: Some(minted.remote))
+                }
+                slots[index] = Some(minted)
+                return Kept(held: minted.held, revoked: Some(earlier.remote))
+            }
+            None => {
+                slots[index] = Some(minted)
+                return Kept(held: minted.held, revoked: None)
+            }
+        }
+    }))
+} Spaced.kept
+
+/// The handle of the space's table for which the runtime holds the capability whose word is `word`,
+/// none when it holds none.
+fn Spaced.named(self, word: u64) -> Option[u64] {
+    return hw::without_irqs(fn(t: hw::IrqsDisabled) => self.minted.with(t, body: fn(mut slots: mem::List[Option[Minted]]) -> Option[u64] {
+        for slot in slots {
+            let Some(minted) = slot else {
+                continue
+            }
+            if handle_word(minted.held) == word {
+                return Some(minted.handle)
+            }
+        }
+        return None
+    }))
+} Spaced.named
 
 /// The capability the runtime holds for the handle `handle` of the space's table, served through
 /// `serve` on a remote capability deriving from `base` the first time.
@@ -3019,8 +3106,8 @@ fn minted_for(base: Remote, crossed: Carried) -> Option[sys::Handle] {
     }
 } minted_for
 
-/// The handles of the space's table for which the runtime minted the capabilities `minted` holds,
-/// none when it minted none of one.
+/// The handles of the space's table for which the runtime holds the capabilities `minted` holds,
+/// none when it holds none of one.
 fn handles_named(base: Remote, minted: Slice[sys::Handle], alloc: mem::Alloc) -> Option[mem::List[u64]] {
     var indices = mem::List[u64].empty(alloc)
     for handle in minted {
@@ -3032,12 +3119,52 @@ fn handles_named(base: Remote, minted: Slice[sys::Handle], alloc: mem::Alloc) ->
     return Some(take indices)
 } handles_named
 
-/// The handle of the space's table for which the runtime minted the capability `minted` holds,
-/// none when it minted none.
+/// The handle of the space's table for which the runtime holds the capability `minted` holds, none
+/// when it holds none.
 fn handle_named(base: Remote, minted: sys::Handle) -> Option[u64] {
     let word = handle_word(minted)
-    return sys::reach(base, body: fn(state: Spaced, record: u64) => state.handles.get(word)).value_or(None)
+    return sys::reach(base, body: fn(state: Spaced, record: u64) => state.named(word)).value_or(None)
 } handle_named
+
+test later_handles_of_a_slot_revoke_what_was_minted_for_earlier_ones for held_for {
+    let world = testing::world()
+    let alloc = world.alloc
+    let task::Channel(sender: up, receiver: _) = task::Channel[mem::Bytes].bounded(1, alloc)
+    let waits = task::Cown.of(PortWaits(next: 0, waiting: mem::Map[u64, task::Sender[PortAnswer]].empty(alloc)), alloc)
+    let kinds = task::Cown.of(mem::Map[u64, Ride].empty(alloc), alloc)
+    let remotes = sys::Minter[Remote, Spaced, u64].of(Spaced(alloc: alloc, minted: unminted(alloc), up: take up, waits: take waits, kinds: take kinds, runner: 0, clock: world.clock), alloc)
+    let base = remotes.mint(MOST_HELD)
+    let one = held_log(base, handle: 3, otherwise: world.log)
+    let again = held_log(base, handle: 3, otherwise: world.log)
+    let later = held_log(base, handle: 3 + MOST_HELD, otherwise: world.log)
+    let earlier = held_log(base, handle: 3, otherwise: world.log)
+    let revoked = handle_word(one) == handle_word(again) and not live_log(one) and live_log(later) and not live_log(earlier)
+    let named = handle_named(base, minted: later)
+    let unnamed = handle_named(base, minted: one)
+    take remotes.close()
+    expect revoked and named == Some(3 + MOST_HELD) and unnamed.is_none()
+} later_handles_of_a_slot_revoke_what_was_minted_for_earlier_ones
+
+/// The handle of the log the runtime holds through `base` for the handle `handle` of the space's
+/// table, that of `otherwise` when it holds none.
+fn held_log(base: Remote, handle: u64, otherwise: sys::Log) -> sys::Handle {
+    return match attempt Cap[sys::Log].held(base, handle, serve: served_log) {
+        Ok(log) => sys::Handle.of(log)
+        Err(_) => sys::Handle.of(otherwise)
+    }
+} held_log
+
+/// Whether the log `handle` holds is live, a revocable log deriving from it.
+fn live_log(handle: sys::Handle) -> bool {
+    let Some(log) = sys::CapabilityId[sys::Log](id: 0).of_handle(handle) else {
+        return false
+    }
+    let Ok(revoker) = attempt sys::revocable(log) else {
+        return false
+    }
+    take revoker.revoke()
+    return true
+} live_log
 
 /// The allocator and handle a remote capability's record names, none for a stale one.
 fn reached(remote: Remote) -> Option[Reach] {
@@ -3633,6 +3760,9 @@ fn handle_word(handle: sys::Handle) -> u64 limits pure, notrap, terminates
 
 /// The handle hash of the type of the capability a handle holds.
 fn handle_hash(handle: sys::Handle) -> Array[u8, 33] limits pure, notrap, terminates
+
+/// Revokes `remote` and every capability deriving from it, as the minter it belongs to does.
+fn revoke(remote: Remote)
 
 /// Makes an `CALL_INVOKE` call, giving its result.
 fn invoke(handle: u64, operation: u64, args: Slice[u8], mut result: SliceMut[u8]) -> u64

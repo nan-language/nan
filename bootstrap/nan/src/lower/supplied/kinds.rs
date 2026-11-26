@@ -1,11 +1,11 @@
-//! Capability kinds: minters, reaches and derivations, the operations of crossing kinds through
-//! the handles holding their capabilities, and the handles of the capabilities a space's runtime
-//! holds for its kernel's. A minter is the holding of its state's record, which is a shared
-//! value's whose count holds one for the minter and one for each reach or derivation in flight,
-//! and which the outermost domain reaches. An entry of a kind holds that record, its own record,
-//! which the capability table keeps given its address and size, and the kind's method table for
-//! `sys::Crossing`; a reach pins the state under the table lock, which copies the record out, and
-//! calls its body outside it.
+//! Capability kinds: minters, reaches and derivations, the operations of crossing kinds through the
+//! handles holding their capabilities, and the handles of the capabilities a space's runtime holds
+//! for its kernel's with the revocation of what it minted for them. A minter is the holding of its
+//! state's record, which is a shared value's whose count holds one for the minter and one for each
+//! reach or derivation in flight, and which the outermost domain reaches. An entry of a kind holds
+//! that record, its own record, which the capability table keeps given its address and size, and
+//! the kind's method table for `sys::Crossing`; a reach pins the state under the table lock, which
+//! copies the record out, and calls its body outside it.
 
 use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC};
 
@@ -66,6 +66,11 @@ pub fn lower(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) -> bool {
         "nanos::handle_word" => {
             let word = fx.load(PTR, supply.param(0).address(), handle::HANDLE);
             supply.ret(lo, fx, Held::Scalar(word));
+        }
+        "nanos::revoke" => {
+            let handle = fx.load(PTR, supply.param(0).address(), 0);
+            lo.call_routine(fx, Routine::Revoke, &[handle]);
+            supply.done(lo, fx);
         }
         "nanos::handle_hash" => {
             let hash = fx.offset(supply.param(0).address(), handle::HASH);

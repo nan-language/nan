@@ -1,6 +1,6 @@
 # 0233. Entries following the capabilities that cross into a space
 
-Status: accepted
+Status: accepted; the runtime keeping the capability it minted for each handle until its job or instance ends superseded by 0235
 
 ## Context
 

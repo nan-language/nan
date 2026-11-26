@@ -1,8 +1,8 @@
 //! The synchronisation primitives of `hw`: `hw::without_irqs`, spin locks, devices behind an
 //! IRQ-safe lock, per-CPU values, one-slot signals and the anchor. A lock word holds the number of
 //! the CPU holding it plus one, each executor thread being a CPU on `x86_64-linux`, so a CPU
-//! acquiring a lock it holds halts. Only a machine target has maskable interrupts to disable and
-//! interrupts to install a device on.
+//! acquiring a lock it holds halts. Only a machine target has interrupts to install a device on,
+//! and maskable interrupts to disable outside the user-mode runtime of its isolated spaces.
 
 use cranelift_codegen::ir::{
     AbiParam, InstBuilder, MemFlagsData, Signature, Value, condcodes::IntCC, types,
@@ -20,8 +20,8 @@ use super::super::{Supply, tasks as task_ops};
 use super::forward;
 use crate::check::ty::{FnTy, Ty};
 
-/// `hw::without_irqs(body)`: calls `body` with a token, maskable interrupts disabled around it on
-/// a machine target and their state restored after.
+/// `hw::without_irqs(body)`: calls `body` with a token, maskable interrupts disabled around it
+/// where they can be and their state restored after.
 pub fn without_irqs(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     let flags = irq_save(lo, fx);
     let body_ty = super::super::mem::lists::fn_param(supply, 0);
@@ -30,10 +30,10 @@ pub fn without_irqs(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
     forward(lo, fx, supply, called);
 }
 
-/// Disables maskable interrupts on a machine target, giving the flags to restore.
+/// Disables maskable interrupts on a machine target outside the runtime of its isolated spaces,
+/// which runs in user mode, giving the flags to restore.
 fn irq_save(lo: &mut Lowering, fx: &mut Fx) -> Option<Value> {
-    lo.machine()
-        .then(|| lo.call_stub(fx, Stub::IrqSave, &[])[0])
+    (lo.machine() && !lo.user()).then(|| lo.call_stub(fx, Stub::IrqSave, &[])[0])
 }
 
 fn irq_restore(lo: &mut Lowering, fx: &mut Fx, flags: Option<Value>) {

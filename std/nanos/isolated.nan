@@ -912,9 +912,10 @@ fn shared_into(mut space: sys::load::Space, frame: hw::UserFrame, mut addresses:
 /// A job or instance its space runs: its entry, the runner it acts through, what crossed into the
 /// space's table for each capability that runner holds by number, the addresses at which the space
 /// maps its link's frames and the frames of the bridges it holds, whether its holder abandoned it,
-/// whether it breached a channel and whether the space's runtime was ordered to abandon it, and the
-/// senders telling its task through which of its channels the space moved bytes and what the space
-/// sent through its runner capability, and how it ended.
+/// whether it breached a channel and whether the space's runtime was ordered to abandon it, how
+/// many messages the space sent through its runner capability whose results its runtime is yet to
+/// be told, and the senders telling its task through which of its channels the space moved bytes
+/// and what the space sent through its runner capability, and how it ended.
 struct Running {
     job: sys::load::Job
     runner: sys::Runner
@@ -923,6 +924,7 @@ struct Running {
     halted: mem::Shared[core::atomic::AtomicBool]
     breached: bool
     abandoning: bool
+    calling: u64
     notices: task::Sender[Notified]
     ended: task::Sender[Outcome]
 } Running
@@ -1262,7 +1264,7 @@ fn admitted(cpu: hw::Ring0, tenant: u64, isolation: Isolation, take joining: Joi
     for address in ports {
         mut unmapping.push(address)
     }
-    discard mut held.jobs.insert(id, value: Running(job: job, runner: runner, ids: mem::Map[u64, Carried].empty(alloc), frames: take unmapping, halted: take halted, breached: false, abandoning: false, notices: take notices, ended: take ended))
+    discard mut held.jobs.insert(id, value: Running(job: job, runner: runner, ids: mem::Map[u64, Carried].empty(alloc), frames: take unmapping, halted: take halted, breached: false, abandoning: false, calling: 0, notices: take notices, ended: take ended))
     mut held.pending.push(Pending(id: id, job: job, input: take input, held: instance, frames: take addresses, keys: take keys, channels: take channels, runner: acting, granting: take granted, bridging: holding_back, budget: budget))
     mut placing.push(Placed(space: take returned_space, driving: take held))
 } admitted
@@ -1351,15 +1353,26 @@ fn Driven.startable(self) -> Option[usize] {
     return None
 } Driven.startable
 
-/// The position in `pending` of the first instance that starts once the ends of its bridges are open.
-fn Driven.startable_once_bridged(self) -> Option[usize] {
-    for index in 0..<self.pending.len() {
-        if self.pending[index].bridging {
-            return Some(index)
+/// Whether the kernel can still give the space's runtime an order while it has none to take: the
+/// start of an instance once the ends of its bridges are open, what the other end of a bridge the
+/// space holds wrote or read, or the result of a message a job or instance sent through its runner
+/// capability.
+fn Driven.wakeable(self) -> bool {
+    if self.bridges.len() > 0 {
+        return true
+    }
+    for start in self.pending {
+        if start.bridging {
+            return true
         }
     }
-    return None
-} Driven.startable_once_bridged
+    for entry in self.jobs {
+        if entry.value().calling > 0 {
+            return true
+        }
+    }
+    return false
+} Driven.wakeable
 
 /// The position in `notices` of the first notice for an instance the space's runtime has started.
 fn Driven.noticeable(self) -> Option[usize] {
@@ -1450,7 +1463,7 @@ fn Driven.served(mut self, cpu: hw::Ring0, tenant: u64, clock: sys::Clock, servi
                 let deadline = user_word(self.state.regs[register(0)])
                 if self.orders() != 0 {
                     answer = WOKE_ORDERS
-                } else if deadline == 0 and self.startable_once_bridged().is_none() {
+                } else if deadline == 0 and not self.wakeable() {
                     mut self.ended_all(mut space, kind: ABANDONED, report: "", alloc)
                     return
                 } else {
@@ -1596,7 +1609,9 @@ fn Driven.runner_invoked(mut self, isolation: Isolation, mut space: sys::load::S
     }
     var running = found
     if operation == RUN_UP {
-        discard attempt await running.notices.send(Notified.Sent(bytes_of(args.view(), alloc)))
+        if (attempt await running.notices.send(Notified.Sent(bytes_of(args.view(), alloc)))).is_ok() {
+            running.calling = running.calling.saturating_add(1)
+        }
         return 0
     }
     return try await runner_served(mut space, runner: running.runner, job, operation, args, target, capacity, table: isolation.door.contents().table, ids: mut running.ids, alloc)

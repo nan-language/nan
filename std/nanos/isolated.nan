@@ -325,16 +325,27 @@ enum Holding derives Copy {
 } Holding
 
 /// An entry of a space's table: the number of the job or instance it was added for, 0 for the
-/// space's own, and the capability it holds.
+/// space's own, the capability it holds, and what crossed into it when a capability crossing into
+/// the space added it.
 struct Entry derives Copy {
     job: u64
     holding: Holding
+    crossed: Option[Crossings]
 } Entry
 
+/// What crossed into an entry of a space's table: the handle holding its capability, and how many
+/// crossings hold the entry.
+struct Crossings derives Copy {
+    handle: sys::Handle
+    count: u64
+} Crossings
+
 /// A space's table of handles: `MOST_HELD` slots, the slot of a handle being its remainder by
-/// `MOST_HELD`.
+/// `MOST_HELD`, and the allocator through which it asks whether a capability that crossed into it
+/// is stale.
 struct Table {
     slots: hw::SpinLock[mem::List[Slot]]
+    alloc: mem::Alloc
 } Table
 
 /// A slot of a space's table: the handle naming its entry, which advances by `MOST_HELD` each time
@@ -1603,7 +1614,7 @@ fn Table.of(services: Services, alloc: mem::Alloc) -> Table {
     for handle in 0u64..<MOST_HELD {
         mut slots.push(Slot(handle: handle, entry: None))
     }
-    let table = Table(slots: hw::SpinLock.of(take slots))
+    let table = Table(slots: hw::SpinLock.of(take slots), alloc: alloc)
     discard table.held_by(job: 0, holding: Holding.Log(services.log))
     discard table.held_by(job: 0, holding: Holding.Stdio(services.stdio))
     discard table.held_by(job: 0, holding: Holding.Random(services.random))
@@ -1620,19 +1631,36 @@ fn Table.held_by(self, job: u64, holding: Holding) -> u64 {
 } Table.held_by
 
 /// The handle of a capability the table holds from now on for the job or instance numbered `job`,
-/// none while it holds `MOST_HELD` entries.
+/// none while it holds `MOST_HELD` entries once those of stale capabilities that crossed into it
+/// are taken back.
 fn Table.add(self, job: u64, holding: Holding) -> Option[u64] {
+    let entry = Entry(job: job, holding: holding, crossed: None)
+    match self.placed(entry) {
+        Some(handle) => return Some(handle)
+        None => {}
+    }
+    self.stale_taken_back()
+    return self.placed(entry)
+} Table.add
+
+/// The handle of a free slot holding `entry` from now on, none while no slot is free.
+fn Table.placed(self, entry: Entry) -> Option[u64] {
     return hw::without_irqs(fn(t: hw::IrqsDisabled) => self.slots.with(t, body: fn(mut slots: mem::List[Slot]) -> Option[u64] {
         for index in 0..<slots.len() {
             let slot = slots[index]
             if slot.entry.is_none() and slot.handle < HANDLE_BOUND {
-                slots[index] = Slot(handle: slot.handle, entry: Some(Entry(job: job, holding: holding)))
+                slots[index] = Slot(handle: slot.handle, entry: Some(entry))
                 return Some(slot.handle)
             }
         }
         return None
     }))
-} Table.add
+} Table.placed
+
+/// The slot of index `index`, none past the last.
+fn Table.slot(self, index: usize) -> Option[Slot] {
+    return hw::without_irqs(fn(t: hw::IrqsDisabled) => self.slots.with(t, body: fn(mut slots: mem::List[Slot]) => slots.get(index)))
+} Table.slot
 
 /// The entry `handle` names, none when it is stale.
 fn Table.entry(self, handle: u64) -> Option[Entry] {
@@ -1652,7 +1680,7 @@ fn Table.entry(self, handle: u64) -> Option[Entry] {
 fn Table.crossed(self, job: u64, word: u64) -> Option[u64] {
     return hw::without_irqs(fn(t: hw::IrqsDisabled) => self.slots.with(t, body: fn(mut slots: mem::List[Slot]) -> Option[u64] {
         for slot in slots {
-            let Some(Entry(job: holder, holding: Holding.Kind(capability))) = slot.entry else {
+            let Some(Entry(job: holder, holding: Holding.Kind(capability), crossed: _)) = slot.entry else {
                 continue
             }
             if holder == job and handle_word(capability) == word {
@@ -1728,27 +1756,128 @@ test taken_back_entries_leave_their_handles_stale for Table.taken_back {
     expect earlier.len() == 250 and unnamed and named
 } taken_back_entries_leave_their_handles_stale
 
-/// What a space receives of the capabilities `handles` hold, each added to the table for the job
-/// or instance numbered `job`; none, adding nothing, when no space holds one's type or the table is
-/// full.
+/// What a space receives of the capabilities `handles` hold, each crossing into the table for the
+/// job or instance numbered `job`; none, changing nothing, when no space holds one's type or the
+/// table is full once the entries of stale capabilities that crossed into it are taken back.
 fn Table.admitted(self, job: u64, handles: Slice[sys::Handle], alloc: mem::Alloc) -> Option[mem::List[Carried]] {
-    var crossables = mem::List[Crossable].empty(alloc)
+    for handle in handles {
+        if crossable_of(handle).is_none() {
+            return None
+        }
+    }
+    match self.crossed_all(job, handles, alloc) {
+        Some(crossing) => return Some(take crossing)
+        None => {}
+    }
+    self.stale_taken_back()
+    return self.crossed_all(job, handles, alloc)
+} Table.admitted
+
+/// What a space receives of the capabilities `handles` hold, each crossing into the table for the
+/// job or instance numbered `job`; none, releasing what crossed, once one does not cross or the
+/// table is full.
+fn Table.crossed_all(self, job: u64, handles: Slice[sys::Handle], alloc: mem::Alloc) -> Option[mem::List[Carried]] {
+    var crossing = mem::List[Carried].empty(alloc)
     for handle in handles {
         let Some(crossable) = crossable_of(handle) else {
+            self.crossings_released(crossing.view())
             return None
         }
-        mut crossables.push(crossable)
-    }
-    var crossing = mem::List[Carried].empty(alloc)
-    for crossable in crossables {
-        let Some(handle) = self.add(job, holding: crossable.holding()) else {
-            self.crossing_taken(crossing.view())
+        let Some(entry) = self.crossed_in(job, holding: crossable.holding(), handle) else {
+            self.crossings_released(crossing.view())
             return None
         }
-        mut crossing.push(crossable.carried(handle))
+        mut crossing.push(crossable.carried(entry))
     }
     return Some(take crossing)
-} Table.admitted
+} Table.crossed_all
+
+/// The handle of the entry holding `holding`, the capability `handle` holds, for the job or
+/// instance numbered `job`, one more crossing holding it from now on: the entry an earlier crossing
+/// of that capability added for `job`, or one added in a free slot; none while no slot is free.
+fn Table.crossed_in(self, job: u64, holding: Holding, handle: sys::Handle) -> Option[u64] {
+    let word = handle_word(handle)
+    return hw::without_irqs(fn(t: hw::IrqsDisabled) => self.slots.with(t, body: fn(mut slots: mem::List[Slot]) -> Option[u64] {
+        var free: Option[usize] = None
+        for index in 0..<slots.len() {
+            let slot = slots[index]
+            match slot.entry {
+                Some(Entry(job: holder, holding: held, crossed: Some(crossed))) => {
+                    if holder == job and handle_word(crossed.handle) == word {
+                        slots[index] = Slot(handle: slot.handle, entry: Some(Entry(job: job, holding: held, crossed: Some(Crossings(handle: crossed.handle, count: crossed.count.saturating_add(1))))))
+                        return Some(slot.handle)
+                    }
+                }
+                Some(Entry(job: _, holding: _, crossed: None)) => {}
+                None => {
+                    if free.is_none() and slot.handle < HANDLE_BOUND {
+                        free = Some(index)
+                    }
+                }
+            }
+        }
+        let Some(index) = free else {
+            return None
+        }
+        let Some(slot) = slots.get(index) else {
+            return None
+        }
+        slots[index] = Slot(handle: slot.handle, entry: Some(Entry(job: job, holding: holding, crossed: Some(Crossings(handle: handle, count: 1)))))
+        return Some(slot.handle)
+    }))
+} Table.crossed_in
+
+/// Releases one crossing holding the entry `handle` names, taking the entry back, stale from now
+/// on, once no crossing holds it.
+fn Table.released(self, handle: u64) {
+    hw::without_irqs(fn(t: hw::IrqsDisabled) {
+        self.slots.with(t, body: fn(mut slots: mem::List[Slot]) {
+            let index = usize.widen(handle % MOST_HELD)
+            let Some(slot) = slots.get(index) else {
+                return
+            }
+            let Some(Entry(job: job, holding: holding, crossed: Some(crossed))) = slot.entry else {
+                return
+            }
+            if slot.handle != handle {
+                return
+            }
+            if crossed.count > 1 {
+                slots[index] = Slot(handle: handle, entry: Some(Entry(job: job, holding: holding, crossed: Some(Crossings(handle: crossed.handle, count: crossed.count - 1)))))
+            } else {
+                slots[index] = slot.freed()
+            }
+        })
+    })
+} Table.released
+
+/// Takes back each entry holding a capability that crossed into the table once it is stale, every
+/// handle naming one stale from now on.
+fn Table.stale_taken_back(self) {
+    for index in 0u64..<MOST_HELD {
+        let Some(slot) = self.slot(usize.widen(index)) else {
+            return
+        }
+        let Some(Entry(job: _, holding: _, crossed: Some(crossed))) = slot.entry else {
+            continue
+        }
+        if stale_held(crossed.handle, alloc: self.alloc) {
+            self.taken(slot.handle)
+        }
+    }
+} Table.stale_taken_back
+
+/// Whether the capability `handle` holds is stale: `invoke` fails with `Revoked` for a stale one
+/// and calls no kind for one that does not cross.
+fn stale_held(handle: sys::Handle, alloc: mem::Alloc) -> bool {
+    if handle.crosses() {
+        return false
+    }
+    return match attempt handle.invoke(0, args: b"", alloc) {
+        Err(sys::CrossError.Revoked(_)) => true
+        else => false
+    }
+} stale_held
 
 test full_tables_admit_nothing for Table.admitted {
     let world = testing::world()
@@ -1760,26 +1889,77 @@ test full_tables_admit_nothing for Table.admitted {
             None => {}
         }
     }
-    var logs = mem::List[sys::Handle].empty(world.alloc)
-    for index in 0usize..<2 {
-        table.taken(held[index])
-        mut logs.push(sys::Handle.of(world.log))
-    }
+    table.taken(held[0])
+    table.taken(held[1])
+    var fitting = mem::List[sys::Handle].empty(world.alloc)
+    mut fitting.push(sys::Handle.of(world.log))
+    mut fitting.push(sys::Handle.of(world.stdio))
     var more = mem::List[sys::Handle].empty(world.alloc)
-    for _ in 0usize..<3 {
-        mut more.push(sys::Handle.of(world.log))
-    }
+    mut more.push(sys::Handle.of(world.log))
+    mut more.push(sys::Handle.of(world.stdio))
+    mut more.push(sys::Handle.of(world.random))
     let refused = table.admitted(job: 2, handles: more.view(), alloc: world.alloc)
-    let fitting = table.admitted(job: 2, handles: logs.view(), alloc: world.alloc)
-    expect held.len() == 250 and refused.is_none() and fitting.is_some()
+    let fitted = table.admitted(job: 2, handles: fitting.view(), alloc: world.alloc)
+    expect held.len() == 250 and refused.is_none() and fitted.is_some()
 } full_tables_admit_nothing
 
-/// Takes back the entry of each capability `crossing` holds.
-fn Table.crossing_taken(self, crossing: Slice[Carried]) {
-    for crossed in crossing {
-        self.taken(crossed.handle())
+test crossings_of_one_capability_share_its_entry for Table.released {
+    let world = testing::world()
+    let table = Table.of(Services(clock: world.clock, log: world.log, stdio: world.stdio, random: world.random, fs: world.fs), alloc: world.alloc)
+    let log = Array[sys::Handle, 1].filled(sys::Handle.of(world.log))
+    let shared = crossed_handle(table.admitted(job: 1, handles: log.view(), alloc: world.alloc))
+    let again = crossed_handle(table.admitted(job: 1, handles: log.view(), alloc: world.alloc))
+    let other = crossed_handle(table.admitted(job: 2, handles: log.view(), alloc: world.alloc))
+    table.released(shared)
+    let kept = table.entry(shared).is_some()
+    table.released(shared)
+    let released = table.entry(shared).is_none()
+    let apart = table.entry(other).is_some()
+    expect shared != MOST_HELD and again == shared and other != MOST_HELD and other != shared and kept and released and apart
+} crossings_of_one_capability_share_its_entry
+
+test stale_crossings_give_way_once_the_table_is_full for Table.stale_taken_back {
+    let world = testing::world()
+    let table = Table.of(Services(clock: world.clock, log: world.log, stdio: world.stdio, random: world.random, fs: world.fs), alloc: world.alloc)
+    var held = mem::List[u64].empty(world.alloc)
+    for _ in 0u64..<MOST_HELD {
+        match table.add(job: 1, holding: Holding.Runner) {
+            Some(handle) => mut held.push(handle)
+            None => {}
+        }
     }
-} Table.crossing_taken
+    table.taken(held[0])
+    let Ok(lender) = attempt sys::revocable(world.log) else {
+        expect false
+        return
+    }
+    let lent = Array[sys::Handle, 1].filled(sys::Handle.of(lender.capability()))
+    let stdio = Array[sys::Handle, 1].filled(sys::Handle.of(world.stdio))
+    let crossed = crossed_handle(table.admitted(job: 2, handles: lent.view(), alloc: world.alloc))
+    let refused = table.admitted(job: 2, handles: stdio.view(), alloc: world.alloc)
+    take lender.revoke()
+    let given_way = crossed_handle(table.admitted(job: 2, handles: stdio.view(), alloc: world.alloc))
+    let taken = table.entry(crossed).is_none()
+    expect crossed != MOST_HELD and refused.is_none() and taken and given_way == crossed + MOST_HELD
+} stale_crossings_give_way_once_the_table_is_full
+
+/// The handle of the entry of the first capability that crossed, `MOST_HELD` when none did.
+fn crossed_handle(crossing: Option[mem::List[Carried]]) -> u64 {
+    let Some(crossed) = crossing else {
+        return MOST_HELD
+    }
+    return match crossed.get(0) {
+        Some(head) => head.handle()
+        None => MOST_HELD
+    }
+} crossed_handle
+
+/// Releases the crossing of each capability `crossing` holds.
+fn Table.crossings_released(self, crossing: Slice[Carried]) {
+    for crossed in crossing {
+        self.released(crossed.handle())
+    }
+} Table.crossings_released
 
 /// The handle of the entry of a space's table holding a capability the kernel added to it.
 fn Carried.handle(self) -> u64 limits pure, notrap, terminates {
@@ -1957,7 +2137,7 @@ fn spanned(space: sys::load::Space, state: hw::UserState, at: usize, alloc: mem:
 
 /// Serves an operation of the runner capability of the instance numbered `job` through `runner`,
 /// the handles crossing through `table`; `ids` keeps what crossed into the table for each
-/// capability `runner` holds by number until it is dropped.
+/// capability `runner` holds by number until it is dropped, which releases that crossing.
 fn runner_served(mut space: sys::load::Space, runner: sys::Runner, job: u64, operation: u64, args: Untrusted[mem::Bytes], target: u64, capacity: u64, table: Table, mut ids: mem::Map[u64, Carried], alloc: mem::Alloc) -> u64 {
     if operation == RUN_SEND_TO {
         let Ok(Sending(port: port, hash: hash, call: Naming(bytes: bytes, handles: handles))) = attempt mem::wire::Codec[Sending].decode(args.view(), alloc) else {
@@ -1990,7 +2170,10 @@ fn runner_served(mut space: sys::load::Space, runner: sys::Runner, job: u64, ope
         return INVALID
     }
     if operation == RUN_DROP {
-        discard mut ids.remove(id)
+        match mut ids.remove(id) {
+            Some(crossed) => table.released(crossed.handle())
+            None => {}
+        }
         return outcome_of(attempt runner.drop_capability(id))
     }
     if operation != RUN_CAPABILITY {

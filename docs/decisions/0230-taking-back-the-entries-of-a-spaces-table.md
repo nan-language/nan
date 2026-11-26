@@ -1,6 +1,6 @@
 # 0230. Taking back the entries of a space's table
 
-Status: accepted
+Status: accepted; an entry a live instance no longer holds staying until the instance ends superseded by 0233
 
 ## Context
 

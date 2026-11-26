@@ -1,6 +1,6 @@
 # 0136. Runner capabilities of instances in isolated spaces
 
-Status: accepted
+Status: accepted; the capability of a number taking another entry after `drop_capability` superseded by 0233
 
 ## Context
 

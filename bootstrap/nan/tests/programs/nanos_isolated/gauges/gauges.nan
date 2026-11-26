@@ -1,4 +1,4 @@
-//! Gauges and lines whose operations cross as bytes: each gauge adds the amounts it is given to the total the gauges of its minter share, and settles that total once its minter's clock has run on; each line dials the calls it is given, which its kernel admits while the credit the lines of its minter share lasts and a kernel's own call of reaches no instance; the gauges and lines of a minter keep the first byte of the header their last settling or admission ran under.
+//! Gauges and lines whose operations cross as bytes and handles: each gauge adds the amounts it is given to the total the gauges of its minter share, settles that total once its minter's clock has run on, and trades, writing the total through the log it is given and giving back a gauge deriving from it; each line dials the calls it is given, which its kernel admits while the credit the lines of its minter share lasts and a kernel's own call of reaches no instance; the gauges and lines of a minter keep the first byte of the header their last settling or admission ran under.
 
 pub open struct Gauge {
 } Gauge
@@ -15,10 +15,13 @@ impl Gauge: sys::Kind[Gauged, u64]
 
 impl Gauge: sys::Crossing
 
-/// The operations of a gauge: adding an amount and giving the total, and settling the total.
+/// The operations of a gauge: adding an amount and giving the total, settling the total, and
+/// trading.
 const ADD: u64 = 0
 
 const SETTLE: u64 = 1
+
+const TRADE: u64 = 2
 
 /// The nanoseconds a settling waits.
 const SETTLING_NS: u64 = 1_000_000
@@ -42,14 +45,29 @@ pub fn close(take minter: sys::Minter[Gauge, Gauged, u64]) {
 pub fn Gauge.add(self, amount: u64, alloc: mem::Alloc) -> u64 fails sys::CrossError {
     var args = mem::Bytes.empty(alloc)
     mem::wire::Codec[u64].encode(amount, out: mut args)
-    return try total_of(try sys::Handle.of(self).invoke(ADD, args: args.view(), alloc), alloc)
+    let none = mem::List[sys::Handle].empty(alloc)
+    return try total_of(try sys::Handle.of(self).invoke(ADD, args: args.view(), handles: none.view(), alloc), alloc)
 } Gauge.add
 
 pub fn Gauge.settled(self, alloc: mem::Alloc) -> u64 fails sys::CrossError uses wait {
-    return try total_of(try await sys::Handle.of(self).call(SETTLE, args: b"", alloc), alloc)
+    let none = mem::List[sys::Handle].empty(alloc)
+    return try total_of(try await sys::Handle.of(self).call(SETTLE, args: b"", handles: none.view(), alloc), alloc)
 } Gauge.settled
 
-pub fn Gauge.invoke(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError limits stack 4_096 {
+/// Has the gauge's kernel write its total through `log` and give back a gauge deriving from it.
+pub fn Gauge.traded(self, log: sys::Log, alloc: mem::Alloc) -> Gauge fails sys::CrossError uses wait {
+    let given = Array[sys::Handle, 1].filled(sys::Handle.of(log))
+    let traded = try await sys::Handle.of(self).call(TRADE, args: b"", handles: given.view(), alloc)
+    let Some(handle) = traded.handles.get(0) else {
+        fail sys::CrossError.Refused
+    }
+    let Some(gauge) = sys::CapabilityId[Gauge](id: 0).of_handle(handle) else {
+        fail sys::CrossError.Refused
+    }
+    return gauge
+} Gauge.traded
+
+pub fn Gauge.invoke(self, operation: u64, args: Untrusted[Slice[u8]], handles: Slice[sys::Handle], alloc: mem::Alloc) -> sys::Encoded fails sys::CrossError limits stack 4_096 {
     let Ok(amount) = attempt mem::wire::Codec[u64].decode(args, alloc) else {
         fail sys::CrossError.Refused
     }
@@ -63,7 +81,10 @@ pub fn Gauge.invoke(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem
     return encoded_total(before.wrapping_add(amount), alloc)
 } Gauge.invoke
 
-pub fn Gauge.call(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError uses wait limits stack 4_096 {
+pub fn Gauge.call(self, operation: u64, args: Untrusted[Slice[u8]], handles: Slice[sys::Handle], alloc: mem::Alloc) -> sys::Encoded fails sys::CrossError uses wait limits stack 4_096 {
+    if operation == TRADE {
+        return try traded_through(self, handles, alloc)
+    }
     if operation != SETTLE {
         fail sys::CrossError.Refused
     }
@@ -80,6 +101,23 @@ pub fn Gauge.call(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::
     return encoded_total(total, alloc)
 } Gauge.call
 
+/// Writes the total of `gauge` through the log `handles` holds and gives a gauge deriving from it.
+fn traded_through(gauge: Gauge, handles: Slice[sys::Handle], alloc: mem::Alloc) -> sys::Encoded fails sys::CrossError {
+    if handles.len() != 1 {
+        fail sys::CrossError.Refused
+    }
+    let Some(log) = sys::CapabilityId[sys::Log](id: 0).of_handle(handles[0]) else {
+        fail sys::CrossError.Refused
+    }
+    let Some(total) = sys::reach(gauge, body: fn(state: Gauged, record: u64) => state.total.load()) else {
+        fail sys::CrossError.Revoked(sys::Revoked.Stale)
+    }
+    log.info("traded", value: total)
+    var traded = sys::Encoded.empty(alloc)
+    mut traded.handles.push(sys::Handle.of(try sys::derive(gauge, narrow: fn(state: Gauged, record: u64) => record)))
+    return traded
+} traded_through
+
 /// The first byte of the header of the last settling of a gauge's minter, 0 once it is revoked.
 pub fn Gauge.headed(self) -> u64 {
     return sys::reach(self, body: fn(state: Gauged, record: u64) => state.headed.load()).value_or(0)
@@ -93,14 +131,14 @@ fn header_mark() -> u64 {
     return u64.widen(header.bytes[0])
 } header_mark
 
-fn encoded_total(total: u64, alloc: mem::Alloc) -> mem::Bytes {
-    var bytes = mem::Bytes.empty(alloc)
-    mem::wire::Codec[u64].encode(total, out: mut bytes)
-    return bytes
+fn encoded_total(total: u64, alloc: mem::Alloc) -> sys::Encoded {
+    var encoding = sys::Encoded.empty(alloc)
+    mem::wire::Codec[u64].encode(total, out: mut encoding.bytes)
+    return encoding
 } encoded_total
 
-fn total_of(bytes: mem::Bytes, alloc: mem::Alloc) -> u64 fails sys::CrossError {
-    match attempt mem::wire::Codec[u64].decode(Untrusted.of(bytes.view()), alloc) {
+fn total_of(encoding: sys::Encoded, alloc: mem::Alloc) -> u64 fails sys::CrossError {
+    match attempt mem::wire::Codec[u64].decode(Untrusted.of(encoding.bytes.view()), alloc) {
         Ok(total) => return total
         Err(_) => fail sys::CrossError.Refused
     }
@@ -143,7 +181,9 @@ pub fn close_lines(take minter: sys::Minter[Line, Lined, u64]) {
 } close_lines
 
 pub fn Line.dial(self, call: Slice[u8], alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError uses wait {
-    return try await sys::Handle.of(self).call(DIAL, args: call, alloc)
+    let none = mem::List[sys::Handle].empty(alloc)
+    let sys::Encoded(bytes: reply, handles: _) = try await sys::Handle.of(self).call(DIAL, args: call, handles: none.view(), alloc)
+    return reply
 } Line.dial
 
 /// The calls the kernel of a line admitted, 0 once it is revoked.
@@ -162,7 +202,7 @@ pub fn Line.relayed(self) -> u64 {
 } Line.relayed
 
 /// Admits a dialled call while the credit lasts.
-pub fn Line.invoke(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError limits stack 4_096 {
+pub fn Line.invoke(self, operation: u64, args: Untrusted[Slice[u8]], handles: Slice[sys::Handle], alloc: mem::Alloc) -> sys::Encoded fails sys::CrossError limits stack 4_096 {
     if operation != DIAL {
         fail sys::CrossError.Refused
     }
@@ -180,11 +220,11 @@ pub fn Line.invoke(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem:
     if not admitted {
         fail sys::CrossError.Refused
     }
-    return mem::Bytes.empty(alloc)
+    return sys::Encoded.empty(alloc)
 } Line.invoke
 
 /// Counts a call its kernel makes itself, which reaches no instance.
-pub fn Line.call(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError limits stack 4_096 {
+pub fn Line.call(self, operation: u64, args: Untrusted[Slice[u8]], handles: Slice[sys::Handle], alloc: mem::Alloc) -> sys::Encoded fails sys::CrossError limits stack 4_096 {
     let Some(_) = sys::reach(self, body: fn(state: Lined, record: u64) => state.relayed.fetch_add(1)) else {
         fail sys::CrossError.Revoked(sys::Revoked.Stale)
     }

@@ -418,9 +418,10 @@ fn kind_awaited(take asked: Awaiting, table: Table, job: u64, out: task::Sender[
 
 /// What crosses down of the result of the waiting operation a space asks of the capability of a
 /// crossing kind the entry of the space's `table` it names holds for the instance numbered `job`,
-/// called under the header of the space's task asking it.
+/// called under the header of the space's task asking it with the capabilities of the entries its
+/// arguments name, the handles of its result crossing into the table for `job`.
 fn kind_answer(take asked: Awaiting, table: Table, job: u64, alloc: mem::Alloc) -> PortAnswer fails task::Cancelled uses wait {
-    let Awaiting(id: _, handle: handle, operation: operation, header: header, args: args) = asked
+    let Awaiting(id: _, handle: handle, operation: operation, header: header, call: Naming(bytes: args, handles: handles)) = asked
     let Some(entry) = table.entry(handle) else {
         return PortAnswer.Unknown
     }
@@ -430,11 +431,19 @@ fn kind_answer(take asked: Awaiting, table: Table, job: u64, alloc: mem::Alloc) 
     if entry.job != job {
         return PortAnswer.Unknown
     }
-    let called = attempt await under_header(header_of(header), body: fn() -> mem::Bytes fails sys::CrossError uses wait {
-        return try await capability.call(operation, args: args.view(), alloc)
+    let Some(handed) = table.handed(handles, alloc) else {
+        return PortAnswer.Unknown
+    }
+    let called = attempt await under_header(header_of(header), body: fn() -> sys::Encoded fails sys::CrossError uses wait {
+        return try await capability.call(operation, args: args.view(), handles: handed.view(), alloc)
     })
     match called {
-        Ok(bytes) => return PortAnswer.Replied(Carrying(bytes: take bytes, handles: mem::List[Carried].empty(alloc)))
+        Ok(result) => {
+            let Some(crossing) = table.admitted(job, handles: result.handles.view(), alloc) else {
+                return PortAnswer.Unknown
+            }
+            return PortAnswer.Replied(Carrying(bytes: take result.bytes, handles: take crossing))
+        }
         Err(sys::CrossError.Cancelled(cancelled)) => fail cancelled
         Err(sys::CrossError.Revoked(_)) => return PortAnswer.Revoked
         Err(sys::CrossError.Refused) => return PortAnswer.Unknown
@@ -610,7 +619,7 @@ struct Awaiting derives Encode {
     handle: u64
     operation: u64
     header: Option[Array[u8, 32]]
-    args: mem::Bytes
+    call: Naming
 } Awaiting
 
 /// The reply to a call an instance made through a port or to a waiting operation of a capability of

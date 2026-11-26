@@ -1481,7 +1481,7 @@ fn Driven.invoked(mut self, cpu: hw::Ring0, tenant: u64, clock: sys::Clock, serv
             }
         }
         Holding.Runner => return try await mut self.runner_invoked(isolation, mut space, handle, job: entry.job, operation, args, target, capacity, mut frames)
-        Holding.Kind(capability) => return kind_invoked(mut space, capability, operation, args, target, capacity, alloc)
+        Holding.Kind(capability) => return kind_invoked(mut space, capability, operation, args, target, capacity, table: isolation.door.contents().table, job: entry.job, alloc)
         Holding.Bridge => return try await mut self.bridge_invoked(mut space, handle, operation, args, target, capacity, mut frames, alloc)
     }
     return INVALID
@@ -1510,19 +1510,36 @@ fn Driven.runner_invoked(mut self, isolation: Isolation, mut space: sys::load::S
 } Driven.runner_invoked
 
 /// Serves an operation of the capability of a crossing kind a space holds through
-/// `sys::Handle.invoke`: writes its result at `target` when it fits `capacity`, giving its length,
-/// and gives `INVALID`, losing it, otherwise.
-fn kind_invoked(mut space: sys::load::Space, capability: sys::Handle, operation: u64, args: Untrusted[mem::Bytes], target: u64, capacity: u64, alloc: mem::Alloc) -> u64 {
-    let result = match attempt capability.invoke(operation, args: bytes_of(args.view(), alloc).view(), alloc) {
-        Ok(bytes) => bytes
+/// `sys::Handle.invoke`, the handles of its arguments naming entries of the space's `table` and those
+/// of its result crossing into it for the job or instance numbered `job`: writes the encoding of its
+/// result at `target` when it fits `capacity`, giving its length, and gives `INVALID`, losing it,
+/// otherwise.
+fn kind_invoked(mut space: sys::load::Space, capability: sys::Handle, operation: u64, args: Untrusted[mem::Bytes], target: u64, capacity: u64, table: Table, job: u64, alloc: mem::Alloc) -> u64 {
+    let Ok(Naming(bytes: bytes, handles: handles)) = attempt mem::wire::Codec[Naming].decode(args.view(), alloc) else {
+        return INVALID
+    }
+    let Some(handed) = table.handed(handles, alloc) else {
+        return INVALID
+    }
+    let result = match attempt capability.invoke(operation, args: bytes.view(), handles: handed.view(), alloc) {
+        Ok(given) => given
         Err(sys::CrossError.Revoked(_)) => return STALE
         Err(sys::CrossError.Refused) or Err(sys::CrossError.Cancelled(_)) => return INVALID
     }
-    let len = u64.widen(result.len())
-    if len > capacity {
+    if u64.widen(result.bytes.len()) > capacity {
         return INVALID
     }
-    return written_back(mut space, address: target, bytes: result, count: len)
+    let Some(crossing) = table.admitted(job, handles: result.handles.view(), alloc) else {
+        return INVALID
+    }
+    let carrying = Carrying(bytes: take result.bytes, handles: take crossing)
+    let written = encoded(carrying, alloc)
+    let len = u64.widen(written.len())
+    if len > capacity {
+        table.crossings_released(carrying.handles.view())
+        return INVALID
+    }
+    return written_back(mut space, address: target, bytes: written, count: len)
 } kind_invoked
 
 /// Whether every job and instance of a map was abandoned by its holder.
@@ -1881,7 +1898,8 @@ fn stale_held(handle: sys::Handle, alloc: mem::Alloc) -> bool {
     if handle.crosses() {
         return false
     }
-    return match attempt handle.invoke(0, args: b"", alloc) {
+    let none = mem::List[sys::Handle].empty(alloc)
+    return match attempt handle.invoke(0, args: b"", handles: none.view(), alloc) {
         Err(sys::CrossError.Revoked(_)) => true
         else => false
     }
@@ -2742,8 +2760,8 @@ fn begun(order: Taken, domain: mem::Shared[sys::Abandoner], granted: Base, take 
     }
     let task::Channel(sender: up, receiver: outgoing) = task::Channel[mem::Bytes].bounded(QUEUED_CALLS, alloc)
     let kinds = task::Cown.of(mem::Map[u64, Ride].empty(alloc), alloc)
-    let remotes = sys::Minter[Remote, Spaced, u64].of(Spaced(alloc: alloc, minted: unminted(alloc), up: up.split(), waits: waits.share(), kinds: kinds.share(), runner: record.runner, clock: granted.clock), alloc)
-    let base = remotes.mint(MOST_HELD)
+    let remotes = sys::Minter[Remote, Spaced, u64].of(Spaced(alloc: alloc, minted: unminted(alloc), base: hw::SpinLock.of(None), up: up.split(), waits: waits.share(), kinds: kinds.share(), runner: record.runner, clock: granted.clock), alloc)
+    let base = based(remotes)
     let task::Channel(sender: late, receiver: postponed) = task::Channel[Late].bounded(QUEUED_CALLS, alloc)
     let bridges = Bridges(ports: task::Cown.of(mem::Map[u64, Pump].empty(alloc), alloc), kinds: take kinds, routes: task::Cown.of(Routes(next: 0, waiting: mem::Map[u64, Route].empty(alloc)), alloc), late: take late, base: base, clock: granted.clock, alloc: alloc)
     let ports = sys::Minter[Port, Ports, u64].of(Ports(bell: record.bell, list: take list), alloc)
@@ -2924,13 +2942,14 @@ fn end_trapped(trap: sys::Trap, job: u64, alloc: mem::Alloc) {
 
 /// What the capabilities a space's runtime holds by the kernel's handles share: the runtime's
 /// allocator, what it minted for the last handle of each slot of the space's table it received, the
-/// sender of the frames an instance's space sends up, the waits of its calls that wait for the
-/// kernel's reply, the ends of bridges carrying the calls of capabilities of crossing kinds by their
-/// handles, the handle of its runner capability, and the runtime's clock, which times the sleeps of
-/// the clocks it holds.
+/// remote capability it mints those from, none until it is set, the sender of the frames an
+/// instance's space sends up, the waits of its calls that wait for the kernel's reply, the ends of
+/// bridges carrying the calls of capabilities of crossing kinds by their handles, the handle of its
+/// runner capability, and the runtime's clock, which times the sleeps of the clocks it holds.
 struct Spaced {
     alloc: mem::Alloc
     minted: hw::SpinLock[mem::List[Option[Minted]]]
+    base: hw::SpinLock[Option[Remote]]
     up: task::Sender[mem::Bytes]
     waits: task::Cown[PortWaits]
     kinds: task::Cown[mem::Map[u64, Ride]]
@@ -2955,6 +2974,26 @@ fn unminted(alloc: mem::Alloc) -> hw::SpinLock[mem::List[Option[Minted]]] {
     }
     return hw::SpinLock.of(take slots)
 } unminted
+
+/// The remote capability `remotes` mints every capability the runtime holds for a handle of the
+/// space's table from, which their state keeps from now on.
+fn based(remotes: sys::Minter[Remote, Spaced, u64]) -> Remote {
+    let base = remotes.mint(MOST_HELD)
+    discard sys::reach(base, body: fn(state: Spaced, record: u64) {
+        hw::without_irqs(fn(t: hw::IrqsDisabled) {
+            state.base.with(t, body: fn(mut kept: Option[Remote]) {
+                kept = Some(base)
+            })
+        })
+    })
+    return base
+} based
+
+/// The remote capability the runtime mints every capability it holds for a handle of the space's
+/// table from, none until it is set.
+fn Spaced.based(self) -> Option[Remote] {
+    return hw::without_irqs(fn(t: hw::IrqsDisabled) => self.base.with(t, body: fn(mut kept: Option[Remote]) => kept))
+} Spaced.based
 
 /// The handle the runtime holds for the handle `handle` of the space's table, minted through `mint`
 /// from a remote capability deriving from `base` the first time, which revokes the capability
@@ -3137,8 +3176,8 @@ test later_handles_of_a_slot_revoke_what_was_minted_for_earlier_ones for held_fo
     let task::Channel(sender: up, receiver: _) = task::Channel[mem::Bytes].bounded(1, alloc)
     let waits = task::Cown.of(PortWaits(next: 0, waiting: mem::Map[u64, task::Sender[PortAnswer]].empty(alloc)), alloc)
     let kinds = task::Cown.of(mem::Map[u64, Ride].empty(alloc), alloc)
-    let remotes = sys::Minter[Remote, Spaced, u64].of(Spaced(alloc: alloc, minted: unminted(alloc), up: take up, waits: take waits, kinds: take kinds, runner: 0, clock: world.clock), alloc)
-    let base = remotes.mint(MOST_HELD)
+    let remotes = sys::Minter[Remote, Spaced, u64].of(Spaced(alloc: alloc, minted: unminted(alloc), base: hw::SpinLock.of(None), up: take up, waits: take waits, kinds: take kinds, runner: 0, clock: world.clock), alloc)
+    let base = based(remotes)
     let one = held_log(base, handle: 3, otherwise: world.log)
     let again = held_log(base, handle: 3, otherwise: world.log)
     let later = held_log(base, handle: 3 + MOST_HELD, otherwise: world.log)
@@ -3287,12 +3326,15 @@ fn stream_error(answer: u64) -> sys::StdioError {
     }
 } stream_error
 
-fn Remote.invoke(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError limits stack 4_096 {
-    let Some(reach) = reached(self) else {
+fn Remote.invoke(self, operation: u64, args: Untrusted[Slice[u8]], handles: Slice[sys::Handle], alloc: mem::Alloc) -> sys::Encoded fails sys::CrossError limits stack 4_096 {
+    let Some(Rooted(base: Some(base), handle: handle)) = sys::reach(self, body: fn(state: Spaced, handle: u64) => Rooted(base: state.based(), handle: handle)) else {
         fail sys::CrossError.Revoked(sys::Revoked.Stale)
     }
+    let Some(named) = handles_named(base, minted: handles, alloc) else {
+        fail sys::CrossError.Refused
+    }
     var result = mem::Bytes.zeroed(CROSSED_BYTES, alloc)
-    let given = invoke(reach.handle, operation, args: bytes_of(args, alloc).view(), result: mut result.view_mut())
+    let given = invoke(handle, operation, args: encoded(Naming(bytes: bytes_of(args, alloc), handles: take named), alloc).view(), result: mut result.view_mut())
     if given == STALE {
         fail sys::CrossError.Revoked(sys::Revoked.Stale)
     }
@@ -3300,16 +3342,32 @@ fn Remote.invoke(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::A
         fail sys::CrossError.Refused
     }
     mut result.truncate(usize.widen(given))
-    return result
+    let Ok(carrying) = attempt mem::wire::Codec[Carrying].decode(Untrusted.of(result.view()), alloc) else {
+        fail sys::CrossError.Refused
+    }
+    return try crossed_reply(Some(PortAnswer.Replied(take carrying)), base, alloc)
 } Remote.invoke
 
-fn Remote.call(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError uses wait limits stack 4_096 {
-    let Some(uplink) = sys::reach(self, body: fn(state: Spaced, handle: u64) => Uplink(up: state.up.split(), waits: state.waits.share(), kinds: state.kinds.share(), runner: state.runner, handle: handle)) else {
+/// What reaching a remote capability gives for an operation crossing handles: the remote capability
+/// the runtime mints what it receives from, and the capability's own handle.
+struct Rooted derives Copy {
+    base: Option[Remote]
+    handle: u64
+} Rooted
+
+fn Remote.call(self, operation: u64, args: Untrusted[Slice[u8]], handles: Slice[sys::Handle], alloc: mem::Alloc) -> sys::Encoded fails sys::CrossError uses wait limits stack 4_096 {
+    let Some(uplink) = sys::reach(self, body: fn(state: Spaced, handle: u64) => Uplink(base: state.based(), up: state.up.split(), waits: state.waits.share(), kinds: state.kinds.share(), runner: state.runner, handle: handle)) else {
         fail sys::CrossError.Revoked(sys::Revoked.Stale)
     }
-    let Uplink(up: up, waits: waits, kinds: kinds, runner: runner, handle: handle) = uplink
+    let Uplink(base: rooted, up: up, waits: waits, kinds: kinds, runner: runner, handle: handle) = uplink
+    let Some(base) = rooted else {
+        fail sys::CrossError.Revoked(sys::Revoked.Stale)
+    }
+    let Some(named) = handles_named(base, minted: handles, alloc) else {
+        fail sys::CrossError.Refused
+    }
     let given = bytes_of(args, alloc)
-    if u64.widen(given.len()) <= MOST_BYTES {
+    if named.len() == 0 and u64.widen(given.len()) <= MOST_BYTES {
         var ride: Option[Ride] = None
         await when mut kinds {
             match kinds.get(handle) {
@@ -3322,25 +3380,36 @@ fn Remote.call(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::All
             }
         }
         match ride {
-            Some(across) => return try await rode_across(across, args: take given, alloc)
+            Some(across) => return try await rode_across(across, base, args: take given, alloc)
             None => {}
         }
     }
     let Waiting(id: id, answers: answers) = try await wait_added(waits, alloc)
-    let frame = up_framed(Up.Awaited(Awaiting(id: id, handle: handle, operation: operation, header: header_bytes(sys::current_header()), args: take given)), runner, alloc)
+    let frame = up_framed(Up.Awaited(Awaiting(id: id, handle: handle, operation: operation, header: header_bytes(sys::current_header()), call: Naming(bytes: take given, handles: take named))), runner, alloc)
     let answered = try await answer_awaited(up, waits, id, take frame, take answers)
-    match answered {
-        Some(PortAnswer.Replied(Carrying(bytes: bytes, handles: _))) => return bytes
-        Some(PortAnswer.Revoked) => fail sys::CrossError.Revoked(sys::Revoked.Stale)
-        else => fail sys::CrossError.Refused
-    }
+    return try crossed_reply(take answered, base, alloc)
 } Remote.call
 
+/// The result of an operation of a capability of a crossing kind as the space receives it, its
+/// handles minted through `base`; failing as the operation failed, or as refused when it has no
+/// answer.
+fn crossed_reply(take answered: Option[PortAnswer], base: Remote, alloc: mem::Alloc) -> sys::Encoded fails sys::CrossError {
+    let Some(answer) = answered else {
+        fail sys::CrossError.Refused
+    }
+    match attempt reply_minted(take answer, base, alloc) {
+        Ok(reply) => return reply
+        Err(sys::RunnerError.Revoked(revoked)) => fail sys::CrossError.Revoked(revoked)
+        else => fail sys::CrossError.Refused
+    }
+} crossed_reply
+
 /// What reaching a remote capability gives for an operation that waits for the kernel's reply: the
-/// sender of the frames the space sends up, the waits for the kernel's replies, the ends of bridges
-/// carrying the calls of capabilities of crossing kinds, the handle of the runner capability and the
-/// capability's own.
+/// remote capability the runtime mints what it receives from, the sender of the frames the space
+/// sends up, the waits for the kernel's replies, the ends of bridges carrying the calls of
+/// capabilities of crossing kinds, the handle of the runner capability and the capability's own.
 struct Uplink {
+    base: Option[Remote]
     up: task::Sender[mem::Bytes]
     waits: task::Cown[PortWaits]
     kinds: task::Cown[mem::Map[u64, Ride]]

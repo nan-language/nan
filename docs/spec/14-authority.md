@@ -847,7 +847,7 @@ pub fn hold_isolated[T, E](space: Isolation, job: sys::load::Isolated, component
 - The first channel of `link` carries the instance: the kernel sends down it each request of the holder, the end of each wait the holder no longer waits for, the protocol hash, number, header, bytes and handles of each call of an inbox, the instance's release by `end` and the reply to each call through a port and to each `call` of a crossing kind's capability, and the space's runtime sends up it each answer, each call the instance makes through a port and each such `call`, with the header of the task making it, each as a `mem::wire` encoding after its length as four little-endian bytes. A message whose encoding is longer than 1 MiB **moves** instead: the kernel unmaps the pages holding the encoding from the space, as the writing side's kernel of a [bridge](#bridges) does, the runtime sends up the handle of the instance's runner capability and the token they moved under, and the kernel reads the message from those frames, giving them back to its isolation's frames, as it gives back those it has not read once the instance has ended; a message cannot move once the isolation takes no more frames. The kernel reads what the space sends as untrusted: a message it does not decode or longer than 1 MiB, and a token naming nothing that moved through the instance's runner capability, breach the channel, and the kernel hears no more of the instance and ends it.
 - The instance acts through `runner`. The space's runtime attaches to its stepper a runner capability that forwards each operation to `runner`, with the arguments it is given: a call through a port up the first channel of `link`, so that the space runs on while the call waits, failing with `RunnerError.Unknown` when its message there passes 1 MiB and cannot move, and each other operation as a system call the kernel serves at once. The kernel makes each call and `send_to` through a port under the header of the space's task making it when that task has one, as `sys::run_headed` gives it. Their handles cross as a call's and a reply's do, an operation failing with `RunnerError.Unknown` when one cannot, and the capability that `capability` gives for a number crosses into the table once until `drop_capability` drops that number, which releases that crossing. A space's runtime holds no file or listener of its kernel's, so `resource`, `take_resource` and `put_resource` fail with `RunnerError.Unknown` there without reaching `runner`.
 - A capability **crosses** into a space when it is a `sys::Log`, a `sys::Stdio`, a `sys::Random` or a live capability of a [crossing kind](#crossing-kinds). Handles cross the space through its table. The kernel adds the capability each handle of a call holds to the table, and the call reaches the instance with a handle of the space's runtime in its place, holding a capability of the same type that reaches that entry through `invoke`; the runtime holds one capability per entry for each job or instance, and revokes it once a later handle of the entry's slot crosses for that job or instance, the table having taken that entry back, while a handle earlier than one of its slot that crossed for the job or instance reaches it as a stale capability. A handle of a reply names the entry the runtime holds its capability for, and reaches the holder as a handle of that entry's capability. A call carrying a handle of a capability that does not cross, or one the full table cannot take, and a call whose reply carries a handle of a capability the runtime holds for no entry or whose answer up the first channel of `link` passes 1 MiB and cannot move, fails with `CallError.Malformed(core::DecodeError.Invalid)`. The handles of the encodings `step_encoded` and `take_sent` give cross as a reply's do, and an encoding carrying a handle that cannot cross, or whose answer passes 1 MiB and cannot move, reaches the holder without bytes or handles.
-- A capability of a crossing kind reaches the instance as a capability of the same type that a kind of the space's runtime serves: its `invoke` is a system call the kernel serves at once by `Handle.invoke` on its own capability, failing with `CrossError.Refused` when the result is longer than 4,096 bytes, and its `call`, unless a [bridge](#bridges) carries it, goes up the first channel of `link`, the kernel making `Handle.call` on a task of its own, under the header of the space's task making the call when that task has one, and sending its result down, so that the space runs on while it waits, and failing with `CrossError.Refused` when its message there passes 1 MiB and cannot move. Through it `sys::reach` gives `None` and `sys::derive` fails, and once the kernel's capability is stale its operations fail with `CrossError.Revoked`.
+- A capability of a crossing kind reaches the instance as a capability of the same type that a kind of the space's runtime serves: its `invoke` is a system call the kernel serves at once by `Handle.invoke` on its own capability, failing with `CrossError.Refused` when the `mem::wire` encoding of the result's bytes and of what crosses for its handles is longer than 4,096 bytes, and its `call`, unless a [bridge](#bridges) carries it, goes up the first channel of `link`, the kernel making `Handle.call` on a task of its own, under the header of the space's task making the call when that task has one, and sending its result down, so that the space runs on while it waits, and failing with `CrossError.Refused` when its message there passes 1 MiB and cannot move. The handles of each operation's arguments cross as a call's through a port do, and those of its result as a reply's do, the operation failing with `CrossError.Refused` when one cannot. Through it `sys::reach` gives `None` and `sys::derive` fails, and once the kernel's capability is stale its operations fail with `CrossError.Revoked`.
 - An instance in a space ends as one `hold` holds does, `Abandoned` once the abandoner `instance.domain()` shares is triggered and the space has abandoned its domain, or, when no job or instance of the space runs on that its holder has not abandoned, from the space's next exit, `Trapped` as a job in a space does when a trap ends it, `Trapped` with a trap of `trap.bounds` whose report is `trap.bounds writing what no end of a channel writes` once it breaches the first channel of `link` or a bridge ([bridges](#bridges)), the space's other jobs and instances running on, and `Failed` with the rendering of `IsolatedError.NoChannel` when `link` has no channel or `open_port` or `open_crossing` added its first and of `IsolatedError.Unplaced` when it cannot be placed.
 
 ### Bridges
@@ -855,10 +855,10 @@ pub fn hold_isolated[T, E](space: Isolation, job: sys::load::Isolated, component
 An instance in an isolated space calls a port on an instance in another isolated space, or in its own, and a job or instance in an isolated space calls such an instance through a capability of a crossing kind, over a **bridge**: a channel of its link that the kernel maps into both spaces, through which their runtimes exchange the call and its reply without the kernel relaying them.
 
 - When `hold_isolated` places an instance whose `link` has a channel `link.open_port(port, to, inbound, outbound)` opened while the instance of `to` runs in an isolated space, the kernel clears the channel's frames and maps them into the space of each instance before it starts the instance. Each call the instance makes through `port` then passes over the channel rather than through `runner`, its space writing in `outbound` and reading in `inbound`, the other space the other way, and the other instance serves it as `inbox.call` does, under the header the call's record carries, its runtime keeping a postponed call pending for the `reply` of the runner capability that instance acts through. When `to` names an instance of the shared space or one that has ended, or a space has no room for the frames, the channel carries nothing and the calls through `port` reach `runner`.
-- When `run_isolated` or `hold_isolated` places a job or instance whose `link` has a channel `link.open_crossing(key, operation, hash, to, inbound, outbound)` opened while the instance of `to` runs in an isolated space, and whose `caps` hold under `key` a capability of a crossing kind that crosses into the space, the kernel maps the channel likewise. Each `call` of `operation` through that capability in the space whose arguments are at most 1 MiB then passes over the channel rather than through the kernel, as a call of the protocol of `hash` whose bytes are those arguments, and gives the bytes of its reply. Before the other instance serves such a call, its space's runtime has the kernel **admit** it: the kernel makes `Handle.invoke` of `operation` on its own capability with the call's bytes, under the header the call's record carries when it carries one, so that the kind decides whether each call may pass, and the call fails with `CrossError.Refused` when that `invoke` fails, with `CrossError.Revoked` when the capability is stale, and with `CrossError.Refused` when the other instance fails it or its reply carries handles. When `caps` holds no such capability under `key`, or the channel carries nothing as for a port, the calls reach the kernel as without the channel.
+- When `run_isolated` or `hold_isolated` places a job or instance whose `link` has a channel `link.open_crossing(key, operation, hash, to, inbound, outbound)` opened while the instance of `to` runs in an isolated space, and whose `caps` hold under `key` a capability of a crossing kind that crosses into the space, the kernel maps the channel likewise. Each `call` of `operation` through that capability in the space whose arguments are at most 1 MiB and carry no handles then passes over the channel rather than through the kernel, as a call of the protocol of `hash` whose bytes are those arguments, and gives the bytes and handles of its reply. Before the other instance serves such a call, its space's runtime has the kernel **admit** it: the kernel makes `Handle.invoke` of `operation` on its own capability with the call's bytes, under the header the call's record carries when it carries one, so that the kind decides whether each call may pass, and the call fails with `CrossError.Refused` when that `invoke` fails, with `CrossError.Revoked` when the capability is stale, and with `CrossError.Refused` when the other instance fails it. When `caps` holds no such capability under `key`, or the channel carries nothing as for a port, the calls reach the kernel as without the channel.
 - Each side writes into the ring of the frame it writes **records**, each the `mem::wire` encoding of a call, with the number of its wait, its protocol hash, the header of the task making it and its bytes, or of the reply to the call of a number or its failure, through a stale capability or not, after its length as four little-endian bytes, and reads the other side's records from the ring of the frame it reads, both rings laid out as a link's channel's. A side waiting for bytes sets the word at offset 16 of the frame it reads, and one waiting for room the word at offset 24 of the frame it writes; the other side, having written or read, takes that word and asks its kernel to wake the waiting side only when the word was set. A waiting side looks at its rings again at least every second while its runtime's clock is live.
 - The bytes of a call or reply travel in its record below 256 KiB. From 256 KiB, the kernel of the writing side unmaps the pages holding them from its space, and the kernel of the reading side maps those frames into its space in place of pages of its own, giving the frames those pages held back to its isolation's frames; once the reading side's end is closed, frames that moved for it without being mapped go back to the frames of its isolation, and pages no longer move to it.
-- The handles of a call or reply cross from the table of the writing side's space into the other's: the kernel adds the capability each names to the other space's table, as a call's handles cross into a space, keeping what crossed under a token the record names, which only the reading side's runtime claims; once the reading side's end is closed, the kernel drops what it keeps for it unclaimed, releasing each crossing of it. A call whose handles cannot cross fails with `RunnerError.Unknown`, and so does a call whose reply's handles cannot.
+- The handles of a call or reply cross from the table of the writing side's space into the other's: the kernel adds the capability each names to the other space's table, as a call's handles cross into a space, keeping what crossed under a token the record names, which only the reading side's runtime claims; once the reading side's end is closed, the kernel drops what it keeps for it unclaimed, releasing each crossing of it. A call whose handles cannot cross fails with `RunnerError.Unknown`, and so does a call whose reply's handles cannot, or with `CrossError.Refused` through a capability.
 - Each side reads the other's frame as untrusted. Counts no reader and writer could leave, a record longer than 260 KiB, one it does not decode, a call carrying handles over a bridge whose calls the kernel admits, and a token naming nothing that crossed or moved are a **breach** of the bridge by the other side, whose job or instance its kernel ends as `Trapped` with a trap of `trap.bounds`; the reading side's end closes.
 - A bridge closes once either side's job or instance ends or breaches it. The calls waiting on it then fail with `RunnerError.Unknown`, or with `CrossError.Refused` through a capability, and later calls through `port` reach `runner`, and those through a capability the kernel; `run_isolated` or `hold_isolated` of the calling job or instance returns only once the other space no longer maps the channel's frames.
 
@@ -1201,14 +1201,14 @@ pub fn forge(minter: sys::Minter[ports::Port, u32, u64]) -> ports::Port {
 
 ### Crossing kinds
 
-A capability kind **crosses** when its module implements `sys::Crossing` for it: its operations take and give bytes, which a `sys::Handle` carries to the code of the image that minted the capability, so that the capability acts alike in every closure holding it and in [isolated spaces](#component-instances).
+A capability kind **crosses** when its module implements `sys::Crossing` for it: its operations take and give bytes and handles, which a `sys::Handle` carries to the code of the image that minted the capability, so that the capability acts alike in every closure holding it and in [isolated spaces](#component-instances).
 
 ```nan-api
 // module: sys
 
 pub interface Crossing {
-    fn invoke(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails CrossError limits stack 4_096
-    fn call(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails CrossError uses wait limits stack 4_096
+    fn invoke(self, operation: u64, args: Untrusted[Slice[u8]], handles: Slice[Handle], alloc: mem::Alloc) -> Encoded fails CrossError limits stack 4_096
+    fn call(self, operation: u64, args: Untrusted[Slice[u8]], handles: Slice[Handle], alloc: mem::Alloc) -> Encoded fails CrossError uses wait limits stack 4_096
 } Crossing
 
 pub closed enum CrossError derives Render {
@@ -1219,14 +1219,14 @@ pub closed enum CrossError derives Render {
 
 pub fn Handle.crosses(self) -> bool
 
-pub fn Handle.invoke(self, operation: u64, args: Slice[u8], alloc: mem::Alloc) -> mem::Bytes fails CrossError
+pub fn Handle.invoke(self, operation: u64, args: Slice[u8], handles: Slice[Handle], alloc: mem::Alloc) -> Encoded fails CrossError
 
-pub fn Handle.call(self, operation: u64, args: Slice[u8], alloc: mem::Alloc) -> mem::Bytes fails CrossError uses wait
+pub fn Handle.call(self, operation: u64, args: Slice[u8], handles: Slice[Handle], alloc: mem::Alloc) -> Encoded fails CrossError uses wait
 ```
 
-- `invoke` and `call` are a crossing kind's operations, one that never waits and one that may: each takes the number of an operation and its arguments, which it reads as untrusted, and gives the bytes of its result drawn through `alloc`. A kind fails them with `CrossError.Refused` for an operation or arguments it refuses, and with `CrossError.Revoked` through a stale capability.
+- `invoke` and `call` are a crossing kind's operations, one that never waits and one that may: each takes the number of an operation, the bytes of its arguments, which it reads as untrusted, and the handles of the capabilities they pass, and gives the bytes of its result drawn through `alloc` with the handles of the capabilities it passes back. A kind reads the capability a handle holds through `sys::CapabilityId.of_handle` ([wire encoding](26-components.md#wire-encoding)), and fails its operations with `CrossError.Refused` for an operation or arguments it refuses, and with `CrossError.Revoked` through a stale capability.
 - An entry of a crossing kind records the kind's methods for `sys::Crossing` in the image minting it, and an entry deriving from it, through `sys::derive` or `sys::revocable`, records the same.
-- `handle.crosses()` is true when the capability `handle` holds is live and of a crossing kind. `handle.invoke(operation, args, alloc)` and `handle.call(operation, args, alloc)` call the method of their name of the kind of that capability, with the capability as `self`, on the calling task as a [served capability](#served-capabilities) calls its kind's methods, and fail as it fails; they fail with `CrossError.Revoked(Revoked.Stale)` when the capability is stale and otherwise with `CrossError.Refused` when it is not of a crossing kind. Their digests are those of `sys::Handle`'s operations, whatever the methods do.
+- `handle.crosses()` is true when the capability `handle` holds is live and of a crossing kind. `handle.invoke(operation, args, handles, alloc)` and `handle.call(operation, args, handles, alloc)` call the method of their name of the kind of that capability, with the capability as `self`, on the calling task as a [served capability](#served-capabilities) calls its kind's methods, and fail as it fails; they fail with `CrossError.Revoked(Revoked.Stale)` when the capability is stale and otherwise with `CrossError.Refused` when it is not of a crossing kind. Their digests are those of `sys::Handle`'s operations, whatever the methods do.
 
 ```nan
 // file: meters/package.nan
@@ -1239,7 +1239,7 @@ package meters {
 } meters
 
 // file: meters/meters.nan
-//! Meters adding the amounts their operations carry as bytes.
+//! Meters adding the amounts their operations carry as bytes, moving them to the meters they are handed and handing out meters deriving from them.
 
 pub open struct Meter {
 } Meter
@@ -1248,26 +1248,75 @@ impl Meter: sys::Kind[core::atomic::AtomicU64, u64]
 
 impl Meter: sys::Crossing
 
-/// The operation of a meter adding an amount and giving its total.
+/// The operations of a meter: adding an amount and giving its total, moving an amount to the meter
+/// its handles hold and giving a meter deriving from it.
 const ADD: u64 = 0
+
+const MOVE: u64 = 1
+
+const SPLIT: u64 = 2
 
 pub fn open_meters(alloc: mem::Alloc) -> sys::Minter[Meter, core::atomic::AtomicU64, u64] {
     return sys::Minter.of(core::atomic::AtomicU64.of(0), alloc)
 } open_meters
 
 pub fn Meter.add(self, amount: u64, alloc: mem::Alloc) -> u64 fails sys::CrossError {
-    var args = mem::Bytes.empty(alloc)
-    mem::wire::Codec[u64].encode(amount, out: mut args)
-    let total = try sys::Handle.of(self).invoke(ADD, args: args.view(), alloc)
-    match attempt mem::wire::Codec[u64].decode(Untrusted.of(total.view()), alloc) {
+    let none = mem::List[sys::Handle].empty(alloc)
+    let total = try sys::Handle.of(self).invoke(ADD, args: amount_bytes(amount, alloc).view(), handles: none.view(), alloc)
+    match attempt mem::wire::Codec[u64].decode(Untrusted.of(total.bytes.view()), alloc) {
         Ok(sum) => return sum
         Err(_) => fail sys::CrossError.Refused
     }
 } Meter.add
 
-pub fn Meter.invoke(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError limits stack 4_096 {
+pub fn Meter.move_to(self, to: Meter, amount: u64, alloc: mem::Alloc) fails sys::CrossError {
+    let given = Array[sys::Handle, 1].filled(sys::Handle.of(to))
+    discard try sys::Handle.of(self).invoke(MOVE, args: amount_bytes(amount, alloc).view(), handles: given.view(), alloc)
+} Meter.move_to
+
+pub fn Meter.split(self, alloc: mem::Alloc) -> Meter fails sys::CrossError {
+    let none = mem::List[sys::Handle].empty(alloc)
+    let derived = try sys::Handle.of(self).invoke(SPLIT, args: b"", handles: none.view(), alloc)
+    let Some(handle) = derived.handles.get(0) else {
+        fail sys::CrossError.Refused
+    }
+    let Some(meter) = sys::CapabilityId[Meter](id: 0).of_handle(handle) else {
+        fail sys::CrossError.Refused
+    }
+    return meter
+} Meter.split
+
+pub fn Meter.invoke(
+    self,
+    operation: u64,
+    args: Untrusted[Slice[u8]],
+    handles: Slice[sys::Handle],
+    alloc: mem::Alloc,
+    ) -> sys::Encoded fails sys::CrossError limits stack 4_096 {
+    var result = sys::Encoded.empty(alloc)
+    if operation == SPLIT {
+        let derived = try sys::derive(self, narrow: fn(state: core::atomic::AtomicU64, record: u64) => record)
+        mut result.handles.push(sys::Handle.of(derived))
+        return result
+    }
     let Ok(amount) = attempt mem::wire::Codec[u64].decode(args, alloc) else {
         fail sys::CrossError.Refused
+    }
+    if operation == MOVE {
+        if handles.len() != 1 {
+            fail sys::CrossError.Refused
+        }
+        let Some(to) = sys::CapabilityId[Meter](id: 0).of_handle(handles[0]) else {
+            fail sys::CrossError.Refused
+        }
+        let Some(taken) = sys::reach(self, body: fn(state: core::atomic::AtomicU64, record: u64) => state.fetch_sub(amount)) else {
+            fail sys::CrossError.Revoked(sys::Revoked.Stale)
+        }
+        if taken.is_none() {
+            fail sys::CrossError.Refused
+        }
+        discard sys::reach(to, body: fn(state: core::atomic::AtomicU64, record: u64) => state.fetch_add(amount))
+        return result
     }
     if operation != ADD {
         fail sys::CrossError.Refused
@@ -1276,14 +1325,25 @@ pub fn Meter.invoke(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem
     let Some(Some(before)) = added else {
         fail sys::CrossError.Revoked(sys::Revoked.Stale)
     }
-    var total = mem::Bytes.empty(alloc)
-    mem::wire::Codec[u64].encode(before.wrapping_add(amount), out: mut total)
-    return total
+    mut result.bytes.append(amount_bytes(before.wrapping_add(amount), alloc).view())
+    return result
 } Meter.invoke
 
-pub fn Meter.call(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::Alloc) -> mem::Bytes fails sys::CrossError limits stack 4_096 {
-    return try self.invoke(operation, args, alloc)
+pub fn Meter.call(
+    self,
+    operation: u64,
+    args: Untrusted[Slice[u8]],
+    handles: Slice[sys::Handle],
+    alloc: mem::Alloc,
+    ) -> sys::Encoded fails sys::CrossError limits stack 4_096 {
+    return try self.invoke(operation, args, handles, alloc)
 } Meter.call
+
+fn amount_bytes(amount: u64, alloc: mem::Alloc) -> mem::Bytes {
+    var bytes = mem::Bytes.empty(alloc)
+    mem::wire::Codec[u64].encode(amount, out: mut bytes)
+    return bytes
+} amount_bytes
 
 test meters_add_through_handles_until_revoked for Meter.add {
     let world = testing::world()
@@ -1298,7 +1358,8 @@ test meters_add_through_handles_until_revoked for Meter.add {
     let crosses = sys::Handle.of(meter).crosses()
     let clock = sys::Handle.of(world.clock)
     let clock_crosses = clock.crosses()
-    let refused = match attempt clock.invoke(ADD, args: b"", alloc: world.alloc) {
+    let none = mem::List[sys::Handle].empty(world.alloc)
+    let refused = match attempt clock.invoke(ADD, args: b"", handles: none.view(), alloc: world.alloc) {
         Err(sys::CrossError.Refused) => true
         else => false
     }
@@ -1312,6 +1373,38 @@ test meters_add_through_handles_until_revoked for Meter.add {
     expect crosses and not clock_crosses and refused
     expect revoked and not still_crosses
 } meters_add_through_handles_until_revoked
+
+test meters_move_to_and_hand_out_meters_through_handles for Meter.move_to {
+    let world = testing::world()
+    let minter = open_meters(world.alloc)
+    defer take minter.close()
+    let others = open_meters(world.alloc)
+    defer take others.close()
+    let meter = minter.mint(0)
+    let other = others.mint(0)
+    discard attempt meter.add(5, alloc: world.alloc)
+    let moved = attempt meter.move_to(other, amount: 3, alloc: world.alloc)
+    let short = attempt meter.move_to(other, amount: 3, alloc: world.alloc)
+    let received = match attempt other.add(0, alloc: world.alloc) {
+        Ok(sum) => sum
+        Err(_) => 0
+    }
+    let Ok(derived) = attempt meter.split(world.alloc) else {
+        expect false
+        return
+    }
+    let split_total = match attempt derived.add(1, alloc: world.alloc) {
+        Ok(sum) => sum
+        Err(_) => 0
+    }
+    minter.revoke(meter)
+    let split_revoked = match attempt derived.add(1, alloc: world.alloc) {
+        Err(sys::CrossError.Revoked(_)) => true
+        else => false
+    }
+    expect moved.is_ok() and short.is_err() and received == 3
+    expect split_total == 3 and split_revoked
+} meters_move_to_and_hand_out_meters_through_handles
 ```
 
 ## Protocol phases

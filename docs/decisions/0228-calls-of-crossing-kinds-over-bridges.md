@@ -1,6 +1,6 @@
 # 0228. Calls of crossing kinds over bridges
 
-Status: accepted
+Status: accepted; a reply carrying handles failing the call superseded by 0239
 
 ## Context
 

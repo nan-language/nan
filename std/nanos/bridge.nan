@@ -377,7 +377,13 @@ fn Driven.bridge_invoked(mut self, mut space: sys::load::Space, handle: u64, ope
         let Some(admission) = bridge.admission else {
             return INVALID
         }
-        return match attempt admission.capability.invoke(admission.operation, args: bytes_of(args.view(), alloc).view(), alloc) {
+        let Ok(Admitting(header: header, bytes: bytes)) = attempt mem::wire::Codec[Admitting].decode(args.view(), alloc) else {
+            return INVALID
+        }
+        let invoked = attempt await under_header(header_of(header), body: fn() -> mem::Bytes fails sys::CrossError {
+            return try admission.capability.invoke(admission.operation, args: bytes.view(), alloc)
+        })
+        return match invoked {
             Ok(_) => 0
             Err(sys::CrossError.Revoked(_)) => STALE
             Err(sys::CrossError.Refused) or Err(sys::CrossError.Cancelled(_)) => INVALID
@@ -694,12 +700,21 @@ const PAGE_BYTES: u64 = 4_096
 
 const MOST_MOVED: u64 = 1_073_741_824
 
-/// A call one end of a bridge writes: the number of its wait, its protocol hash and what it carries.
+/// A call one end of a bridge writes: the number of its wait, its protocol hash, the bytes of the
+/// header of the task making it and what it carries.
 struct BridgeCall derives Encode {
     id: u64
     hash: sys::ProtocolHash
+    header: Option[Array[u8, 32]]
     payload: Payload
 } BridgeCall
+
+/// The arguments of the admission of a call an end of a bridge serves: the bytes of the header of
+/// the task that made it, and its bytes.
+struct Admitting derives Encode {
+    header: Option[Array[u8, 32]]
+    bytes: mem::Bytes
+} Admitting
 
 /// The reply the other end writes to the call of a number, none when the call failed, through a
 /// stale capability when `revoked`.
@@ -1211,7 +1226,7 @@ fn called_across(pump: Pump, base: Remote, hash: sys::ProtocolHash, take sent: N
     let Naming(bytes: bytes, handles: handles) = sent
     let token = try carried_across(pump.handle, handles, alloc)
     let Waiting(id: id, answers: answers) = try await wait_added(pump.waits, alloc)
-    let record = framed(BridgeCall(id: id, hash: hash, payload: try payload_of(pump.handle, take bytes, crossed: token, alloc)), alloc)
+    let record = framed(BridgeCall(id: id, hash: hash, header: header_bytes(sys::current_header()), payload: try payload_of(pump.handle, take bytes, crossed: token, alloc)), alloc)
     try await pump.queue(take record)
     var receiver = answers
     let Some(answered) = try await mut receiver.receive() else {
@@ -1229,7 +1244,7 @@ fn rode_across(ride: Ride, take args: mem::Bytes, alloc: mem::Alloc) -> mem::Byt
         fail sys::CrossError.Refused
     }
     let Waiting(id: id, answers: answers) = try await wait_added(ride.pump.waits, alloc)
-    try await ride.pump.queue(framed(BridgeCall(id: id, hash: ride.hash, payload: take payload), alloc))
+    try await ride.pump.queue(framed(BridgeCall(id: id, hash: ride.hash, header: header_bytes(sys::current_header()), payload: take payload), alloc))
     var receiver = answers
     match try await mut receiver.receive() {
         Some(PortAnswer.Replied(Carrying(bytes: bytes, handles: handles))) => {
@@ -1275,7 +1290,7 @@ fn reply_heard(record: mem::Bytes, pump: Pump, alloc: mem::Alloc) -> bool fails 
 /// not admit; false for a record no calling end writes, which carries handles when `admits`.
 fn call_heard(record: mem::Bytes, pump: Pump, bridges: Bridges, calls: task::Sender[Called], admits: bool) -> bool fails task::Cancelled uses wait {
     let alloc = bridges.alloc
-    let Ok(BridgeCall(id: caller, hash: hash, payload: payload)) = attempt mem::wire::Codec[BridgeCall].decode(Untrusted.of(record.view()), alloc) else {
+    let Ok(BridgeCall(id: caller, hash: hash, header: header, payload: payload)) = attempt mem::wire::Codec[BridgeCall].decode(Untrusted.of(record.view()), alloc) else {
         return false
     }
     if admits and payload.carried != 0 {
@@ -1287,16 +1302,17 @@ fn call_heard(record: mem::Bytes, pump: Pump, bridges: Bridges, calls: task::Sen
     let Some(bytes) = payload_bytes(pump.handle, take payload, alloc) else {
         return false
     }
+    var encoding = sys::Encoded.empty(alloc)
+    mut encoding.bytes.append(bytes.view())
     if admits {
         var nothing = Array[u8, 1].filled(0)
-        let admission = invoke(pump.handle, operation: BRIDGE_ADMIT, args: bytes.view(), result: mut nothing.view_mut())
+        let admitting = encoded(Admitting(header: header, bytes: take bytes), alloc)
+        let admission = invoke(pump.handle, operation: BRIDGE_ADMIT, args: admitting.view(), result: mut nothing.view_mut())
         if admission != 0 {
             try await pump.queue(framed(BridgeReply(id: caller, reply: None, revoked: admission == STALE), alloc))
             return true
         }
     }
-    var encoding = sys::Encoded.empty(alloc)
-    mut encoding.bytes.append(bytes.view())
     for crossed in crossing {
         match minted_for(bridges.base, crossed) {
             Some(handle) => mut encoding.handles.push(handle)
@@ -1310,7 +1326,7 @@ fn call_heard(record: mem::Bytes, pump: Pump, bridges: Bridges, calls: task::Sen
         routes.next += 1
         discard mut routes.waiting.insert(id, value: Route(pump: pump.share(), call: caller))
     }
-    discard attempt await calls.send(Called(id: id, hash: hash, request: id, encoding: take encoding, alloc: alloc))
+    discard attempt await calls.send(Called(id: id, hash: hash, request: id, header: header_of(header), encoding: take encoding, alloc: alloc))
     return true
 } call_heard
 

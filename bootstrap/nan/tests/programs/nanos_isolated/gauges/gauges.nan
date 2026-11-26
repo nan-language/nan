@@ -1,12 +1,14 @@
-//! Gauges and lines whose operations cross as bytes: each gauge adds the amounts it is given to the total the gauges of its minter share, and settles that total once its minter's clock has run on; each line dials the calls it is given, which its kernel admits while the credit the lines of its minter share lasts and a kernel's own call of reaches no instance.
+//! Gauges and lines whose operations cross as bytes: each gauge adds the amounts it is given to the total the gauges of its minter share, and settles that total once its minter's clock has run on; each line dials the calls it is given, which its kernel admits while the credit the lines of its minter share lasts and a kernel's own call of reaches no instance; the gauges and lines of a minter keep the first byte of the header their last settling or admission ran under.
 
 pub open struct Gauge {
 } Gauge
 
-/// What the gauges of a minter share: their total, and the clock a settling waits on.
+/// What the gauges of a minter share: their total, the clock a settling waits on and the first byte
+/// of the header their last settling ran under, 0 for none.
 pub open struct Gauged derives Send {
     total: core::atomic::AtomicU64
     clock: sys::Clock
+    headed: core::atomic::AtomicU64
 } Gauged
 
 impl Gauge: sys::Kind[Gauged, u64]
@@ -22,7 +24,7 @@ const SETTLE: u64 = 1
 const SETTLING_NS: u64 = 1_000_000
 
 pub fn open(clock: sys::Clock, alloc: mem::Alloc) -> sys::Minter[Gauge, Gauged, u64] {
-    return sys::Minter.of(Gauged(total: core::atomic::AtomicU64.of(0), clock: clock), alloc)
+    return sys::Minter.of(Gauged(total: core::atomic::AtomicU64.of(0), clock: clock, headed: core::atomic::AtomicU64.of(0)), alloc)
 } open
 
 pub fn mint(minter: sys::Minter[Gauge, Gauged, u64]) -> Gauge {
@@ -65,7 +67,10 @@ pub fn Gauge.call(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::
     if operation != SETTLE {
         fail sys::CrossError.Refused
     }
-    let Some(clock) = sys::reach(self, body: fn(state: Gauged, record: u64) => state.clock) else {
+    let Some(clock) = sys::reach(self, body: fn(state: Gauged, record: u64) -> sys::Clock {
+        state.headed.store(header_mark())
+        return state.clock
+    }) else {
         fail sys::CrossError.Revoked(sys::Revoked.Stale)
     }
     try await clock.sleep_ns(SETTLING_NS)
@@ -74,6 +79,19 @@ pub fn Gauge.call(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::
     }
     return encoded_total(total, alloc)
 } Gauge.call
+
+/// The first byte of the header of the last settling of a gauge's minter, 0 once it is revoked.
+pub fn Gauge.headed(self) -> u64 {
+    return sys::reach(self, body: fn(state: Gauged, record: u64) => state.headed.load()).value_or(0)
+} Gauge.headed
+
+/// The first byte of the running task's header, 0 for none.
+fn header_mark() -> u64 {
+    let Some(header) = sys::current_header() else {
+        return 0
+    }
+    return u64.widen(header.bytes[0])
+} header_mark
 
 fn encoded_total(total: u64, alloc: mem::Alloc) -> mem::Bytes {
     var bytes = mem::Bytes.empty(alloc)
@@ -91,12 +109,14 @@ fn total_of(bytes: mem::Bytes, alloc: mem::Alloc) -> u64 fails sys::CrossError {
 pub open struct Line {
 } Line
 
-/// What the lines of a minter share: the calls they may still make, those their kernel admitted and
-/// those it made itself.
+/// What the lines of a minter share: the calls they may still make, those their kernel admitted,
+/// those it made itself and the first byte of the header their last admission ran under, 0 for
+/// none.
 pub open struct Lined derives Send {
     credit: core::atomic::AtomicU64
     admitted: core::atomic::AtomicU64
     relayed: core::atomic::AtomicU64
+    headed: core::atomic::AtomicU64
 } Lined
 
 impl Line: sys::Kind[Lined, u64]
@@ -107,7 +127,7 @@ impl Line: sys::Crossing
 pub const DIAL: u64 = 0
 
 pub fn open_lines(credit: u64, alloc: mem::Alloc) -> sys::Minter[Line, Lined, u64] {
-    return sys::Minter.of(Lined(credit: core::atomic::AtomicU64.of(credit), admitted: core::atomic::AtomicU64.of(0), relayed: core::atomic::AtomicU64.of(0)), alloc)
+    return sys::Minter.of(Lined(credit: core::atomic::AtomicU64.of(credit), admitted: core::atomic::AtomicU64.of(0), relayed: core::atomic::AtomicU64.of(0), headed: core::atomic::AtomicU64.of(0)), alloc)
 } open_lines
 
 pub fn mint_line(minter: sys::Minter[Line, Lined, u64]) -> Line {
@@ -131,6 +151,11 @@ pub fn Line.admitted(self) -> u64 {
     return sys::reach(self, body: fn(state: Lined, record: u64) => state.admitted.load()).value_or(0)
 } Line.admitted
 
+/// The first byte of the header of the last admission of a line's minter, 0 once it is revoked.
+pub fn Line.headed(self) -> u64 {
+    return sys::reach(self, body: fn(state: Lined, record: u64) => state.headed.load()).value_or(0)
+} Line.headed
+
 /// The calls the kernel of a line made itself, 0 once it is revoked.
 pub fn Line.relayed(self) -> u64 {
     return sys::reach(self, body: fn(state: Lined, record: u64) => state.relayed.load()).value_or(0)
@@ -142,6 +167,7 @@ pub fn Line.invoke(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem:
         fail sys::CrossError.Refused
     }
     let spent = sys::reach(self, body: fn(state: Lined, record: u64) -> bool {
+        state.headed.store(header_mark())
         if state.credit.fetch_sub(1).is_none() {
             return false
         }

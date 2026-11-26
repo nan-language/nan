@@ -440,10 +440,12 @@ struct TestRun derives Encode {
     texts: mem::List[text::String]
 } TestRun
 
-/// The arguments of a call handed to the runner capability through a port.
+/// The arguments of a call handed to the runner capability through a port, with the bytes of the
+/// header of the task handing it.
 struct Sending derives Encode {
     port: u64
     hash: sys::ProtocolHash
+    header: Option[Array[u8, 32]]
     call: Naming
 } Sending
 
@@ -818,8 +820,8 @@ fn sent_heard(isolation: Isolation, id: u64, take bytes: mem::Bytes, alloc: mem:
         try await door.asked(Ask.Breach(id))
         return
     }
-    let Awaiting(id: wait, handle: handle, operation: operation, args: args) = asked
-    let answer = try await kind_answer(handle, operation, args: args.view(), table: door.table, job: id, alloc)
+    let wait = asked.id
+    let answer = try await kind_answer(take asked, table: door.table, job: id, alloc)
     try await door.asked(Ask.Resolve(Resolution(id: id, reply: PortReply(id: wait, answer: take answer))))
 } sent_heard
 
@@ -1504,7 +1506,7 @@ fn Driven.runner_invoked(mut self, isolation: Isolation, mut space: sys::load::S
         discard attempt await running.notices.send(Notified.Sent(bytes_of(args.view(), alloc)))
         return 0
     }
-    return runner_served(mut space, runner: running.runner, job, operation, args, target, capacity, table: isolation.door.contents().table, ids: mut running.ids, alloc)
+    return try await runner_served(mut space, runner: running.runner, job, operation, args, target, capacity, table: isolation.door.contents().table, ids: mut running.ids, alloc)
 } Driven.runner_invoked
 
 /// Serves an operation of the capability of a crossing kind a space holds through
@@ -2142,17 +2144,20 @@ fn spanned(space: sys::load::Space, state: hw::UserState, at: usize, alloc: mem:
 } spanned
 
 /// Serves an operation of the runner capability of the instance numbered `job` through `runner`,
-/// the handles crossing through `table`; `ids` keeps what crossed into the table for each
-/// capability `runner` holds by number until it is dropped, which releases that crossing.
-fn runner_served(mut space: sys::load::Space, runner: sys::Runner, job: u64, operation: u64, args: Untrusted[mem::Bytes], target: u64, capacity: u64, table: Table, mut ids: mem::Map[u64, Carried], alloc: mem::Alloc) -> u64 {
+/// a call handed through a port under the header of the space's task handing it, the handles
+/// crossing through `table`; `ids` keeps what crossed into the table for each capability `runner`
+/// holds by number until it is dropped, which releases that crossing.
+fn runner_served(mut space: sys::load::Space, runner: sys::Runner, job: u64, operation: u64, args: Untrusted[mem::Bytes], target: u64, capacity: u64, table: Table, mut ids: mem::Map[u64, Carried], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
     if operation == RUN_SEND_TO {
-        let Ok(Sending(port: port, hash: hash, call: Naming(bytes: bytes, handles: handles))) = attempt mem::wire::Codec[Sending].decode(args.view(), alloc) else {
+        let Ok(Sending(port: port, hash: hash, header: header, call: Naming(bytes: bytes, handles: handles))) = attempt mem::wire::Codec[Sending].decode(args.view(), alloc) else {
             return INVALID
         }
         let Some(handed) = table.handed(handles, alloc) else {
             return INVALID
         }
-        return outcome_of(attempt runner.send_to(port, hash, bytes: bytes.view(), handles: handed.view()))
+        return outcome_of(attempt await under_header(header_of(header), body: fn() fails sys::RunnerError {
+            try runner.send_to(port, hash, bytes: bytes.view(), handles: handed.view())
+        }))
     }
     if operation == RUN_REPLY {
         let Ok(Replying(request: request, reply: Naming(bytes: bytes, handles: handles))) = attempt mem::wire::Codec[Replying].decode(args.view(), alloc) else {
@@ -3322,7 +3327,7 @@ fn Remote.call(self, operation: u64, args: Untrusted[Slice[u8]], alloc: mem::All
         }
     }
     let Waiting(id: id, answers: answers) = try await wait_added(waits, alloc)
-    let frame = up_framed(Up.Awaited(Awaiting(id: id, handle: handle, operation: operation, args: take given)), runner, alloc)
+    let frame = up_framed(Up.Awaited(Awaiting(id: id, handle: handle, operation: operation, header: header_bytes(sys::current_header()), args: take given)), runner, alloc)
     let answered = try await answer_awaited(up, waits, id, take frame, take answers)
     match answered {
         Some(PortAnswer.Replied(Carrying(bytes: bytes, handles: _))) => return bytes

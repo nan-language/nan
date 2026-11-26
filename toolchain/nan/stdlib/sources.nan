@@ -18846,7 +18846,13 @@ const TEXT_NANOS_BRIDGE: Str =
     \\        let Some(admission) = bridge.admission else {
     \\            return INVALID
     \\        }
-    \\        return match attempt admission.capability.invoke(admission.operation, args: bytes_of(args.view(), alloc).view(), alloc) {
+    \\        let Ok(Admitting(header: header, bytes: bytes)) = attempt mem::wire::Codec[Admitting].decode(args.view(), alloc) else {
+    \\            return INVALID
+    \\        }
+    \\        let invoked = attempt await under_header(header_of(header), body: fn() -> mem::Bytes fails sys::CrossError {
+    \\            return try admission.capability.invoke(admission.operation, args: bytes.view(), alloc)
+    \\        })
+    \\        return match invoked {
     \\            Ok(_) => 0
     \\            Err(sys::CrossError.Revoked(_)) => STALE
     \\            Err(sys::CrossError.Refused) or Err(sys::CrossError.Cancelled(_)) => INVALID
@@ -19163,12 +19169,21 @@ const TEXT_NANOS_BRIDGE: Str =
     \\
     \\const MOST_MOVED: u64 = 1_073_741_824
     \\
-    \\/// A call one end of a bridge writes: the number of its wait, its protocol hash and what it carries.
+    \\/// A call one end of a bridge writes: the number of its wait, its protocol hash, the bytes of the
+    \\/// header of the task making it and what it carries.
     \\struct BridgeCall derives Encode {
     \\    id: u64
     \\    hash: sys::ProtocolHash
+    \\    header: Option[Array[u8, 32]]
     \\    payload: Payload
     \\} BridgeCall
+    \\
+    \\/// The arguments of the admission of a call an end of a bridge serves: the bytes of the header of
+    \\/// the task that made it, and its bytes.
+    \\struct Admitting derives Encode {
+    \\    header: Option[Array[u8, 32]]
+    \\    bytes: mem::Bytes
+    \\} Admitting
     \\
     \\/// The reply the other end writes to the call of a number, none when the call failed, through a
     \\/// stale capability when `revoked`.
@@ -19680,7 +19695,7 @@ const TEXT_NANOS_BRIDGE: Str =
     \\    let Naming(bytes: bytes, handles: handles) = sent
     \\    let token = try carried_across(pump.handle, handles, alloc)
     \\    let Waiting(id: id, answers: answers) = try await wait_added(pump.waits, alloc)
-    \\    let record = framed(BridgeCall(id: id, hash: hash, payload: try payload_of(pump.handle, take bytes, crossed: token, alloc)), alloc)
+    \\    let record = framed(BridgeCall(id: id, hash: hash, header: header_bytes(sys::current_header()), payload: try payload_of(pump.handle, take bytes, crossed: token, alloc)), alloc)
     \\    try await pump.queue(take record)
     \\    var receiver = answers
     \\    let Some(answered) = try await mut receiver.receive() else {
@@ -19698,7 +19713,7 @@ const TEXT_NANOS_BRIDGE: Str =
     \\        fail sys::CrossError.Refused
     \\    }
     \\    let Waiting(id: id, answers: answers) = try await wait_added(ride.pump.waits, alloc)
-    \\    try await ride.pump.queue(framed(BridgeCall(id: id, hash: ride.hash, payload: take payload), alloc))
+    \\    try await ride.pump.queue(framed(BridgeCall(id: id, hash: ride.hash, header: header_bytes(sys::current_header()), payload: take payload), alloc))
     \\    var receiver = answers
     \\    match try await mut receiver.receive() {
     \\        Some(PortAnswer.Replied(Carrying(bytes: bytes, handles: handles))) => {
@@ -19744,7 +19759,7 @@ const TEXT_NANOS_BRIDGE: Str =
     \\/// not admit; false for a record no calling end writes, which carries handles when `admits`.
     \\fn call_heard(record: mem::Bytes, pump: Pump, bridges: Bridges, calls: task::Sender[Called], admits: bool) -> bool fails task::Cancelled uses wait {
     \\    let alloc = bridges.alloc
-    \\    let Ok(BridgeCall(id: caller, hash: hash, payload: payload)) = attempt mem::wire::Codec[BridgeCall].decode(Untrusted.of(record.view()), alloc) else {
+    \\    let Ok(BridgeCall(id: caller, hash: hash, header: header, payload: payload)) = attempt mem::wire::Codec[BridgeCall].decode(Untrusted.of(record.view()), alloc) else {
     \\        return false
     \\    }
     \\    if admits and payload.carried != 0 {
@@ -19756,16 +19771,17 @@ const TEXT_NANOS_BRIDGE: Str =
     \\    let Some(bytes) = payload_bytes(pump.handle, take payload, alloc) else {
     \\        return false
     \\    }
+    \\    var encoding = sys::Encoded.empty(alloc)
+    \\    mut encoding.bytes.append(bytes.view())
     \\    if admits {
     \\        var nothing = Array[u8, 1].filled(0)
-    \\        let admission = invoke(pump.handle, operation: BRIDGE_ADMIT, args: bytes.view(), result: mut nothing.view_mut())
+    \\        let admitting = encoded(Admitting(header: header, bytes: take bytes), alloc)
+    \\        let admission = invoke(pump.handle, operation: BRIDGE_ADMIT, args: admitting.view(), result: mut nothing.view_mut())
     \\        if admission != 0 {
     \\            try await pump.queue(framed(BridgeReply(id: caller, reply: None, revoked: admission == STALE), alloc))
     \\            return true
     \\        }
     \\    }
-    \\    var encoding = sys::Encoded.empty(alloc)
-    \\    mut encoding.bytes.append(bytes.view())
     \\    for crossed in crossing {
     \\        match minted_for(bridges.base, crossed) {
     \\            Some(handle) => mut encoding.handles.push(handle)
@@ -19779,7 +19795,7 @@ const TEXT_NANOS_BRIDGE: Str =
     \\        routes.next += 1
     \\        discard mut routes.waiting.insert(id, value: Route(pump: pump.share(), call: caller))
     \\    }
-    \\    discard attempt await calls.send(Called(id: id, hash: hash, request: id, encoding: take encoding, alloc: alloc))
+    \\    discard attempt await calls.send(Called(id: id, hash: hash, request: id, header: header_of(header), encoding: take encoding, alloc: alloc))
     \\    return true
     \\} call_heard
     \\
@@ -20410,7 +20426,7 @@ const TEXT_NANOS_HELD: Str =
     \\        let Some(called) = try await mut receiver.receive() else {
     \\            return
     \\        }
-    \\        let Called(id: id, hash: hash, request: request, encoding: encoding, alloc: drawn) = called
+    \\        let Called(id: id, hash: hash, request: request, header: header, encoding: encoding, alloc: drawn) = called
     \\        let Some(crossing) = table.admitted(job, handles: encoding.handles.view(), alloc) else {
     \\            discard attempt await answers.send(Routed.Answered(Replied(id: id, answer: Answer.Served(Err(sys::CallError.Malformed(core::DecodeError.Invalid))))))
     \\            continue
@@ -20419,7 +20435,7 @@ const TEXT_NANOS_HELD: Str =
     \\            discard mut allocs.insert(id, value: drawn)
     \\        }
     \\        let sys::Encoded(bytes: bytes, handles: _) = encoding
-    \\        discard attempt await out.send(framed(Down.Call(Calling(id: id, hash: hash, request: request, bytes: take bytes, handles: take crossing)), alloc))
+    \\        discard attempt await out.send(framed(Down.Call(Calling(id: id, hash: hash, request: request, header: header_bytes(header), bytes: take bytes, handles: take crossing)), alloc))
     \\    }
     \\} called_down
     \\
@@ -20573,12 +20589,18 @@ const TEXT_NANOS_HELD: Str =
     \\    }
     \\} up_of
     \\
-    \\/// Calls through `runner` the port an instance's space calls, its handles those of the entries of
-    \\/// the space's `table` it names, and sends `out` the frame of the reply, its handles added to
-    \\/// `table`.
+    \\/// Calls through `runner` the port an instance's space calls, under the header of the space's task
+    \\/// calling it, its handles those of the entries of the space's `table` it names, and sends `out`
+    \\/// the frame of the reply, its handles added to `table`.
     \\fn ported(take called: PortCall, runner: sys::Runner, table: Table, job: u64, out: task::Sender[mem::Bytes], alloc: mem::Alloc) fails task::Cancelled uses wait {
-    \\    let PortCall(id: id, port: port, hash: hash, call: request) = called
-    \\    let answer = try await port_answer(port, hash, take request, runner, table, job, alloc)
+    \\    let PortCall(id: id, port: port, hash: hash, header: header, call: request) = called
+    \\    var calling = Some(take request)
+    \\    let answer = try await under_header(header_of(header), body: fn[mut calling]() -> PortAnswer fails task::Cancelled uses wait {
+    \\        let Some(given) = mut calling.extract() else {
+    \\            return PortAnswer.Unknown
+    \\        }
+    \\        return try await port_answer(port, hash, request: take given, runner, table, job, alloc)
+    \\    })
     \\    discard attempt await out.send(framed(Down.Ported(PortReply(id: id, answer: take answer)), alloc))
     \\} ported
     \\
@@ -20604,14 +20626,16 @@ const TEXT_NANOS_HELD: Str =
     \\/// by the handle of the entry of the space's `table` added for it, and sends `out` the frame of its
     \\/// result.
     \\fn kind_awaited(take asked: Awaiting, table: Table, job: u64, out: task::Sender[mem::Bytes], alloc: mem::Alloc) fails task::Cancelled uses wait {
-    \\    let Awaiting(id: id, handle: handle, operation: operation, args: args) = asked
-    \\    let answer = try await kind_answer(handle, operation, args: args.view(), table, job, alloc)
+    \\    let id = asked.id
+    \\    let answer = try await kind_answer(take asked, table, job, alloc)
     \\    discard attempt await out.send(framed(Down.Ported(PortReply(id: id, answer: take answer)), alloc))
     \\} kind_awaited
     \\
-    \\/// What crosses down of the result of the waiting operation `operation` of the capability of a
-    \\/// crossing kind the entry `handle` of the space's `table` holds for the instance numbered `job`.
-    \\fn kind_answer(handle: u64, operation: u64, args: Slice[u8], table: Table, job: u64, alloc: mem::Alloc) -> PortAnswer fails task::Cancelled uses wait {
+    \\/// What crosses down of the result of the waiting operation a space asks of the capability of a
+    \\/// crossing kind the entry of the space's `table` it names holds for the instance numbered `job`,
+    \\/// called under the header of the space's task asking it.
+    \\fn kind_answer(take asked: Awaiting, table: Table, job: u64, alloc: mem::Alloc) -> PortAnswer fails task::Cancelled uses wait {
+    \\    let Awaiting(id: _, handle: handle, operation: operation, header: header, args: args) = asked
     \\    let Some(entry) = table.entry(handle) else {
     \\        return PortAnswer.Unknown
     \\    }
@@ -20621,7 +20645,10 @@ const TEXT_NANOS_HELD: Str =
     \\    if entry.job != job {
     \\        return PortAnswer.Unknown
     \\    }
-    \\    match attempt await capability.call(operation, args, alloc) {
+    \\    let called = attempt await under_header(header_of(header), body: fn() -> mem::Bytes fails sys::CrossError uses wait {
+    \\        return try await capability.call(operation, args: args.view(), alloc)
+    \\    })
+    \\    match called {
     \\        Ok(bytes) => return PortAnswer.Replied(Carrying(bytes: take bytes, handles: mem::List[Carried].empty(alloc)))
     \\        Err(sys::CrossError.Cancelled(cancelled)) => fail cancelled
     \\        Err(sys::CrossError.Revoked(_)) => return PortAnswer.Revoked
@@ -20689,7 +20716,7 @@ const TEXT_NANOS_HELD: Str =
     \\    return encoding
     \\} encoding_handed
     \\
-    \\/// The header whose bytes a space sends.
+    \\/// The header whose bytes cross a space's link or a bridge.
     \\fn header_of(bytes: Option[Array[u8, 32]]) -> Option[sys::Header] {
     \\    let Some(given) = bytes else {
     \\        return None
@@ -20697,7 +20724,7 @@ const TEXT_NANOS_HELD: Str =
     \\    return Some(sys::Header(bytes: given))
     \\} header_of
     \\
-    \\/// The bytes of a header as a space sends them.
+    \\/// The bytes of a header as they cross a space's link or a bridge.
     \\fn header_bytes(header: Option[sys::Header]) -> Option[Array[u8, 32]] {
     \\    let Some(given) = header else {
     \\        return None
@@ -20744,11 +20771,13 @@ const TEXT_NANOS_HELD: Str =
     \\} Order
     \\
     \\/// A call of an instance's inbox: the number of its wait, its protocol hash, the number its holder
-    \\/// gives it, its bytes and what the space receives of its handles.
+    \\/// gives it, the bytes of the header it is served under, its bytes and what the space receives of
+    \\/// its handles.
     \\struct Calling derives Encode {
     \\    id: u64
     \\    hash: sys::ProtocolHash
     \\    request: u64
+    \\    header: Option[Array[u8, 32]]
     \\    bytes: mem::Bytes
     \\    handles: mem::List[Carried]
     \\} Calling
@@ -20778,22 +20807,24 @@ const TEXT_NANOS_HELD: Str =
     \\    answer: Sent
     \\} Answering
     \\
-    \\/// A call an instance makes through a port: the number of its wait, the port, the protocol hash and
-    \\/// the call.
+    \\/// A call an instance makes through a port: the number of its wait, the port, the protocol hash, the
+    \\/// bytes of the header of the task making it and the call.
     \\struct PortCall derives Encode {
     \\    id: u64
     \\    port: u64
     \\    hash: sys::ProtocolHash
+    \\    header: Option[Array[u8, 32]]
     \\    call: Naming
     \\} PortCall
     \\
     \\/// A waiting operation an instance calls of a capability of a crossing kind: the number of its
-    \\/// wait, the handle of the capability's entry of the space's table, the operation and its
-    \\/// arguments.
+    \\/// wait, the handle of the capability's entry of the space's table, the operation, the bytes of the
+    \\/// header of the task calling it and its arguments.
     \\struct Awaiting derives Encode {
     \\    id: u64
     \\    handle: u64
     \\    operation: u64
+    \\    header: Option[Array[u8, 32]]
     \\    args: mem::Bytes
     \\} Awaiting
     \\
@@ -21146,7 +21177,7 @@ const TEXT_NANOS_HELD: Str =
     \\/// The call of an inbox the kernel sends, with the handles the runtime holds through `base` for what
     \\/// the kernel carried into the space's table, a handle it cannot hold left out.
     \\fn called_in(take calling: Calling, base: Remote, alloc: mem::Alloc) -> Called {
-    \\    let Calling(id: id, hash: hash, request: request, bytes: bytes, handles: crossing) = calling
+    \\    let Calling(id: id, hash: hash, request: request, header: header, bytes: bytes, handles: crossing) = calling
     \\    var encoding = sys::Encoded.empty(alloc)
     \\    mut encoding.bytes.append(bytes.view())
     \\    for crossed in crossing {
@@ -21155,7 +21186,7 @@ const TEXT_NANOS_HELD: Str =
     \\            None => {}
     \\        }
     \\    }
-    \\    return Called(id: id, hash: hash, request: request, encoding: take encoding, alloc: alloc)
+    \\    return Called(id: id, hash: hash, request: request, header: header_of(header), encoding: take encoding, alloc: alloc)
     \\} called_in
     \\
     \\/// The request of an order, a waiting one's with the receiver whose sender `stops` keeps under the
@@ -21309,7 +21340,7 @@ const TEXT_NANOS_HELD: Str =
     \\fn Forwarder.send_to(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], handles: Slice[sys::Handle]) fails sys::RunnerError limits stack 4_096 {
     \\    let forward = try forwarded(self)
     \\    let sent = try naming(forward.base, bytes, handles, alloc: forward.alloc)
-    \\    try acted(forward, operation: RUN_SEND_TO, args: encoded(Sending(port: port, hash: hash, call: take sent), alloc: forward.alloc).view())
+    \\    try acted(forward, operation: RUN_SEND_TO, args: encoded(Sending(port: port, hash: hash, header: header_bytes(sys::current_header()), call: take sent), alloc: forward.alloc).view())
     \\} Forwarder.send_to
     \\
     \\fn Forwarder.call(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], handles: Slice[sys::Handle], alloc: mem::Alloc) -> sys::Encoded fails sys::RunnerError uses wait limits stack 4_096 {
@@ -21332,7 +21363,7 @@ const TEXT_NANOS_HELD: Str =
     \\        None => {}
     \\    }
     \\    let Waiting(id: id, answers: answers) = try await wait_added(waits, alloc)
-    \\    let frame = up_framed(Up.Called(PortCall(id: id, port: port, hash: hash, call: take sent)), runner, alloc)
+    \\    let frame = up_framed(Up.Called(PortCall(id: id, port: port, hash: hash, header: header_bytes(sys::current_header()), call: take sent)), runner, alloc)
     \\    let Some(answered) = try await answer_awaited(up, waits, id, take frame, take answers) else {
     \\        fail sys::RunnerError.Unknown
     \\    }
@@ -21954,10 +21985,12 @@ const TEXT_NANOS_ISOLATED: Str =
     \\    texts: mem::List[text::String]
     \\} TestRun
     \\
-    \\/// The arguments of a call handed to the runner capability through a port.
+    \\/// The arguments of a call handed to the runner capability through a port, with the bytes of the
+    \\/// header of the task handing it.
     \\struct Sending derives Encode {
     \\    port: u64
     \\    hash: sys::ProtocolHash
+    \\    header: Option[Array[u8, 32]]
     \\    call: Naming
     \\} Sending
     \\
@@ -22332,8 +22365,8 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        try await door.asked(Ask.Breach(id))
     \\        return
     \\    }
-    \\    let Awaiting(id: wait, handle: handle, operation: operation, args: args) = asked
-    \\    let answer = try await kind_answer(handle, operation, args: args.view(), table: door.table, job: id, alloc)
+    \\    let wait = asked.id
+    \\    let answer = try await kind_answer(take asked, table: door.table, job: id, alloc)
     \\    try await door.asked(Ask.Resolve(Resolution(id: id, reply: PortReply(id: wait, answer: take answer))))
     \\} sent_heard
     \\
@@ -23018,7 +23051,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        discard attempt await running.notices.send(Notified.Sent(bytes_of(args.view(), alloc)))
     \\        return 0
     \\    }
-    \\    return runner_served(mut space, runner: running.runner, job, operation, args, target, capacity, table: isolation.door.contents().table, ids: mut running.ids, alloc)
+    \\    return try await runner_served(mut space, runner: running.runner, job, operation, args, target, capacity, table: isolation.door.contents().table, ids: mut running.ids, alloc)
     \\} Driven.runner_invoked
     \\
     \\/// Serves an operation of the capability of a crossing kind a space holds through
@@ -23656,17 +23689,20 @@ const TEXT_NANOS_ISOLATED: Str =
     \\} spanned
     \\
     \\/// Serves an operation of the runner capability of the instance numbered `job` through `runner`,
-    \\/// the handles crossing through `table`; `ids` keeps what crossed into the table for each
-    \\/// capability `runner` holds by number until it is dropped, which releases that crossing.
-    \\fn runner_served(mut space: sys::load::Space, runner: sys::Runner, job: u64, operation: u64, args: Untrusted[mem::Bytes], target: u64, capacity: u64, table: Table, mut ids: mem::Map[u64, Carried], alloc: mem::Alloc) -> u64 {
+    \\/// a call handed through a port under the header of the space's task handing it, the handles
+    \\/// crossing through `table`; `ids` keeps what crossed into the table for each capability `runner`
+    \\/// holds by number until it is dropped, which releases that crossing.
+    \\fn runner_served(mut space: sys::load::Space, runner: sys::Runner, job: u64, operation: u64, args: Untrusted[mem::Bytes], target: u64, capacity: u64, table: Table, mut ids: mem::Map[u64, Carried], alloc: mem::Alloc) -> u64 fails task::Cancelled uses wait {
     \\    if operation == RUN_SEND_TO {
-    \\        let Ok(Sending(port: port, hash: hash, call: Naming(bytes: bytes, handles: handles))) = attempt mem::wire::Codec[Sending].decode(args.view(), alloc) else {
+    \\        let Ok(Sending(port: port, hash: hash, header: header, call: Naming(bytes: bytes, handles: handles))) = attempt mem::wire::Codec[Sending].decode(args.view(), alloc) else {
     \\            return INVALID
     \\        }
     \\        let Some(handed) = table.handed(handles, alloc) else {
     \\            return INVALID
     \\        }
-    \\        return outcome_of(attempt runner.send_to(port, hash, bytes: bytes.view(), handles: handed.view()))
+    \\        return outcome_of(attempt await under_header(header_of(header), body: fn() fails sys::RunnerError {
+    \\            try runner.send_to(port, hash, bytes: bytes.view(), handles: handed.view())
+    \\        }))
     \\    }
     \\    if operation == RUN_REPLY {
     \\        let Ok(Replying(request: request, reply: Naming(bytes: bytes, handles: handles))) = attempt mem::wire::Codec[Replying].decode(args.view(), alloc) else {
@@ -24836,7 +24872,7 @@ const TEXT_NANOS_ISOLATED: Str =
     \\        }
     \\    }
     \\    let Waiting(id: id, answers: answers) = try await wait_added(waits, alloc)
-    \\    let frame = up_framed(Up.Awaited(Awaiting(id: id, handle: handle, operation: operation, args: take given)), runner, alloc)
+    \\    let frame = up_framed(Up.Awaited(Awaiting(id: id, handle: handle, operation: operation, header: header_bytes(sys::current_header()), args: take given)), runner, alloc)
     \\    let answered = try await answer_awaited(up, waits, id, take frame, take answers)
     \\    match answered {
     \\        Some(PortAnswer.Replied(Carrying(bytes: bytes, handles: _))) => return bytes
@@ -26005,7 +26041,7 @@ const TEXT_NANOS_NANOS: Str =
     \\        fail sys::CallError.Closed(task::SendError.Closed)
     \\    }
     \\    let Awaited(id: id, answers: receiver) = awaited
-    \\    try await self.calls.send(Called(id: id, hash: hash, request: request, encoding: take encoding, alloc: alloc))
+    \\    try await self.calls.send(Called(id: id, hash: hash, request: request, header: sys::current_header(), encoding: take encoding, alloc: alloc))
     \\    var answers = receiver
     \\    let Some(Answer.Served(served)) = try await mut answers.receive() else {
     \\        fail sys::CallError.Closed(task::SendError.Closed)
@@ -26105,11 +26141,13 @@ const TEXT_NANOS_NANOS: Str =
     \\} Answer
     \\
     \\/// An encoded call an inbox carries: the number of its wait, its protocol hash, the number its
-    \\/// holder gives it, its encoding and the allocator its reply is drawn through.
+    \\/// holder gives it, the header it is served under, its encoding and the allocator its reply is
+    \\/// drawn through.
     \\struct Called {
     \\    id: u64
     \\    hash: sys::ProtocolHash
     \\    request: u64
+    \\    header: Option[sys::Header]
     \\    encoding: sys::Encoded
     \\    alloc: mem::Alloc
     \\} Called
@@ -26322,9 +26360,9 @@ const TEXT_NANOS_NANOS: Str =
     \\    })
     \\} serving
     \\
-    \\/// Serves each encoded call `calls` carries through `out` on a task of its own, sending its reply,
-    \\/// none when its handler postponed it, through `answers`, until every sender of `calls` is
-    \\/// released.
+    \\/// Serves each encoded call `calls` carries through `out` on a task of its own under the call's
+    \\/// header, sending its reply, none when its handler postponed it, through `answers`, until every
+    \\/// sender of `calls` is released.
     \\fn dispatched[P: sys::Protocol and Send](out: sys::Outbox[P], take calls: task::Receiver[Called], answers: task::Sender[Routed], exec: task::Executor) fails task::Cancelled uses wait {
     \\    var receiver = calls
     \\    try await task::scope(exec, body: fn[mut receiver](s: task::Scope) fails task::Cancelled uses wait {
@@ -26334,14 +26372,24 @@ const TEXT_NANOS_NANOS: Str =
     \\            }
     \\            let replies = answers.split()
     \\            discard s.spawn(fn[take called, take replies]() fails task::Cancelled uses wait {
-    \\                let Called(id: id, hash: hash, request: request, encoding: encoding, alloc: alloc) = called
+    \\                let Called(id: id, hash: hash, request: request, header: header, encoding: encoding, alloc: alloc) = called
     \\                let peers = mem::List[sys::ProtocolSchema].empty(alloc)
-    \\                let served = attempt await sys::Wire[P].serve(out, request, hash, peers: peers.view(), raw: Untrusted.of(encoding.bytes.view()), handles: encoding.handles.view(), alloc)
+    \\                let served = attempt await under_header(header, body: fn() -> Option[sys::Encoded] fails sys::CallError[Never] uses wait {
+    \\                    return try await sys::Wire[P].serve(out, request, hash, peers: peers.view(), raw: Untrusted.of(encoding.bytes.view()), handles: encoding.handles.view(), alloc)
+    \\                })
     \\                discard attempt await replies.send(Routed.Answered(Replied(id: id, answer: Answer.Served(take served))))
     \\            })
     \\        }
     \\    })
     \\} dispatched
+    \\
+    \\/// Calls `body` under `header`, or under the running task's own header when `header` is none.
+    \\fn under_header[T, E](header: Option[sys::Header], body: fn() -> T fails E uses wait) -> T fails E uses wait {
+    \\    let Some(given) = header else {
+    \\        return try await body()
+    \\    }
+    \\    return try await sys::run_headed(given, body)
+    \\} under_header
     \\
     \\/// Carries out a request of an instance's holder on its stepper, giving the answer, none when the
     \\/// holder ended the wait it asked for.
@@ -26625,19 +26673,24 @@ const TEXT_NANOS_NANOS: Str =
     \\
     \\fn CountedEnv.build(take world: World) -> CountedEnv = CountedEnv(alloc: world.alloc)
     \\
-    \\/// A count that answers the request it postpones once asked to sync.
+    \\/// A count that answers the request it postpones once asked to sync, and counts the additions it
+    \\/// handles under a header.
     \\struct Count derives Encode {
     \\    total: u64
     \\    pending: Option[u64]
+    \\    headed: u64
     \\} Count
     \\
     \\impl Count: sys::Component[CountedEnv, Counted]
     \\
-    \\fn Count.start(mut env: CountedEnv) -> Count = Count(total: 0, pending: None)
+    \\fn Count.start(mut env: CountedEnv) -> Count = Count(total: 0, pending: None, headed: 0)
     \\
     \\fn Count.add(mut self, take amount: u32, mut env: CountedEnv, mut cx: sys::Cx[Counted]) -> u64 fails Over {
     \\    if amount > 100 {
     \\        fail Over.Over
+    \\    }
+    \\    if sys::current_header().is_some() {
+    \\        self.headed += 1
     \\    }
     \\    self.total += u64.widen(amount)
     \\    return self.total
@@ -26751,6 +26804,54 @@ const TEXT_NANOS_NANOS: Str =
     \\    }
     \\    expect last.total == 5
     \\} instances_answer_calls_and_end_with_their_state
+    \\
+    \\test calls_are_handled_under_the_header_they_are_made_under for Inbox.call {
+    \\    let world = testing::world()
+    \\    var ended = Ended.Undecodable
+    \\    try await task::scope(world.exec, body: fn[mut ended](s: task::Scope) fails InstanceError uses wait {
+    \\        let Opened(instance: opening, launch: launch, ending: ending, last: last) = opened(s, checkpoint: None, runner: sys::Runner.denied(), placed: None, alloc: world.alloc)
+    \\        let granted = tested(world)
+    \\        discard s.spawn(fn[take granted, take launch, take ending, take last]() fails task::Cancelled uses wait {
+    \\            let given = try await Hosted[Count, CountedEnv, Counted].run(take granted, take launch)
+    \\            discard attempt await ending.send(Routed.Ended)
+    \\            discard attempt await last.send(take given)
+    \\        })
+    \\        var instance = opening
+    \\        defer take instance.abandon()
+    \\        for round in 0u32..<2 {
+    \\            var header: Option[sys::Header] = None
+    \\            if round == 0 {
+    \\                header = Some(sys::Header(bytes: Array[u8, 32].filled(7)))
+    \\            }
+    \\            var request = sys::Encoded.empty(world.alloc)
+    \\            discard sys::Wire[Counted].add(mut request, amount: 1)
+    \\            let caller = instance.inbox()
+    \\            let answered = s.spawn(fn[take caller, take request]() fails task::Cancelled uses wait {
+    \\                var calling = Some(take request)
+    \\                try await under_header(header, body: fn[mut calling]() fails task::Cancelled uses wait {
+    \\                    let Some(encoding) = mut calling.extract() else {
+    \\                        return
+    \\                    }
+    \\                    discard attempt await caller.call(sys::Wire[Counted].hash(), request: 1, encoding: take encoding, alloc: world.alloc)
+    \\                })
+    \\            })
+    \\            try await instance.incoming()
+    \\            discard try await mut instance.step()
+    \\            try await take answered.join()
+    \\        }
+    \\        undefer instance
+    \\        ended = try await take instance.end()
+    \\    })
+    \\    let Ended.Returned(state) = ended else {
+    \\        expect false
+    \\        return
+    \\    }
+    \\    let Ok(last) = attempt mem::wire::Codec[Count].decode(Untrusted.of(state.view()), alloc: world.alloc) else {
+    \\        expect false
+    \\        return
+    \\    }
+    \\    expect last.total == 2 and last.headed == 1
+    \\} calls_are_handled_under_the_header_they_are_made_under
     \\
     \\test requests_a_domain_never_takes_end_with_it for Instance.ask {
     \\    let world = testing::world()

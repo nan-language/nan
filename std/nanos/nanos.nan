@@ -313,7 +313,7 @@ pub fn Inbox.call(self, hash: sys::ProtocolHash, request: u64, take encoding: sy
         fail sys::CallError.Closed(task::SendError.Closed)
     }
     let Awaited(id: id, answers: receiver) = awaited
-    try await self.calls.send(Called(id: id, hash: hash, request: request, encoding: take encoding, alloc: alloc))
+    try await self.calls.send(Called(id: id, hash: hash, request: request, header: sys::current_header(), encoding: take encoding, alloc: alloc))
     var answers = receiver
     let Some(Answer.Served(served)) = try await mut answers.receive() else {
         fail sys::CallError.Closed(task::SendError.Closed)
@@ -413,11 +413,13 @@ enum Answer {
 } Answer
 
 /// An encoded call an inbox carries: the number of its wait, its protocol hash, the number its
-/// holder gives it, its encoding and the allocator its reply is drawn through.
+/// holder gives it, the header it is served under, its encoding and the allocator its reply is
+/// drawn through.
 struct Called {
     id: u64
     hash: sys::ProtocolHash
     request: u64
+    header: Option[sys::Header]
     encoding: sys::Encoded
     alloc: mem::Alloc
 } Called
@@ -630,9 +632,9 @@ fn serving[S: sys::Component[Env, P] and Encode, Env: Environment and Send, P: s
     })
 } serving
 
-/// Serves each encoded call `calls` carries through `out` on a task of its own, sending its reply,
-/// none when its handler postponed it, through `answers`, until every sender of `calls` is
-/// released.
+/// Serves each encoded call `calls` carries through `out` on a task of its own under the call's
+/// header, sending its reply, none when its handler postponed it, through `answers`, until every
+/// sender of `calls` is released.
 fn dispatched[P: sys::Protocol and Send](out: sys::Outbox[P], take calls: task::Receiver[Called], answers: task::Sender[Routed], exec: task::Executor) fails task::Cancelled uses wait {
     var receiver = calls
     try await task::scope(exec, body: fn[mut receiver](s: task::Scope) fails task::Cancelled uses wait {
@@ -642,14 +644,24 @@ fn dispatched[P: sys::Protocol and Send](out: sys::Outbox[P], take calls: task::
             }
             let replies = answers.split()
             discard s.spawn(fn[take called, take replies]() fails task::Cancelled uses wait {
-                let Called(id: id, hash: hash, request: request, encoding: encoding, alloc: alloc) = called
+                let Called(id: id, hash: hash, request: request, header: header, encoding: encoding, alloc: alloc) = called
                 let peers = mem::List[sys::ProtocolSchema].empty(alloc)
-                let served = attempt await sys::Wire[P].serve(out, request, hash, peers: peers.view(), raw: Untrusted.of(encoding.bytes.view()), handles: encoding.handles.view(), alloc)
+                let served = attempt await under_header(header, body: fn() -> Option[sys::Encoded] fails sys::CallError[Never] uses wait {
+                    return try await sys::Wire[P].serve(out, request, hash, peers: peers.view(), raw: Untrusted.of(encoding.bytes.view()), handles: encoding.handles.view(), alloc)
+                })
                 discard attempt await replies.send(Routed.Answered(Replied(id: id, answer: Answer.Served(take served))))
             })
         }
     })
 } dispatched
+
+/// Calls `body` under `header`, or under the running task's own header when `header` is none.
+fn under_header[T, E](header: Option[sys::Header], body: fn() -> T fails E uses wait) -> T fails E uses wait {
+    let Some(given) = header else {
+        return try await body()
+    }
+    return try await sys::run_headed(given, body)
+} under_header
 
 /// Carries out a request of an instance's holder on its stepper, giving the answer, none when the
 /// holder ended the wait it asked for.
@@ -933,19 +945,24 @@ impl CountedEnv: Environment
 
 fn CountedEnv.build(take world: World) -> CountedEnv = CountedEnv(alloc: world.alloc)
 
-/// A count that answers the request it postpones once asked to sync.
+/// A count that answers the request it postpones once asked to sync, and counts the additions it
+/// handles under a header.
 struct Count derives Encode {
     total: u64
     pending: Option[u64]
+    headed: u64
 } Count
 
 impl Count: sys::Component[CountedEnv, Counted]
 
-fn Count.start(mut env: CountedEnv) -> Count = Count(total: 0, pending: None)
+fn Count.start(mut env: CountedEnv) -> Count = Count(total: 0, pending: None, headed: 0)
 
 fn Count.add(mut self, take amount: u32, mut env: CountedEnv, mut cx: sys::Cx[Counted]) -> u64 fails Over {
     if amount > 100 {
         fail Over.Over
+    }
+    if sys::current_header().is_some() {
+        self.headed += 1
     }
     self.total += u64.widen(amount)
     return self.total
@@ -1059,6 +1076,54 @@ test instances_answer_calls_and_end_with_their_state for Hosted.run {
     }
     expect last.total == 5
 } instances_answer_calls_and_end_with_their_state
+
+test calls_are_handled_under_the_header_they_are_made_under for Inbox.call {
+    let world = testing::world()
+    var ended = Ended.Undecodable
+    try await task::scope(world.exec, body: fn[mut ended](s: task::Scope) fails InstanceError uses wait {
+        let Opened(instance: opening, launch: launch, ending: ending, last: last) = opened(s, checkpoint: None, runner: sys::Runner.denied(), placed: None, alloc: world.alloc)
+        let granted = tested(world)
+        discard s.spawn(fn[take granted, take launch, take ending, take last]() fails task::Cancelled uses wait {
+            let given = try await Hosted[Count, CountedEnv, Counted].run(take granted, take launch)
+            discard attempt await ending.send(Routed.Ended)
+            discard attempt await last.send(take given)
+        })
+        var instance = opening
+        defer take instance.abandon()
+        for round in 0u32..<2 {
+            var header: Option[sys::Header] = None
+            if round == 0 {
+                header = Some(sys::Header(bytes: Array[u8, 32].filled(7)))
+            }
+            var request = sys::Encoded.empty(world.alloc)
+            discard sys::Wire[Counted].add(mut request, amount: 1)
+            let caller = instance.inbox()
+            let answered = s.spawn(fn[take caller, take request]() fails task::Cancelled uses wait {
+                var calling = Some(take request)
+                try await under_header(header, body: fn[mut calling]() fails task::Cancelled uses wait {
+                    let Some(encoding) = mut calling.extract() else {
+                        return
+                    }
+                    discard attempt await caller.call(sys::Wire[Counted].hash(), request: 1, encoding: take encoding, alloc: world.alloc)
+                })
+            })
+            try await instance.incoming()
+            discard try await mut instance.step()
+            try await take answered.join()
+        }
+        undefer instance
+        ended = try await take instance.end()
+    })
+    let Ended.Returned(state) = ended else {
+        expect false
+        return
+    }
+    let Ok(last) = attempt mem::wire::Codec[Count].decode(Untrusted.of(state.view()), alloc: world.alloc) else {
+        expect false
+        return
+    }
+    expect last.total == 2 and last.headed == 1
+} calls_are_handled_under_the_header_they_are_made_under
 
 test requests_a_domain_never_takes_end_with_it for Instance.ask {
     let world = testing::world()

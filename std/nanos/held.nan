@@ -211,7 +211,7 @@ fn called_down(take calls: task::Receiver[Called], out: task::Sender[mem::Bytes]
         let Some(called) = try await mut receiver.receive() else {
             return
         }
-        let Called(id: id, hash: hash, request: request, encoding: encoding, alloc: drawn) = called
+        let Called(id: id, hash: hash, request: request, header: header, encoding: encoding, alloc: drawn) = called
         let Some(crossing) = table.admitted(job, handles: encoding.handles.view(), alloc) else {
             discard attempt await answers.send(Routed.Answered(Replied(id: id, answer: Answer.Served(Err(sys::CallError.Malformed(core::DecodeError.Invalid))))))
             continue
@@ -220,7 +220,7 @@ fn called_down(take calls: task::Receiver[Called], out: task::Sender[mem::Bytes]
             discard mut allocs.insert(id, value: drawn)
         }
         let sys::Encoded(bytes: bytes, handles: _) = encoding
-        discard attempt await out.send(framed(Down.Call(Calling(id: id, hash: hash, request: request, bytes: take bytes, handles: take crossing)), alloc))
+        discard attempt await out.send(framed(Down.Call(Calling(id: id, hash: hash, request: request, header: header_bytes(header), bytes: take bytes, handles: take crossing)), alloc))
     }
 } called_down
 
@@ -374,12 +374,18 @@ fn up_of(frame: mem::Bytes, alloc: mem::Alloc) -> Heard {
     }
 } up_of
 
-/// Calls through `runner` the port an instance's space calls, its handles those of the entries of
-/// the space's `table` it names, and sends `out` the frame of the reply, its handles added to
-/// `table`.
+/// Calls through `runner` the port an instance's space calls, under the header of the space's task
+/// calling it, its handles those of the entries of the space's `table` it names, and sends `out`
+/// the frame of the reply, its handles added to `table`.
 fn ported(take called: PortCall, runner: sys::Runner, table: Table, job: u64, out: task::Sender[mem::Bytes], alloc: mem::Alloc) fails task::Cancelled uses wait {
-    let PortCall(id: id, port: port, hash: hash, call: request) = called
-    let answer = try await port_answer(port, hash, take request, runner, table, job, alloc)
+    let PortCall(id: id, port: port, hash: hash, header: header, call: request) = called
+    var calling = Some(take request)
+    let answer = try await under_header(header_of(header), body: fn[mut calling]() -> PortAnswer fails task::Cancelled uses wait {
+        let Some(given) = mut calling.extract() else {
+            return PortAnswer.Unknown
+        }
+        return try await port_answer(port, hash, request: take given, runner, table, job, alloc)
+    })
     discard attempt await out.send(framed(Down.Ported(PortReply(id: id, answer: take answer)), alloc))
 } ported
 
@@ -405,14 +411,16 @@ fn port_answer(port: u64, hash: sys::ProtocolHash, take request: Naming, runner:
 /// by the handle of the entry of the space's `table` added for it, and sends `out` the frame of its
 /// result.
 fn kind_awaited(take asked: Awaiting, table: Table, job: u64, out: task::Sender[mem::Bytes], alloc: mem::Alloc) fails task::Cancelled uses wait {
-    let Awaiting(id: id, handle: handle, operation: operation, args: args) = asked
-    let answer = try await kind_answer(handle, operation, args: args.view(), table, job, alloc)
+    let id = asked.id
+    let answer = try await kind_answer(take asked, table, job, alloc)
     discard attempt await out.send(framed(Down.Ported(PortReply(id: id, answer: take answer)), alloc))
 } kind_awaited
 
-/// What crosses down of the result of the waiting operation `operation` of the capability of a
-/// crossing kind the entry `handle` of the space's `table` holds for the instance numbered `job`.
-fn kind_answer(handle: u64, operation: u64, args: Slice[u8], table: Table, job: u64, alloc: mem::Alloc) -> PortAnswer fails task::Cancelled uses wait {
+/// What crosses down of the result of the waiting operation a space asks of the capability of a
+/// crossing kind the entry of the space's `table` it names holds for the instance numbered `job`,
+/// called under the header of the space's task asking it.
+fn kind_answer(take asked: Awaiting, table: Table, job: u64, alloc: mem::Alloc) -> PortAnswer fails task::Cancelled uses wait {
+    let Awaiting(id: _, handle: handle, operation: operation, header: header, args: args) = asked
     let Some(entry) = table.entry(handle) else {
         return PortAnswer.Unknown
     }
@@ -422,7 +430,10 @@ fn kind_answer(handle: u64, operation: u64, args: Slice[u8], table: Table, job: 
     if entry.job != job {
         return PortAnswer.Unknown
     }
-    match attempt await capability.call(operation, args, alloc) {
+    let called = attempt await under_header(header_of(header), body: fn() -> mem::Bytes fails sys::CrossError uses wait {
+        return try await capability.call(operation, args: args.view(), alloc)
+    })
+    match called {
         Ok(bytes) => return PortAnswer.Replied(Carrying(bytes: take bytes, handles: mem::List[Carried].empty(alloc)))
         Err(sys::CrossError.Cancelled(cancelled)) => fail cancelled
         Err(sys::CrossError.Revoked(_)) => return PortAnswer.Revoked
@@ -490,7 +501,7 @@ fn encoding_handed(take named: Naming, table: Table, alloc: mem::Alloc) -> sys::
     return encoding
 } encoding_handed
 
-/// The header whose bytes a space sends.
+/// The header whose bytes cross a space's link or a bridge.
 fn header_of(bytes: Option[Array[u8, 32]]) -> Option[sys::Header] {
     let Some(given) = bytes else {
         return None
@@ -498,7 +509,7 @@ fn header_of(bytes: Option[Array[u8, 32]]) -> Option[sys::Header] {
     return Some(sys::Header(bytes: given))
 } header_of
 
-/// The bytes of a header as a space sends them.
+/// The bytes of a header as they cross a space's link or a bridge.
 fn header_bytes(header: Option[sys::Header]) -> Option[Array[u8, 32]] {
     let Some(given) = header else {
         return None
@@ -545,11 +556,13 @@ enum Order derives Copy, Encode {
 } Order
 
 /// A call of an instance's inbox: the number of its wait, its protocol hash, the number its holder
-/// gives it, its bytes and what the space receives of its handles.
+/// gives it, the bytes of the header it is served under, its bytes and what the space receives of
+/// its handles.
 struct Calling derives Encode {
     id: u64
     hash: sys::ProtocolHash
     request: u64
+    header: Option[Array[u8, 32]]
     bytes: mem::Bytes
     handles: mem::List[Carried]
 } Calling
@@ -579,22 +592,24 @@ struct Answering derives Encode {
     answer: Sent
 } Answering
 
-/// A call an instance makes through a port: the number of its wait, the port, the protocol hash and
-/// the call.
+/// A call an instance makes through a port: the number of its wait, the port, the protocol hash, the
+/// bytes of the header of the task making it and the call.
 struct PortCall derives Encode {
     id: u64
     port: u64
     hash: sys::ProtocolHash
+    header: Option[Array[u8, 32]]
     call: Naming
 } PortCall
 
 /// A waiting operation an instance calls of a capability of a crossing kind: the number of its
-/// wait, the handle of the capability's entry of the space's table, the operation and its
-/// arguments.
+/// wait, the handle of the capability's entry of the space's table, the operation, the bytes of the
+/// header of the task calling it and its arguments.
 struct Awaiting derives Encode {
     id: u64
     handle: u64
     operation: u64
+    header: Option[Array[u8, 32]]
     args: mem::Bytes
 } Awaiting
 
@@ -947,7 +962,7 @@ fn port_replied(take reply: PortReply, waits: task::Cown[PortWaits]) fails task:
 /// The call of an inbox the kernel sends, with the handles the runtime holds through `base` for what
 /// the kernel carried into the space's table, a handle it cannot hold left out.
 fn called_in(take calling: Calling, base: Remote, alloc: mem::Alloc) -> Called {
-    let Calling(id: id, hash: hash, request: request, bytes: bytes, handles: crossing) = calling
+    let Calling(id: id, hash: hash, request: request, header: header, bytes: bytes, handles: crossing) = calling
     var encoding = sys::Encoded.empty(alloc)
     mut encoding.bytes.append(bytes.view())
     for crossed in crossing {
@@ -956,7 +971,7 @@ fn called_in(take calling: Calling, base: Remote, alloc: mem::Alloc) -> Called {
             None => {}
         }
     }
-    return Called(id: id, hash: hash, request: request, encoding: take encoding, alloc: alloc)
+    return Called(id: id, hash: hash, request: request, header: header_of(header), encoding: take encoding, alloc: alloc)
 } called_in
 
 /// The request of an order, a waiting one's with the receiver whose sender `stops` keeps under the
@@ -1110,7 +1125,7 @@ fn naming(base: Remote, bytes: Slice[u8], handles: Slice[sys::Handle], alloc: me
 fn Forwarder.send_to(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], handles: Slice[sys::Handle]) fails sys::RunnerError limits stack 4_096 {
     let forward = try forwarded(self)
     let sent = try naming(forward.base, bytes, handles, alloc: forward.alloc)
-    try acted(forward, operation: RUN_SEND_TO, args: encoded(Sending(port: port, hash: hash, call: take sent), alloc: forward.alloc).view())
+    try acted(forward, operation: RUN_SEND_TO, args: encoded(Sending(port: port, hash: hash, header: header_bytes(sys::current_header()), call: take sent), alloc: forward.alloc).view())
 } Forwarder.send_to
 
 fn Forwarder.call(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], handles: Slice[sys::Handle], alloc: mem::Alloc) -> sys::Encoded fails sys::RunnerError uses wait limits stack 4_096 {
@@ -1133,7 +1148,7 @@ fn Forwarder.call(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], ha
         None => {}
     }
     let Waiting(id: id, answers: answers) = try await wait_added(waits, alloc)
-    let frame = up_framed(Up.Called(PortCall(id: id, port: port, hash: hash, call: take sent)), runner, alloc)
+    let frame = up_framed(Up.Called(PortCall(id: id, port: port, hash: hash, header: header_bytes(sys::current_header()), call: take sent)), runner, alloc)
     let Some(answered) = try await answer_awaited(up, waits, id, take frame, take answers) else {
         fail sys::RunnerError.Unknown
     }

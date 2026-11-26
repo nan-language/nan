@@ -37,6 +37,7 @@ Run `nan` from a directory of NaN packages. Most commands take a scope: a packag
 | `nan lsp` | Serve the Language Server Protocol |
 | `nan dep sync` | Lock dependencies |
 | `nan verify` | Check a package is ready to publish |
+| `nan verify <package> --against <interface>` | Check a bundle is ready to load, trusting the kernel's own packages |
 | `nan publish --local <dir>` | Publish a release to the local store |
 
 ## Development

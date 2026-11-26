@@ -151,24 +151,8 @@ fn bundle(
     written: &str,
     against: &str,
 ) -> io::Result<Outcome> {
-    let package = scope.package(workspace).and_then(|package| {
-        workspace
-            .packages
-            .iter()
-            .position(|candidate| std::ptr::eq(&**candidate, package))
-    });
-    let buildable = package.filter(|index| {
-        workspace.packages[*index]
-            .manifest
-            .as_ref()
-            .is_some_and(|manifest| {
-                manifest.entry.is_none() || manifest.targets.iter().any(|target| target.is_nanos())
-            })
-    });
-    let usable = invocation.name == Name::Build
-        && matches!(scope, Scope::Package(_))
-        && invocation.value("--compare-with").is_none();
-    let Some(package) = buildable.filter(|_| usable) else {
+    let usable = invocation.name == Name::Build && invocation.value("--compare-with").is_none();
+    let Some(package) = bundled(workspace, scope).filter(|_| usable) else {
         return Ok(Outcome::Output(
             invocation.tool_error(Code::ToolUsage, written),
         ));
@@ -200,6 +184,17 @@ fn bundle(
         build.diagnostics,
         build.image.into_iter().chain(build.companions).collect(),
     )))
+}
+
+/// The index of the package a scope names when it declares no entry or a nanos target, whose
+/// bundle builds against a kernel's interface file.
+pub(super) fn bundled(workspace: &Workspace, scope: &Scope) -> Option<usize> {
+    let Scope::Package(package) = scope else {
+        return None;
+    };
+    let manifest = workspace.packages[*package].manifest.as_ref()?;
+    (manifest.entry.is_none() || manifest.targets.iter().any(|target| target.is_nanos()))
+        .then_some(*package)
 }
 
 /// Whether diagnostics hold an error.

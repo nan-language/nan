@@ -134,6 +134,49 @@ pub fn interrupt_stack(checker: &Checker, packages: &[PackageId]) -> u64 {
         .unwrap_or(0)
 }
 
+/// A kernel's interface file as a bundle build of a package reads it: its bytes, what it records
+/// and the target the bundle is built for.
+pub struct Against {
+    file: Vec<u8>,
+    read: Read,
+    target: Target,
+}
+
+impl Against {
+    /// The interface file at `against` that a bundle of the package `source` is built against, or
+    /// the `target.bundle-interface` error refusing it.
+    pub fn read(source: &Package, against: &Path) -> Result<Against, Box<Diagnostic>> {
+        let unusable = |reason: &str| Err(Box::new(interface_error(source, reason)));
+        let Ok(file) = fs::read(against) else {
+            return unusable("the interface file cannot be read");
+        };
+        let Some(read) = read_interface(&file) else {
+            return unusable("the interface file does not decode");
+        };
+        if read.toolchain != crate::toolchain::hash(1) {
+            return unusable("another toolchain built the kernel");
+        }
+        let manifest = source.manifest.as_ref().expect("a bundle's manifest");
+        let target = match (manifest.entry.is_some(), read.target.arch()) {
+            (true, Some(arch)) => Target::of(arch, Kind::Nanos),
+            _ => read.target,
+        };
+        if !manifest.targets.contains(&target) {
+            return unusable(&format!("the package does not declare {}", target.name()));
+        }
+        Ok(Against { file, read, target })
+    }
+
+    /// Whether the current state of the workspace package at `index` is the kernel's: the
+    /// interface file records its code root under its name.
+    pub fn holds(&self, workspace: &Workspace, index: usize) -> bool {
+        let recorded = workspace.packages[index]
+            .name()
+            .and_then(|name| self.read.roots.get(name));
+        recorded.is_some_and(|root| check::root::code_root(workspace, index) == Some(*root))
+    }
+}
+
 /// Builds the bundle of the package at index `package` of the workspace against the interface
 /// file at `against`, signed with the secret key of `seed` when given, writing it into
 /// `.nan/images/<target>/`: a library's for the interface's target, a nanos program's for the
@@ -145,26 +188,13 @@ pub fn bundle(
     seed: Option<[u8; 32]>,
 ) -> io::Result<Build> {
     let source = &workspace.packages[package];
-    let unusable = |reason: &str| Ok(Build::failed(vec![interface_error(source, reason)]));
-    let Ok(file) = fs::read(against) else {
-        return unusable("the interface file cannot be read");
+    let Against { file, read, target } = match Against::read(source, against) {
+        Ok(read) => read,
+        Err(refused) => return Ok(Build::failed(vec![*refused])),
     };
-    let Some(read) = read_interface(&file) else {
-        return unusable("the interface file does not decode");
-    };
-    if read.toolchain != crate::toolchain::hash(1) {
-        return unusable("another toolchain built the kernel");
-    }
     let manifest = source.manifest.as_ref().expect("a bundle's manifest");
     let names = manifest.entry.as_ref().map(|(names, _)| names);
     let program = names.is_some();
-    let target = match (program, read.target.arch()) {
-        (true, Some(arch)) => Target::of(arch, Kind::Nanos),
-        _ => read.target,
-    };
-    if !manifest.targets.contains(&target) {
-        return unusable(&format!("the package does not declare {}", target.name()));
-    }
     let mut diagnostics = check::reported(workspace, &crate::scope::Scope::Workspace);
     let Some(checked) = workspace.closure_of(source) else {
         return Ok(Build::failed(diagnostics));

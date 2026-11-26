@@ -332,34 +332,19 @@ pkg fn bundle(session: check::Session, package_index: usize, against: Str, signe
         expect false
         return Build.failed(mem::List[diagnostic::Diagnostic].empty(alloc), alloc)
     }
-    let Ok(file) = attempt platform::os::read_all(against, alloc) else {
-        return unusable(source, reason: "the interface file cannot be read", alloc)
-    }
-    let Some(read) = read_interface(file.view(), alloc) else {
-        return unusable(source, reason: "the interface file does not decode", alloc)
-    }
-    if hash_of(read.toolchain.view(), chunk: artefact::Chunk(start: 0, next: read.toolchain.len())) != Some(session.toolchain_hash()) {
-        return unusable(source, reason: "another toolchain built the kernel", alloc)
+    let Against(file: file, read: read, target: target) = match read_against(session, source, against, alloc) {
+        Ok(read) => read
+        Err(refused) => {
+            var diagnostics = mem::List[diagnostic::Diagnostic].empty(alloc)
+            mut diagnostics.push(take refused)
+            return Build.failed(take diagnostics, alloc)
+        }
     }
     let Some(manifest) = source.manifest else {
         expect false
         return Build.failed(mem::List[diagnostic::Diagnostic].empty(alloc), alloc)
     }
     let program = manifest.entry.is_some()
-    var target = read.target
-    match read.target.arch() {
-        Some(arch) => {
-            if program {
-                target = workspace::Target.of(arch, kind: workspace::Kind.Nanos)
-            }
-        }
-        None => {}
-    }
-    if manifest.targets.position(fn(declared: workspace::Target) => declared == target).is_none() {
-        var reason = text::String.of("the package does not declare ", alloc)
-        mut reason.append(target.name())
-        return unusable(source, reason: reason.as_str(), alloc)
-    }
     let closures = session.check_closures_coding(package_index)
     var diagnostics = session.reported_by(closures, scope: scope::Scope.Workspace)
     let Some(checked) = held.closure_of(package_index) else {
@@ -484,6 +469,64 @@ fn unusable(source: workspace::Package, reason: Str, alloc: mem::Alloc) -> Build
     mut diagnostics.push(interface_error(source, reason, alloc))
     return Build.failed(take diagnostics, alloc)
 } unusable
+
+/// A kernel's interface file as a bundle build of a package reads it: its bytes, what it records
+/// and the target the bundle is built for.
+pkg struct Against {
+    file: mem::Bytes
+    read: ReadInterface
+    target: workspace::Target
+} Against
+
+/// The interface file at `against` that a bundle of the package `source` is built against, or the
+/// `target.bundle-interface` error refusing it.
+pkg fn read_against(session: check::Session, source: workspace::Package, against: Str, alloc: mem::Alloc) -> Result[Against, diagnostic::Diagnostic] {
+    let Ok(file) = attempt platform::os::read_all(against, alloc) else {
+        return Err(interface_error(source, reason: "the interface file cannot be read", alloc))
+    }
+    let Some(read) = read_interface(file.view(), alloc) else {
+        return Err(interface_error(source, reason: "the interface file does not decode", alloc))
+    }
+    if hash_of(read.toolchain.view(), chunk: artefact::Chunk(start: 0, next: read.toolchain.len())) != Some(session.toolchain_hash()) {
+        return Err(interface_error(source, reason: "another toolchain built the kernel", alloc))
+    }
+    var target = read.target
+    var declares = false
+    match source.manifest {
+        Some(manifest) => {
+            match read.target.arch() {
+                Some(arch) => if manifest.entry.is_some() {
+                    target = workspace::Target.of(arch, kind: workspace::Kind.Nanos)
+                }
+                None => {}
+            }
+            declares = manifest.targets.position(fn(declared: workspace::Target) => declared == target).is_some()
+        }
+        None => {}
+    }
+    if not declares {
+        var reason = text::String.of("the package does not declare ", alloc)
+        mut reason.append(target.name())
+        return Err(interface_error(source, reason: reason.as_str(), alloc))
+    }
+    return Ok(Against(file: take file, read: take read, target: target))
+} read_against
+
+/// Whether the current state of the workspace package at an index is the kernel's: the interface
+/// file records its code root under its name.
+pkg fn Against.holds(self, session: check::Session, package_index: usize) -> bool {
+    let Some(source) = session.workspace.contents().package_at(package_index) else {
+        expect false
+        return false
+    }
+    let Some(name) = source.name() else {
+        return false
+    }
+    let Some(at) = self.read.roots.position(fn(kernel: PackageRoot) => kernel.name.as_str() == name) else {
+        return false
+    }
+    return session.code_root(package_index) == Some(self.read.roots[at].root)
+} Against.holds
 
 /// Whether package roots name a package.
 fn names_package(roots: Slice[PackageRoot], name: Str) -> bool {

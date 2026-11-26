@@ -160,6 +160,88 @@ The **release gate** is `nan verify`. It accepts a package exactly when, for the
 
 A package reached through a store-name source is a named release, which passed the release gate when it was [published](29-identity-versioning.md#publishing); `nan verify` judges it only by its release check.
 
+`nan verify <package> --against <interface file>` applies the release gate to a package that a [bundle build](30-artefacts.md#bundles) takes, before building it against a kernel's interface file. Of the packages the gate judges, each whose current state has the code root that the file records under its name is the kernel's, which the machine already runs: `nan verify` judges it by that code root alone. Every other package passes the release gate as above, one whose code root differs from the file's included. It is an error (`target.bundle-interface`), reported on the package's `package` line with a `note` reason, when the file cannot be read or does not decode, or records another toolchain hash or a target the package does not declare, as for a bundle build.
+
+```nan
+// file: os/package.nan
+//! What a kernel and its jobs share.
+
+package os {
+    language 1
+    targets x86_64-bare, x86_64-nanos
+    allow trusted in os
+} os
+
+// file: os/os.nan
+//! Reads the first byte of a view.
+
+pub fn first_byte(source: Slice[u8]) -> u8 {
+    if source.len() == 0 {
+        return 0
+    }
+    let start = hw::Ptr.of_view(source)
+    return trusted "source is a live view of at least one byte" { start.read() }
+} first_byte
+
+// file: kernel/package.nan
+//! A kernel exporting its load ABI.
+
+package kernel {
+    language 1
+    targets x86_64-bare
+    entry main
+    dep os "../os"
+    allow trusted in os
+} kernel
+
+// file: kernel/kernel.nan
+//! Entry of the kernel.
+
+fn main(take k: boot::Kernel) -> Never limits stack 16_384 {
+    discard k.loader()
+    discard os::first_byte
+    loop {
+    }
+} main
+
+// file: hello/package.nan
+//! A job.
+
+package hello {
+    language 1
+    targets x86_64-nanos
+    entry main
+    dep os "../os"
+    allow trusted in os
+} hello
+
+// file: hello/hello.nan
+//! Entry of the job.
+
+fn main(take world: nanos::World, take input: u32) -> u32 fails task::Cancelled uses wait {
+    world.log.info("hello", value: os::first_byte("a".as_bytes()))
+    return input
+} main
+```
+
+```text
+$ nan build kernel
+ok build kernel: files 3, errors 0, incomplete 0
+wrote .nan/images/x86_64-bare/kernel.elf
+wrote .nan/images/x86_64-bare/kernel.narts
+wrote .nan/images/x86_64-bare/kernel.nlif
+ok build kernel: files 3, errors 0, incomplete 0
+$ nan verify hello
+failed verify hello: errors 0, incomplete 1, tests 0, failed 0
+incomplete trust.unsealed os/os.nan:3 os::first_byte
+    pub fn first_byte(source: Slice[u8]) -> u8 {
+    because note - - trusted os/os.nan:8
+failed verify hello: errors 0, incomplete 1, tests 0, failed 0
+$ nan verify hello --against .nan/images/x86_64-bare/kernel.nlif
+ok verify hello --against .nan/images/x86_64-bare/kernel.nlif: errors 0, incomplete 0, tests 0, failed 0
+ok verify hello --against .nan/images/x86_64-bare/kernel.nlif: errors 0, incomplete 0, tests 0, failed 0
+```
+
 ## Ledger
 
 The **ledger** of an item is the list of its entries of the kinds this table gives; the ledger of a package lists the ledgers of its items. Each entry is its kind, its [span](19-nir.md#spans) and the parts the table gives, in that order. The ledger is computed from source and is part of the [code root](30-artefacts.md#code-roots).

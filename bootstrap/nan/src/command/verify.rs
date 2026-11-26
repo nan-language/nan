@@ -1,6 +1,7 @@
 //! `nan verify`: the release gate over the packages holding its scope and those they reach
 //! through chains of relative-path sources: their checks, their tests, the checks of the releases
-//! they reach, their API snapshots, pending weakenings and seals.
+//! they reach, their API snapshots, pending weakenings and seals. With `--against`, those whose
+//! code roots a kernel's interface file records are the kernel's, judged by those alone.
 
 use std::io;
 use std::path::Path;
@@ -10,6 +11,7 @@ use super::{Invocation, Trace, record};
 use crate::cache::Cache;
 use crate::check;
 use crate::diagnostic::{Class, Code, Diagnostic, sort_diagnostics};
+use crate::final_build::Against;
 use crate::output::{Output, Verdict};
 use crate::scope::Scope;
 use crate::test_runs::{self, Report, Runs};
@@ -25,8 +27,22 @@ pub fn run(
         return Ok(invocation.tool_error(Code::ToolUnknownScope, invocation.scope().unwrap_or(".")));
     };
     trace.scope = Some(written.clone());
-    let packages = gated(workspace, &scope);
-    let (diagnostics, report) = judged(workspace, &packages, &[])?;
+    let mut packages = gated(workspace, &scope);
+    let (diagnostics, report) = match invocation.value("--against") {
+        None => judged(workspace, &packages, &[])?,
+        Some(against) => {
+            let Some(package) = super::build::bundled(workspace, &scope) else {
+                return Ok(invocation.tool_error(Code::ToolUsage, &written));
+            };
+            match Against::read(&workspace.packages[package], &current.join(against)) {
+                Ok(kernel) => {
+                    packages.retain(|index| !kernel.holds(workspace, *index));
+                    judged(workspace, &packages, &[])?
+                }
+                Err(refused) => (vec![*refused], Report::default()),
+            }
+        }
+    };
     let count = |class: Class| {
         diagnostics
             .iter()

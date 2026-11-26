@@ -99,6 +99,16 @@ pub fn pending_syncs(workspace: &Workspace, scope: &Scope) -> Vec<Diagnostic> {
     found
 }
 
+/// The code root hash of the current state of the workspace package at `index`, none when no
+/// closure checks it.
+pub fn code_root(workspace: &Workspace, index: usize) -> Option<Hash> {
+    let closure = workspace.closure_of(&workspace.packages[index])?;
+    let built = build(workspace, closure, Member::Source(index));
+    artefact::decode(&built.artefact)
+        .ok()
+        .map(|decoded| decoded.root_hash())
+}
+
 /// The state of a workspace package its code root and seals depend on: the hash of its files but
 /// its lock, which its closure's members stand for.
 fn coded_state(package: &Package) -> Hash {

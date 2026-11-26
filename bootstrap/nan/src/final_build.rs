@@ -20,7 +20,7 @@ use crate::hash::{Hash, checksummed_base32};
 use crate::lower;
 use crate::workspace::{Kind, Level, Member, Package, Target, Workspace};
 
-pub use bundle::{at_manifest, bundle};
+pub use bundle::{Against, at_manifest, bundle};
 
 /// The entry landing fn each platform package holds.
 const LANDING: &str = "enter";

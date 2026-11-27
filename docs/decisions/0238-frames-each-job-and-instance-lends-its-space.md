@@ -1,6 +1,6 @@
 # 0238. Frames each job and instance lends its space
 
-Status: accepted
+Status: accepted; the frames of `isolate` serving the images of the space's bundles superseded by 0241
 
 ## Context
 

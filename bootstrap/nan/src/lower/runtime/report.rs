@@ -11,7 +11,8 @@
 pub mod values;
 
 use cranelift_codegen::ir::{
-    AbiParam, InstBuilder, MemFlagsData, Signature, TrapCode, Value, condcodes::IntCC, types,
+    AbiParam, AtomicRmwOp, InstBuilder, MemFlagsData, Signature, TrapCode, Value, condcodes::IntCC,
+    types,
 };
 use cranelift_frontend::Variable;
 
@@ -609,12 +610,12 @@ fn raise(lo: &mut Lowering, fx: &mut Fx) {
         &[types::I8],
         |fx| {
             let flag = fx.offset(domain, tasks::domain::ABANDONED);
-            let zero = fx.ptr(0);
             let one = fx.ptr(1);
             let seen =
                 fx.b.ins()
-                    .atomic_cas(MemFlagsData::trusted(), flag, zero, one);
-            vec![fx.b.ins().icmp_imm_s(IntCC::Equal, seen, 0)]
+                    .atomic_rmw(PTR, MemFlagsData::trusted(), AtomicRmwOp::Or, flag, one);
+            let abandoned = fx.b.ins().band_imm_s(seen, 1);
+            vec![fx.b.ins().icmp_imm_s(IntCC::Equal, abandoned, 0)]
         },
         |fx| vec![fx.int(types::I8, 0)],
     )[0];

@@ -243,16 +243,24 @@ fn each_task(mut lo: Lowering, mut fx: Fx, abandoned: clif::Value, visit: fn(mut
     discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
 } each_task
 
-/// Asks every task of the domain to stop and waits until each has: a new or parked task stops
-/// at once, a ready or preempted one leaves the run queue, and a running one stops once its
-/// thread has switched away from it, its thread receiving the stop signal until then.
+/// Asks every task of the domain to stop but the first task of a closed domain, which ends, and
+/// waits until each has: a new or parked task stops at once, a ready or preempted one leaves the
+/// run queue, and a running one stops once its thread has switched away from it, its thread
+/// receiving the stop signal until then.
 fn stop_tasks(mut lo: Lowering, mut fx: Fx, abandoned: clif::Value) {
     discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
         let pending = mut fx1.b.declare_var(clif::Type.Int8)
         let none = mut fx1.int(clif::Type.Int8, value: 0)
         mut fx1.b.def_var(pending, val: none)
         each_task(mut lo, fx: mut fx1, abandoned, visit: fn(mut lo2: Lowering, mut fx2: Fx, record: clif::Value) -> clif::Value {
-            let held = settle_stop(mut lo2, fx: mut fx2, record)
+            let ending = first_ending(mut fx2, record)
+            let helds = mut fx2.choose_in(mut lo2, condition: ending, results: fx2.types1(clif::Type.Int8).view(), then: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                return fx3.list1(mut fx3.int(clif::Type.Int8, value: 0))
+            }, otherwise: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                return fx3.list1(settle_stop(mut lo3, fx: mut fx3, record))
+            })
+            expect helds.len() > 0
+            let held = helds[0]
             let waiting_before = mut fx2.b.use_var(pending)
             let waiting_now = mut fx2.b.bor(waiting_before, y: held)
             mut fx2.b.def_var(pending, val: waiting_now)
@@ -265,6 +273,18 @@ fn stop_tasks(mut lo: Lowering, mut fx: Fx, abandoned: clif::Value) {
         return Pass(again: waiting, next: mem::List[clif::Value].empty(fx1.alloc))
     })
 } stop_tasks
+
+/// Whether a task is the first task of a closed domain: its entry has ended, and the run of its
+/// domain frees its record.
+fn first_ending(mut fx: Fx, record: clif::Value) -> clif::Value {
+    let owner = mut fx.load(PTR, addr: record, offset: TASK_OWNER)
+    let domain = mut fx.load(PTR, addr: record, offset: TASK_DOMAIN)
+    let opened = mut fx.b.icmp(clif::IntCC.Equal, x: owner, y: domain)
+    let word = mut fx.load(PTR, addr: domain, offset: DOMAIN_ABANDONED)
+    let closed_bit = mut fx.b.band_imm_s(word, y: DOMAIN_CLOSED)
+    let closed = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: closed_bit, y: 0)
+    return mut fx.b.band(opened, y: closed)
+} first_ending
 
 /// Asks a task to stop and stops it when it is off every thread; gives whether it has yet to
 /// stop. A running task's thread receives the stop signal, or on a Windows target is suspended

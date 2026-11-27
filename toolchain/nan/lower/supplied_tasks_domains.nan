@@ -141,12 +141,17 @@ fn abandoner_trigger(mut lo: Lowering, mut fx: Fx, fields: AbandonerFields) {
 } abandoner_trigger
 
 /// Returns `Err` of the trap that abandoned the domain of a record, once it is settled and its
-/// record freed, when it is abandoned.
-fn return_abandoned(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Value, trap: clif::Value, option: ty::Ty, slot: clif::Value) {
-    let abandoned_word = mut fx.load(PTR, addr: record, offset: DOMAIN_ABANDONED)
-    let abandoned = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: abandoned_word, y: 1)
+/// record freed, with that of its first task when the domain closed first, when it is abandoned.
+fn return_abandoned(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Value, first_task: clif::Value, trap: clif::Value, option: ty::Ty, slot: clif::Value) {
+    let abandoned = abandoned_domain(mut fx, record)
     mut fx.if_true(abandoned, then: fn[mut lo](mut fx1: Fx) {
         discard mut lo.call_routine(mut fx1, routine: Routine.Settle, args: Array[clif::Value, 1].filled(record).view())
+        let word = mut fx1.load(PTR, addr: record, offset: DOMAIN_ABANDONED)
+        let closed_bit = mut fx1.b.band_imm_s(word, y: DOMAIN_CLOSED)
+        let closed = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: closed_bit, y: 0)
+        mut fx1.if_true(closed, then: fn[mut lo](mut fx2: Fx) {
+            mut lo.record_free(mut fx2, address: first_task)
+        })
         mut lo.record_free(mut fx1, address: record)
         let value = mut fx1.slot(8, align: 8)
         mut fx1.store(trap, addr: value, offset: 0)
@@ -204,7 +209,7 @@ fn domains_run(mut lo: Lowering, mut fx: Fx, supply: Supply, sized: bool, throug
         Some(sret) => sret
         None => mut fx.slot(laid.contents().size, align: laid.contents().align)
     }
-    return_abandoned(mut lo, mut fx, supply, record, trap, option, slot)
+    return_abandoned(mut lo, mut fx, supply, record, first_task, trap, option, slot)
     discard mut lo.call_routine(mut fx, routine: Routine.Free, args: Array[clif::Value, 1].filled(trap).view())
     let outcome = mut fx.load(PTR, addr: first_task, offset: TASK_OUTCOME)
     let returned = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: outcome, y: 1)
@@ -317,8 +322,7 @@ fn run_nested(mut lo: Lowering, mut fx: Fx, body_ty: ty::FnTy, function: clif::V
             discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
             let tasks = mut fx1.load(PTR, addr: record, offset: DOMAIN_TASKS)
             let ended = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: tasks, y: 0)
-            let abandoned_word = mut fx1.load(PTR, addr: record, offset: DOMAIN_ABANDONED)
-            let abandoned = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: abandoned_word, y: 1)
+            let abandoned = abandoned_domain(mut fx1, record)
             let over = mut fx1.b.bor(ended, y: abandoned)
             let waiting = mut fx1.b.bxor_imm_s(over, y: 1)
             discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
@@ -376,6 +380,13 @@ fn domain_first_through(mut lo: Lowering, mut fx: Fx, fields: AbandonerFields, b
     return chosen[0]
 } domain_first_through
 
+/// Whether a domain has been abandoned.
+fn abandoned_domain(mut fx: Fx, record: clif::Value) -> clif::Value {
+    let word = mut fx.load(PTR, addr: record, offset: DOMAIN_ABANDONED)
+    let abandoned = mut fx.b.band_imm_s(word, y: 1)
+    return mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: abandoned, y: 0)
+} abandoned_domain
+
 /// Ends a domain whose first task ended: the holdings it still owns pass to `parent`, its other
 /// chunks are freed, and its records with them.
 fn domains_end_nested(mut lo: Lowering, mut fx: Fx, record: clif::Value, first_task: clif::Value, parent: clif::Value) {
@@ -412,8 +423,9 @@ fn unlink_child(mut fx: Fx, parent: clif::Value, child: clif::Value) {
     })
 } unlink_child
 
-/// What a domain's first task does once its entry has ended: it closes the domain, so that no
-/// abandoning begins after it, or stops when one began first.
+/// What a domain's first task does once its entry has ended: it closes the domain, so that its
+/// abandoner no longer abandons it and a settlement lets the task end, or stops when abandoning
+/// began first.
 fn domain_end(mut lo: Lowering) -> object::FuncId {
     let signature = record_signature(lo.alloc)
     return mut lo.glue_function(Glue.DomainEnd, signature: take signature, build: fn(mut lo1: Lowering, mut fx1: Fx) {

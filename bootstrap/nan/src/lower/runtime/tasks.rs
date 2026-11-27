@@ -177,8 +177,8 @@ pub mod domain {
     pub const PARENT: u64 = 0;
     pub const POOLS: u64 = 8;
     pub const CHUNKS: u64 = 16;
-    /// Zero while it runs, 1 once abandoned, and `CLOSED` once its first task's entry has ended
-    /// first.
+    /// Zero while it runs; `CLOSED` is set once its first task's entry ends before any
+    /// abandoning, and 1 once it is abandoned, whether or not it closed first.
     pub const ABANDONED: u64 = 24;
     /// The task waiting for the domain's tasks to end, and the lock of that wait.
     pub const WAITER: u64 = 32;

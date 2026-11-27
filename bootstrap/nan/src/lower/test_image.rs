@@ -20,7 +20,7 @@ use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use super::body::Held;
 use super::fx::{Fx, PTR};
 use super::machine::Stub;
-use super::runtime::tasks::{self, domain, trap_record};
+use super::runtime::tasks::{self, trap_record};
 use super::runtime::{Routine, state, system};
 use super::supplied::tasks::domains;
 use super::{CALL_CONV, Instance, Lowered, Lowering, lines};
@@ -529,8 +529,7 @@ fn entry_glue(lo: &mut Lowering, tests: &Tests) -> FuncId {
         let ran = fx.b.ins().symbol_value(PTR, global);
         let ran = fx.b.ins().iadd(ran, target);
         let ran = fx.load(types::I8, ran, 0);
-        let abandoned = fx.load(PTR, record, domain::ABANDONED);
-        let abandoned = fx.b.ins().icmp_imm_s(IntCC::Equal, abandoned, 1);
+        let abandoned = domains::abandoned(fx, record);
         fx.when(abandoned, |fx| {
             lo.call_routine(fx, Routine::Settle, &[record]);
             let len = fx.load(PTR, trap, trap_record::LEN);

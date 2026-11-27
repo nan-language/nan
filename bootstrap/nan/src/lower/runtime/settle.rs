@@ -257,16 +257,24 @@ fn each_task(
     lo.call_routine(fx, Routine::Unlock, &[lock]);
 }
 
-/// Asks every task of the domain to stop and waits until each has: a new or parked task stops
-/// at once, a ready or preempted one leaves the run queue, and a running one stops once its
-/// thread has switched away from it, its thread receiving the stop signal until then.
+/// Asks every task of the domain to stop but the first task of a closed domain, which ends, and
+/// waits until each has: a new or parked task stops at once, a ready or preempted one leaves the
+/// run queue, and a running one stops once its thread has switched away from it, its thread
+/// receiving the stop signal until then.
 fn stop_tasks(lo: &mut Lowering, fx: &mut Fx, abandoned: Value) {
     fx.repeat(&[], |fx, _| {
         let pending = fx.b.declare_var(types::I8);
         let none = fx.int(types::I8, 0);
         fx.b.def_var(pending, none);
         each_task(lo, fx, abandoned, &mut |lo, fx, record| {
-            let held = stop(lo, fx, record);
+            let ending = first_ending(fx, record);
+            let held = fx.choose_in(
+                lo,
+                ending,
+                &[types::I8],
+                |_, fx| vec![fx.int(types::I8, 0)],
+                |lo, fx| vec![stop(lo, fx, record)],
+            )[0];
             let waiting = fx.b.use_var(pending);
             let waiting = fx.b.ins().bor(waiting, held);
             fx.b.def_var(pending, waiting);
@@ -278,6 +286,18 @@ fn stop_tasks(lo: &mut Lowering, fx: &mut Fx, abandoned: Value) {
         });
         (waiting, Vec::new())
     });
+}
+
+/// Whether a task is the first task of a closed domain: its entry has ended, and the run of its
+/// domain frees its record.
+fn first_ending(fx: &mut Fx, record: Value) -> Value {
+    let owner = fx.load(PTR, record, task::OWNER);
+    let domain = fx.load(PTR, record, task::DOMAIN);
+    let first = fx.b.ins().icmp(IntCC::Equal, owner, domain);
+    let word = fx.load(PTR, domain, domain::ABANDONED);
+    let closed = fx.b.ins().band_imm_s(word, domain::CLOSED);
+    let closed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, closed, 0);
+    fx.b.ins().band(first, closed)
 }
 
 /// Asks a task to stop and stops it when it is off every thread; gives whether it has yet to

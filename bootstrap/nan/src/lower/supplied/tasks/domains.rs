@@ -203,10 +203,13 @@ fn run(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, sized: bool, through: bo
     let slot = supply
         .sret
         .unwrap_or_else(|| fx.slot(layout.size, layout.align));
-    let abandoned = fx.load(PTR, record, domain::ABANDONED);
-    let abandoned = fx.b.ins().icmp_imm_s(IntCC::Equal, abandoned, 1);
+    let abandoned = abandoned(fx, record);
     fx.when(abandoned, |fx| {
         lo.call_routine(fx, Routine::Settle, &[record]);
+        let word = fx.load(PTR, record, domain::ABANDONED);
+        let closed = fx.b.ins().band_imm_s(word, domain::CLOSED);
+        let closed = fx.b.ins().icmp_imm_s(IntCC::NotEqual, closed, 0);
+        fx.when(closed, |fx| lo.record_free(fx, first));
         lo.record_free(fx, record);
         let value = fx.slot(8, 8);
         fx.store(trap, value, 0);
@@ -373,8 +376,7 @@ pub fn run_nested(
             lo.call_routine(fx, Routine::Lock, &[lock]);
             let tasks = fx.load(PTR, record, domain::TASKS);
             let ended = fx.b.ins().icmp_imm_s(IntCC::Equal, tasks, 0);
-            let abandoned = fx.load(PTR, record, domain::ABANDONED);
-            let abandoned = fx.b.ins().icmp_imm_s(IntCC::Equal, abandoned, 1);
+            let abandoned = abandoned(fx, record);
             let over = fx.b.ins().bor(ended, abandoned);
             let waiting = fx.b.ins().bxor_imm_s(over, 1);
             lo.call_routine(fx, Routine::Unlock, &[lock]);
@@ -398,6 +400,13 @@ pub fn run_nested(
         first,
         trap,
     }
+}
+
+/// Whether a domain has been abandoned.
+pub fn abandoned(fx: &mut Fx, record: Value) -> Value {
+    let word = fx.load(PTR, record, domain::ABANDONED);
+    let abandoned = fx.b.ins().band_imm_s(word, 1);
+    fx.b.ins().icmp_imm_s(IntCC::NotEqual, abandoned, 0)
 }
 
 /// Ends a domain whose first task ended: the holdings it still owns pass to `parent`, its other
@@ -436,8 +445,9 @@ fn unlink_child(fx: &mut Fx, parent: Value, child: Value) {
     );
 }
 
-/// What a domain's first task does once its entry has ended: it closes the domain, so that no
-/// abandoning begins after it, or stops when one began first.
+/// What a domain's first task does once its entry has ended: it closes the domain, so that its
+/// abandoner no longer abandons it and a settlement lets the task end, or stops when abandoning
+/// began first.
 fn domain_end(lo: &mut Lowering) -> FuncId {
     lo.glue_function(Glue::DomainEnd, super::record_signature(), |lo, fx| {
         let first = fx.entry()[0];

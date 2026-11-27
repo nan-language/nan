@@ -497,7 +497,6 @@ fn sweep(lo: &mut Lowering, fx: &mut Fx) {
         let revoked = fx.b.ins().icmp_imm_s(IntCC::Equal, live, 2);
         fx.when(revoked, |fx| {
             expire_deadlines(lo, fx, record);
-            super::serial::release_waiting(lo, fx, record);
             let text = owns_text(fx, record);
             let block = owns_record(fx, record);
             let owns = fx.b.ins().bor(text, block);
@@ -505,7 +504,7 @@ fn sweep(lo: &mut Lowering, fx: &mut Fx) {
                 let owned = fx.load(PTR, record, entry::STATE + 8);
                 lo.record_free(fx, owned);
             });
-            free_entry(lo, fx, record, index);
+            super::serial::free_revoked(lo, fx, record, index);
         });
     });
 }
@@ -600,7 +599,7 @@ pub fn unlink_deadline(lo: &mut Lowering, fx: &mut Fx, timer: Value) {
 
 /// Frees an entry: its generation advances and it heads the free entries, unless that
 /// generation is 2^32 − 1, which retires it. The caller holds the lock.
-fn free_entry(lo: &mut Lowering, fx: &mut Fx, record: Value, index: Value) {
+pub fn free_entry(lo: &mut Lowering, fx: &mut Fx, record: Value, index: Value) {
     let dead = fx.int(types::I32, 0);
     fx.store(dead, record, entry::LIVE);
     let generation = fx.load(types::I32, record, entry::GENERATION);

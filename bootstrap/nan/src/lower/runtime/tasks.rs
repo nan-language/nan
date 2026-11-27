@@ -913,7 +913,7 @@ pub fn wake(lo: &mut Lowering, fx: &mut Fx, record: Value) {
 /// Gives a task the state a wake leaves it in: ready for a new or parked one, notified for a
 /// running or parking one and for a preempted kernel task; gives whether it made the task ready,
 /// which then runs only once `push_ready` admits it.
-pub fn wake_state(lo: &Lowering, fx: &mut Fx, record: Value) -> Value {
+fn wake_state(lo: &Lowering, fx: &mut Fx, record: Value) -> Value {
     let word = fx.offset(record, task::STATE);
     let notified = fx.int(types::I32, run::NOTIFIED);
     let ready = fx.int(types::I32, run::READY);

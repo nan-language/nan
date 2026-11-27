@@ -559,8 +559,8 @@ fn wakes_come_before_unlocking() {
 }
 
 /// A wait on a charge retakes the lock after each park before it returns, and a return of
-/// memory, which takes the task of an arm out of it under the lock, calls no wake, whose
-/// admission takes that lock.
+/// memory, which takes the task of an arm out of it under the lock, wakes that task before
+/// releasing the lock.
 #[test]
 fn charge_waits_end_under_the_lock() {
     let (texts, [park, lock, unlock, wake, _]) = lowered(
@@ -585,5 +585,6 @@ fn charge_waits_end_under_the_lock() {
     let parks = reach_first(wait, park, [unlock, lock]);
     assert!(!parks.is_empty() && !parks.contains(&false), "{wait}");
     let free = text(Routine::Free.name());
-    assert!(reach_first(free, wake, [lock, unlock]).is_empty(), "{free}");
+    let wakes = reach_first(free, wake, [lock, unlock]);
+    assert!(!wakes.is_empty() && !wakes.contains(&false), "{free}");
 }

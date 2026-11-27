@@ -1,0 +1,43 @@
+//! Wakes a serial executor's task from under the runtime's locks: by revoking the clock it waits under through a deadline, and by a trap of the capability tables abandoning the domain it waits for.
+
+fn main(take world: host::World) fails task::Cancelled uses wait {
+    let batch = world.exec.serial(7)
+    defer take batch.close()
+    try await task::scope(batch.executor(), body: fn(s: task::Scope) fails task::Cancelled uses wait {
+        let Ok(revoker) = attempt sys::revocable(world.clock) else {
+            return
+        }
+        let clock = revoker.capability()
+        let channel = task::Channel[u32].bounded(1, alloc: world.alloc)
+        let sender = channel.sender
+        var receiver = channel.receiver
+        discard s.spawn(fn[take receiver]() fails task::Cancelled uses wait {
+            let outcome = try await task::within(clock, ms: 60_000, body: fn[mut receiver]() -> Option[u32] fails task::Cancelled uses wait {
+                return try await mut receiver.receive()
+            })
+            world.log.info("deadline passed", value: outcome.is_none())
+        })
+        discard attempt await world.clock.sleep(200)
+        world.log.info("revoking", value: true)
+        take revoker.revoke()
+        world.log.info("revoked", value: true)
+        discard sender.offer(1)
+    })
+    try await task::scope(batch.executor(), body: fn(s: task::Scope) {
+        discard s.spawn(fn() fails task::Cancelled uses wait {
+            let clock = world.clock
+            let outcome = try await sys::Domain.run(fn() -> u64 {
+                var derived: u64 = 0
+                while derived < 100_000 {
+                    discard attempt clock.coarse(1)
+                    derived += 1
+                }
+                return derived
+            }, exec: world.exec, alloc: world.alloc)
+            match outcome {
+                Ok(derived) => world.log.info("derived", value: derived)
+                Err(trap) => world.log.info("table full", value: trap.kind())
+            }
+        })
+    })
+} main

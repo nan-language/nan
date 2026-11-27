@@ -533,7 +533,10 @@ pub mod state {
     /// kqueue and the key of the thread-specific value holding that record.
     pub const PORT: u64 = 552;
     pub const TLS_INDEX: u64 = 560;
-    pub const SIZE: u64 = 568;
+    /// The lock of the turns and waiting tasks of serial executors, which a thread holding any
+    /// other lock of the runtime may take, as it takes none while holding it.
+    pub const SERIAL_LOCK: u64 = 568;
+    pub const SIZE: u64 = 576;
 }
 
 impl Lowering<'_, '_> {

@@ -1,4 +1,4 @@
-//! Memory: byte copies, fills and comparisons; the cell table with each cell's limit, charge, parent and state; chunks of 64 KiB drawn through a cell and charged to its chain; and the allocations carved from the chunks a domain draws through one cell. A cell handle is the cell's index in its low 32 bits and its generation in its high 32. A cell record is its limit, its charge, its parent's index plus one, its generation, whether it is open and, for a chain whose root cell is over a region, the supply of the region's chunks, which each cell of the chain copies from its parent and draws from instead of the platform. Each drawn run of chunks has a record, found from the address of its first chunk through the chunk map: its cell handle, its domain, its live allocation count, the offset of its free bytes, its chunk count, its links in its domain's list, its address, and for a chunk a pool carves, its granule marks and its pool. A cell whose charge a task has waited on has an arm record, kept as long as the cell: the band of charges the waiting task waits for the charge to leave, which holds every charge while no task waits, the task, and its link in the list of arms whose charge left their band, whose tasks a routine changing charges wakes under the lock, admitting those it made ready once it has released it. A run passes to an enclosing domain when a value it holds leaves the domain owning it, charged from then on to that domain's cell when both cells' chains draw from one supply and the new chain has room for it, and the runs a domain still owns are freed when it ends. A carved allocation starts at a granule and rounds up to a size class; the mark of its first granule names its class, with the freed bit once it is freed. A freed allocation joins its pool's free list of its class, through its first two words, and the pool's next allocation of that class takes it, zeroed, before carving fresh bytes; a chunk leaving its pool, returned or passed to another domain, takes its freed allocations out of the lists first.
+//! Memory: byte copies, fills and comparisons; the cell table with each cell's limit, charge, parent and state; chunks of 64 KiB drawn through a cell and charged to its chain; and the allocations carved from the chunks a domain draws through one cell. A cell handle is the cell's index in its low 32 bits and its generation in its high 32. A cell record is its limit, its charge, its parent's index plus one, its generation, whether it is open and, for a chain whose root cell is over a region, the supply of the region's chunks, which each cell of the chain copies from its parent and draws from instead of the platform. Each drawn run of chunks has a record, found from the address of its first chunk through the chunk map: its cell handle, its domain, its live allocation count, the offset of its free bytes, its chunk count, its links in its domain's list, its address, and for a chunk a pool carves, its granule marks and its pool. A cell whose charge a task has waited on has an arm record, kept as long as the cell: the band of charges the waiting task waits for the charge to leave, which holds every charge while no task waits, the task, and its link in the list of arms whose charge left their band, whose tasks a routine changing charges wakes under the lock. A run passes to an enclosing domain when a value it holds leaves the domain owning it, charged from then on to that domain's cell when both cells' chains draw from one supply and the new chain has room for it, and the runs a domain still owns are freed when it ends. A carved allocation starts at a granule and rounds up to a size class; the mark of its first granule names its class, with the freed bit once it is freed. A freed allocation joins its pool's free list of its class, through its first two words, and the pool's next allocation of that class takes it, zeroed, before carving fresh bytes; a chunk leaving its pool, returned or passed to another domain, takes its freed allocations out of the lists first.
 
 const MEMORY_CHUNK: u64 = 65_536
 
@@ -560,9 +560,8 @@ fn charge_outside(mut fx: Fx, charge: clif::Value, low: clif::Value, span: clif:
 } charge_outside
 
 /// Wakes the task of each arm listed as having left its band, taking each arm out of the list
-/// and its task out of the arm and giving the task its woken state under the lock, so that the
-/// task finds itself woken once it retakes the lock to leave its wait; a task made ready joins a
-/// run queue once the lock is released, since admitting it takes the lock.
+/// and its task out of the arm and waking the task under the lock, so that the task finds itself
+/// woken once it retakes the lock to leave its wait.
 fn wake_left(mut lo: Lowering, mut fx: Fx) {
     let state_address = mut lo.state(mut fx)
     let head = mut fx.load(PTR, addr: state_address, offset: STATE_LEFT)
@@ -587,17 +586,10 @@ fn wake_left(mut lo: Lowering, mut fx: Fx) {
             })
             let waiter = taken[0]
             let waits = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: waiter, y: 0)
-            let woken = mut fx2.choose_in(mut lo, condition: waits, results: fx2.types1(clif::Type.Int8).view(), then: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
-                let readied = wake_state(lo3, fx: mut fx3, record: waiter)
-                return fx3.list1(readied)
-            }, otherwise: fn(mut lo3: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
-                let none = mut fx3.int(clif::Type.Int8, value: 0)
-                return fx3.list1(none)
+            mut fx2.if_true(waits, then: fn[mut lo](mut fx3: Fx) {
+                discard mut lo.call_routine(mut fx3, routine: Routine.Wake, args: fx3.list1(waiter).view())
             })
             discard mut lo.call_routine(mut fx2, routine: Routine.Unlock, args: fx2.list1(lock).view())
-            mut fx2.if_true(woken[0], then: fn[mut lo](mut fx3: Fx) {
-                tasks_push_ready(mut lo, fx: mut fx3, record: waiter)
-            })
             return Pass(again: present, next: mem::List[clif::Value].empty(fx2.alloc))
         })
     })

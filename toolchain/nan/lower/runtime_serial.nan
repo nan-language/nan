@@ -7,7 +7,7 @@ fn serial_admit(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Valu
     let gated = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: serial, y: 0)
     let admitted = mut fx.choose_in(mut lo, condition: gated, results: fx.types1(clif::Type.Int8).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         let state_address = mut lo1.state(mut fx1)
-        let lock = mut fx1.offset(state_address, offset: STATE_LOCK)
+        let lock = mut fx1.offset(state_address, offset: STATE_SERIAL_LOCK)
         discard mut lo1.call_routine(mut fx1, routine: Routine.Lock, args: fx1.list1(lock).view())
         let owner = live_entry(mut lo1, fx: mut fx1, handle: serial)
         let live = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: owner, y: 0)
@@ -50,7 +50,7 @@ fn define_turn(mut lo: Lowering, mut fx: Fx) {
     let gated = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: serial, y: 0)
     mut fx.if_true(gated, then: fn[mut lo](mut fx1: Fx) {
         let state_address = mut lo.state(mut fx1)
-        let lock = mut fx1.offset(state_address, offset: STATE_LOCK)
+        let lock = mut fx1.offset(state_address, offset: STATE_SERIAL_LOCK)
         discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: fx1.list1(lock).view())
         let owner = live_entry(mut lo, fx: mut fx1, handle: serial)
         let live = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: owner, y: 0)
@@ -154,7 +154,7 @@ fn serial_withdraw(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::V
     let gated = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: serial, y: 0)
     let withdrawn = mut fx.choose_in(mut lo, condition: gated, results: fx.types1(clif::Type.Int8).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         let state_address = mut lo1.state(mut fx1)
-        let lock = mut fx1.offset(state_address, offset: STATE_LOCK)
+        let lock = mut fx1.offset(state_address, offset: STATE_SERIAL_LOCK)
         discard mut lo1.call_routine(mut fx1, routine: Routine.Lock, args: fx1.list1(lock).view())
         let owner = live_entry(mut lo1, fx: mut fx1, handle: serial)
         let live = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: owner, y: 0)
@@ -194,10 +194,18 @@ fn serial_withdraw(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::V
     return withdrawn[0]
 } serial_withdraw
 
-/// Puts every task waiting for the turn of a serial executor's entry being revoked in a run queue.
-/// The caller holds the lock.
-fn release_waiting(mut lo: Lowering, mut fx: Fx, owner: clif::Value) {
+/// Frees a revoked entry under the serial executors' lock, so that a task of a serial executor
+/// finds its entry either live, with its waiting tasks, or stale, then puts every task that
+/// waited for the entry's turn in a run queue. The caller holds the lock.
+fn free_revoked(mut lo: Lowering, mut fx: Fx, owner: clif::Value, index: clif::Value) {
+    let state_address = mut lo.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_SERIAL_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
     let waiting = mut fx.load(PTR, addr: owner, offset: TABLES_ENTRY_WAITING)
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: owner, offset: TABLES_ENTRY_WAITING)
+    free_entry(mut lo, mut fx, record: owner, index)
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
     discard mut fx.repeat(fx.list1(waiting).view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
         expect state.len() > 0
         let current = state[0]
@@ -212,6 +220,4 @@ fn release_waiting(mut lo: Lowering, mut fx: Fx, owner: clif::Value) {
         })
         return Pass(again: present, next: take next)
     })
-    let zero = mut fx.ptr(0)
-    mut fx.store(zero, addr: owner, offset: TABLES_ENTRY_WAITING)
-} release_waiting
+} free_revoked

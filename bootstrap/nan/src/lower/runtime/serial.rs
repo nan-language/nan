@@ -24,7 +24,7 @@ pub fn admit(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
         &[types::I8],
         |lo, fx| {
             let state_address = lo.state(fx);
-            let lock = fx.offset(state_address, state::LOCK);
+            let lock = fx.offset(state_address, state::SERIAL_LOCK);
             lo.call_routine(fx, Routine::Lock, &[lock]);
             let owner = tables::live_entry(lo, fx, serial);
             let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, owner, 0);
@@ -68,7 +68,7 @@ pub fn define_turn(lo: &mut Lowering, fx: &mut Fx) {
     let gated = fx.b.ins().icmp_imm_s(IntCC::NotEqual, serial, 0);
     fx.when(gated, |fx| {
         let state_address = lo.state(fx);
-        let lock = fx.offset(state_address, state::LOCK);
+        let lock = fx.offset(state_address, state::SERIAL_LOCK);
         lo.call_routine(fx, Routine::Lock, &[lock]);
         let owner = tables::live_entry(lo, fx, serial);
         let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, owner, 0);
@@ -185,7 +185,7 @@ pub fn withdraw(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
         &[types::I8],
         |lo, fx| {
             let state_address = lo.state(fx);
-            let lock = fx.offset(state_address, state::LOCK);
+            let lock = fx.offset(state_address, state::SERIAL_LOCK);
             lo.call_routine(fx, Routine::Lock, &[lock]);
             let owner = tables::live_entry(lo, fx, serial);
             let live = fx.b.ins().icmp_imm_s(IntCC::NotEqual, owner, 0);
@@ -221,10 +221,18 @@ pub fn withdraw(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
     )[0]
 }
 
-/// Puts every task waiting for the turn of a serial executor's entry being revoked in a run queue.
-/// The caller holds the lock.
-pub fn release_waiting(lo: &mut Lowering, fx: &mut Fx, owner: Value) {
+/// Frees a revoked entry under the serial executors' lock, so that a task of a serial executor
+/// finds its entry either live, with its waiting tasks, or stale, then puts every task that
+/// waited for the entry's turn in a run queue. The caller holds the lock.
+pub fn free_revoked(lo: &mut Lowering, fx: &mut Fx, owner: Value, index: Value) {
+    let state_address = lo.state(fx);
+    let lock = fx.offset(state_address, state::SERIAL_LOCK);
+    lo.call_routine(fx, Routine::Lock, &[lock]);
     let first = fx.load(PTR, owner, entry::WAITING);
+    let zero = fx.ptr(0);
+    fx.store(zero, owner, entry::WAITING);
+    tables::free_entry(lo, fx, owner, index);
+    lo.call_routine(fx, Routine::Unlock, &[lock]);
     fx.repeat(&[first], |fx, state| {
         let current = state[0];
         let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, current, 0);
@@ -241,6 +249,4 @@ pub fn release_waiting(lo: &mut Lowering, fx: &mut Fx, owner: Value) {
         )[0];
         (present, vec![next])
     });
-    let zero = fx.ptr(0);
-    fx.store(zero, owner, entry::WAITING);
 }

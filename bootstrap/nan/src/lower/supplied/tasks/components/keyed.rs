@@ -93,7 +93,7 @@ pub fn spawn(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
         node,
         None,
         None,
-        done,
+        Some(done),
     );
     fx.store(outbox, started, task::ARGUMENT);
     fx.store(started, node, node::TASK);

@@ -12,7 +12,7 @@ use cranelift_module::FuncId;
 
 use super::super::super::body::Held;
 use super::super::super::fx::{Fx, PTR};
-use super::super::super::runtime::tasks::{self, domain, flag, task, trap_record};
+use super::super::super::runtime::tasks::{self, domain, task, trap_record};
 use super::super::super::runtime::{Routine, holdings, memory, report};
 use super::super::super::{Glue, Lowering, transfer};
 use super::super::Supply;
@@ -319,7 +319,6 @@ pub fn run_nested(
         None => lo.transfer(fx, &Ty::Fn(body_ty.clone().into()), function, none, record),
     }
     let end = domain_end(lo);
-    let done = domain_done(lo);
     let start = |lo: &mut Lowering, fx: &mut Fx| {
         let first = super::scopes::start_task(
             lo,
@@ -333,7 +332,7 @@ pub fn run_nested(
             record,
             stack,
             Some(end),
-            done,
+            None,
         );
         match point {
             true => tasks::spawned(lo, fx, first),
@@ -372,12 +371,8 @@ pub fn run_nested(
     fx.when(started, |fx| {
         fx.repeat(&[], |fx, _| {
             lo.call_routine(fx, Routine::Lock, &[lock]);
-            let flags = fx.load(PTR, first, task::FLAGS);
-            let ended = fx.b.ins().band_imm_s(flags, flag::DONE);
-            let ended = fx.b.ins().icmp_imm_s(IntCC::NotEqual, ended, 0);
             let tasks = fx.load(PTR, record, domain::TASKS);
-            let none = fx.b.ins().icmp_imm_s(IntCC::Equal, tasks, 0);
-            let ended = fx.b.ins().band(ended, none);
+            let ended = fx.b.ins().icmp_imm_s(IntCC::Equal, tasks, 0);
             let abandoned = fx.load(PTR, record, domain::ABANDONED);
             let abandoned = fx.b.ins().icmp_imm_s(IntCC::Equal, abandoned, 1);
             let over = fx.b.ins().bor(ended, abandoned);
@@ -457,30 +452,6 @@ fn domain_end(lo: &mut Lowering) -> FuncId {
         fx.when(abandoned, |fx| {
             lo.call_routine(fx, Routine::Stop, &[first]);
         });
-        fx.b.ins().return_(&[]);
-    })
-}
-
-/// What the executor thread does once a domain's first task has ended: the caller of
-/// `sys::Domain.run` wakes when no other task of the domain remains, or else once the last has
-/// been counted out.
-fn domain_done(lo: &mut Lowering) -> FuncId {
-    lo.glue_function(Glue::DomainDone, super::record_signature(), |lo, fx| {
-        let params = fx.entry();
-        let first = params[0];
-        let record = fx.load(PTR, first, task::OWNER);
-        let lock = fx.offset(record, domain::LOCK);
-        lo.call_routine(fx, Routine::Lock, &[lock]);
-        let flags = fx.load(PTR, first, task::FLAGS);
-        let flags = fx.b.ins().bor_imm_s(flags, flag::DONE);
-        fx.store(flags, first, task::FLAGS);
-        let tasks = fx.load(PTR, record, domain::TASKS);
-        let none = fx.b.ins().icmp_imm_s(IntCC::Equal, tasks, 0);
-        fx.when(none, |fx| {
-            let waiter = fx.load(PTR, record, domain::WAITER);
-            lo.call_routine(fx, Routine::Wake, &[waiter]);
-        });
-        lo.call_routine(fx, Routine::Unlock, &[lock]);
         fx.b.ins().return_(&[]);
     })
 }

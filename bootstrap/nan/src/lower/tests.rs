@@ -417,18 +417,25 @@ fn proven_divisions_lower_without_a_zero_test() {
 /// For each call to `from` in a function's text, whether every path from it reaches a call to
 /// `goal` before any call to `stop` and before the function returns.
 fn reach_first(text: &str, from: FuncId, [stop, goal]: [FuncId; 2]) -> Vec<bool> {
+    let [froms, stops, goals] = [from, stop, goal].map(|id| calls_to(text, id));
+    reach_first_line(text, [&froms, &stops, &goals])
+}
+
+/// The texts a function's text calls a function with.
+fn calls_to(text: &str, id: FuncId) -> Vec<String> {
+    let callee = format!(" u0:{} ", id.as_u32());
+    (text.lines().map(str::trim))
+        .filter_map(|line| line.split_once(" = "))
+        .filter(|(name, target)| name.starts_with("fn") && format!(" {target} ").contains(&callee))
+        .map(|(name, _)| format!("call {name}("))
+        .collect()
+}
+
+/// For each line of a function's text holding one of `froms`, whether every path from it reaches
+/// a line holding one of `goals` before one holding one of `stops` and before the function
+/// returns.
+fn reach_first_line(text: &str, [froms, stops, goals]: [&[String]; 3]) -> Vec<bool> {
     let lines: Vec<&str> = text.lines().map(str::trim).collect();
-    let calls_of = |id: FuncId| -> Vec<String> {
-        let callee = format!(" u0:{} ", id.as_u32());
-        (lines.iter())
-            .filter_map(|line| line.split_once(" = "))
-            .filter(|(name, target)| {
-                name.starts_with("fn") && format!(" {target} ").contains(&callee)
-            })
-            .map(|(name, _)| format!("call {name}("))
-            .collect()
-    };
-    let (froms, stops, goals) = (calls_of(from), calls_of(stop), calls_of(goal));
     let mut blocks: HashMap<&str, Vec<&str>> = HashMap::new();
     let mut current = None;
     for line in &lines {
@@ -471,8 +478,7 @@ fn reach_first(text: &str, from: FuncId, [stop, goal]: [FuncId; 2]) -> Vec<bool>
         for (at, line) in body.iter().enumerate() {
             if froms.iter().any(|call| line.contains(call.as_str())) {
                 let seen = &mut HashSet::new();
-                let calls = [stops.as_slice(), goals.as_slice()];
-                outcomes.push(reaches(&blocks, (block, at + 1), calls, seen));
+                outcomes.push(reaches(&blocks, (block, at + 1), [stops, goals], seen));
             }
         }
     }
@@ -570,9 +576,32 @@ fn wakes_come_before_unlocking() {
         .collect();
     assert_eq!(
         waking.len(),
-        10,
+        9,
         "send, offer, the cown release, the releases of a sender and a receiver, the scheduler \
-         and four glues: {waking:?}"
+         and three glues: {waking:?}"
+    );
+}
+
+/// Once an ended task's done glue returns, the executor thread's next call takes the lock of the
+/// task's domain to count it out, so that no done glue runs once settlement has seen the domain's
+/// tasks counted out.
+#[test]
+fn ended_tasks_are_counted_out_after_their_done_glue() {
+    let (texts, [lock, _]) = lowered(
+        "//! Ends.\n\npub fn noop() {\n} noop\n",
+        "noop",
+        [Routine::Lock, Routine::Schedule],
+    );
+    let schedule = (texts.iter())
+        .find(|(name, _)| name.contains(Routine::Schedule.name()))
+        .map(|(_, text)| text.as_str())
+        .expect("the scheduler's text");
+    let indirect = ["call_indirect".to_string()];
+    let any = ["call fn".to_string()];
+    let counted = reach_first_line(schedule, [&indirect, &any, &calls_to(schedule, lock)]);
+    assert!(
+        !counted.is_empty() && !counted.contains(&false),
+        "{schedule}"
     );
 }
 

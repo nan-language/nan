@@ -15,7 +15,7 @@ use super::super::supplied::tasks::cowns;
 use super::super::{CALL_CONV, Lowering};
 use super::regions::WAITING;
 use super::tasks::{self, domain, kind, operation, run, task};
-use super::{Routine, holdings, memory, serial, state, tables};
+use super::{Routine, fetch_add, holdings, memory, serial, state, tables};
 
 /// The offsets of a wait record's fields: the glue withdrawing the wait, given the record and
 /// the waiting task, the structure waited in, the waiting node and the record of the wait it
@@ -70,12 +70,14 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
     }
 }
 
-/// `Settle(domain)`: stops every task of an abandoned domain, takes them out of the list of
+/// `Settle(domain)`: stops every task of an abandoned domain, waits until each task of it and of
+/// the domains nested in it has been counted out, takes the stopped ones out of the list of
 /// live tasks, cancels their operations in flight and waits for each acknowledgement, withdraws
 /// their waits from what other domains reach, releases their stacks and records, then ends the
 /// domains nested in it and itself: each one's holdings are released and its chunks freed.
 fn settle(lo: &mut Lowering, fx: &mut Fx, abandoned: Value) {
     stop_tasks(lo, fx, abandoned);
+    wait_counted(lo, fx, abandoned);
     let first = detach_tasks(lo, fx, abandoned);
     each_stopped(fx, first, &mut |fx, record| {
         cancel_operations(lo, fx, record)
@@ -321,7 +323,9 @@ fn stop(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
             let seen =
                 fx.b.ins()
                     .atomic_cas(MemFlagsData::trusted(), word, current, stopped);
-            vec![fx.b.ins().icmp(IntCC::NotEqual, seen, current)]
+            let left = fx.b.ins().icmp(IntCC::Equal, seen, current);
+            fx.when(left, |fx| count_out_stopped(fx, record));
+            vec![fx.b.ins().bxor_imm_s(left, 1)]
         },
         |lo, fx| {
             let left = fx.choose_in(
@@ -332,6 +336,7 @@ fn stop(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
                     let removed = remove_ready(lo, fx, record);
                     fx.when(removed, |fx| {
                         fx.atomic_store(stopped, word);
+                        count_out_stopped(fx, record);
                     });
                     vec![fx.b.ins().bxor_imm_s(removed, 1)]
                 },
@@ -369,6 +374,63 @@ fn stop(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
             vec![left]
         },
     )[0]
+}
+
+/// Counts a task that settlement stopped before it ran again out of its domain's tasks: no
+/// thread switches away from it as stopped.
+fn count_out_stopped(fx: &mut Fx, record: Value) {
+    let domain = fx.load(PTR, record, task::DOMAIN);
+    let tasks = fx.offset(domain, domain::TASKS);
+    let less = fx.int(PTR, -1);
+    fetch_add(fx, tasks, less);
+}
+
+/// Waits until the abandoned domain and each domain nested in it have no task left to count out,
+/// so that no thread still runs the end of one of their tasks.
+fn wait_counted(lo: &mut Lowering, fx: &mut Fx, abandoned: Value) {
+    fx.repeat(&[abandoned], |fx, state| {
+        let current = state[0];
+        let lock = fx.offset(current, domain::LOCK);
+        fx.repeat(&[], |fx, _| {
+            lo.call_routine(fx, Routine::Lock, &[lock]);
+            let tasks = fx.load(PTR, current, domain::TASKS);
+            lo.call_routine(fx, Routine::Unlock, &[lock]);
+            let pending = fx.b.ins().icmp_imm_s(IntCC::NotEqual, tasks, 0);
+            fx.when(pending, |fx| {
+                lo.relax(fx);
+            });
+            (pending, Vec::new())
+        });
+        let child = fx.load(PTR, current, domain::CHILDREN);
+        let deeper = fx.b.ins().icmp_imm_s(IntCC::NotEqual, child, 0);
+        let next = fx.choose(
+            deeper,
+            &[PTR],
+            |_| vec![child],
+            |fx| vec![next_outside(fx, current, abandoned)],
+        )[0];
+        let more = fx.b.ins().icmp_imm_s(IntCC::NotEqual, next, 0);
+        (more, vec![next])
+    });
+}
+
+/// The domain a walk of the domains nested in `abandoned` visits after `current`, which has none
+/// nested in it: the next sibling of it or of its nearest enclosing domain that has one, or zero
+/// once the walk has ended.
+fn next_outside(fx: &mut Fx, current: Value, abandoned: Value) -> Value {
+    let zero = fx.ptr(0);
+    fx.repeat(&[current, zero], |fx, state| {
+        let at = state[0];
+        let top = fx.b.ins().icmp(IntCC::Equal, at, abandoned);
+        let sibling = fx.load(PTR, at, domain::SIBLING);
+        let none = fx.ptr(0);
+        let next = fx.b.ins().select(top, none, sibling);
+        let last = fx.b.ins().icmp_imm_s(IntCC::Equal, sibling, 0);
+        let inner = fx.b.ins().bxor_imm_s(top, 1);
+        let climbs = fx.b.ins().band(inner, last);
+        let parent = fx.load(PTR, at, domain::PARENT);
+        (climbs, vec![parent, next])
+    })[1]
 }
 
 /// Takes a ready task out of the run queue that holds it, passing on its serial executor's turn,

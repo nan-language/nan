@@ -1089,7 +1089,8 @@ fn run_task(lo: &mut Lowering, fx: &mut Fx, record: Value) {
         &[],
         |lo, fx| {
             lo.call_routine(fx, Routine::Turn, &[record]);
-            count_out(lo, fx, record);
+            let domain = fx.load(PTR, record, task::DOMAIN);
+            count_out(lo, fx, domain);
             let stopped = fx.int(types::I32, run::STOPPED);
             fx.atomic_store(stopped, word);
             Vec::new()
@@ -1180,7 +1181,8 @@ fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
         &[],
         |lo, fx| {
             lo.call_routine(fx, Routine::Turn, &[record]);
-            count_out(lo, fx, record);
+            let domain = fx.load(PTR, record, task::DOMAIN);
+            count_out(lo, fx, domain);
             let stopped = fx.int(types::I32, run::STOPPED);
             fx.atomic_store(stopped, word);
             Vec::new()
@@ -1212,7 +1214,8 @@ fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
 
 /// Settles the state of a task that switched away without being preempted: one notified was
 /// woken after it parked, and keeps its serial executor's turn, while one parking passes it on
-/// before it is parked, so a wake once parked finds the turn passed; one ended returns its stack.
+/// before it is parked, so a wake once parked finds the turn passed; one ended returns its stack
+/// and runs its done glue before it is counted out.
 fn settle_away(
     lo: &mut Lowering,
     fx: &mut Fx,
@@ -1245,7 +1248,7 @@ fn settle_away(
     });
     fx.when(ended, |fx| {
         release_stack(lo, fx, record);
-        count_out(lo, fx, record);
+        let domain = fx.load(PTR, record, task::DOMAIN);
         let done = fx.load(PTR, record, task::DONE);
         let has_done = fx.b.ins().icmp_imm_s(IntCC::NotEqual, done, 0);
         fx.when(has_done, |fx| {
@@ -1255,6 +1258,7 @@ fn settle_away(
             let call = fx.b.ins().call_indirect(signature, done, &[record]);
             fx.classify(call, stack::Kind::Glues(stack::Family::Done));
         });
+        count_out(lo, fx, domain);
     });
 }
 
@@ -1274,11 +1278,9 @@ fn requeue_preempted(lo: &mut Lowering, fx: &mut Fx, record: Value, word: Value)
     push_ready(lo, fx, record);
 }
 
-/// Counts a task that ended or stopped out of its domain's tasks, waking the task waiting for the
-/// domain to end once none remains, unless the last is the domain's first task, the one its
-/// domain owns, whose done glue wakes that task.
-fn count_out(lo: &mut Lowering, fx: &mut Fx, record: Value) {
-    let domain = fx.load(PTR, record, task::DOMAIN);
+/// Counts a task that ended or stopped out of its domain's tasks, the last its thread does for
+/// it, waking the task waiting for the domain to end once none remains.
+fn count_out(lo: &mut Lowering, fx: &mut Fx, domain: Value) {
     let lock = fx.offset(domain, domain::LOCK);
     lo.call_routine(fx, Routine::Lock, &[lock]);
     let tasks = fx.offset(domain, domain::TASKS);
@@ -1287,10 +1289,7 @@ fn count_out(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let last = fx.b.ins().icmp_imm_s(IntCC::Equal, before, 1);
     let waiter = fx.load(PTR, domain, domain::WAITER);
     let waits = fx.b.ins().icmp_imm_s(IntCC::NotEqual, waiter, 0);
-    let owner = fx.load(PTR, record, task::OWNER);
-    let other = fx.b.ins().icmp(IntCC::NotEqual, owner, domain);
     let wakes = fx.b.ins().band(last, waits);
-    let wakes = fx.b.ins().band(wakes, other);
     fx.when(wakes, |fx| {
         lo.call_routine(fx, Routine::Wake, &[waiter]);
     });

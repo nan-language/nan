@@ -128,8 +128,6 @@ pub enum Glue {
     RaceDone,
     /// What a domain's first task does once its entry ends: closes the domain.
     DomainEnd,
-    /// What the executor thread does once a domain's first task has ended.
-    DomainDone,
     /// What the executor thread does once a kernel anchor's first task has ended.
     AnchorDone,
     /// A runner's component task, for its state, Env and message types.
@@ -232,7 +230,6 @@ impl Glue {
             Glue::ChildEnd(..) | Glue::RaceEnd | Glue::DomainEnd => Some(stack::Family::End),
             Glue::ChildDone
             | Glue::RaceDone
-            | Glue::DomainDone
             | Glue::AnchorDone
             | Glue::ComponentDone
             | Glue::KeyedDone => Some(stack::Family::Done),
@@ -262,7 +259,6 @@ impl Glue {
                 | Glue::RaceEnd
                 | Glue::RaceDone
                 | Glue::DomainEnd
-                | Glue::DomainDone
                 | Glue::AnchorDone
                 | Glue::ComponentDone
                 | Glue::KeyedDone

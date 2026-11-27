@@ -1175,7 +1175,8 @@ fn run_task(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
     let asked = stop_asked(mut fx, record)
     discard mut fx.choose_in(mut lo, condition: asked, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         discard mut lo1.call_routine(mut fx1, routine: Routine.Turn, args: fx1.list1(record).view())
-        count_out(mut lo1, fx: mut fx1, record)
+        let domain = mut fx1.load(PTR, addr: record, offset: TASK_DOMAIN)
+        count_out(mut lo1, fx: mut fx1, domain)
         let stopped = mut fx1.int(clif::Type.Int32, value: RUN_STOPPED)
         mut fx1.atomic_store(stopped, addr: word)
         return mem::List[clif::Value].empty(fx1.alloc)
@@ -1260,7 +1261,8 @@ fn switch_in(mut lo: Lowering, mut fx: Fx, record: clif::Value)
     let stops = mut fx.b.bor(trapped, y: asked)
     discard mut fx.choose_in(mut lo, condition: stops, results: mem::List[clif::Type].empty(fx.alloc).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         discard mut lo1.call_routine(mut fx1, routine: Routine.Turn, args: fx1.list1(record).view())
-        count_out(mut lo1, fx: mut fx1, record)
+        let domain = mut fx1.load(PTR, addr: record, offset: TASK_DOMAIN)
+        count_out(mut lo1, fx: mut fx1, domain)
         let stopped = mut fx1.int(clif::Type.Int32, value: RUN_STOPPED)
         mut fx1.atomic_store(stopped, addr: word)
         return mem::List[clif::Value].empty(fx1.alloc)
@@ -1284,7 +1286,8 @@ fn switch_in(mut lo: Lowering, mut fx: Fx, record: clif::Value)
 
 /// Settles the state of a task that switched away without being preempted: one notified was
 /// woken after it parked, and keeps its serial executor's turn, while one parking passes it on
-/// before it is parked, so a wake once parked finds the turn passed; one ended returns its stack.
+/// before it is parked, so a wake once parked finds the turn passed; one ended returns its stack
+/// and runs its done glue before it is counted out.
 fn settle_away(mut lo: Lowering, mut fx: Fx, record: clif::Value, word: clif::Value, state_now: clif::Value, ended: clif::Value) {
     let parking_now = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: state_now, y: RUN_PARKING)
     let ending = mut fx.b.bor(parking_now, y: ended)
@@ -1306,7 +1309,7 @@ fn settle_away(mut lo: Lowering, mut fx: Fx, record: clif::Value, word: clif::Va
     })
     mut fx.if_true(ended, then: fn[mut lo](mut fx1: Fx) {
         release_stack(mut lo, fx: mut fx1, record)
-        count_out(mut lo, fx: mut fx1, record)
+        let domain = mut fx1.load(PTR, addr: record, offset: TASK_DOMAIN)
         let done = mut fx1.load(PTR, addr: record, offset: TASK_DONE)
         let has_done = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: done, y: 0)
         mut fx1.if_true(has_done, then: fn(mut fx2: Fx) {
@@ -1316,6 +1319,7 @@ fn settle_away(mut lo: Lowering, mut fx: Fx, record: clif::Value, word: clif::Va
             let call = mut fx2.b.call_indirect(imported, callee: done, args: fx2.list1(record).view())
             mut fx2.classify(call, kind: StackKind.Glues(StackFamily.Done))
         })
+        count_out(mut lo, fx: mut fx1, domain)
     })
 } settle_away
 
@@ -1333,11 +1337,9 @@ fn requeue_preempted(mut lo: Lowering, mut fx: Fx, record: clif::Value, word: cl
     tasks_push_ready(mut lo, mut fx, record)
 } requeue_preempted
 
-/// Counts a task that ended or stopped out of its domain's tasks, waking the task waiting for the
-/// domain to end once none remains, unless the last is the domain's first task, the one its
-/// domain owns, whose done glue wakes that task.
-fn count_out(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
-    let domain = mut fx.load(PTR, addr: record, offset: TASK_DOMAIN)
+/// Counts a task that ended or stopped out of its domain's tasks, the last its thread does for
+/// it, waking the task waiting for the domain to end once none remains.
+fn count_out(mut lo: Lowering, mut fx: Fx, domain: clif::Value) {
     let lock = mut fx.offset(domain, offset: DOMAIN_LOCK)
     discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
     let tasks = mut fx.offset(domain, offset: DOMAIN_TASKS)
@@ -1346,10 +1348,7 @@ fn count_out(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
     let last = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: before, y: 1)
     let waiter = mut fx.load(PTR, addr: domain, offset: DOMAIN_WAITER)
     let waits = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: waiter, y: 0)
-    let owner = mut fx.load(PTR, addr: record, offset: TASK_OWNER)
-    let other = mut fx.b.icmp(clif::IntCC.NotEqual, x: owner, y: domain)
-    let waiting = mut fx.b.band(last, y: waits)
-    let wakes = mut fx.b.band(waiting, y: other)
+    let wakes = mut fx.b.band(last, y: waits)
     mut fx.if_true(wakes, then: fn[mut lo](mut fx1: Fx) {
         discard mut lo.call_routine(mut fx1, routine: Routine.Wake, args: fx1.list1(waiter).view())
     })

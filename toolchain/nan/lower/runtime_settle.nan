@@ -58,12 +58,14 @@ fn settle_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
     }
 } settle_define
 
-/// `Settle(domain)`: stops every task of an abandoned domain, takes them out of the list of
+/// `Settle(domain)`: stops every task of an abandoned domain, waits until each task of it and of
+/// the domains nested in it has been counted out, takes the stopped ones out of the list of
 /// live tasks, cancels their operations in flight and waits for each acknowledgement, withdraws
 /// their waits from what other domains reach, releases their stacks and records, then ends the
 /// domains nested in it and itself: each one's holdings are released and its chunks freed.
 fn settle(mut lo: Lowering, mut fx: Fx, abandoned: clif::Value) {
     stop_tasks(mut lo, mut fx, abandoned)
+    wait_counted(mut lo, mut fx, abandoned)
     let head = detach_tasks(mut lo, mut fx, abandoned)
     each_stopped(mut fx, head, visit: fn[mut lo](mut fx1: Fx, record: clif::Value) {
         cancel_operations(mut lo, fx: mut fx1, record)
@@ -294,13 +296,18 @@ fn settle_stop(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value
     let is_stopped = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: current, y: RUN_STOPPED)
     let left = mut fx.choose_in(mut lo, condition: idle, results: fx.types1(clif::Type.Int8).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         let seen = mut fx1.b.atomic_cas(clif::MemFlags.owned(), p: word, e: current, x: stopped)
-        let raced = mut fx1.b.icmp(clif::IntCC.NotEqual, x: seen, y: current)
+        let left_idle = mut fx1.b.icmp(clif::IntCC.Equal, x: seen, y: current)
+        mut fx1.if_true(left_idle, then: fn(mut fx2: Fx) {
+            count_out_stopped(mut fx2, record)
+        })
+        let raced = mut fx1.b.bxor_imm_s(left_idle, y: 1)
         return fx1.list1(raced)
     }, otherwise: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
         let still = mut fx1.choose_in(mut lo1, condition: is_ready, results: fx1.types1(clif::Type.Int8).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
             let removed = remove_ready(mut lo2, fx: mut fx2, record)
             mut fx2.if_true(removed, then: fn(mut fx3: Fx) {
                 mut fx3.atomic_store(stopped, addr: word)
+                count_out_stopped(mut fx3, record)
             })
             let remains = mut fx2.b.bxor_imm_s(removed, y: 1)
             return fx2.list1(remains)
@@ -340,6 +347,66 @@ fn settle_stop(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value
     })
     return left[0]
 } settle_stop
+
+/// Counts a task that settlement stopped before it ran again out of its domain's tasks: no
+/// thread switches away from it as stopped.
+fn count_out_stopped(mut fx: Fx, record: clif::Value) {
+    let domain = mut fx.load(PTR, addr: record, offset: TASK_DOMAIN)
+    let tasks = mut fx.offset(domain, offset: DOMAIN_TASKS)
+    let less = mut fx.int(PTR, value: -1)
+    discard fetch_add(mut fx, address: tasks, amount: less)
+} count_out_stopped
+
+/// Waits until the abandoned domain and each domain nested in it have no task left to count out,
+/// so that no thread still runs the end of one of their tasks.
+fn wait_counted(mut lo: Lowering, mut fx: Fx, abandoned: clif::Value) {
+    discard mut fx.repeat(fx.list1(abandoned).view(), body: fn[mut lo](mut fx1: Fx, walk: Slice[clif::Value]) -> Pass {
+        expect walk.len() == 1
+        let current = walk[0]
+        let lock = mut fx1.offset(current, offset: DOMAIN_LOCK)
+        discard mut fx1.repeat(mem::List[clif::Value].empty(fx1.alloc).view(), body: fn[mut lo](mut fx2: Fx, state: Slice[clif::Value]) -> Pass {
+            discard mut lo.call_routine(mut fx2, routine: Routine.Lock, args: fx2.list1(lock).view())
+            let tasks = mut fx2.load(PTR, addr: current, offset: DOMAIN_TASKS)
+            discard mut lo.call_routine(mut fx2, routine: Routine.Unlock, args: fx2.list1(lock).view())
+            let pending = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: tasks, y: 0)
+            mut fx2.if_true(pending, then: fn[mut lo](mut fx3: Fx) {
+                mut lo.relax(mut fx3)
+            })
+            return Pass(again: pending, next: mem::List[clif::Value].empty(fx2.alloc))
+        })
+        let child = mut fx1.load(PTR, addr: current, offset: DOMAIN_CHILDREN)
+        let deeper = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: child, y: 0)
+        let next = mut fx1.choose(deeper, results: fx1.types1(PTR).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list1(child)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
+            let after = next_outside(mut fx2, current, abandoned)
+            return fx2.list1(after)
+        })
+        let more = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: next[0], y: 0)
+        return Pass(again: more, next: fx1.list1(next[0]))
+    })
+} wait_counted
+
+/// The domain a walk of the domains nested in `abandoned` visits after `current`, which has none
+/// nested in it: the next sibling of it or of its nearest enclosing domain that has one, or zero
+/// once the walk has ended.
+fn next_outside(mut fx: Fx, current: clif::Value, abandoned: clif::Value) -> clif::Value {
+    let zero = mut fx.ptr(0)
+    let climbed = mut fx.repeat(fx.list2(current, b: zero).view(), body: fn(mut fx1: Fx, walk: Slice[clif::Value]) -> Pass {
+        expect walk.len() == 2
+        let at = walk[0]
+        let top = mut fx1.b.icmp(clif::IntCC.Equal, x: at, y: abandoned)
+        let sibling = mut fx1.load(PTR, addr: at, offset: DOMAIN_SIBLING)
+        let none = mut fx1.ptr(0)
+        let next = mut fx1.b.select(top, x: none, y: sibling)
+        let last = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: sibling, y: 0)
+        let inner = mut fx1.b.bxor_imm_s(top, y: 1)
+        let climbs = mut fx1.b.band(inner, y: last)
+        let parent = mut fx1.load(PTR, addr: at, offset: DOMAIN_PARENT)
+        return Pass(again: climbs, next: fx1.list2(parent, b: next))
+    })
+    return climbed[1]
+} next_outside
 
 /// Takes a ready task out of the run queue that holds it, passing on its serial executor's turn,
 /// or out of its serial executor's waiting tasks; gives whether it was in either.

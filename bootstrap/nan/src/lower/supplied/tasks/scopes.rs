@@ -413,7 +413,7 @@ pub fn start_task(
     owner: Value,
     stack: Option<Value>,
     end: Option<FuncId>,
-    done: FuncId,
+    done: Option<FuncId>,
 ) -> Value {
     let (failure_at, extra) = storage(lo, fn_ty);
     let glue = entry_glue(lo, fn_ty);
@@ -441,9 +441,11 @@ pub fn start_task(
         let end = fx.b.ins().func_addr(PTR, end);
         fx.store(end, record, task::END);
     }
-    let done = lo.func_ref(fx, done);
-    let done = fx.b.ins().func_addr(PTR, done);
-    fx.store(done, record, task::DONE);
+    if let Some(done) = done {
+        let done = lo.func_ref(fx, done);
+        let done = fx.b.ins().func_addr(PTR, done);
+        fx.store(done, record, task::DONE);
+    }
     if lo.needs_release(&fn_ty.result) {
         let release = lo.instance(super::super::super::Instance::Release(fn_ty.result.clone()));
         let release = lo.func_ref(fx, release);
@@ -553,7 +555,7 @@ fn spawn_child(
         scope_record,
         stack,
         Some(end),
-        done,
+        Some(done),
     );
     tasks::spawned(lo, fx, record);
     record
@@ -794,7 +796,7 @@ fn race_call(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             record,
             None,
             Some(end),
-            done,
+            Some(done),
         );
         tasks.push(started);
     }

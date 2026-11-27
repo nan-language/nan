@@ -67,6 +67,7 @@ pub protocol Ledger {
     pub fn weigh(bytes: mem::Bytes) -> u64 limits pure
     pub fn fill(kibibytes: u32) -> mem::Bytes limits recorded
     pub fn sum(one: sys::Log, two: sys::Log, three: sys::Log, four: sys::Log, given: sys::Log) -> u64 limits pure
+    pub fn flood(calls: u32) limits recorded
 } Ledger
 
 pub protocol Till {
@@ -1169,8 +1170,9 @@ fn Revokers.revoke(take self) {
 /// a link a hoard, then instances of the book, with a gauge in their worlds, acting through a runner
 /// the kernel serves: started, called, given a log it notes through, publishing its total, and
 /// gives back, lent logs through its runner, gauged, refused a call carrying a clock, checkpointed
-/// and ended, then restored from that checkpoint, a handler that traps and a handler that never
-/// returns until the instance is abandoned.
+/// and ended, then restored from that checkpoint, a handler that traps, a handler that never
+/// returns until the instance is abandoned, and, in a space whose executor draws from a budget, a
+/// handler flooding a port its runner stalls with calls.
 fn booked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: mem::List[hw::PhysFrame[4_096]]) fails task::Cancelled uses wait {
     let Some(schema) = job.schema("Book", alloc: grants.alloc) else {
         stop(text: "no schema\n")
@@ -1188,7 +1190,7 @@ fn booked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: 
     mut nanos::Cap[gauges::Gauge].put(mut caps, key: "gauge", capability: gauge)
     var later = nanos::Caps.empty(grants.alloc)
     mut nanos::Cap[gauges::Gauge].put(mut later, key: "gauge", capability: gauges::mint(gauging))
-    let lending = sys::Minter[Lending, Lent, u64].of(Lent(noter: grants.noter, gauge: gauges::mint(gauging), alloc: grants.alloc), alloc: grants.alloc)
+    let lending = sys::Minter[Lending, Lent, u64].of(Lent(noter: grants.noter, gauge: gauges::mint(gauging), clock: grants.clock, alloc: grants.alloc), alloc: grants.alloc)
     defer take lending.close()
     let given = gauges::mint(gauging)
     let Ok(runner) = attempt sys::Runner.served(lending.mint(0)) else {
@@ -1219,10 +1221,22 @@ fn booked(cpu: hw::Ring0, job: sys::load::Isolated, grants: Grants, mut frames: 
             try await abandoned(take instance, grants)
         })
     })
+    var flooding = nanos::Link.of(next_frame(mut frames), alloc: grants.alloc)
+    discard mut flooding.open("book", inbound: next_frame(mut frames), outbound: next_frame(mut frames))
+    let budget = grants.alloc.split(FLOOD_BYTES)
+    let account = grants.exec.split_on(task::Share(weight: 1, class: 0, reserve_ppm: 0), alloc: budget.alloc())
+    discard attempt await nanos::isolate(cpu, tenant: 12, services: services(grants), frames: mut pool, mut extended, exec: account.executor(), alloc: grants.alloc, body: fn[mut loan](space: nanos::Isolation) fails task::Cancelled uses wait {
+        discard attempt await nanos::hold_isolated(space, job, component: "Book", link: flooding, services: services(grants), caps: later, checkpoint: None, runner, frames: mut loan, alloc: grants.alloc, body: fn(take instance: nanos::Instance) fails nanos::InstanceError uses wait {
+            try await flooded(take instance, grants)
+        })
+    })
+    take account.close()
+    take budget.close()
     given_back(take pool, mut frames)
     given_back(take loan, mut frames)
     returned(take extended, mut frames)
     take link.release(mut frames)
+    take flooding.release(mut frames)
 } booked
 
 /// Holds the ledger's book and runs the typed job in one space: the job traps dividing by zero while
@@ -1878,19 +1892,24 @@ fn postponed(mut book: nanos::Instance, grants: Grants) fails nanos::InstanceErr
 /// The runner the kernel serves the book: it writes each total the book publishes and each reply
 /// it gives, holds the noting console's log as capability 7, which it drops when asked, and lends
 /// it through port 1, writing the header of each call and message through that port, holds a
-/// gauge as capability 8, refusing every other operation.
+/// gauge as capability 8, answers no call through port 3 before `STALL_NS` have passed, refusing
+/// every other operation.
 struct Lending {
 } Lending
 
 impl Lending: sys::Kind[Lent, u64]
 
-/// What the runner the kernel serves the book holds: the noting console, a gauge, and the allocator
-/// it decodes through.
+/// What the runner the kernel serves the book holds: the noting console, a gauge, the clock it
+/// stalls on and the allocator it decodes through.
 struct Lent derives Copy {
     noter: Console
     gauge: gauges::Gauge
+    clock: sys::Clock
     alloc: mem::Alloc
 } Lent
+
+/// How long the runner the kernel serves the book stalls a call through port 3.
+const STALL_NS: u64 = 10_000_000_000
 
 impl Lending: sys::RunnerService
 
@@ -1900,7 +1919,14 @@ fn Lending.send_to(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], h
     say(text: "\n")
 } Lending.send_to
 
-fn Lending.call(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], handles: Slice[sys::Handle], alloc: mem::Alloc) -> sys::Encoded fails sys::RunnerError limits stack 4_096 {
+fn Lending.call(self, port: u64, hash: sys::ProtocolHash, bytes: Slice[u8], handles: Slice[sys::Handle], alloc: mem::Alloc) -> sys::Encoded fails sys::RunnerError uses wait limits stack 4_096 {
+    if port == 3 {
+        let Some(clock) = sys::reach(self, body: fn(state: Lent, record: u64) => state.clock) else {
+            fail sys::RunnerError.Unknown
+        }
+        try await clock.sleep_ns(STALL_NS)
+        fail sys::RunnerError.Unknown
+    }
     let Some(log) = lent(self) else {
         fail sys::RunnerError.Unknown
     }
@@ -2030,6 +2056,33 @@ fn trapped(take instance: nanos::Instance, grants: Grants) fails nanos::Instance
     say(text: "book divider ")
     say_ended(try await take book.end(), alloc: grants.alloc)
 } trapped
+
+/// The bytes the executor of the isolation holding a flooding book draws its tasks' stacks from,
+/// and the calls the book makes through port 3 at once.
+const FLOOD_BYTES: usize = 2_097_152
+
+const FLOOD_CALLS: u32 = 32
+
+/// Has the book call port 3 from `FLOOD_CALLS` tasks at once, more than the kernel can serve on
+/// tasks drawn from `FLOOD_BYTES`, and writes how it ended.
+fn flooded(take instance: nanos::Instance, grants: Grants) fails nanos::InstanceError uses wait {
+    var book = instance
+    defer take book.abandon()
+    var flood = sys::Encoded.empty(grants.alloc)
+    sys::Wire[Ledger].flood(mut flood, calls: FLOOD_CALLS)
+    discard try await called(mut book, request: take flood, grants)
+    discard attempt await mut book.start_keyed()
+    discard attempt await book.incoming()
+    undefer book
+    say(text: "flooding book ")
+    match try await take book.end() {
+        nanos::Ended.Trapped(trap) => match trap.kind() {
+            sys::TrapKind.Exhausted => say(text: "trapped trap.exhausted\n")
+            else => say_trap(trap, alloc: grants.alloc)
+        }
+        else => say(text: "ended otherwise\n")
+    }
+} flooded
 
 /// Calls a handler of the book that never returns, abandoning the instance from a task of its own
 /// while its holder steps the call.

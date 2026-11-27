@@ -82,7 +82,8 @@ struct Relays {
 /// numbered `id`, on `input` with a world reaching `services` and the capabilities of `caps` that
 /// cross, sending its holder's requests and its inboxes' calls down the first channel of `link` and
 /// routing the answers the space sends up it, calling through `runner` the ports the instance calls
-/// and the capabilities of crossing kinds whose waiting operations it calls, and gives how it ended
+/// and the capabilities of crossing kinds whose waiting operations it calls as work `run_watched`
+/// serves, ending each wait of the holder's there too, and gives how it ended
 /// or why it could not be placed once the space's table has taken back every entry added for it,
 /// those its relays add once it has ended included, the instance lending the isolation the frames of
 /// `frames` while it runs; once `abandoner` abandons, the space abandons the instance, which ends
@@ -111,23 +112,25 @@ fn relayed(isolation: Isolation, id: u64, job: sys::load::Isolated, take compone
         }
         let requests_down = down.split()
         let calls_down = down.split()
-        let ports_down = down.split()
         let replies = answers.split()
         let answered = answers.split()
         let routing = allocs.share()
         let drawing = allocs.share()
         let watching = halted.share()
+        let work = task::Channel[Work].bounded(QUEUED_CALLS, alloc)
+        let waits = work.sender.split()
+        let calls_up = work.sender.split()
         discard s.spawn(fn[take sending]() fails task::Cancelled uses wait {
             try await sent_down(link, outgoing: take sending)
         })
-        discard s.spawn(fn[take asked, take requests_down]() fails task::Cancelled uses wait {
-            try await asked_down(take asked, out: requests_down, exec, alloc)
+        discard s.spawn(fn[take asked, take requests_down, take waits]() fails task::Cancelled uses wait {
+            try await asked_down(take asked, out: requests_down, work: waits, alloc)
         })
         discard s.spawn(fn[take called, take calls_down, take replies, take drawing]() fails task::Cancelled uses wait {
             try await called_down(take called, out: calls_down, answers: replies, allocs: drawing, table, job: id, alloc)
         })
-        discard s.spawn(fn[take answered, take routing, take ports_down]() fails task::Cancelled uses wait {
-            try await answered_up(isolation, link, answers: answered, allocs: routing, table, job: id, runner, out: ports_down, alloc)
+        discard s.spawn(fn[take answered, take routing, take calls_up]() fails task::Cancelled uses wait {
+            try await answered_up(isolation, link, answers: answered, allocs: routing, table, job: id, work: calls_up, alloc)
         })
         discard s.spawn(fn[take waiting, take domain, take watching]() fails task::Cancelled uses wait {
             let domain_ran = attempt await domain.contents().run(fn[take waiting]() fails task::Cancelled uses wait {
@@ -140,7 +143,7 @@ fn relayed(isolation: Isolation, id: u64, job: sys::load::Isolated, take compone
             watching.contents().store(true)
             isolation.wake(WOKE_ORDERS)
         })
-        let Joined(outcome: how, cancelled: _) = try await joined(isolation, id, job, component: Some(take name), link, services, caps, input: take fed, runner, halted, mut frames, alloc)
+        let Joined(outcome: how, cancelled: _) = try await joined(isolation, id, job, component: Some(take name), link, services, caps, input: take fed, runner, halted, working: Working(work: take work, down: down.split()), mut frames, alloc)
         outcome = how
         s.cancel()
     })
@@ -196,31 +199,24 @@ fn ordered(take request: Request) -> Ordered {
     }
 } ordered
 
-/// Sends `out` the frame of each request of an instance's holder, then the end of its wait once
-/// the holder releases the sender of a waiting one's stop, and that the holder released the
-/// instance once every sender of `requests` is released.
-fn asked_down(take requests: task::Receiver[Asked], out: task::Sender[mem::Bytes], exec: task::Executor, alloc: mem::Alloc) fails task::Cancelled uses wait {
+/// Sends `out` the frame of each request of an instance's holder, giving `work` the wait of each
+/// waiting one, and that the holder released the instance once every sender of `requests` is
+/// released.
+fn asked_down(take requests: task::Receiver[Asked], out: task::Sender[mem::Bytes], work: task::Sender[Work], alloc: mem::Alloc) fails task::Cancelled uses wait {
     var receiver = requests
-    try await task::scope(exec, body: fn[mut receiver](s: task::Scope) fails task::Cancelled uses wait {
-        loop {
-            let Some(asked) = try await mut receiver.receive() else {
-                discard attempt await out.send(framed(Down.Release, alloc))
-                return
-            }
-            let Asked(id: id, request: request) = asked
-            let Ordered(order: order, stop: stop) = ordered(take request)
-            discard attempt await out.send(framed(Down.Ask(Asking(id: id, order: order)), alloc))
-            let Some(watching) = stop else {
-                continue
-            }
-            let stopping = out.split()
-            discard s.spawn(fn[take watching, take stopping]() fails task::Cancelled uses wait {
-                var released = watching
-                discard try await mut released.receive()
-                discard attempt await stopping.send(framed(Down.Stop(id), alloc))
-            })
+    loop {
+        let Some(asked) = try await mut receiver.receive() else {
+            discard attempt await out.send(framed(Down.Release, alloc))
+            return
         }
-    })
+        let Asked(id: id, request: request) = asked
+        let Ordered(order: order, stop: stop) = ordered(take request)
+        discard attempt await out.send(framed(Down.Ask(Asking(id: id, order: order)), alloc))
+        let Some(watching) = stop else {
+            continue
+        }
+        discard attempt await work.send(Work.Waited(Watch(id: id, stop: take watching)))
+    }
 } asked_down
 
 /// Sends `out` the frame of each call of an instance's inboxes, its handles added to the space's
@@ -247,49 +243,41 @@ fn called_down(take calls: task::Receiver[Called], out: task::Sender[mem::Bytes]
 
 /// Routes through `answers` each answer the space sends up the first channel of `link`, or moves to
 /// the kernel when too long for it, a call's reply drawn through the allocator `allocs` keeps for it
-/// and its handles those of the entries of the space's `table` it names, and calls through `runner`
-/// each port the instance calls, and each waiting operation of a capability of a crossing kind the
-/// instance holds in `table`, on a task of its own sending `out` the frame of the reply; once the
-/// space frames a message it cannot decode or longer than `MOST_BYTES`, or names wrongly where one
-/// moved, it stops hearing it and has `isolation` end the instance numbered `job` as breaching the
-/// channel.
-fn answered_up(isolation: Isolation, link: Link, answers: task::Sender[Routed], allocs: task::Cown[mem::Map[u64, mem::Alloc]], table: Table, job: u64, runner: sys::Runner, out: task::Sender[mem::Bytes], alloc: mem::Alloc) fails task::Cancelled uses wait {
+/// and its handles those of the entries of the space's `table` it names, and gives `work` each call
+/// the instance makes through a port and each waiting operation of a capability of a crossing kind
+/// it calls; once the space frames a message it cannot decode or longer than `MOST_BYTES`, or names
+/// wrongly where one moved, it stops hearing it and has `isolation` end the instance numbered `job`
+/// as breaching the channel.
+fn answered_up(isolation: Isolation, link: Link, answers: task::Sender[Routed], allocs: task::Cown[mem::Map[u64, mem::Alloc]], table: Table, job: u64, work: task::Sender[Work], alloc: mem::Alloc) fails task::Cancelled uses wait {
+    let door = isolation.door.contents()
     var pending = mem::Bytes.empty(alloc)
-    try await task::scope(isolation.exec, body: fn[mut pending](s: task::Scope) fails task::Cancelled uses wait {
-        loop {
-            let heard = try await next_up(link, mut pending, alloc)
-            let up = match try await moved_heard(isolation, take heard, table, job, alloc) {
-                Heard.Up(up) => up
-                Heard.Breach => {
-                    try await isolation.door.contents().asked(Ask.Breach(job))
-                    return
-                }
-                Heard.Gone => return
+    loop {
+        let heard = try await next_up(link, mut pending, alloc)
+        let up = match try await moved_heard(door, take heard, table, job, alloc) {
+            Heard.Up(up) => up
+            Heard.Breach => {
+                try await door.asked(Ask.Breach(job))
+                return
             }
-            match up {
-                Up.Answered(Answering(id: id, answer: sent)) => {
-                    let drawn = await when mut allocs => mut allocs.remove(id)
-                    discard attempt await answers.send(Routed.Answered(Replied(id: id, answer: answer_of(take sent, table, alloc: drawn.value_or(alloc)))))
-                }
-                Up.Called(called) => {
-                    let replying = out.split()
-                    discard s.spawn(fn[take called, take replying]() fails task::Cancelled uses wait {
-                        try await ported(take called, runner, table, job, out: replying, alloc)
-                    })
-                }
-                Up.Awaited(operation) => {
-                    let replying = out.split()
-                    discard s.spawn(fn[take operation, take replying]() fails task::Cancelled uses wait {
-                        try await kind_awaited(take operation, table, job, out: replying, alloc)
-                    })
-                }
-                Up.Moved(_) => {
-                    try await isolation.door.contents().asked(Ask.Breach(job))
-                    return
-                }
+            Heard.Gone => return
+        }
+        match up {
+            Up.Answered(Answering(id: id, answer: sent)) => {
+                let drawn = await when mut allocs => mut allocs.remove(id)
+                discard attempt await answers.send(Routed.Answered(Replied(id: id, answer: answer_of(take sent, table, alloc: drawn.value_or(alloc)))))
+            }
+            Up.Called(called) => {
+                discard attempt await work.send(Work.Called(take called))
+            }
+            Up.Awaited(operation) => {
+                discard attempt await work.send(Work.Awaited(take operation))
+            }
+            Up.Moved(_) => {
+                try await door.asked(Ask.Breach(job))
+                return
             }
         }
-    })
+    }
 } answered_up
 
 /// What the kernel hears next up the first channel of a link: a message, a frame it cannot decode
@@ -326,10 +314,10 @@ fn next_up(link: Link, mut pending: mem::Bytes, alloc: mem::Alloc) -> Heard fail
 
 /// What the kernel hears of a message the space sends: when it names where the encoding of another
 /// moved through the runner capability the space's `table` holds for the instance numbered `job`,
-/// that other message, read from the frames it moved in by the task running the space of
-/// `isolation`; a breach when it names another capability, nothing moved under its token or what
+/// that other message, read from the frames it moved in by the task running the space of `door`'s
+/// isolation; a breach when it names another capability, nothing moved under its token or what
 /// moved does not decode; what it heard otherwise.
-fn moved_heard(isolation: Isolation, take heard: Heard, table: Table, job: u64, alloc: mem::Alloc) -> Heard fails task::Cancelled uses wait {
+fn moved_heard(door: Door, take heard: Heard, table: Table, job: u64, alloc: mem::Alloc) -> Heard fails task::Cancelled uses wait {
     let Heard.Up(Up.Moved(movement)) = heard else {
         return heard
     }
@@ -343,7 +331,7 @@ fn moved_heard(isolation: Isolation, take heard: Heard, table: Table, job: u64, 
         return Heard.Breach
     }
     let task::Channel(sender: reply, receiver: replies) = task::Channel[mem::Bytes].bounded(1, alloc)
-    try await isolation.door.contents().asked(Ask.Read(Reading(handle: movement.handle, token: movement.token, reply: take reply)))
+    try await door.asked(Ask.Read(Reading(handle: movement.handle, token: movement.token, reply: take reply)))
     var receiver = replies
     let Some(bytes) = try await mut receiver.receive() else {
         return Heard.Breach

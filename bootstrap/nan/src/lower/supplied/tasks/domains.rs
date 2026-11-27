@@ -462,7 +462,8 @@ fn domain_end(lo: &mut Lowering) -> FuncId {
 }
 
 /// What the executor thread does once a domain's first task has ended: the caller of
-/// `sys::Domain.run` wakes.
+/// `sys::Domain.run` wakes when no other task of the domain remains, or else once the last has
+/// been counted out.
 fn domain_done(lo: &mut Lowering) -> FuncId {
     lo.glue_function(Glue::DomainDone, super::record_signature(), |lo, fx| {
         let params = fx.entry();
@@ -473,9 +474,13 @@ fn domain_done(lo: &mut Lowering) -> FuncId {
         let flags = fx.load(PTR, first, task::FLAGS);
         let flags = fx.b.ins().bor_imm_s(flags, flag::DONE);
         fx.store(flags, first, task::FLAGS);
-        let waiter = fx.load(PTR, record, domain::WAITER);
+        let tasks = fx.load(PTR, record, domain::TASKS);
+        let none = fx.b.ins().icmp_imm_s(IntCC::Equal, tasks, 0);
+        fx.when(none, |fx| {
+            let waiter = fx.load(PTR, record, domain::WAITER);
+            lo.call_routine(fx, Routine::Wake, &[waiter]);
+        });
         lo.call_routine(fx, Routine::Unlock, &[lock]);
-        lo.call_routine(fx, Routine::Wake, &[waiter]);
         fx.b.ins().return_(&[]);
     })
 }

@@ -513,14 +513,16 @@ fn lowered<const N: usize>(
     (texts, ids)
 }
 
-/// A sender wakes the receiver of its channel, and a cown's release the task its next request
-/// waits in, before releasing the lock under which it read that task.
+/// A sender wakes the receiver of its channel, a cown's release the task its next request waits
+/// in, an ended task's count out and the done glues of a domain's first task, a scope's child and
+/// a race's task the tasks waiting for them, before releasing the lock under which it read that
+/// task.
 #[test]
 fn wakes_come_before_unlocking() {
-    let (texts, [wake, lock, unlock]) = lowered(
+    let (texts, [wake, lock, unlock, _]) = lowered(
         "//! Wakes.\n\n\
          /// A level.\npub closed struct Gauge {\n    pub level: u32\n} Gauge\n\n\
-         pub fn pass(value: u32, alloc: mem::Alloc) -> u32 fails task::Cancelled uses wait {\n\
+         pub fn pass(value: u32, exec: task::Executor, alloc: mem::Alloc) -> u32 fails task::Cancelled uses wait {\n\
          \x20   let gauge = task::Cown.of(Gauge(level: value), alloc)\n\
          \x20   await when mut gauge {\n        gauge.level += 1\n    }\n\
          \x20   let channel = task::Channel[u32].bounded(2, alloc)\n\
@@ -528,11 +530,24 @@ fn wakes_come_before_unlocking() {
          \x20   var receiver = channel.receiver\n\
          \x20   discard sender.offer(value)\n\
          \x20   discard attempt await sender.send(value)\n\
+         \x20   discard try await sys::Domain.run(fn() -> u32 fails task::Cancelled uses wait {\n\
+         \x20       var joined: u32 = 0\n\
+         \x20       try await task::scope(exec, body: fn[mut joined](s: task::Scope) fails task::Cancelled uses wait {\n\
+         \x20           let child = s.spawn(fn() -> u32 {\n                return 1\n            })\n\
+         \x20           joined = try await take child.join()\n\
+         \x20       })\n\
+         \x20       return try await task::race(exec, left: fn() -> u32 {\n            return joined\n        }, right: fn() -> u32 {\n            return 2\n        })\n\
+         \x20   }, exec: exec, alloc: alloc)\n\
          \x20   let Some(oldest) = try await mut receiver.receive() else {\n        return 0\n    }\n\
          \x20   return oldest\n\
          } pass\n",
         "pass",
-        [Routine::Wake, Routine::Lock, Routine::Unlock],
+        [
+            Routine::Wake,
+            Routine::Lock,
+            Routine::Unlock,
+            Routine::Schedule,
+        ],
     );
     let waking: Vec<&str> = (texts.iter())
         .filter(|(name, _)| {
@@ -541,6 +556,8 @@ fn wakes_come_before_unlocking() {
                 "SenderD5offerE",
                 "cown_release",
                 "_NXrelease_",
+                "_NXglue_",
+                Routine::Schedule.name(),
             ]
             .iter()
             .any(|part| name.contains(part))
@@ -553,8 +570,9 @@ fn wakes_come_before_unlocking() {
         .collect();
     assert_eq!(
         waking.len(),
-        5,
-        "send, offer, the cown release and the releases of a sender and a receiver: {waking:?}"
+        10,
+        "send, offer, the cown release, the releases of a sender and a receiver, the scheduler \
+         and four glues: {waking:?}"
     );
 }
 

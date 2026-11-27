@@ -1275,7 +1275,8 @@ fn requeue_preempted(lo: &mut Lowering, fx: &mut Fx, record: Value, word: Value)
 }
 
 /// Counts a task that ended or stopped out of its domain's tasks, waking the task waiting for the
-/// domain to end once none remains.
+/// domain to end once none remains, unless the last is the domain's first task, the one its
+/// domain owns, whose done glue wakes that task.
 fn count_out(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let domain = fx.load(PTR, record, task::DOMAIN);
     let lock = fx.offset(domain, domain::LOCK);
@@ -1285,12 +1286,15 @@ fn count_out(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let before = fetch_add(fx, tasks, less);
     let last = fx.b.ins().icmp_imm_s(IntCC::Equal, before, 1);
     let waiter = fx.load(PTR, domain, domain::WAITER);
-    lo.call_routine(fx, Routine::Unlock, &[lock]);
     let waits = fx.b.ins().icmp_imm_s(IntCC::NotEqual, waiter, 0);
+    let owner = fx.load(PTR, record, task::OWNER);
+    let other = fx.b.ins().icmp(IntCC::NotEqual, owner, domain);
     let wakes = fx.b.ins().band(last, waits);
+    let wakes = fx.b.ins().band(wakes, other);
     fx.when(wakes, |fx| {
         lo.call_routine(fx, Routine::Wake, &[waiter]);
     });
+    lo.call_routine(fx, Routine::Unlock, &[lock]);
 }
 
 /// Adds `ns` to the time a task ran and to the time its executor's entry and each entry that

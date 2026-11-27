@@ -642,13 +642,13 @@ fn child_done(lo: &mut Lowering) -> FuncId {
         let waiter = fx.load(PTR, scope_record, region::WAITER);
         let zero = fx.ptr(0);
         let waiter = fx.b.ins().select(last, waiter, zero);
-        lo.call_routine(fx, Routine::Unlock, &[lock]);
         for woken in [joiner, waiter] {
             let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, woken, 0);
             fx.when(present, |fx| {
                 lo.call_routine(fx, Routine::Wake, &[woken]);
             });
         }
+        lo.call_routine(fx, Routine::Unlock, &[lock]);
         let reaped = fx.b.ins().band_imm_s(flags, flag::REAPED);
         let reaped = fx.b.ins().icmp_imm_s(IntCC::NotEqual, reaped, 0);
         fx.when(reaped, |fx| {
@@ -894,13 +894,13 @@ fn race_done(lo: &mut Lowering) -> FuncId {
         let live = fx.b.ins().iadd_imm_s(live, -1);
         fx.store(live, owner, region::LIVE);
         let waiter = fx.load(PTR, owner, region::WAITER);
-        lo.call_routine(fx, Routine::Unlock, &[lock]);
         let last = fx.b.ins().icmp_imm_s(IntCC::Equal, live, 0);
         let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, waiter, 0);
         let wakes = fx.b.ins().band(last, present);
         fx.when(wakes, |fx| {
             lo.call_routine(fx, Routine::Wake, &[waiter]);
         });
+        lo.call_routine(fx, Routine::Unlock, &[lock]);
         fx.b.ins().return_(&[]);
     })
 }

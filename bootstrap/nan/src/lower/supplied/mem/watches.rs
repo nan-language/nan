@@ -2,7 +2,7 @@
 //! to leave a band arms the cell's arm record, made on the cell's first wait, with the band and
 //! the waiting task, which a draw or return taking the charge out of the band wakes.
 
-use cranelift_codegen::ir::{InstBuilder, Value, condcodes::IntCC};
+use cranelift_codegen::ir::{InstBuilder, TrapCode, Value, condcodes::IntCC, types};
 use cranelift_module::FuncId;
 
 use super::super::super::fx::{Fx, PTR};
@@ -26,8 +26,9 @@ pub fn watch(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
 
 /// Returns at once when the charge lies outside the band; otherwise arms the cell's arm record
 /// with the band and the running task, which another task waiting on it traps, and parks until a
-/// wake. A wait cancelled at its start fails at once; a cancelled one returns only when the
-/// charge left the band.
+/// wake, after which it takes the task out of the arm: it returns when the charge lies outside the
+/// band, and arms the record and parks again while it lies inside. A wait cancelled at its start
+/// fails at once; a cancelled one returns only when the charge left the band.
 fn wait_outside(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, handle: Value) {
     let low = supply.param(1).scalar();
     let high = supply.param(2).scalar();
@@ -74,36 +75,42 @@ fn wait_outside(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, handle: Value) 
         },
         |_, _| vec![held],
     )[0];
-    let waiter = fx.load(PTR, record_arm, arm::WAITER);
-    let waits = fx.b.ins().icmp_imm_s(IntCC::NotEqual, waiter, 0);
-    let elsewhere = fx.b.ins().icmp(IntCC::NotEqual, waiter, current);
-    let other = fx.b.ins().band(waits, elsewhere);
-    fx.when(other, |fx| {
+    fx.repeat(&[], |fx, _| {
+        let waiter = fx.load(PTR, record_arm, arm::WAITER);
+        let waits = fx.b.ins().icmp_imm_s(IntCC::NotEqual, waiter, 0);
+        let elsewhere = fx.b.ins().icmp(IntCC::NotEqual, waiter, current);
+        let other = fx.b.ins().band(waits, elsewhere);
+        fx.when(other, |fx| {
+            lo.call_routine(fx, Routine::Unlock, &[lock]);
+            report::raise_kind(lo, fx, "trap.duplicate-access");
+        });
+        fx.store(low, record_arm, arm::LOW);
+        fx.store(span, record_arm, arm::SPAN);
+        fx.store(current, record_arm, arm::WAITER);
+        tasks::waiting_on(lo, fx, WAITING);
         lo.call_routine(fx, Routine::Unlock, &[lock]);
-        report::raise_kind(lo, fx, "trap.duplicate-access");
-    });
-    fx.store(low, record_arm, arm::LOW);
-    fx.store(span, record_arm, arm::SPAN);
-    fx.store(current, record_arm, arm::WAITER);
-    tasks::waiting_on(lo, fx, WAITING);
-    lo.call_routine(fx, Routine::Unlock, &[lock]);
-    let withdraw = withdraw_arm(lo);
-    settle::enter_wait(lo, fx, withdraw, record_arm, current);
-    task_ops::park_waiting(lo, fx);
-    settle::leave_wait(lo, fx);
-    tasks::waiting_on(lo, fx, 0);
-    let origin = task_ops::origin(lo, fx);
-    let cancelled = fx.b.ins().icmp_imm_s(IntCC::NotEqual, origin, 0);
-    fx.when(cancelled, |fx| {
+        let withdraw = withdraw_arm(lo);
+        settle::enter_wait(lo, fx, withdraw, record_arm, current);
+        task_ops::park_waiting(lo, fx);
+        settle::leave_wait(lo, fx);
+        tasks::waiting_on(lo, fx, 0);
+        let origin = task_ops::origin(lo, fx);
         lo.call_routine(fx, Routine::Lock, &[lock]);
         clear_waiter(fx, record_arm, current);
         let charge = fx.load(PTR, record, cell::CHARGE);
         let left = memory::outside(fx, charge, low, span);
-        lo.call_routine(fx, Routine::Unlock, &[lock]);
-        let stays = fx.b.ins().bxor_imm_s(left, 1);
-        fx.when(stays, |fx| task_ops::fail_cancelled(lo, fx, supply, origin));
+        fx.when(left, |fx| {
+            lo.call_routine(fx, Routine::Unlock, &[lock]);
+            supply.done(lo, fx);
+        });
+        let cancelled = fx.b.ins().icmp_imm_s(IntCC::NotEqual, origin, 0);
+        fx.when(cancelled, |fx| {
+            lo.call_routine(fx, Routine::Unlock, &[lock]);
+            task_ops::fail_cancelled(lo, fx, supply, origin);
+        });
+        (fx.int(types::I8, 1), Vec::new())
     });
-    supply.done(lo, fx);
+    fx.b.ins().trap(TrapCode::user(1).expect("a trap code"));
 }
 
 /// Takes a task out of an arm record when it waits there. The caller holds the lock.

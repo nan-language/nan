@@ -906,10 +906,19 @@ fn park(lo: &mut Lowering, fx: &mut Fx) {
 /// Makes a task ready: a new or parked one joins the run queue, a running or parking one is
 /// notified, and so is a preempted kernel task.
 pub fn wake(lo: &mut Lowering, fx: &mut Fx, record: Value) {
+    let readied = wake_state(lo, fx, record);
+    fx.when(readied, |fx| push_ready(lo, fx, record));
+}
+
+/// Gives a task the state a wake leaves it in: ready for a new or parked one, notified for a
+/// running or parking one and for a preempted kernel task; gives whether it made the task ready,
+/// which then runs only once `push_ready` admits it.
+pub fn wake_state(lo: &Lowering, fx: &mut Fx, record: Value) -> Value {
     let word = fx.offset(record, task::STATE);
     let notified = fx.int(types::I32, run::NOTIFIED);
     let ready = fx.int(types::I32, run::READY);
-    fx.repeat(&[], |fx, _| {
+    let none = fx.int(types::I8, 0);
+    fx.repeat(&[none], |fx, _| {
         let current =
             fx.b.ins()
                 .atomic_load(types::I32, MemFlagsData::trusted(), word);
@@ -927,23 +936,25 @@ pub fn wake(lo: &mut Lowering, fx: &mut Fx, record: Value) {
             target = fx.b.ins().select(is_preempted, kept, target);
         }
         let acting = fx.b.ins().bor(is_parked, notify);
-        let again = fx.choose_in(
-            lo,
+        let outcome = fx.choose(
             acting,
-            &[types::I8],
-            |lo, fx| {
+            &[types::I8, types::I8],
+            |fx| {
                 let seen =
                     fx.b.ins()
                         .atomic_cas(MemFlagsData::trusted(), word, current, target);
                 let done = fx.b.ins().icmp(IntCC::Equal, seen, current);
-                let enqueue = fx.b.ins().band(done, is_parked);
-                fx.when(enqueue, |fx| push_ready(lo, fx, record));
-                vec![fx.b.ins().bxor_imm_s(done, 1)]
+                let readied = fx.b.ins().band(done, is_parked);
+                let retry = fx.b.ins().bxor_imm_s(done, 1);
+                vec![retry, readied]
             },
-            |_, fx| vec![fx.int(types::I8, 0)],
+            |fx| {
+                let settled = fx.int(types::I8, 0);
+                vec![settled, settled]
+            },
         );
-        (again[0], Vec::new())
-    });
+        (outcome[0], vec![outcome[1]])
+    })[0]
 }
 
 /// Makes a task just spawned ready; the spawn is a scheduling point of the running task.

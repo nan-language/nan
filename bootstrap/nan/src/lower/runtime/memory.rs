@@ -12,7 +12,8 @@
 //! cell whose charge a task has waited on has an arm record, kept as long as the cell: the band
 //! of charges the waiting task waits for the charge to leave, which holds every charge while no
 //! task waits, the task, and its link in the list of arms whose charge left their band, whose
-//! tasks a routine changing charges wakes once it has released the lock. A
+//! tasks a routine changing charges wakes under the lock, admitting those it made ready once it
+//! has released it. A
 //! run passes to an enclosing domain when a value it holds leaves the domain owning it, charged
 //! from then on to that domain's cell when both cells' chains draw from one supply and the new
 //! chain has room for it, and the runs a domain still owns are freed when it ends. A carved
@@ -563,7 +564,9 @@ pub fn outside(fx: &mut Fx, charge: Value, low: Value, span: Value) -> Value {
 }
 
 /// Wakes the task of each arm listed as having left its band, taking each arm out of the list
-/// and its task out of the arm under the lock.
+/// and its task out of the arm and giving the task its woken state under the lock, so that the
+/// task finds itself woken once it retakes the lock to leave its wait; a task made ready joins a
+/// run queue once the lock is released, since admitting it takes the lock.
 pub fn wake_left(lo: &mut Lowering, fx: &mut Fx) {
     let state_address = lo.state(fx);
     let head = fx.load(PTR, state_address, state::LEFT);
@@ -588,11 +591,16 @@ pub fn wake_left(lo: &mut Lowering, fx: &mut Fx) {
                 },
                 |fx| vec![fx.ptr(0)],
             )[0];
-            lo.call_routine(fx, Routine::Unlock, &[lock]);
             let waits = fx.b.ins().icmp_imm_s(IntCC::NotEqual, waiter, 0);
-            fx.when(waits, |fx| {
-                lo.call_routine(fx, Routine::Wake, &[waiter]);
-            });
+            let readied = fx.choose_in(
+                lo,
+                waits,
+                &[types::I8],
+                |lo, fx| vec![tasks::wake_state(lo, fx, waiter)],
+                |_, fx| vec![fx.int(types::I8, 0)],
+            )[0];
+            lo.call_routine(fx, Routine::Unlock, &[lock]);
+            fx.when(readied, |fx| tasks::push_ready(lo, fx, waiter));
             (present, Vec::new())
         });
     });

@@ -19,8 +19,9 @@ fn watches_watch(mut lo: Lowering, mut fx: Fx, supply: Supply) {
 
 /// Returns at once when the charge lies outside the band; otherwise arms the cell's arm record
 /// with the band and the running task, which another task waiting on it traps, and parks until a
-/// wake. A wait cancelled at its start fails at once; a cancelled one returns only when the
-/// charge left the band.
+/// wake, after which it takes the task out of the arm: it returns when the charge lies outside the
+/// band, and arms the record and parks again while it lies inside. A wait cancelled at its start
+/// fails at once; a cancelled one returns only when the charge left the band.
 fn watches_wait_outside(mut lo: Lowering, mut fx: Fx, supply: Supply, handle: clif::Value) {
     let low = supply.param(1).scalar_value()
     let high = supply.param(2).scalar_value()
@@ -64,6 +65,15 @@ fn watches_wait_outside(mut lo: Lowering, mut fx: Fx, supply: Supply, handle: cl
         return fx1.list1(held)
     })
     let record_arm = arms[0]
+    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, walk_state: Slice[clif::Value]) -> Pass {
+        return wait_outside_pass(mut lo, fx: mut fx1, supply, record, record_arm, current, lock, low, span)
+    })
+    mut fx.b.trap(clif::TrapCode(user: 1))
+} watches_wait_outside
+
+/// One pass of a wait's loop, entered and left holding the lock: arms the arm record and parks,
+/// then returns once the charge lies outside the band, or fails once the wait is cancelled.
+fn wait_outside_pass(mut lo: Lowering, mut fx: Fx, supply: Supply, record: clif::Value, record_arm: clif::Value, current: clif::Value, lock: clif::Value, low: clif::Value, span: clif::Value) -> Pass {
     let waiter = mut fx.load(PTR, addr: record_arm, offset: ARM_WAITER)
     let waits = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: waiter, y: 0)
     let elsewhere = mut fx.b.icmp(clif::IntCC.NotEqual, x: waiter, y: current)
@@ -83,20 +93,22 @@ fn watches_wait_outside(mut lo: Lowering, mut fx: Fx, supply: Supply, handle: cl
     leave_wait(mut lo, mut fx)
     waiting_on(mut lo, mut fx, what: 0)
     let origin = tasks_origin(mut lo, mut fx)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+    clear_arm_waiter(mut fx, record_arm, task: current)
+    let charge = mut fx.load(PTR, addr: record, offset: CELL_CHARGE)
+    let left = charge_outside(mut fx, charge, low, span)
+    mut fx.if_true(left, then: fn[mut lo](mut fx1: Fx) {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: fx1.list1(lock).view())
+        supply.done(mut lo, fx: mut fx1)
+    })
     let stopped = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: origin, y: 0)
     mut fx.if_true(stopped, then: fn[mut lo](mut fx1: Fx) {
-        discard mut lo.call_routine(mut fx1, routine: Routine.Lock, args: fx1.list1(lock).view())
-        clear_arm_waiter(mut fx1, record_arm, task: current)
-        let now = mut fx1.load(PTR, addr: record, offset: CELL_CHARGE)
-        let gone = charge_outside(mut fx1, charge: now, low, span)
         discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: fx1.list1(lock).view())
-        let stays = mut fx1.b.bxor_imm_s(gone, y: 1)
-        mut fx1.if_true(stays, then: fn[mut lo](mut fx2: Fx) {
-            tasks_fail_cancelled(mut lo, fx: mut fx2, supply, origin)
-        })
+        tasks_fail_cancelled(mut lo, fx: mut fx1, supply, origin)
     })
-    supply.done(mut lo, mut fx)
-} watches_wait_outside
+    let again = mut fx.int(clif::Type.Int8, value: 1)
+    return Pass(again: again, next: mem::List[clif::Value].empty(fx.alloc))
+} wait_outside_pass
 
 /// Takes a task out of an arm record when it waits there. The caller holds the lock.
 fn clear_arm_waiter(mut fx: Fx, record_arm: clif::Value, task: clif::Value) {

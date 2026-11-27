@@ -1007,10 +1007,21 @@ fn park(mut lo: Lowering, mut fx: Fx) {
 /// Makes a task ready: a new or parked one joins the run queue, a running or parking one is
 /// notified, and so is a preempted kernel task.
 fn tasks_wake(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let readied = wake_state(lo, mut fx, record)
+    mut fx.if_true(readied, then: fn[mut lo](mut fx1: Fx) {
+        tasks_push_ready(mut lo, fx: mut fx1, record)
+    })
+} tasks_wake
+
+/// Gives a task the state a wake leaves it in: ready for a new or parked one, notified for a
+/// running or parking one and for a preempted kernel task; gives whether it made the task ready,
+/// which then runs only once `tasks_push_ready` admits it.
+fn wake_state(lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value {
     let word = mut fx.offset(record, offset: TASK_STATE)
     let notified = mut fx.int(clif::Type.Int32, value: RUN_NOTIFIED)
     let ready = mut fx.int(clif::Type.Int32, value: RUN_READY)
-    discard mut fx.repeat(mem::List[clif::Value].empty(fx.alloc).view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+    let none = mut fx.int(clif::Type.Int8, value: 0)
+    let outcome = mut fx.repeat(fx.list1(none).view(), body: fn(mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
         let current = mut fx1.b.atomic_load(clif::Type.Int32, flags: clif::MemFlags.owned(), p: word)
         let is_new = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: current, y: RUN_NEW)
         let parked_now = mut fx1.b.icmp_imm_s(clif::IntCC.Equal, x: current, y: RUN_PARKED)
@@ -1026,22 +1037,20 @@ fn tasks_wake(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
             target = mut fx1.b.select(is_preempted, x: kept, y: target)
         }
         let acting = mut fx1.b.bor(is_parked, y: notify)
-        let again = mut fx1.choose_in(mut lo, condition: acting, results: fx1.types1(clif::Type.Int8).view(), then: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+        let chosen = mut fx1.choose(acting, results: fx1.types2(clif::Type.Int8, b: clif::Type.Int8).view(), then: fn(mut fx2: Fx) -> mem::List[clif::Value] {
             let seen = mut fx2.b.atomic_cas(clif::MemFlags.owned(), p: word, e: current, x: target)
             let done = mut fx2.b.icmp(clif::IntCC.Equal, x: seen, y: current)
-            let enqueue = mut fx2.b.band(done, y: is_parked)
-            mut fx2.if_true(enqueue, then: fn[mut lo2](mut fx3: Fx) {
-                tasks_push_ready(mut lo2, fx: mut fx3, record)
-            })
+            let readied = mut fx2.b.band(done, y: is_parked)
             let retry = mut fx2.b.bxor_imm_s(done, y: 1)
-            return fx2.list1(retry)
-        }, otherwise: fn(mut lo2: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            return fx2.list2(retry, b: readied)
+        }, otherwise: fn(mut fx2: Fx) -> mem::List[clif::Value] {
             let settled = mut fx2.int(clif::Type.Int8, value: 0)
-            return fx2.list1(settled)
+            return fx2.list2(settled, b: settled)
         })
-        return Pass(again: again[0], next: mem::List[clif::Value].empty(fx1.alloc))
+        return Pass(again: chosen[0], next: fx1.list1(chosen[1]))
     })
-} tasks_wake
+    return outcome[0]
+} wake_state
 
 /// Makes a task just spawned ready; the spawn is a scheduling point of the running task.
 fn spawned(mut lo: Lowering, mut fx: Fx, record: clif::Value) {

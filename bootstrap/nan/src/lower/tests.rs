@@ -414,9 +414,9 @@ fn proven_divisions_lower_without_a_zero_test() {
     );
 }
 
-/// For each call to `wake` in a function's text, whether every path from it reaches a call to
-/// `unlock` before any call to `lock` and before the function returns.
-fn wakes_under_lock(text: &str, wake: FuncId, [lock, unlock]: [FuncId; 2]) -> Vec<bool> {
+/// For each call to `from` in a function's text, whether every path from it reaches a call to
+/// `goal` before any call to `stop` and before the function returns.
+fn reach_first(text: &str, from: FuncId, [stop, goal]: [FuncId; 2]) -> Vec<bool> {
     let lines: Vec<&str> = text.lines().map(str::trim).collect();
     let calls_of = |id: FuncId| -> Vec<String> {
         let callee = format!(" u0:{} ", id.as_u32());
@@ -428,7 +428,7 @@ fn wakes_under_lock(text: &str, wake: FuncId, [lock, unlock]: [FuncId; 2]) -> Ve
             .map(|(name, _)| format!("call {name}("))
             .collect()
     };
-    let (wakes, locks, unlocks) = (calls_of(wake), calls_of(lock), calls_of(unlock));
+    let (froms, stops, goals) = (calls_of(from), calls_of(stop), calls_of(goal));
     let mut blocks: HashMap<&str, Vec<&str>> = HashMap::new();
     let mut current = None;
     for line in &lines {
@@ -443,16 +443,16 @@ fn wakes_under_lock(text: &str, wake: FuncId, [lock, unlock]: [FuncId; 2]) -> Ve
     fn reaches<'a>(
         blocks: &HashMap<&'a str, Vec<&'a str>>,
         (block, from): (&'a str, usize),
-        [locks, unlocks]: [&[String]; 2],
+        [stops, goals]: [&[String]; 2],
         seen: &mut HashSet<&'a str>,
     ) -> bool {
         let calls =
             |line: &str, calls: &[String]| calls.iter().any(|call| line.contains(call.as_str()));
         for line in &blocks[block][from..] {
-            if calls(line, unlocks) {
+            if calls(line, goals) {
                 return true;
             }
-            if calls(line, locks) || line.starts_with("return") {
+            if calls(line, stops) || line.starts_with("return") {
                 return false;
             }
             if line.starts_with("jump") || line.starts_with("brif") {
@@ -460,7 +460,7 @@ fn wakes_under_lock(text: &str, wake: FuncId, [lock, unlock]: [FuncId; 2]) -> Ve
                     .filter(|word| word.starts_with("block"))
                     .all(|target| {
                         let target = *blocks.get_key_value(target).expect("a block").0;
-                        !seen.insert(target) || reaches(blocks, (target, 0), [locks, unlocks], seen)
+                        !seen.insert(target) || reaches(blocks, (target, 0), [stops, goals], seen)
                     });
             }
         }
@@ -469,9 +469,9 @@ fn wakes_under_lock(text: &str, wake: FuncId, [lock, unlock]: [FuncId; 2]) -> Ve
     let mut outcomes = Vec::new();
     for (block, body) in &blocks {
         for (at, line) in body.iter().enumerate() {
-            if wakes.iter().any(|call| line.contains(call.as_str())) {
+            if froms.iter().any(|call| line.contains(call.as_str())) {
                 let seen = &mut HashSet::new();
-                let calls = [locks.as_slice(), unlocks.as_slice()];
+                let calls = [stops.as_slice(), goals.as_slice()];
                 outcomes.push(reaches(&blocks, (block, at + 1), calls, seen));
             }
         }
@@ -479,11 +479,45 @@ fn wakes_under_lock(text: &str, wake: FuncId, [lock, unlock]: [FuncId; 2]) -> Ve
     outcomes
 }
 
+/// The text of each function lowering `example::<name>` of an example workspace holding `source`
+/// gives, with the functions of `routines`, and the ids of those routines.
+fn lowered<const N: usize>(
+    source: &str,
+    name: &str,
+    routines: [Routine; N],
+) -> (Vec<(String, String)>, [FuncId; N]) {
+    let scratch = example(source);
+    let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
+    let std = crate::stdlib::packages();
+    let checker = checked(&workspace, &workspace.closures[0], std, Target::X64Linux);
+    let item = item_named(&checker, &format!("example::{name}"));
+    let mut lowering = Lowering::new(
+        &checker,
+        HashMap::new(),
+        Vec::new(),
+        None,
+        None,
+        super::load::Linking::Image,
+    );
+    let (ids, texts) = dumping(|| {
+        let ids = routines.map(|routine| lowering.routine(routine));
+        lowering.instance(Instance::Nir {
+            item,
+            role: Role::Body,
+            index: 0,
+            args: no_args(),
+        });
+        lowering.drain();
+        ids
+    });
+    (texts, ids)
+}
+
 /// A sender wakes the receiver of its channel, and a cown's release the task its next request
 /// waits in, before releasing the lock under which it read that task.
 #[test]
 fn wakes_come_before_unlocking() {
-    let scratch = example(
+    let (texts, [wake, lock, unlock]) = lowered(
         "//! Wakes.\n\n\
          /// A level.\npub closed struct Gauge {\n    pub level: u32\n} Gauge\n\n\
          pub fn pass(value: u32, alloc: mem::Alloc) -> u32 fails task::Cancelled uses wait {\n\
@@ -497,30 +531,9 @@ fn wakes_come_before_unlocking() {
          \x20   let Some(oldest) = try await mut receiver.receive() else {\n        return 0\n    }\n\
          \x20   return oldest\n\
          } pass\n",
+        "pass",
+        [Routine::Wake, Routine::Lock, Routine::Unlock],
     );
-    let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
-    let std = crate::stdlib::packages();
-    let checker = checked(&workspace, &workspace.closures[0], std, Target::X64Linux);
-    let item = item_named(&checker, "example::pass");
-    let mut lowering = Lowering::new(
-        &checker,
-        HashMap::new(),
-        Vec::new(),
-        None,
-        None,
-        super::load::Linking::Image,
-    );
-    let ((), texts) = dumping(|| {
-        lowering.instance(Instance::Nir {
-            item,
-            role: Role::Body,
-            index: 0,
-            args: no_args(),
-        });
-        lowering.drain();
-    });
-    let wake = lowering.routine(Routine::Wake);
-    let locking = [Routine::Lock, Routine::Unlock].map(|routine| lowering.routine(routine));
     let waking: Vec<&str> = (texts.iter())
         .filter(|(name, _)| {
             [
@@ -533,7 +546,7 @@ fn wakes_come_before_unlocking() {
             .any(|part| name.contains(part))
         })
         .filter_map(|(name, text)| {
-            let outcomes = wakes_under_lock(text, wake, locking);
+            let outcomes = reach_first(text, wake, [lock, unlock]);
             assert!(!outcomes.contains(&false), "{name}:\n{text}");
             (!outcomes.is_empty()).then_some(name.as_str())
         })
@@ -543,4 +556,34 @@ fn wakes_come_before_unlocking() {
         5,
         "send, offer, the cown release and the releases of a sender and a receiver: {waking:?}"
     );
+}
+
+/// A wait on a charge retakes the lock after each park before it returns, and a return of
+/// memory, which takes the task of an arm out of it under the lock, calls no wake, whose
+/// admission takes that lock.
+#[test]
+fn charge_waits_end_under_the_lock() {
+    let (texts, [park, lock, unlock, wake, _]) = lowered(
+        "//! Levels.\n\n\
+         pub fn next(watch: mem::Watch, level: usize) -> usize fails task::Cancelled uses wait {\n\
+         \x20   return try await watch.changed(seen: level)\n\
+         } next\n",
+        "next",
+        [
+            Routine::Park,
+            Routine::Lock,
+            Routine::Unlock,
+            Routine::Wake,
+            Routine::Free,
+        ],
+    );
+    let text = |part: &str| {
+        let found = texts.iter().find(|(name, _)| name.contains(part));
+        found.map(|(_, text)| text.as_str()).expect(part)
+    };
+    let wait = text("wait_outside");
+    let parks = reach_first(wait, park, [unlock, lock]);
+    assert!(!parks.is_empty() && !parks.contains(&false), "{wait}");
+    let free = text(Routine::Free.name());
+    assert!(reach_first(free, wake, [lock, unlock]).is_empty(), "{free}");
 }

@@ -1,6 +1,7 @@
 //! An isolated space's runtime: its one executor thread, which runs in user mode over a boot
 //! area its kernel maps as it is used, the system calls through which it reads its kernel's
-//! clock, waits for its first timer, its doorbell or its kernel's orders and ends its jobs, its
+//! clock, names the account of each task it switches to, waits for its first timer, its doorbell
+//! or its kernel's orders and ends its jobs, its
 //! start, which runs `nanos::isolated` as its first task, and its fault routine, in which its kernel resumes its
 //! thread at an exception. A test image running alone in a space runs on such a runtime too,
 //! writing its standard streams and ending with its exit status through its kernel.
@@ -19,13 +20,14 @@ use super::super::trap::{OPERAND_RECORD, kind_number};
 use super::super::{CALL_CONV, Instance, Lowering, lines};
 use super::system::unavailable_unless;
 use super::tasks::{self, EXPIRED, thread};
-use super::{Routine, state};
+use super::{Routine, state, tables};
 use crate::check::ty::no_args;
 use crate::nir::{Role, Span};
 
 /// The numbers of the system calls the runtime makes: waiting until a deadline of the kernel's
 /// clock, drawing and releasing pages of the boot area, reading the clock, invoking a capability
-/// its kernel serves, telling how a job ended, and naming the fault routine.
+/// its kernel serves, telling how a job ended, naming the fault routine, and reading the clock
+/// as it names the account of the task it switches to.
 pub const WAIT: u64 = 1;
 pub const DRAW: u64 = 2;
 pub const RELEASE: u64 = 3;
@@ -33,6 +35,7 @@ pub const NOW: u64 = 5;
 pub const INVOKE: u64 = 6;
 pub const END: u64 = 11;
 pub const FAULT: u64 = 12;
+pub const SWITCH: u64 = 13;
 
 /// How an `END` call tells a trap.
 const TRAPPED: u64 = 2;
@@ -129,27 +132,86 @@ pub fn define(lo: &mut Lowering, fx: &mut Fx, routine: Routine) {
     let result = match routine {
         Routine::ClockNow => {
             let reading = call(lo, fx, NOW, &[]);
-            let held = lo.reserved(fx, CLOCK);
-            let failed =
-                fx.b.ins()
-                    .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, reading, FAILURES);
-            fx.choose(
-                failed,
-                &[PTR],
-                |fx| {
-                    let one = fx.ptr(1);
-                    fx.store(one, held, clock::FAILED);
-                    vec![fx.load(PTR, held, clock::READING)]
-                },
-                |fx| {
-                    fx.store(reading, held, clock::READING);
-                    vec![reading]
-                },
-            )[0]
+            latest(lo, fx, reading)
         }
         _ => fx.ptr(0),
     };
     fx.b.ins().return_(&[result]);
+}
+
+/// A reading of the kernel's clock as the runtime switches to the task at `record`, through a
+/// `SWITCH` call naming its account: the handle of the executor deriving directly from a root
+/// executor that the task's executor is or derives from, zero for a task of a root executor or of
+/// a stale one. Gives the latest reading once a reading fails.
+pub fn switched(lo: &mut Lowering, fx: &mut Fx, record: Value) -> Value {
+    let state_address = lo.state(fx);
+    let lock = fx.offset(state_address, state::LOCK);
+    lo.call_routine(fx, Routine::Lock, &[lock]);
+    let handle = fx.load(PTR, record, tasks::task::EXECUTOR);
+    let entry = tables::live_entry(lo, fx, handle);
+    let none = fx.ptr(0);
+    let found = fx.repeat(&[handle, entry, none], |fx, state| {
+        let [handle, entry] = [state[0], state[1]];
+        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, entry, 0);
+        let next = fx.choose_in(
+            lo,
+            present,
+            &[types::I8, PTR, PTR, PTR],
+            |lo, fx| {
+                let source = fx.load(types::I32, entry, tables::entry::SOURCE);
+                let source = fx.b.ins().uextend(PTR, source);
+                let derived = fx.b.ins().icmp_imm_s(IntCC::NotEqual, source, 0);
+                fx.choose_in(
+                    lo,
+                    derived,
+                    &[types::I8, PTR, PTR, PTR],
+                    |lo, fx| {
+                        let index = fx.b.ins().iadd_imm_s(source, -1);
+                        let parent = tables::entry_at(lo, fx, index);
+                        let above = fx.load(types::I32, parent, tables::entry::SOURCE);
+                        let deeper = fx.b.ins().icmp_imm_s(IntCC::NotEqual, above, 0);
+                        let generation = fx.load(types::I32, parent, tables::entry::GENERATION);
+                        let generation = fx.b.ins().uextend(PTR, generation);
+                        let generation = fx.b.ins().ishl_imm_s(generation, 32);
+                        let parent_handle = fx.b.ins().bor(generation, index);
+                        let next_handle = fx.b.ins().select(deeper, parent_handle, handle);
+                        let next_entry = fx.b.ins().select(deeper, parent, entry);
+                        let zero = fx.ptr(0);
+                        let found = fx.b.ins().select(deeper, zero, handle);
+                        vec![deeper, next_handle, next_entry, found]
+                    },
+                    |_, fx| vec![fx.int(types::I8, 0), handle, entry, fx.ptr(0)],
+                )
+            },
+            |_, fx| vec![fx.int(types::I8, 0), handle, entry, fx.ptr(0)],
+        );
+        (next[0], next[1..].to_vec())
+    })[2];
+    lo.call_routine(fx, Routine::Unlock, &[lock]);
+    let reading = call(lo, fx, SWITCH, &[found]);
+    latest(lo, fx, reading)
+}
+
+/// `reading`, a call's reading of the kernel's clock, kept as the latest; the latest reading once
+/// a reading fails, as every reading of a stale clock does.
+fn latest(lo: &mut Lowering, fx: &mut Fx, reading: Value) -> Value {
+    let held = lo.reserved(fx, CLOCK);
+    let failed =
+        fx.b.ins()
+            .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, reading, FAILURES);
+    fx.choose(
+        failed,
+        &[PTR],
+        |fx| {
+            let one = fx.ptr(1);
+            fx.store(one, held, clock::FAILED);
+            vec![fx.load(PTR, held, clock::READING)]
+        },
+        |fx| {
+            fx.store(reading, held, clock::READING);
+            vec![reading]
+        },
+    )[0]
 }
 
 /// Once a reading of the kernel's clock has failed, revokes the clock of the first task's grants,

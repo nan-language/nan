@@ -1103,7 +1103,8 @@ fn run_task(lo: &mut Lowering, fx: &mut Fx, record: Value) {
 
 /// Runs a task on the executor thread until it switches away, on a machine target other than an
 /// isolated space, whose tasks share its thread's, with the extended state it owns, charging the
-/// time it ran, then settles its state.
+/// time it ran, then settles its state; an isolated space names the task's account to its kernel
+/// as it reads the clock the task starts at.
 fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     let word = fx.offset(record, task::STATE);
     let thread = lo.thread(fx);
@@ -1129,7 +1130,11 @@ fn switch_in(lo: &mut Lowering, fx: &mut Fx, record: Value) {
     }
     fx.store(record, thread, thread::CURRENT);
     fx.store(thread, record, task::THREAD);
-    let started = (!lo.seeded()).then(|| lo.now_ns(fx));
+    let started = match (lo.seeded(), lo.user()) {
+        (true, _) => None,
+        (false, true) => Some(super::space::switched(lo, fx, record)),
+        (false, false) => Some(lo.now_ns(fx)),
+    };
     if lo.on_cpus() {
         lo.kernel_switch_in(fx, record, started.expect("the time a kernel task starts"));
     }

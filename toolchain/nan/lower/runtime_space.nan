@@ -1,8 +1,9 @@
-//! An isolated space's runtime: its one executor thread, which runs in user mode over a boot area its kernel maps as it is used, the system calls through which it reads its kernel's clock, waits for its first timer, its doorbell or its kernel's orders and ends its jobs, its start, which runs `nanos::isolated` as its first task, and its fault routine, in which its kernel resumes its thread at an exception. A test image running alone in a space runs on such a runtime too, writing its standard streams and ending with its exit status through its kernel.
+//! An isolated space's runtime: its one executor thread, which runs in user mode over a boot area its kernel maps as it is used, the system calls through which it reads its kernel's clock, names the account of each task it switches to, waits for its first timer, its doorbell or its kernel's orders and ends its jobs, its start, which runs `nanos::isolated` as its first task, and its fault routine, in which its kernel resumes its thread at an exception. A test image running alone in a space runs on such a runtime too, writing its standard streams and ending with its exit status through its kernel.
 
 /// The numbers of the system calls the runtime makes: waiting until a deadline of the kernel's
 /// clock, drawing and releasing pages of the boot area, reading the clock, invoking a capability
-/// its kernel serves, telling how a job ended, and naming the fault routine.
+/// its kernel serves, telling how a job ended, naming the fault routine, and reading the clock
+/// as it names the account of the task it switches to.
 const SPACE_WAIT: u64 = 1
 
 const SPACE_DRAW: u64 = 2
@@ -16,6 +17,8 @@ pkg const SPACE_INVOKE: u64 = 6
 pkg const SPACE_END: u64 = 11
 
 const SPACE_FAULT: u64 = 12
+
+const SPACE_SWITCH: u64 = 13
 
 /// How an `END` call tells a trap.
 const SPACE_TRAPPED: u64 = 2
@@ -121,6 +124,65 @@ fn space_define(mut lo: Lowering, mut fx: Fx, routine: Routine) {
 /// A reading of the kernel's clock through a `NOW` call, the latest one once a reading fails.
 fn space_clock_now(mut lo: Lowering, mut fx: Fx) -> clif::Value {
     let reading = space_call(mut lo, mut fx, number: SPACE_NOW, args: mem::List[clif::Value].empty(fx.alloc).view())
+    return space_latest(mut lo, mut fx, reading)
+} space_clock_now
+
+/// A reading of the kernel's clock as the runtime switches to the task at `record`, through a
+/// `SWITCH` call naming its account: the handle of the executor deriving directly from a root
+/// executor that the task's executor is or derives from, zero for a task of a root executor or of
+/// a stale one. Gives the latest reading once a reading fails.
+fn space_switched(mut lo: Lowering, mut fx: Fx, record: clif::Value) -> clif::Value {
+    let state_address = mut lo.state(mut fx)
+    let lock = mut fx.offset(state_address, offset: STATE_LOCK)
+    discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: fx.list1(lock).view())
+    let handle = mut fx.load(PTR, addr: record, offset: TASK_EXECUTOR)
+    let entry = live_entry(mut lo, mut fx, handle)
+    let none = mut fx.ptr(0)
+    let found = mut fx.repeat(fx.list3(handle, b: entry, c: none).view(), body: fn[mut lo](mut fx1: Fx, state: Slice[clif::Value]) -> Pass {
+        expect state.len() > 1
+        let current = state[0]
+        let record1 = state[1]
+        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: record1, y: 0)
+        let next = mut fx1.choose_in(mut lo, condition: present, results: fx1.types4(clif::Type.Int8, b: PTR, c: PTR, d: PTR).view(), then: fn(mut lo1: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let source_word = mut fx2.load(clif::Type.Int32, addr: record1, offset: TABLES_ENTRY_SOURCE)
+            let source = mut fx2.b.uextend(PTR, x: source_word)
+            let derived = mut fx2.b.icmp_imm_s(clif::IntCC.NotEqual, x: source, y: 0)
+            return mut fx2.choose_in(mut lo1, condition: derived, results: fx2.types4(clif::Type.Int8, b: PTR, c: PTR, d: PTR).view(), then: fn(mut lo2: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                let index = mut fx3.b.iadd_imm_s(source, y: -1)
+                let parent = entry_at(mut lo2, fx: mut fx3, handle: index)
+                let above = mut fx3.load(clif::Type.Int32, addr: parent, offset: TABLES_ENTRY_SOURCE)
+                let deeper = mut fx3.b.icmp_imm_s(clif::IntCC.NotEqual, x: above, y: 0)
+                let generation_word = mut fx3.load(clif::Type.Int32, addr: parent, offset: TABLES_ENTRY_GENERATION)
+                let generation = mut fx3.b.uextend(PTR, x: generation_word)
+                let shifted = mut fx3.b.ishl_imm_s(generation, y: 32)
+                let parent_handle = mut fx3.b.bor(shifted, y: index)
+                let next_handle = mut fx3.b.select(deeper, x: parent_handle, y: current)
+                let next_record = mut fx3.b.select(deeper, x: parent, y: record1)
+                let zero = mut fx3.ptr(0)
+                let found_handle = mut fx3.b.select(deeper, x: zero, y: current)
+                return fx3.list4(deeper, b: next_handle, c: next_record, d: found_handle)
+            }, otherwise: fn(mut lo2: Lowering, mut fx3: Fx) -> mem::List[clif::Value] {
+                let stop = mut fx3.int(clif::Type.Int8, value: 0)
+                let unfound = mut fx3.ptr(0)
+                return fx3.list4(stop, b: current, c: record1, d: unfound)
+            })
+        }, otherwise: fn(mut lo1: Lowering, mut fx2: Fx) -> mem::List[clif::Value] {
+            let stop = mut fx2.int(clif::Type.Int8, value: 0)
+            let unfound = mut fx2.ptr(0)
+            return fx2.list4(stop, b: current, c: record1, d: unfound)
+        })
+        expect next.len() > 3
+        return Pass(again: next[0], next: fx1.list3(next[1], b: next[2], c: next[3]))
+    })
+    expect found.len() > 2
+    discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: fx.list1(lock).view())
+    let reading = space_call(mut lo, mut fx, number: SPACE_SWITCH, args: fx.list1(found[2]).view())
+    return space_latest(mut lo, mut fx, reading)
+} space_switched
+
+/// `reading`, a call's reading of the kernel's clock, kept as the latest; the latest reading once
+/// a reading fails, as every reading of a stale clock does.
+fn space_latest(mut lo: Lowering, mut fx: Fx, reading: clif::Value) -> clif::Value {
     let held = mut lo.reserved(mut fx, data_name: SPACE_CLOCK, size: SPACE_CLOCK_SIZE, align: 8)
     let failed = mut fx.b.icmp_imm_s(clif::IntCC.UnsignedGreaterThanOrEqual, x: reading, y: SPACE_FAILURES)
     let chosen = mut fx.choose(failed, results: fx.types1(PTR).view(), then: fn(mut fx1: Fx) -> mem::List[clif::Value] {
@@ -133,7 +195,7 @@ fn space_clock_now(mut lo: Lowering, mut fx: Fx) -> clif::Value {
         return fx1.list1(reading)
     })
     return chosen[0]
-} space_clock_now
+} space_latest
 
 /// Once a reading of the kernel's clock has failed, revokes the clock of the first task's grants,
 /// and with it every clock deriving from it, and expires every timer armed: its time stands still

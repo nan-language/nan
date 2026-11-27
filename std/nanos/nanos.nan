@@ -623,9 +623,7 @@ fn serving[S: sys::Component[Env, P] and Encode, Env: Environment and Send, P: s
                 break
             }
             let Asked(id: id, request: request) = next
-            let Some(given) = try await carried(mut stepper, take request, exec, alloc) else {
-                continue
-            }
+            let given = try await carried(mut stepper, take request, exec, alloc)
             discard attempt await answers.send(Routed.Answered(Replied(id: id, answer: take given)))
         }
         s.cancel()
@@ -663,51 +661,51 @@ fn under_header[T, E](header: Option[sys::Header], body: fn() -> T fails E uses 
     return try await sys::run_headed(given, body)
 } under_header
 
-/// Carries out a request of an instance's holder on its stepper, giving the answer, none when the
+/// Carries out a request of an instance's holder on its stepper, giving the answer, `Done` when the
 /// holder ended the wait it asked for.
-fn carried[S: sys::Component[Env, P] and Encode, Env: Environment and Send, P: sys::Protocol and Send](mut stepper: sys::Stepper[S, Env, P], take request: Request, exec: task::Executor, alloc: mem::Alloc) -> Option[Answer] fails task::Cancelled uses wait {
+fn carried[S: sys::Component[Env, P] and Encode, Env: Environment and Send, P: sys::Protocol and Send](mut stepper: sys::Stepper[S, Env, P], take request: Request, exec: task::Executor, alloc: mem::Alloc) -> Answer fails task::Cancelled uses wait {
     match request {
         Request.Step => {
             let handled = mut stepper.step()
-            return Some(Answer.Flag(handled.is_some()))
+            return Answer.Flag(handled.is_some())
         }
         Request.StepEncoded => {
             var encoding = sys::Encoded.empty(alloc)
             let Some(handled) = sys::Wire[P].step_encoded(mut stepper, out: mut encoding) else {
-                return Some(Answer.Stepped(None))
+                return Answer.Stepped(None)
             }
-            return Some(Answer.Stepped(Some(Stepped(handled: handled, encoding: take encoding))))
+            return Answer.Stepped(Some(Stepped(handled: handled, encoding: take encoding)))
         }
         Request.TakeSent => {
             let Some(sys::Sent(message: message, header: header, delay_ns: delay_ns)) = mut stepper.take_sent() else {
-                return Some(Answer.Taken(None))
+                return Answer.Taken(None)
             }
             var encoding = sys::Encoded.empty(alloc)
             let operation = sys::Wire[P].encode_any(message, out: mut encoding)
-            return Some(Answer.Taken(Some(SentCall(operation: operation, header: header, delay_ns: delay_ns, encoding: take encoding))))
+            return Answer.Taken(Some(SentCall(operation: operation, header: header, delay_ns: delay_ns, encoding: take encoding)))
         }
-        Request.Held => return Some(Answer.HeldTasks(stepper.held(alloc)))
-        Request.StartHeld(key) => return Some(Answer.Flag(mut stepper.start_held(key)))
-        Request.DropHeld(key) => return Some(Answer.Flag(mut stepper.drop_held(key)))
+        Request.Held => return Answer.HeldTasks(stepper.held(alloc))
+        Request.StartHeld(key) => return Answer.Flag(mut stepper.start_held(key))
+        Request.DropHeld(key) => return Answer.Flag(mut stepper.drop_held(key))
         Request.Incoming(stop) => return try await waited(stepper, take stop, ready: false, exec)
         Request.Ready(stop) => return try await waited(stepper, take stop, ready: true, exec)
-        Request.StartKeyed => return Some(Answer.Started(mut stepper.start_keyed()))
-        Request.Idle => return Some(Answer.Flag(stepper.idle()))
-        Request.Checkpoint => return Some(Answer.Checkpointed(Checkpoint(schema: mem::wire::Codec[S].schema_hash(), bytes: encoded(stepper.state(), alloc))))
+        Request.StartKeyed => return Answer.Started(mut stepper.start_keyed())
+        Request.Idle => return Answer.Flag(stepper.idle())
+        Request.Checkpoint => return Answer.Checkpointed(Checkpoint(schema: mem::wire::Codec[S].schema_hash(), bytes: encoded(stepper.state(), alloc)))
         Request.CheckpointAs(schema) => {
             var bytes = mem::Bytes.empty(alloc)
             if not mem::wire::Codec[S].encode_as(stepper.state(), schema, out: mut bytes, alloc) {
-                return Some(Answer.CheckpointedAs(None))
+                return Answer.CheckpointedAs(None)
             }
-            return Some(Answer.CheckpointedAs(Some(Checkpoint(schema: schema, bytes: take bytes))))
+            return Answer.CheckpointedAs(Some(Checkpoint(schema: schema, bytes: take bytes)))
         }
         Request.Resumed(reason) => mut stepper.resumed(reason)
         Request.Pressure(level) => mut stepper.pressure(level)
-        Request.Health => return Some(Answer.Health(mut stepper.health()))
+        Request.Health => return Answer.Health(mut stepper.health())
         Request.Suspend => mut stepper.suspend()
         Request.Wake => mut stepper.wake()
     }
-    return Some(Answer.Done)
+    return Answer.Done
 } carried
 
 enum Waited {
@@ -716,8 +714,8 @@ enum Waited {
 } Waited
 
 /// Waits as `stepper.incoming()` does, or as `stepper.ready()` does when `ready`, giving whether a
-/// message waits, none once every sender of `stop` is released first.
-fn waited[S, Env: Any, P: Any](stepper: sys::Stepper[S, Env, P], take stop: task::Receiver[u8], ready: bool, exec: task::Executor) -> Option[Answer] fails task::Cancelled uses wait {
+/// message waits, `Done` once every sender of `stop` is released first.
+fn waited[S, Env: Any, P: Any](stepper: sys::Stepper[S, Env, P], take stop: task::Receiver[u8], ready: bool, exec: task::Executor) -> Answer fails task::Cancelled uses wait {
     var waits = true
     var watched = Some(take stop)
     let outcome = attempt await task::scope(exec, body: fn[mut waits, mut watched](s: task::Scope) fails Waited uses wait {
@@ -737,8 +735,8 @@ fn waited[S, Env: Any, P: Any](stepper: sys::Stepper[S, Env, P], take stop: task
         s.cancel()
     })
     match outcome {
-        Ok(_) => return Some(Answer.Flag(waits))
-        Err(Waited.Released) => return None
+        Ok(_) => return Answer.Flag(waits)
+        Err(Waited.Released) => return Answer.Done
         Err(Waited.Cancelled(cancelled)) => fail cancelled
     }
 } waited
@@ -1156,6 +1154,33 @@ test requests_a_domain_never_takes_end_with_it for Instance.ask {
         return
     }
 } requests_a_domain_never_takes_end_with_it
+
+test cancelled_waits_leave_no_wait_behind for Instance.incoming {
+    let world = testing::world()
+    var left: usize = 1
+    try await task::scope(world.exec, body: fn[mut left](s: task::Scope) fails InstanceError uses wait {
+        let Opened(instance: opening, launch: launch, ending: ending, last: last) = opened(s, checkpoint: None, runner: sys::Runner.denied(), placed: None, alloc: world.alloc)
+        let granted = tested(world)
+        discard s.spawn(fn[take granted, take launch, take ending, take last]() fails task::Cancelled uses wait {
+            let given = try await Hosted[Count, CountedEnv, Counted].run(take granted, take launch)
+            discard attempt await ending.send(Routed.Ended)
+            discard attempt await last.send(take given)
+        })
+        var instance = opening
+        defer take instance.abandon()
+        for _ in 0u32..<3 {
+            let arrived = try await task::within(world.clock, ms: 1, body: fn() fails InstanceError uses wait {
+                try await instance.incoming()
+            })
+            expect arrived.is_none()
+        }
+        discard try await instance.idle()
+        left = await when instance.waits => instance.waits.waiting.len()
+        undefer instance
+        discard try await take instance.end()
+    })
+    expect left == 0
+} cancelled_waits_leave_no_wait_behind
 
 test instances_act_through_the_runner_they_are_held_with for Hosted.run {
     let world = testing::world()

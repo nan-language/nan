@@ -653,12 +653,12 @@ pub fn signal(lo: &mut Lowering, fx: &mut Fx, supply: &Supply) {
             let waiter = fx.load(PTR, address, fields.waiter);
             let none = fx.ptr(0);
             fx.store(none, address, fields.waiter);
-            release_word(fx, word);
-            irq_restore(lo, fx, flags);
             let waiting = fx.b.ins().icmp_imm_s(IntCC::NotEqual, waiter, 0);
             fx.when(waiting, |fx| {
                 lo.call_routine(fx, Routine::Wake, &[waiter]);
             });
+            release_word(fx, word);
+            irq_restore(lo, fx, flags);
             supply.done(lo, fx);
         }
         "wait" => wait(lo, fx, supply, &signal_ty, &fields),

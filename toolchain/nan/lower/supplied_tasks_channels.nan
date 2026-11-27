@@ -179,6 +179,18 @@ fn take_oldest(mut lo: Lowering, mut fx: Fx, record: clif::Value, element: ty::T
     })
 } take_oldest
 
+/// Wakes the receiver waiting for a value, taking it out of the channel. The caller holds the
+/// lock.
+fn wake_receiver(mut lo: Lowering, mut fx: Fx, record: clif::Value) {
+    let receiving = mut fx.load(PTR, addr: record, offset: CHANNEL_WAITING_RECEIVER)
+    let zero = mut fx.ptr(0)
+    mut fx.store(zero, addr: record, offset: CHANNEL_WAITING_RECEIVER)
+    let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: receiving, y: 0)
+    mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+        discard mut lo.call_routine(mut fx1, routine: Routine.Wake, args: Array[clif::Value, 1].filled(receiving).view())
+    })
+} wake_receiver
+
 /// Whether the running call is cancelled, with the origin a cancellation then holds.
 fn channels_cancelled(mut lo: Lowering, mut fx: Fx) -> CancellationOrigin {
     let origin = tasks_origin(mut lo, mut fx)
@@ -262,14 +274,8 @@ fn send_pass(mut lo: Lowering, mut fx: Fx, supply: Supply, sending: Sending, wal
         mut lo.store_held(mut fx1, address: slot, held: sending.value, ty: sending.element)
         let grown = mut fx1.b.iadd_imm_s(len, y: 1)
         mut fx1.store(grown, addr: record, offset: CHANNEL_LEN)
-        let receiving = mut fx1.load(PTR, addr: record, offset: CHANNEL_WAITING_RECEIVER)
-        let zero = mut fx1.ptr(0)
-        mut fx1.store(zero, addr: record, offset: CHANNEL_WAITING_RECEIVER)
+        wake_receiver(mut lo, fx: mut fx1, record)
         discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
-        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: receiving, y: 0)
-        mut fx1.if_true(present, then: fn[mut lo](mut fx2: Fx) {
-            discard mut lo.call_routine(mut fx2, routine: Routine.Wake, args: Array[clif::Value, 1].filled(receiving).view())
-        })
         supply.done(mut lo, fx: mut fx1)
     })
     let next = mut fx.choose_in(mut lo, condition: room, results: Array[clif::Type, 1].filled(PTR).view(), then: fn(mut lo1: Lowering, mut fx1: Fx) -> mem::List[clif::Value] {
@@ -361,14 +367,8 @@ fn offer_pass(mut lo: Lowering, mut fx: Fx, supply: Supply, offering: Offering, 
         mut lo.store_held(mut fx1, address: slot, held: offering.value, ty: offering.element)
         let grown = mut fx1.b.iadd_imm_s(len, y: 1)
         mut fx1.store(grown, addr: record, offset: CHANNEL_LEN)
-        let receiving = mut fx1.load(PTR, addr: record, offset: CHANNEL_WAITING_RECEIVER)
-        let zero = mut fx1.ptr(0)
-        mut fx1.store(zero, addr: record, offset: CHANNEL_WAITING_RECEIVER)
+        wake_receiver(mut lo, fx: mut fx1, record)
         discard mut lo.call_routine(mut fx1, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
-        let present = mut fx1.b.icmp_imm_s(clif::IntCC.NotEqual, x: receiving, y: 0)
-        mut fx1.if_true(present, then: fn[mut lo](mut fx2: Fx) {
-            discard mut lo.call_routine(mut fx2, routine: Routine.Wake, args: Array[clif::Value, 1].filled(receiving).view())
-        })
         let none = mut lo.none_value(mut fx1, option)
         mut lo.store_held(mut fx1, address: offering.result, held: none, ty: option)
         let held = mut lo.held_at(mut fx1, ty: option, address: offering.result)
@@ -701,7 +701,6 @@ fn settle_end(mut lo: Lowering, mut fx: Fx, record: clif::Value, sender: bool) {
 fn channels_end(mut lo: Lowering, mut fx: Fx, record: clif::Value, sender: bool, buffered: fn(mut lo: Lowering, mut fx: Fx)) {
     let lock = mut fx.offset(record, offset: CHANNEL_LOCK)
     discard mut lo.call_routine(mut fx, routine: Routine.Lock, args: Array[clif::Value, 1].filled(lock).view())
-    var woken: Option[clif::Value] = None
     if sender {
         let senders = mut fx.load(PTR, addr: record, offset: CHANNEL_SENDERS)
         let fewer = mut fx.b.iadd_imm_s(senders, y: -1)
@@ -709,7 +708,11 @@ fn channels_end(mut lo: Lowering, mut fx: Fx, record: clif::Value, sender: bool,
         let last = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: fewer, y: 0)
         let receiving = mut fx.load(PTR, addr: record, offset: CHANNEL_WAITING_RECEIVER)
         let zero = mut fx.ptr(0)
-        woken = Some(mut fx.b.select(last, x: receiving, y: zero))
+        let woken = mut fx.b.select(last, x: receiving, y: zero)
+        let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: woken, y: 0)
+        mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
+            discard mut lo.call_routine(mut fx1, routine: Routine.Wake, args: Array[clif::Value, 1].filled(woken).view())
+        })
     } else {
         let zero = mut fx.ptr(0)
         mut fx.store(zero, addr: record, offset: CHANNEL_RECEIVER)
@@ -740,15 +743,6 @@ fn channels_end(mut lo: Lowering, mut fx: Fx, record: clif::Value, sender: bool,
     let handles = mut fx.b.bor(senders_left, y: receiver)
     let unused = mut fx.b.icmp_imm_s(clif::IntCC.Equal, x: handles, y: 0)
     discard mut lo.call_routine(mut fx, routine: Routine.Unlock, args: Array[clif::Value, 1].filled(lock).view())
-    match woken {
-        Some(task) => {
-            let present = mut fx.b.icmp_imm_s(clif::IntCC.NotEqual, x: task, y: 0)
-            mut fx.if_true(present, then: fn[mut lo](mut fx1: Fx) {
-                discard mut lo.call_routine(mut fx1, routine: Routine.Wake, args: Array[clif::Value, 1].filled(task).view())
-            })
-        }
-        None => {}
-    }
     mut fx.if_true(unused, then: fn[mut lo](mut fx1: Fx) {
         free_channel(mut lo, fx: mut fx1, record)
     })

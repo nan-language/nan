@@ -1,5 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use cranelift_module::FuncId;
+
+use super::runtime::Routine;
 use super::{Instance, Lowering, dumping};
 use crate::check::checked;
 use crate::check::db::ItemId;
@@ -408,5 +411,136 @@ fn proven_divisions_lower_without_a_zero_test() {
     assert!(
         ratio.contains("brif"),
         "ratio does not test its divisor:\n{ratio}"
+    );
+}
+
+/// For each call to `wake` in a function's text, whether every path from it reaches a call to
+/// `unlock` before any call to `lock` and before the function returns.
+fn wakes_under_lock(text: &str, wake: FuncId, [lock, unlock]: [FuncId; 2]) -> Vec<bool> {
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    let calls_of = |id: FuncId| -> Vec<String> {
+        let callee = format!(" u0:{} ", id.as_u32());
+        (lines.iter())
+            .filter_map(|line| line.split_once(" = "))
+            .filter(|(name, target)| {
+                name.starts_with("fn") && format!(" {target} ").contains(&callee)
+            })
+            .map(|(name, _)| format!("call {name}("))
+            .collect()
+    };
+    let (wakes, locks, unlocks) = (calls_of(wake), calls_of(lock), calls_of(unlock));
+    let mut blocks: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut current = None;
+    for line in &lines {
+        if line.starts_with("block") && line.ends_with(':') {
+            let name = line.split(['(', ':']).next().expect("a block's name");
+            current = Some(name);
+            blocks.insert(name, Vec::new());
+        } else if let Some(name) = current {
+            blocks.get_mut(name).expect("the block").push(line);
+        }
+    }
+    fn reaches<'a>(
+        blocks: &HashMap<&'a str, Vec<&'a str>>,
+        (block, from): (&'a str, usize),
+        [locks, unlocks]: [&[String]; 2],
+        seen: &mut HashSet<&'a str>,
+    ) -> bool {
+        let calls =
+            |line: &str, calls: &[String]| calls.iter().any(|call| line.contains(call.as_str()));
+        for line in &blocks[block][from..] {
+            if calls(line, unlocks) {
+                return true;
+            }
+            if calls(line, locks) || line.starts_with("return") {
+                return false;
+            }
+            if line.starts_with("jump") || line.starts_with("brif") {
+                return (line.split(|c: char| !c.is_alphanumeric()))
+                    .filter(|word| word.starts_with("block"))
+                    .all(|target| {
+                        let target = *blocks.get_key_value(target).expect("a block").0;
+                        !seen.insert(target) || reaches(blocks, (target, 0), [locks, unlocks], seen)
+                    });
+            }
+        }
+        true
+    }
+    let mut outcomes = Vec::new();
+    for (block, body) in &blocks {
+        for (at, line) in body.iter().enumerate() {
+            if wakes.iter().any(|call| line.contains(call.as_str())) {
+                let seen = &mut HashSet::new();
+                let calls = [locks.as_slice(), unlocks.as_slice()];
+                outcomes.push(reaches(&blocks, (block, at + 1), calls, seen));
+            }
+        }
+    }
+    outcomes
+}
+
+/// A sender wakes the receiver of its channel, and a cown's release the task its next request
+/// waits in, before releasing the lock under which it read that task.
+#[test]
+fn wakes_come_before_unlocking() {
+    let scratch = example(
+        "//! Wakes.\n\n\
+         /// A level.\npub closed struct Gauge {\n    pub level: u32\n} Gauge\n\n\
+         pub fn pass(value: u32, alloc: mem::Alloc) -> u32 fails task::Cancelled uses wait {\n\
+         \x20   let gauge = task::Cown.of(Gauge(level: value), alloc)\n\
+         \x20   await when mut gauge {\n        gauge.level += 1\n    }\n\
+         \x20   let channel = task::Channel[u32].bounded(2, alloc)\n\
+         \x20   let sender = channel.sender\n\
+         \x20   var receiver = channel.receiver\n\
+         \x20   discard sender.offer(value)\n\
+         \x20   discard attempt await sender.send(value)\n\
+         \x20   let Some(oldest) = try await mut receiver.receive() else {\n        return 0\n    }\n\
+         \x20   return oldest\n\
+         } pass\n",
+    );
+    let workspace = Workspace::load(scratch.0.clone(), &mut Vec::new()).expect("a workspace");
+    let std = crate::stdlib::packages();
+    let checker = checked(&workspace, &workspace.closures[0], std, Target::X64Linux);
+    let item = item_named(&checker, "example::pass");
+    let mut lowering = Lowering::new(
+        &checker,
+        HashMap::new(),
+        Vec::new(),
+        None,
+        None,
+        super::load::Linking::Image,
+    );
+    let ((), texts) = dumping(|| {
+        lowering.instance(Instance::Nir {
+            item,
+            role: Role::Body,
+            index: 0,
+            args: no_args(),
+        });
+        lowering.drain();
+    });
+    let wake = lowering.routine(Routine::Wake);
+    let locking = [Routine::Lock, Routine::Unlock].map(|routine| lowering.routine(routine));
+    let waking: Vec<&str> = (texts.iter())
+        .filter(|(name, _)| {
+            [
+                "SenderD4sendE",
+                "SenderD5offerE",
+                "cown_release",
+                "_NXrelease_",
+            ]
+            .iter()
+            .any(|part| name.contains(part))
+        })
+        .filter_map(|(name, text)| {
+            let outcomes = wakes_under_lock(text, wake, locking);
+            assert!(!outcomes.contains(&false), "{name}:\n{text}");
+            (!outcomes.is_empty()).then_some(name.as_str())
+        })
+        .collect();
+    assert_eq!(
+        waking.len(),
+        5,
+        "send, offer, the cown release and the releases of a sender and a receiver: {waking:?}"
     );
 }

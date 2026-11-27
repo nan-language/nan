@@ -344,10 +344,10 @@ fn grant_next_locked(lo: &mut Lowering, fx: &mut Fx, record: Value) {
         },
         |fx| vec![fx.ptr(0)],
     )[0];
-    lo.call_routine(fx, Routine::Unlock, &[lock]);
     fx.when(waiting, |fx| {
         lo.call_routine(fx, Routine::Wake, &[task]);
     });
+    lo.call_routine(fx, Routine::Unlock, &[lock]);
 }
 
 /// Requests a cown for the running task through a request node, suspending until it is

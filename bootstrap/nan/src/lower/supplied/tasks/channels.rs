@@ -161,6 +161,18 @@ fn take_oldest(lo: &mut Lowering, fx: &mut Fx, record: Value, element: &Ty, targ
     });
 }
 
+/// Wakes the receiver waiting for a value, taking it out of the channel. The caller holds the
+/// lock.
+fn wake_receiver(lo: &mut Lowering, fx: &mut Fx, record: Value) {
+    let receiving = fx.load(PTR, record, channel::WAITING_RECEIVER);
+    let zero = fx.ptr(0);
+    fx.store(zero, record, channel::WAITING_RECEIVER);
+    let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, receiving, 0);
+    fx.when(present, |fx| {
+        lo.call_routine(fx, Routine::Wake, &[receiving]);
+    });
+}
+
 /// Whether the running call is cancelled, with the origin a cancellation then holds.
 fn cancelled(lo: &mut Lowering, fx: &mut Fx) -> (Value, Value) {
     let origin = super::origin(lo, fx);
@@ -227,14 +239,8 @@ fn send(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, element: &Ty) {
             lo.store_held(fx, slot, value, element);
             let len = fx.b.ins().iadd_imm_s(len, 1);
             fx.store(len, record, channel::LEN);
-            let receiving = fx.load(PTR, record, channel::WAITING_RECEIVER);
-            let zero = fx.ptr(0);
-            fx.store(zero, record, channel::WAITING_RECEIVER);
+            wake_receiver(lo, fx, record);
             lo.call_routine(fx, Routine::Unlock, &[lock]);
-            let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, receiving, 0);
-            fx.when(present, |fx| {
-                lo.call_routine(fx, Routine::Wake, &[receiving]);
-            });
             supply.done(lo, fx);
         });
         let next = fx.choose_in(
@@ -331,14 +337,8 @@ fn offer(lo: &mut Lowering, fx: &mut Fx, supply: &Supply, element: &Ty) {
             lo.store_held(fx, slot, value, element);
             let len = fx.b.ins().iadd_imm_s(len, 1);
             fx.store(len, record, channel::LEN);
-            let receiving = fx.load(PTR, record, channel::WAITING_RECEIVER);
-            let zero = fx.ptr(0);
-            fx.store(zero, record, channel::WAITING_RECEIVER);
+            wake_receiver(lo, fx, record);
             lo.call_routine(fx, Routine::Unlock, &[lock]);
-            let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, receiving, 0);
-            fx.when(present, |fx| {
-                lo.call_routine(fx, Routine::Wake, &[receiving]);
-            });
             let none = lo.none_value(fx, &option);
             lo.store_held(fx, result, none, &option);
             let held = lo.held_at(fx, &option, result);
@@ -626,14 +626,18 @@ fn end(
 ) {
     let lock = fx.offset(record, channel::LOCK);
     lo.call_routine(fx, Routine::Lock, &[lock]);
-    let woken = if sender {
+    if sender {
         let senders = fx.load(PTR, record, channel::SENDERS);
         let senders = fx.b.ins().iadd_imm_s(senders, -1);
         fx.store(senders, record, channel::SENDERS);
         let last = fx.b.ins().icmp_imm_s(IntCC::Equal, senders, 0);
         let receiving = fx.load(PTR, record, channel::WAITING_RECEIVER);
         let zero = fx.ptr(0);
-        Some(fx.b.ins().select(last, receiving, zero))
+        let woken = fx.b.ins().select(last, receiving, zero);
+        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, woken, 0);
+        fx.when(present, |fx| {
+            lo.call_routine(fx, Routine::Wake, &[woken]);
+        });
     } else {
         let zero = fx.ptr(0);
         fx.store(zero, record, channel::RECEIVER);
@@ -657,19 +661,12 @@ fn end(
             );
             (present, next)
         });
-        None
-    };
+    }
     let senders = fx.load(PTR, record, channel::SENDERS);
     let receiver = fx.load(PTR, record, channel::RECEIVER);
     let handles = fx.b.ins().bor(senders, receiver);
     let unused = fx.b.ins().icmp_imm_s(IntCC::Equal, handles, 0);
     lo.call_routine(fx, Routine::Unlock, &[lock]);
-    if let Some(woken) = woken {
-        let present = fx.b.ins().icmp_imm_s(IntCC::NotEqual, woken, 0);
-        fx.when(present, |fx| {
-            lo.call_routine(fx, Routine::Wake, &[woken]);
-        });
-    }
     fx.when(unused, |fx| free_channel(lo, fx, record));
 }
 

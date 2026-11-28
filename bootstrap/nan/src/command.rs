@@ -454,6 +454,20 @@ impl Invocation<'_> {
 
     /// The output of a command that reported a `tool` error and did nothing else.
     fn tool_error(&self, code: Code, scope: &str) -> Output {
+        self.tool_output(code, scope, Vec::new())
+    }
+
+    /// The `tool.usage` output of a command whose operand `found` lies outside its synopses, none
+    /// when the line ends before an operand they need.
+    fn usage(&self, scope: &str, found: Option<&str>) -> Output {
+        let lines = vec![
+            format!("expected: {}", self.name.synopsis()),
+            found_line(found),
+        ];
+        self.tool_output(Code::ToolUsage, scope, lines)
+    }
+
+    fn tool_output(&self, code: Code, scope: &str, lines: Vec<String>) -> Output {
         let summary = self
             .counts()
             .iter()
@@ -464,7 +478,7 @@ impl Invocation<'_> {
             elision: self.command(scope, false),
             verdict: Verdict::Invalid,
             summary,
-            records: vec![unlocated(code, Vec::new())],
+            records: vec![unlocated(code, lines)],
         }
     }
 }
@@ -761,8 +775,16 @@ fn usage_lines(args: &[String], found: Option<&str>) -> Vec<String> {
         }
         None => format!("a command: {COMMANDS}"),
     };
-    let found = found.map_or("end of line".to_owned(), output::argument);
-    vec![format!("expected: {expected}"), format!("found: {found}")]
+    vec![format!("expected: {expected}"), found_line(found)]
+}
+
+/// The `found:` line of a `tool.usage` record: the argument outside the synopses, or `end of
+/// line`.
+fn found_line(found: Option<&str>) -> String {
+    format!(
+        "found: {}",
+        found.map_or("end of line".to_owned(), output::argument)
+    )
 }
 
 fn execute(invocation: &Invocation, current: &Path, trace: &mut Trace) -> io::Result<Outcome> {

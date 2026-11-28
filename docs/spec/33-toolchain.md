@@ -164,6 +164,23 @@ error tool.usage - -
 invalid run hello --keep-reset: files 0, errors 1, incomplete 0
 ```
 
+At the workspace root, `nan dep sync` lacks the package it takes, and a file is no package:
+
+```text
+$ nan dep sync
+invalid dep sync .: files 0, errors 1, incomplete 0
+error tool.usage - -
+    expected: nan dep sync [<package>]
+    found: end of line
+invalid dep sync .: files 0, errors 1, incomplete 0
+$ nan dep sync hello/hello.nan
+invalid dep sync hello/hello.nan: files 0, errors 1, incomplete 0
+error tool.usage - -
+    expected: nan dep sync [<package>]
+    found: hello/hello.nan
+invalid dep sync hello/hello.nan: files 0, errors 1, incomplete 0
+```
+
 ## Output contract
 
 The **output contract** is the rules every command's output follows.

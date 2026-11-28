@@ -29,7 +29,7 @@ pub fn sync(
     let Some((Scope::Package(index), written)) =
         Scope::resolve(workspace, current, invocation.scope())
     else {
-        return Ok(invocation.tool_error(Code::ToolUsage, invocation.scope().unwrap_or(".")));
+        return Ok(invocation.usage(invocation.scope().unwrap_or("."), invocation.scope()));
     };
     trace.scope = Some(written.clone());
     let mut records = Vec::new();
@@ -50,7 +50,7 @@ pub fn upgrade(
     let Some((Scope::Package(index), written)) =
         Scope::resolve(workspace, current, invocation.scope())
     else {
-        return Ok(invocation.tool_error(Code::ToolUsage, invocation.scope().unwrap_or(".")));
+        return Ok(invocation.usage(invocation.scope().unwrap_or("."), invocation.scope()));
     };
     trace.scope = Some(written.clone());
     let mut records = Vec::new();
@@ -109,7 +109,7 @@ pub fn approve(
     let Some((Scope::Package(index), written)) =
         Scope::resolve(workspace, current, invocation.scope())
     else {
-        return Ok(invocation.tool_error(Code::ToolUsage, invocation.scope().unwrap_or(".")));
+        return Ok(invocation.usage(invocation.scope().unwrap_or("."), invocation.scope()));
     };
     trace.scope = Some(written.clone());
     let package = &workspace.packages[index];

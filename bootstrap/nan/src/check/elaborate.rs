@@ -61,6 +61,9 @@ impl Checker<'_> {
     }
 
     fn elaborate(&self, item: ItemId) -> Elaborated<Option<Unit>> {
+        if self.sig(item).has_error() {
+            return Err(Fault::Failed);
+        }
         self.type_parts(item);
         let mut unit = UnitDraft::new(item);
         match &self.db.ast(item).kind {

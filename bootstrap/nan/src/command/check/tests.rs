@@ -541,6 +541,46 @@ fn a_path_source_checks_at_its_locked_release_without_the_store_holding_it_and_t
 }
 
 #[test]
+fn a_dependency_declaring_a_type_through_an_unlocked_dependency_leaves_its_consumer_a_stale_lock() {
+    let package = |name: &str, dep: &str| {
+        format!(
+            "//! {name}.\n\npackage {name} {{\n    language 1\n    targets any\n{dep}}} {name}\n"
+        )
+    };
+    let choice = "//! Choices.\n\n/// A choice.\npub closed enum Choice {\n    Nothing\n} Choice\n";
+    let scratch = Scratch::new(&[
+        ("c/package.nan", &package("c", "")),
+        (
+            "c/c.nan",
+            "//! Values.\n\n/// A value.\npub closed struct Value {\n    pub count: u32\n} Value\n",
+        ),
+        ("b/package.nan", &package("b", "")),
+        ("b/b.nan", choice),
+        ("a/package.nan", &package("a", "    dep b \"../b\"\n")),
+        (
+            "a/a.nan",
+            "//! Uses.\n\n/// Nothing.\npub fn nothing() -> b::Choice = b::Choice.Nothing\n",
+        ),
+    ]);
+    let dir = &scratch.0;
+    run_in(&dir.join("b"), "dep sync");
+    run_in(&dir.join("a"), "dep sync");
+    fs::write(
+        dir.join("b/package.nan"),
+        package("b", "    dep c \"../c\"\n"),
+    )
+    .expect("b's dep");
+    let carried = choice.replace("    Nothing\n", "    Nothing\n    Some(value: c::Value)\n");
+    fs::write(dir.join("b/b.nan"), carried).expect("b's variant");
+    let output = run_in(dir, "check").output;
+    assert!(
+        output.contains("\nerror dep.lock-stale b/package.nan:6 b\n")
+            && output.contains("\nincomplete dep.sync-pending a/package.nan:6 a\n"),
+        "{output}"
+    );
+}
+
+#[test]
 fn a_syntax_error_in_a_target_variant_is_reported_as_such() {
     let scratch = Scratch::new(&[
         (

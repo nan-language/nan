@@ -94,12 +94,14 @@ struct Underway {
     untraced: core::atomic::AtomicBool
     /// The jobs of a batch it runs, if any.
     job: Option[Job]
+    /// Whether the task holds the checker's `judging`.
+    judges: core::atomic::AtomicBool
     /// The allocator the task's checking draws on.
     alloc: mem::Alloc
 } Underway
 
 fn Underway.empty(checking: u32, take job: Option[Job], alloc: mem::Alloc) -> Underway {
-    return Underway(sink: core::atomic::AtomicU32.of(0), muted: core::atomic::AtomicU32.of(0), listener: core::atomic::AtomicU32.of(NO_ID), scope: cell::Swap.of(mem::List[GenericDef].empty(alloc), alloc), within: core::atomic::AtomicU32.of(NO_ID), checking: core::atomic::AtomicU32.of(checking), evaluating: cell::Swap.of(mem::List[ty::ItemId].empty(alloc), alloc), replacing: cell::Swap.of(mem::List[ty::ItemId].empty(alloc), alloc), deciding: Deciding.empty(alloc), computing: DigestSearch.empty(alloc), uses_search: UsesSearch.empty(alloc), finding_cycles: core::atomic::AtomicBool.of(false), traced: core::atomic::AtomicU32.of(NO_ID), untraced: core::atomic::AtomicBool.of(false), job: take job, alloc: alloc)
+    return Underway(sink: core::atomic::AtomicU32.of(0), muted: core::atomic::AtomicU32.of(0), listener: core::atomic::AtomicU32.of(NO_ID), scope: cell::Swap.of(mem::List[GenericDef].empty(alloc), alloc), within: core::atomic::AtomicU32.of(NO_ID), checking: core::atomic::AtomicU32.of(checking), evaluating: cell::Swap.of(mem::List[ty::ItemId].empty(alloc), alloc), replacing: cell::Swap.of(mem::List[ty::ItemId].empty(alloc), alloc), deciding: Deciding.empty(alloc), computing: DigestSearch.empty(alloc), uses_search: UsesSearch.empty(alloc), finding_cycles: core::atomic::AtomicBool.of(false), traced: core::atomic::AtomicU32.of(NO_ID), untraced: core::atomic::AtomicBool.of(false), job: take job, judges: core::atomic::AtomicBool.of(false), alloc: alloc)
 } Underway.empty
 
 /// What a checker holds; its queries change it through read access.
@@ -172,8 +174,12 @@ struct CheckerState {
     /// Whether the rejections of every item are known, once every package is checked; before,
     /// those of the items judged alone.
     judged_all: core::atomic::AtomicBool
-    /// The items checked, each judged alone.
+    /// The items checked, each judged alone, from when its judgment starts.
     judged: mem::OnceMap[ty::ItemId, Unit]
+    /// The items whose judgment alone has ended.
+    settled: mem::OnceMap[ty::ItemId, Unit]
+    /// 1 while a task of the checker judges items alone, which no other task does meanwhile.
+    judging: core::atomic::AtomicU32
     /// The workspace package, by index, that the check is narrowed to: the one package it checks
     /// whole, its closure's other packages judged item by item as it reads them; none when it
     /// checks each package its closure checks.
@@ -445,6 +451,8 @@ fn Checker.new(take db: Db, narrowed: Option[usize]) -> Checker {
         rejections: mem::OnceMap[ty::ItemId, Unit].empty(seed: 0, alloc),
         judged_all: core::atomic::AtomicBool.of(false),
         judged: mem::OnceMap[ty::ItemId, Unit].empty(seed: 0, alloc),
+        settled: mem::OnceMap[ty::ItemId, Unit].empty(seed: 0, alloc),
+        judging: core::atomic::AtomicU32.of(0),
         narrowed: narrowed,
         units: mem::OnceMap[ty::ItemId, Option[mem::Shared[nir::NirUnit]]].empty(seed: 0, alloc),
         const_values: mem::OnceMap[ty::ItemId, Option[mem::Shared[ConstValue]]].empty(seed: 0, alloc),
@@ -1111,14 +1119,35 @@ fn Checker.leaves_out(self, package_id: ty::PackageId) -> bool {
 
 /// Checks an item unless it is checked, judging it alone: rejected when its syntax errors or
 /// those its check reports lie on its lines. A snapshot restoring the check may give the item's
-/// outcome instead.
+/// outcome instead. One task of the checker judges at a time, so that another task reads an
+/// item's outcome only once its judgment has ended.
 fn Checker.judge_alone(self, item: ty::ItemId) {
+    let state = self.state.contents()
+    if state.settled.get(item).is_some() {
+        return
+    }
+    let underway = self.underway.contents()
+    if underway.judges.load() {
+        self.judge_held(item)
+        return
+    }
+    while state.judging.compare_swap(0, replacement: 1).is_err() {
+    }
+    underway.judges.store(true)
+    self.judge_held(item)
+    underway.judges.store(false)
+    state.judging.store(0)
+} Checker.judge_alone
+
+/// Judges an item alone, by the task holding the checker's `judging`.
+fn Checker.judge_held(self, item: ty::ItemId) {
     let state = self.state.contents()
     if state.judged.get(item).is_some() {
         return
     }
     state.judged.insert(item, value: Unit)
     if self.restore_judged(item) {
+        state.settled.insert(item, value: Unit)
         return
     }
     let underway = self.underway.contents()
@@ -1156,7 +1185,8 @@ fn Checker.judge_alone(self, item: ty::ItemId) {
         state.rejections.insert(item, value: Unit)
     }
     state.kept.judged_alone(item, rejected: failed)
-} Checker.judge_alone
+    state.settled.insert(item, value: Unit)
+} Checker.judge_held
 
 /// Whether a diagnostic is an error on one of some lines of a file.
 fn errs_within(reported: diagnostic::Diagnostic, path: Str, lines: core::Range[u32]) -> bool {

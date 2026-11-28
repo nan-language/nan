@@ -160,24 +160,29 @@ impl Checker<'_> {
     }
 
     /// The `dep` directives of a package whose alias no item names and no `allow contribute`
-    /// directive lists as a name among the grants nothing uses, each with the fix deleting it.
+    /// directive holding a grant something uses lists as such a grant or starts its registry
+    /// path with, each with the fix deleting it.
     fn check_unused_dependencies(&self, package: PackageId, unused_grants: &[(u32, String)]) {
         let data = self.db.package(package);
         let Some(manifest) = &data.source.manifest else {
             return;
         };
-        let contributing: HashSet<&str> = manifest
-            .allows
-            .iter()
-            .filter(|allow| matches!(allow.authority, Authority::Contribute(_)))
-            .flat_map(|allow| {
-                allow
-                    .names
-                    .iter()
-                    .filter(|name| !unused_grants.contains(&(allow.line, (*name).clone())))
-            })
-            .map(String::as_str)
-            .collect();
+        let mut contributing: HashSet<&str> = HashSet::new();
+        for allow in &manifest.allows {
+            let Authority::Contribute(registry) = &allow.authority else {
+                continue;
+            };
+            let granted: Vec<&str> = allow
+                .names
+                .iter()
+                .filter(|name| !unused_grants.contains(&(allow.line, (*name).clone())))
+                .map(String::as_str)
+                .collect();
+            if !granted.is_empty() {
+                contributing.extend(registry.split("::").next());
+            }
+            contributing.extend(granted);
+        }
         let mut named: HashSet<&str> = HashSet::new();
         for &module in &data.modules {
             for &item in &self.db.module(module).items {

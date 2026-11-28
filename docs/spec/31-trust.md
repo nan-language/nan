@@ -48,7 +48,7 @@ Each of these rules holds under every declared target: code is used when it is u
 - The `package` item, every item that is not private, every test, impl line, contribution and const assert, every landing fn and [migration](13-text-encode.md#migrations) and the function the `entry` directive names are **reachable**, and so is each private item that the [unit](19-nir.md#units) of a reachable item names. An impl line also names the methods implementing its interface, those of a component [serving](26-components.md#servers) a protocol being its `start`, its handlers and its summary function, and, when it names `sys::Component`, the [abandon method](17-suspension-io.md#abandoning-resources) of its Env. A private item that is not reachable is incompleteness (`unused.item`). A tombstone never makes an item reachable and is never an unused item.
 - A `var` binding, [pattern binding](06-statements-expressions.md#bindings) or name a `for` pattern binds, whose type is not linear and that no expression in its scope uses, is incompleteness (`unused.local`); its appearance as the target of `=` is not a use. For `let name = e` or `var name = e`, with or without a type, the exact fix writes `discard e`, or `e` alone when `e` has type `Unit` or `Never`, and exists only when no statement assigns the binding; for any other binding it writes `_` in place of the name.
 - A field of a struct is exempt when the field and its struct are both `pub`. Any other field that no item of the package reads is incompleteness (`unused.field`). A field is read by a field access other than the target of `=`, by a struct pattern giving it a pattern other than `_`, by a predicate naming it, and by the methods its struct's derives of `Eq`, `Ord`, `Hash`, `Render` and `Encode` write; construction does not read it. The exact fix also deletes its `label: value` in each construction and struct pattern, and exists only when each such value is a place, a literal or `_`.
-- A `dep` directive is incompleteness (`unused.dependency`) when no item other than the `package` item names its alias and no `allow contribute` directive lists the alias as a name that [contributors](25-registries.md#contributors) does not report as `unused.grant`. The exact fix also deletes the alias from each manifest grant listing it, and each grant it leaves listing nothing.
+- A `dep` directive is incompleteness (`unused.dependency`) when no item other than the `package` item names its alias and no `allow contribute` directive listing a name that [contributors](25-registries.md#contributors) does not report as `unused.grant` lists the alias as such a name or starts its registry path with it. The exact fix also deletes the alias from each manifest grant listing it, and each grant it leaves listing nothing.
 - A tombstone is incompleteness (`unused.tombstone`) when the package's history has a [history head](29-identity-versioning.md#publishing) and that release has no item or member visible to consumers whose canonical path is the old form's, or for a member the one its old path spells as written, and, for an old head, that is a function whose parameters have the old head's modes and types. A tombstone keeping an `Encode` [key](13-text-encode.md#keys) is never unused.
 
 ```nan
@@ -144,6 +144,60 @@ $ nan fix monitor
 ok fix monitor: errors 0, incomplete 0
 wrote monitor/package.nan
 ok fix monitor: errors 0, incomplete 0
+```
+
+In the next example, no item of `relay` names `codecs`, but its grant names the registry `codecs::formats` through that alias, so the `dep` directive declaring it is used.
+
+```nan
+// file: codecs/package.nan
+//! Frame codec registry.
+
+package codecs {
+    language 1
+    targets any
+} codecs
+
+// file: codecs/codecs.nan
+//! The table of frame codecs, keyed by frame tag.
+
+pub closed struct Codec {
+    pub tag: u8
+} Codec
+
+pub registry formats: Codec keyed by tag
+
+// file: framing/package.nan
+//! Short-frame codec.
+
+package framing {
+    language 1
+    targets any
+    dep codecs "../codecs"
+} framing
+
+// file: framing/framing.nan
+//! The short-frame codec.
+
+pub const SHORT_TAG: u8 = 1
+
+contribute codecs::formats short_frames = codecs::Codec(tag: SHORT_TAG)
+
+// file: relay/package.nan
+//! The short frame tag, relayed.
+
+package relay {
+    language 1
+    targets any
+    dep codecs "../codecs"
+    dep framing "../framing"
+    allow contribute codecs::formats in framing
+} relay
+
+// file: relay/relay.nan
+//! The short frame tag, relayed.
+
+/// The tag of short frames.
+pub fn short_tag() -> u8 = framing::SHORT_TAG
 ```
 
 ## Release gate

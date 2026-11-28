@@ -49,6 +49,47 @@ The commands are:
 - `nan fix` applies, in one pass, the exact fix of each diagnostic of its scope offering exactly one, skipping a fix that shares a line with an earlier one in path and line order, then checks again and prints the remaining diagnostics. With `--propagate` it then repeats, while a pass applies a fix, for the fixes of `item.wait-missing`, `item.fails-missing`, `error.cancel-unmapped`, `error.unconvertible`, `effect.await-missing` and `error.unhandled`, except fixes editing a `pkg` or `pub` function's head or a `pkg` or `pub` enum.
 - A command writing source, machine or image files prints `wrote <path>` per file it writes and `deleted <path>` per file it deletes, in path order, after its other records.
 
+In the next example, `nan check panel` prints none of the diagnostics of `meter`, which lies outside its scope.
+
+```nan
+// file: meter/package.nan
+//! Meters.
+
+package meter {
+    language 1
+    targets any
+} meter
+
+// file: meter/meter.nan
+//! Meter labels.
+
+/// The byte length of the meter's label.
+pub fn width() -> u32 = todo "measure the label" // incomplete: todo.hole
+
+// file: panel/package.nan
+//! Panels of meters.
+
+package panel {
+    language 1
+    targets any
+    dep meter "../meter"
+} panel
+
+// file: panel/panel.nan
+//! Panel layout.
+
+/// The width of a panel holding a meter.
+pub fn width() -> u32 {
+    return meter::width() + 2
+} width
+```
+
+```text
+$ nan check panel
+ok check panel: errors 0, incomplete 0
+ok check panel: errors 0, incomplete 0
+```
+
 ### Reading commands
 
 - `nan show <scope>` prints per item a record `item <item> <location> <item hash> <interface hash>`, hashes in [short form](29-identity-versioning.md#hash-values), holding its text. A module or package first prints its [module summary](32-docs.md#module-summaries) as a `module <path>` record, then its items in path and line order. `nan read <location>` prints the record of the item holding that line, and a line outside every item is `tool.unknown-scope`. In `nan show`, a canonical path that names nothing in the workspace names the std package, module, item or member it names among the std packages.

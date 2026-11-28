@@ -33,16 +33,16 @@ pub fn run(
     trace: &mut Trace,
 ) -> io::Result<Output> {
     let written = invocation.args.join(" ");
-    let dir = invocation
+    let local = invocation
         .value("--local")
-        .unwrap_or_default()
-        .trim_end_matches('/');
+        .expect("the parser requires --local");
+    let dir = local.trim_end_matches('/');
     let Some(index) = workspace
         .packages
         .iter()
         .position(|package| package.dir == dir)
     else {
-        return Ok(invocation.tool_error(Code::ToolUsage, &written));
+        return Ok(invocation.usage(&written, Some(local)));
     };
     let mut breaking = invocation.listed("--breaking");
     let reason = breaking.pop();

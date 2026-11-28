@@ -23,11 +23,9 @@ pub fn language(
     let Some((scope, written)) = Scope::resolve(workspace, current, invocation.scope()) else {
         return Ok(invocation.tool_error(Code::ToolUnknownScope, invocation.scope().unwrap_or(".")));
     };
-    let Some(version) = invocation
-        .value("--language")
-        .and_then(|version| version.parse::<u64>().ok())
-    else {
-        return Ok(invocation.tool_error(Code::ToolUsage, &written));
+    let language = invocation.value("--language");
+    let Some(version) = language.and_then(|version| version.parse::<u64>().ok()) else {
+        return Ok(invocation.usage(&written, language));
     };
     trace.scope = Some(written.clone());
     let mut diagnostics = Vec::new();

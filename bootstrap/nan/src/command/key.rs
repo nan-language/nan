@@ -18,9 +18,7 @@ use crate::workspace::Workspace;
 /// public key.
 pub fn new(invocation: &Invocation) -> io::Result<Output> {
     let written = invocation.args.join(" ");
-    let [principal] = invocation.operands[..] else {
-        return Ok(invocation.tool_error(Code::ToolUsage, &written));
-    };
+    let principal = invocation.operands[0];
     if !is_principal(principal) {
         return Ok(refused(
             invocation,
@@ -59,9 +57,7 @@ pub fn new(invocation: &Invocation) -> io::Result<Output> {
 /// `nan key show <principal>`: prints the public key of a principal's secret key.
 pub fn show(invocation: &Invocation) -> io::Result<Output> {
     let written = invocation.args.join(" ");
-    let [principal] = invocation.operands[..] else {
-        return Ok(invocation.tool_error(Code::ToolUsage, &written));
-    };
+    let principal = invocation.operands[0];
     if !is_principal(principal) {
         return Ok(refused(
             invocation,
@@ -92,15 +88,14 @@ pub fn trust(
     trace: &mut Trace,
 ) -> io::Result<Output> {
     let written = invocation.args.join(" ");
-    let (Some(package), [principal, key]) = (
-        workspace
-            .packages
-            .iter()
-            .find(|package| current.starts_with(workspace.root.join(&package.dir))),
-        &invocation.operands[..],
-    ) else {
+    let Some(package) = workspace
+        .packages
+        .iter()
+        .find(|package| current.starts_with(workspace.root.join(&package.dir)))
+    else {
         return Ok(invocation.tool_error(Code::ToolUsage, &written));
     };
+    let (principal, key) = (invocation.operands[0], invocation.operands[1]);
     trace.scope = Some(written.clone());
     if !is_principal(principal) {
         return Ok(refused(

@@ -27,18 +27,18 @@ pub fn replace(
     trace: &mut Trace,
 ) -> io::Result<Output> {
     let written = invocation.args.join(" ");
-    let ([operand], Some(expected), Some(from)) = (
-        &invocation.operands[..],
-        invocation.value("--expect").and_then(hash::parse_form),
-        invocation.value("--from"),
-    ) else {
+    let operand = invocation.operands[0];
+    let from = invocation
+        .value("--from")
+        .expect("the parser requires --from");
+    let Some(expected) = invocation.value("--expect").and_then(hash::parse_form) else {
         return Ok(invocation.tool_error(Code::ToolUsage, &written));
     };
     let Some((scope, written)) = Scope::resolve(workspace, current, Some(operand)) else {
         return Ok(invocation.tool_error(Code::ToolUnknownScope, operand));
     };
     let Scope::Lines(path, _) = &scope else {
-        return Ok(invocation.tool_error(Code::ToolUsage, &written));
+        return Ok(invocation.usage(&written, Some(operand)));
     };
     trace.scope = Some(written.clone());
     let [shown] = &check::shown(workspace, &scope)[..] else {
@@ -176,15 +176,12 @@ pub fn rename(
     current: &Path,
     trace: &mut Trace,
 ) -> io::Result<Output> {
-    let written = invocation.args.join(" ");
-    let [operand, name] = invocation.operands[..] else {
-        return Ok(invocation.tool_error(Code::ToolUsage, &written));
-    };
+    let (operand, name) = (invocation.operands[0], invocation.operands[1]);
     let Some((scope, written)) = Scope::resolve(workspace, current, Some(operand)) else {
         return Ok(invocation.tool_error(Code::ToolUnknownScope, operand));
     };
     let Scope::Lines(path, lines) = &scope else {
-        return Ok(invocation.tool_error(Code::ToolUsage, &written));
+        return Ok(invocation.usage(&written, Some(operand)));
     };
     trace.scope = Some(written.clone());
     let located = scope::location(operand).map(|(_, line)| line);
@@ -211,15 +208,12 @@ pub fn move_item(
     current: &Path,
     trace: &mut Trace,
 ) -> io::Result<Output> {
-    let written = invocation.args.join(" ");
-    let [operand, module] = invocation.operands[..] else {
-        return Ok(invocation.tool_error(Code::ToolUsage, &written));
-    };
+    let (operand, module) = (invocation.operands[0], invocation.operands[1]);
     let Some((scope, written)) = Scope::resolve(workspace, current, Some(operand)) else {
         return Ok(invocation.tool_error(Code::ToolUnknownScope, operand));
     };
     let Scope::Lines(path, lines) = &scope else {
-        return Ok(invocation.tool_error(Code::ToolUsage, &written));
+        return Ok(invocation.usage(&written, Some(operand)));
     };
     trace.scope = Some(written.clone());
     let located = scope::location(operand).map(|(_, line)| line);

@@ -20,9 +20,8 @@ pub fn run(
     trace: &mut Trace,
 ) -> io::Result<Output> {
     let written = invocation.args.join(" ");
-    let ([named], Some(principal)) = (&invocation.operands[..], invocation.value("--as")) else {
-        return Ok(invocation.tool_error(Code::ToolUsage, &written));
-    };
+    let named = invocation.operands[0];
+    let principal = invocation.value("--as").expect("the parser requires --as");
     let Some((scope, _)) = Scope::resolve(workspace, current, Some(named)) else {
         return Ok(invocation.tool_error(Code::ToolUnknownScope, named));
     };
@@ -39,7 +38,7 @@ pub fn run(
         }
         Scope::Lines(file, lines) => {
             let Some(item) = workspace.item_at(file, *lines.start()) else {
-                return Ok(invocation.tool_error(Code::ToolUsage, &written));
+                return Ok(invocation.usage(&written, Some(named)));
             };
             let index = workspace
                 .packages
@@ -48,7 +47,7 @@ pub fn run(
                 .expect("a file of a package");
             (index, item.canonical(), (file.clone(), *lines.start()))
         }
-        _ => return Ok(invocation.tool_error(Code::ToolUsage, &written)),
+        _ => return Ok(invocation.usage(&written, Some(named))),
     };
     let package = &workspace.packages[index];
     let mut diagnostics = Vec::new();

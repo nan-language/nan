@@ -282,6 +282,36 @@ impl Name {
         }
     }
 
+    /// The fewest operands the command takes, in the `--green` form when `green`.
+    fn least_operands(self, green: bool) -> usize {
+        match self {
+            Name::Merge => 3,
+            Name::Diff if !green => 2,
+            Name::EditRename | Name::EditMove | Name::DepAdd | Name::KeyTrust => 2,
+            Name::Show
+            | Name::Read
+            | Name::Find
+            | Name::Context
+            | Name::Explain
+            | Name::Expand
+            | Name::EditReplace
+            | Name::Seal
+            | Name::KeyNew
+            | Name::KeyShow => 1,
+            _ => 0,
+        }
+    }
+
+    /// The options the command requires.
+    fn required(self) -> &'static [&'static str] {
+        match self {
+            Name::EditReplace => &["--expect", "--from"],
+            Name::Seal => &["--as"],
+            Name::Publish => &["--local"],
+            _ => &[],
+        }
+    }
+
     /// The option of its form taking no scope and no other option of its own.
     fn alone(self) -> Option<&'static str> {
         match self {
@@ -715,6 +745,15 @@ fn read(args: &[String]) -> Result<Invocation<'_>, Option<&str>> {
             _ => invocation.operands.push(arg),
         }
         index += 1;
+    }
+    let least = name.least_operands(invocation.flag("--green"));
+    if invocation.operands.len() < least
+        || name
+            .required()
+            .iter()
+            .any(|option| invocation.value(option).is_none())
+    {
+        return Err(None);
     }
     let alone = name
         .alone()

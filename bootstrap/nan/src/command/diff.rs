@@ -24,9 +24,7 @@ pub fn workspaces(
     trace: &mut Trace,
 ) -> io::Result<Output> {
     let written = invocation.args.join(" ");
-    let [old, new] = invocation.operands[..] else {
-        return Ok(invocation.tool_error(Code::ToolUsage, &written));
-    };
+    let (old, new) = (invocation.operands[0], invocation.operands[1]);
     trace.scope = Some(written.clone());
     let (old, new) = (current.join(old), current.join(new));
     for root in [&old, &new] {
@@ -55,9 +53,10 @@ pub fn run(
         return green(invocation, workspace, current, trace);
     }
     let written = invocation.args.join(" ");
-    let ([old, new], Some(path)) = (&invocation.operands[..], invocation.value("--path")) else {
-        return Ok(invocation.tool_error(Code::ToolUsage, &written));
-    };
+    let (old, new) = (invocation.operands[0], invocation.operands[1]);
+    let path = invocation
+        .value("--path")
+        .expect("the file form takes --path");
     trace.scope = Some(written.clone());
     let version = |file: &str| {
         let source = fs::read(current.join(file)).unwrap_or_default();

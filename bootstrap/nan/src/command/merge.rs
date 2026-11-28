@@ -17,7 +17,7 @@ use crate::workspace::{self, Workspace};
 pub fn run(invocation: &Invocation, current: &Path, trace: &mut Trace) -> io::Result<Output> {
     let written = invocation.args.join(" ");
     let [base, ours, theirs] = invocation.operands[..] else {
-        return Ok(invocation.tool_error(Code::ToolUsage, &written));
+        unreachable!("the parser requires three versions");
     };
     trace.scope = Some(written.clone());
     let (base, ours_path, theirs) = (current.join(base), current.join(ours), current.join(theirs));

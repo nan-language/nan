@@ -68,15 +68,14 @@ pub fn add(
     trace: &mut Trace,
 ) -> io::Result<Output> {
     let written = invocation.args.join(" ");
-    let (Some(index), [alias, source]) = (
-        workspace
-            .packages
-            .iter()
-            .position(|package| current.starts_with(workspace.root.join(&package.dir))),
-        &invocation.operands[..],
-    ) else {
+    let Some(index) = workspace
+        .packages
+        .iter()
+        .position(|package| current.starts_with(workspace.root.join(&package.dir)))
+    else {
         return Ok(invocation.tool_error(Code::ToolUsage, &written));
     };
+    let (alias, source) = (invocation.operands[0], invocation.operands[1]);
     trace.scope = Some(written.clone());
     let package = &workspace.packages[index];
     let Some(manifest) = package.files.first() else {

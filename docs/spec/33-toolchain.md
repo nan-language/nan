@@ -222,6 +222,29 @@ error tool.usage - -
 invalid dep sync hello/hello.nan: files 0, errors 1, incomplete 0
 ```
 
+A line ending before an operand or option its command needs, and an operand of another kind than its synopsis names, are `tool.usage` too:
+
+```text
+$ nan edit rename hello::main
+invalid edit rename hello::main: files 0, errors 1, incomplete 0
+error tool.usage - -
+    expected: nan edit rename <item> <name>
+    found: end of line
+invalid edit rename hello::main: files 0, errors 1, incomplete 0
+$ nan seal hello::main
+invalid seal hello::main: files 0, errors 1, incomplete 0
+error tool.usage - -
+    expected: nan seal <item> --as <principal>
+    found: end of line
+invalid seal hello::main: files 0, errors 1, incomplete 0
+$ nan read hello
+invalid read hello: records 1
+error tool.usage - -
+    expected: nan read <location>
+    found: hello
+invalid read hello: records 1
+```
+
 ## Output contract
 
 The **output contract** is the rules every command's output follows.

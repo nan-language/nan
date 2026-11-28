@@ -68,10 +68,10 @@ pub fn show(
     trace: &mut Trace,
 ) -> io::Result<Output> {
     let written = invocation.args.join(" ");
-    let operand = match invocation.operands[..] {
-        [operand] if invocation.name != Name::Read || is_location(operand) => operand,
-        _ => return Ok(invocation.tool_error(Code::ToolUsage, &written)),
-    };
+    let operand = invocation.operands[0];
+    if invocation.name == Name::Read && !is_location(operand) {
+        return Ok(invocation.usage(&written, Some(operand)));
+    }
     let std = crate::stdlib::workspace();
     let shown_in = Scope::resolve(workspace, current, Some(operand))
         .map(|resolved| (workspace, resolved))
@@ -131,15 +131,12 @@ pub fn context(
     current: &Path,
     trace: &mut Trace,
 ) -> io::Result<Output> {
-    let written = invocation.args.join(" ");
-    let [operand] = invocation.operands[..] else {
-        return Ok(invocation.tool_error(Code::ToolUsage, &written));
-    };
+    let operand = invocation.operands[0];
     let Some((scope, written)) = Scope::resolve(workspace, current, Some(operand)) else {
         return Ok(invocation.tool_error(Code::ToolUnknownScope, operand));
     };
     if !matches!(scope, Scope::Lines(..)) {
-        return Ok(invocation.tool_error(Code::ToolUsage, &written));
+        return Ok(invocation.usage(&written, Some(operand)));
     }
     trace.scope = Some(written.clone());
     let line = is_location(operand)
@@ -172,10 +169,7 @@ pub fn explain(
     current: &Path,
     trace: &mut Trace,
 ) -> io::Result<Output> {
-    let written = invocation.args.join(" ");
-    let [operand] = invocation.operands[..] else {
-        return Ok(invocation.tool_error(Code::ToolUsage, &written));
-    };
+    let operand = invocation.operands[0];
     let Some((scope, written)) = Scope::resolve(workspace, current, Some(operand)) else {
         return Ok(invocation.tool_error(Code::ToolUnknownScope, operand));
     };
@@ -235,7 +229,7 @@ pub fn explain(
                 });
             }
         }
-        _ => return Ok(invocation.tool_error(Code::ToolUsage, &written)),
+        _ => return Ok(invocation.usage(&written, Some(operand))),
     }
     Ok(listed_output(invocation, &written, records))
 }
@@ -276,10 +270,7 @@ pub fn expand(
     current: &Path,
     trace: &mut Trace,
 ) -> io::Result<Output> {
-    let written = invocation.args.join(" ");
-    let [operand] = invocation.operands[..] else {
-        return Ok(invocation.tool_error(Code::ToolUsage, &written));
-    };
+    let operand = invocation.operands[0];
     let Some((scope, written)) = Scope::resolve(workspace, current, Some(operand)) else {
         return Ok(invocation.tool_error(Code::ToolUnknownScope, operand));
     };
@@ -289,7 +280,7 @@ pub fn expand(
         _ => None,
     };
     let Some(derived) = derived else {
-        return Ok(invocation.tool_error(Code::ToolUsage, &written));
+        return Ok(invocation.usage(&written, Some(operand)));
     };
     let writer = scope.package(workspace).and_then(|package| package.name());
     let records = derived
@@ -428,7 +419,7 @@ pub fn find(invocation: &Invocation, workspace: &Workspace, current: &Path) -> i
     let short = |path: String| written_for(&path, writer);
     if invocation.flag("--contributors") {
         let [registry, rest @ ..] = &invocation.operands[..] else {
-            return Ok(invocation.tool_error(Code::ToolUsage, &written));
+            unreachable!("the parser requires a registry");
         };
         let root = match rest.first() {
             Some(name) => workspace
@@ -464,9 +455,7 @@ pub fn find(invocation: &Invocation, workspace: &Workspace, current: &Path) -> i
             .collect();
         return Ok(listed_output(invocation, &written, records));
     }
-    let [name] = &invocation.operands[..] else {
-        return Ok(invocation.tool_error(Code::ToolUsage, &written));
-    };
+    let name = invocation.operands[0];
     let records = check::declared(workspace, name)
         .into_iter()
         .map(|found| Record {
@@ -506,7 +495,7 @@ pub fn primer(invocation: &Invocation) -> Output {
         _ => None,
     };
     let Some((name, heading)) = tier else {
-        return invocation.tool_error(Code::ToolUsage, &written);
+        return invocation.usage(&written, invocation.operands.first().copied());
     };
     let mut lines = printed(
         PRIMER
